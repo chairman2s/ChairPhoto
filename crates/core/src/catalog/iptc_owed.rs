@@ -31,6 +31,7 @@
 //! The record is per photo, not per copy: an IPTC save writes the sidecar beside the copy
 //! the location resolver picks, and so does the retry.
 
+use super::busy::{is_busy, retry_busy};
 use super::{Catalog, IptcFields, Result};
 use rusqlite::{params, OptionalExtension};
 use std::path::Path;
@@ -526,7 +527,7 @@ impl Catalog {
     ) -> Result<bool> {
         let mut after = 0i64;
         loop {
-            let page: Vec<i64> = {
+            let page: Vec<i64> = retry_busy(abort, || {
                 let mut stmt = self.conn.prepare(
                     "SELECT photo_id FROM pending_sidecar_iptc
                      WHERE owed != 0 AND photo_id > ?1 ORDER BY photo_id LIMIT ?2",
@@ -534,8 +535,8 @@ impl Catalog {
                 let ids = stmt
                     .query_map(params![after, IPTC_REPAIR_PAGE_SIZE], |r| r.get(0))?
                     .collect::<rusqlite::Result<_>>()?;
-                ids
-            };
+                Ok(ids)
+            })?;
             if page.is_empty() {
                 return Ok(true);
             }
@@ -544,17 +545,38 @@ impl Catalog {
                     return Ok(false);
                 }
                 after = photo_id;
-                match self.write_owed_iptc(photo_id)? {
+                match self.retry_owed_iptc_in_pass(photo_id, abort) {
                     // Written by a save since the page was read.
-                    None => summary.superseded += 1,
-                    Some((IptcSettled::Written | IptcSettled::Unchanged, _)) => summary.iptc_written += 1,
-                    Some((IptcSettled::Superseded, _)) => summary.superseded += 1,
-                    Some((IptcSettled::Failed(_), false)) => summary.iptc_unreachable += 1,
-                    Some((IptcSettled::Failed(_), true)) => summary.iptc_failed += 1,
+                    Ok(None) => summary.superseded += 1,
+                    Ok(Some((IptcSettled::Written | IptcSettled::Unchanged, _))) => summary.iptc_written += 1,
+                    Ok(Some((IptcSettled::Superseded, _))) => summary.superseded += 1,
+                    Ok(Some((IptcSettled::Failed(_), false))) => summary.iptc_unreachable += 1,
+                    Ok(Some((IptcSettled::Failed(_), true))) => summary.iptc_failed += 1,
+                    // Locked through every retry: still owed, and the pass carries on (#182).
+                    Err(e) if is_busy(&e) => summary.busy += 1,
+                    Err(e) => return Err(e),
                 }
                 progress(summary);
             }
         }
+    }
+
+    /// [`Self::write_owed_iptc`] for the repair pass: each catalog step is retried while
+    /// another connection holds the write lock ([`retry_busy`]), the sidecar write never is.
+    /// A settle still locked after that leaves the fields owed — what a failed write leaves.
+    fn retry_owed_iptc_in_pass(
+        &self,
+        photo_id: i64,
+        abort: &AtomicBool,
+    ) -> Result<Option<(IptcSettled, bool)>> {
+        let Some(write) = retry_busy(abort, || self.owed_iptc_write(photo_id))? else {
+            return Ok(None);
+        };
+        let (outcome, reachable) = match retry_busy(abort, || self.resolve_photo_path(photo_id))? {
+            Some(original) => (write.run(&original), true),
+            None => (Err(format!("no reachable copy of photo {photo_id}")), false),
+        };
+        Ok(Some((retry_busy(abort, || self.settle_iptc_write(&write, &outcome))?, reachable)))
     }
 }
 

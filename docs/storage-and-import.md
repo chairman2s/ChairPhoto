@@ -172,6 +172,17 @@ compare-and-set can replace — Adopt rewrites `photos.uuid` and leaves the phot
 copies' queue rows untouched when they carry no identifier, so a stale plan would write the
 photo's previous identity into one of those sidecars.
 
+**A locked catalog is waited out, not fatal** (#182). Another connection can hold the write
+lock longer than the 5 s busy timeout — the bundle importer keeps one transaction open across
+its whole index phase. A catalog step of the pass (or of the bulk resolution below) that meets
+such a lock is retried after growing pauses (`catalog/busy.rs`, about 20 s in all, cut short
+by the abort flag). Only the catalog step is retried, never the sidecar IO before it, so the
+record is the same compare-and-set the first attempt would have made. A row still locked after
+that is left exactly as it was — still queued, or its IPTC still owed — counted `busy`, and
+the pass carries on with the next. Its sidecar may already hold what the pass wrote; the next
+pass reads that and records it bound. Only a page read that stays locked ends the pass, and
+under WAL a read does not wait for a writer.
+
 A resolution deliberately does **not** stop a running pass. Killing a 74k-row pass because
 one row got a decision is a worse trade than dropping that row's result, and the per-row
 ownership above is what makes coexistence safe.
@@ -293,7 +304,9 @@ records only the first, so a bulk Overwrite also skips a sidecar holding more th
 (a Bag a DAM appended to, a second `rdf:Description`): another photo's UUID may sit beside the
 DAM id (`xmp::read_identifiers`). The run is its own job family, so it neither stops nor is stopped
 by a repair pass (each queue row has an owner); a newer run, Cancel or a catalog switch stops
-it before its next copy, and a front end's start is bound to the catalog it read
+it before its next copy, a copy whose record stays locked through every retry is left queued
+and counted `busy` (#182; an Overwrite counted there may already have written the sidecar, which
+a later run skips and the repair pass binds), and a front end's start is bound to the catalog it read
 (`CATALOG_CHANGED` otherwise). The GPUI identity-debt panel does not offer it yet.
 
 Before #141 a scan did adopt such a value, so an older catalog can hold rows whose
@@ -330,6 +343,17 @@ take turns owning the row. A row whose primary copies are all on other volumes s
 file found on a volume indexed in place as another location; that moves nothing. A bundle
 whose photo lands as such a separate copy still merges its tags onto the existing row, which
 merge matches by identity.
+
+"Still in place" is a question about the file, not the name (#184). On a case-insensitive
+filesystem (APFS and HFS+ by default, exFAT and vfat drives, a casefold directory) the old
+name of a case-only rename, `IMG.ARW` → `img.arw`, still opens the renamed file, so testing
+the recorded path with `exists()` kept the file apart from its own row. The guard therefore
+asks whether the recorded path opens the very file being scanned (same device and inode;
+the canonical path off Unix) and, if it does, whether the recorded name — and each folder
+name it does not share with the scanned path — is still in its folder's listing. A name the
+filesystem only folds onto the renamed file is not, so the row re-homes; a second hard link
+is, so it stays a copy of its own. An unreadable listing counts as listed. The legacy-identifier
+re-home (`every_primary_copy_is_gone`) still tests `exists()`.
 
 **A re-minted legacy identity is a UUID v5, not v4.** This is the one exception to "a UUID v4
 on first import": a photo imported fresh still gets a random v4, but a value that already

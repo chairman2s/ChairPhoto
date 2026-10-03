@@ -47,6 +47,7 @@
 //! than dropping that row's result. The pass's own ownership — job id, abort flag, status
 //! slot, catalog switch — is the `app::jobs` protocol, one layer up.
 
+use super::busy::{is_busy, retry_busy};
 use super::{Catalog, CatalogError, Result};
 use rusqlite::{params, OptionalExtension};
 use std::path::{Path, PathBuf};
@@ -599,6 +600,11 @@ pub struct ForeignConflictSummary {
     /// Copies whose sidecar Overwrite could not write (read-only storage, an unparseable
     /// sidecar). Still queued as conflicts.
     pub failed: usize,
+    /// Copies left as they were because another connection held the catalog's write lock
+    /// through every retry (#182). Still queued; a later run or pass takes them up. An
+    /// Overwrite counted here may already have written the sidecar: a later run then skips
+    /// the copy as no longer in conflict, and the repair pass records it bound.
+    pub busy: usize,
     /// True when the run stopped early (Cancel, a newer run, a catalog switch); the counts
     /// are then partial.
     pub aborted: bool,
@@ -607,7 +613,7 @@ pub struct ForeignConflictSummary {
 impl ForeignConflictSummary {
     /// Copies the run has finished with, whatever the outcome.
     pub fn done(&self) -> usize {
-        self.overwritten + self.dismissed + self.skipped + self.failed
+        self.overwritten + self.dismissed + self.skipped + self.failed + self.busy
     }
 }
 
@@ -746,6 +752,11 @@ pub struct IdentityRepairSummary {
     /// Photos owing IPTC whose sidecar write still fails (read-only storage, an unparseable
     /// sidecar). Left owed.
     pub iptc_failed: usize,
+    /// Copies and photos left as they were because another connection held the catalog's
+    /// write lock through every retry (#182) — a long bundle import, say. Still queued or
+    /// owed, so the next pass takes them up; not a failure. A copy counted here may already
+    /// have had its sidecar written, which that next pass finds and records.
+    pub busy: usize,
 }
 
 impl IdentityRepairSummary {
@@ -769,6 +780,7 @@ impl IdentityRepairSummary {
             + self.iptc_written
             + self.iptc_unreachable
             + self.iptc_failed
+            + self.busy
     }
 }
 
@@ -1280,12 +1292,17 @@ impl Catalog {
         relative_path: &str,
         action: IdentityConflictAction,
     ) -> Result<IdentityConflictOutcome> {
-        self.resolve_conflict(photo_id, volume_id, relative_path, action, false)
+        self.resolve_conflict(photo_id, volume_id, relative_path, action, false, &AtomicBool::new(false))
     }
 
     /// [`Self::resolve_identity_conflict`]; with `foreign_only`, Overwrite also refuses a
     /// sidecar that carries a UUID when it is read, as the bulk resolution of non-UUID
     /// conflicts requires ([`Self::run_resolve_foreign_conflicts`]).
+    ///
+    /// A catalog statement that meets another connection's write lock is retried
+    /// ([`retry_busy`], until `abort`); one still locked after that returns the busy error,
+    /// and a write it follows — Overwrite's sidecar — has then happened without its record
+    /// (#182). The copy stays queued, and the repair pass records it bound.
     fn resolve_conflict(
         &self,
         photo_id: i64,
@@ -1293,21 +1310,25 @@ impl Catalog {
         relative_path: &str,
         action: IdentityConflictAction,
         foreign_only: bool,
+        abort: &AtomicBool,
     ) -> Result<IdentityConflictOutcome> {
-        let (error, dismissed_at, catalog_uuid, base_path): (String, i64, String, String) = self
-            .conn
-            .query_row(
-                "SELECT q.error, q.dismissed_at, p.uuid, v.base_path
-                 FROM pending_sidecar_identity q
-                 JOIN photos p ON p.id = q.photo_id
-                 JOIN volumes v ON v.id = q.volume_id
-                 WHERE q.photo_id = ?1 AND q.field = 'identifier'
-                   AND q.volume_id = ?2 AND q.relative_path = ?3",
-                params![photo_id, volume_id, relative_path],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
-            )
-            .optional()?
-            .ok_or_else(|| {
+        let queued = retry_busy(abort, || {
+            Ok(self
+                .conn
+                .query_row(
+                    "SELECT q.error, q.dismissed_at, p.uuid, v.base_path
+                     FROM pending_sidecar_identity q
+                     JOIN photos p ON p.id = q.photo_id
+                     JOIN volumes v ON v.id = q.volume_id
+                     WHERE q.photo_id = ?1 AND q.field = 'identifier'
+                       AND q.volume_id = ?2 AND q.relative_path = ?3",
+                    params![photo_id, volume_id, relative_path],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+                )
+                .optional()?)
+        })?;
+        let (error, dismissed_at, catalog_uuid, base_path): (String, i64, String, String) =
+            queued.ok_or_else(|| {
                 CatalogError::NotFound(format!(
                     "no queued identity for photo {photo_id} at {relative_path} on volume \
                      {volume_id}"
@@ -1330,7 +1351,7 @@ impl Catalog {
                     "{relative_path} is not dismissed, so there is nothing to restore"
                 )));
             }
-            self.set_identity_dismissal(photo_id, volume_id, relative_path, 0)?;
+            retry_busy(abort, || self.set_identity_dismissal(photo_id, volume_id, relative_path, 0))?;
             return Ok(outcome);
         }
 
@@ -1359,7 +1380,8 @@ impl Catalog {
                     "{relative_path} is already dismissed"
                 )));
             }
-            self.set_identity_dismissal(photo_id, volume_id, relative_path, now())?;
+            let at = now();
+            retry_busy(abort, || self.set_identity_dismissal(photo_id, volume_id, relative_path, at))?;
             return Ok(outcome);
         }
 
@@ -1461,13 +1483,15 @@ impl Catalog {
                 let backup = crate::xmp::overwrite_identifier(&target, &catalog_uuid)
                     .map_err(CatalogError::Io)?;
                 outcome.sidecar_backup = backup.map(|p| p.to_string_lossy().to_string());
-                self.record_sidecar_field_target(
-                    photo_id,
-                    SidecarField::Identifier,
-                    volume_id,
-                    relative_path,
-                    &SidecarIdentity::Bound,
-                )?;
+                retry_busy(abort, || {
+                    self.record_sidecar_field_target(
+                        photo_id,
+                        SidecarField::Identifier,
+                        volume_id,
+                        relative_path,
+                        &SidecarIdentity::Bound,
+                    )
+                })?;
             }
             IdentityConflictAction::Dismiss | IdentityConflictAction::Restore => unreachable!(
                 "Dismiss and Restore return above, before any sidecar is read"
@@ -1598,17 +1622,21 @@ impl Catalog {
         abort: &AtomicBool,
         mut progress: impl FnMut(&IdentityRepairSummary),
     ) -> Result<IdentityRepairSummary> {
-        let mut summary = IdentityRepairSummary {
-            total: (self.count_active_identity_repairs()? + self.count_owed_iptc()?) as usize,
-            ..Default::default()
-        };
+        let total = retry_busy(abort, || {
+            Ok(self.count_active_identity_repairs()? + self.count_owed_iptc()?)
+        })?;
+        let mut summary = IdentityRepairSummary { total: total as usize, ..Default::default() };
         let mut cursor: Option<IdentityRepairCursor> = None;
         loop {
             if abort.load(Ordering::Relaxed) {
                 summary.aborted = true;
                 return Ok(summary);
             }
-            let page = self.plan_identity_repairs_page(cursor.as_ref(), REPAIR_PAGE_SIZE)?;
+            // A read: under WAL it waits for no writer, so a lock that outlasts the retries
+            // here is not the transient kind and does end the pass.
+            let page = retry_busy(abort, || {
+                self.plan_identity_repairs_page(cursor.as_ref(), REPAIR_PAGE_SIZE)
+            })?;
             if page.is_empty() {
                 // Then the IPTC the catalog owes sidecars (#148), under the same abort flag.
                 summary.aborted = !self.run_iptc_repair(abort, &mut summary, &mut progress)?;
@@ -1622,16 +1650,29 @@ impl Catalog {
                 cursor = Some(plan.cursor());
                 // Resolved or dismissed since the page was planned: the decision is
                 // somebody else's and this pass has nothing to add to it.
-                if !self.refresh_identity_repair(&mut plan)? {
-                    summary.superseded += 1;
-                    progress(&summary);
-                    continue;
+                match retry_busy(abort, || self.refresh_identity_repair(&mut plan)) {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        summary.superseded += 1;
+                        progress(&summary);
+                        continue;
+                    }
+                    Err(e) if is_busy(&e) => {
+                        summary.busy += 1;
+                        progress(&summary);
+                        continue;
+                    }
+                    Err(e) => return Err(e),
                 }
                 let outcome = plan.run();
-                if self.record_planned_repair(&plan, &outcome)? {
-                    summary.tally(&outcome);
-                } else {
-                    summary.superseded += 1;
+                // Only the record is retried, never the IO: it is the same compare-and-set
+                // on the version refreshed above. Left busy, the row keeps that version and
+                // the next pass re-reads the file, which it may find already bound (#182).
+                match retry_busy(abort, || self.record_planned_repair(&plan, &outcome)) {
+                    Ok(true) => summary.tally(&outcome),
+                    Ok(false) => summary.superseded += 1,
+                    Err(e) if is_busy(&e) => summary.busy += 1,
+                    Err(e) => return Err(e),
                 }
                 progress(&summary);
             }
@@ -1711,15 +1752,17 @@ impl Catalog {
         abort: &AtomicBool,
         mut progress: impl FnMut(&ForeignConflictSummary),
     ) -> Result<ForeignConflictSummary> {
-        let mut summary =
-            ForeignConflictSummary { total: self.count_foreign_conflicts()?, ..Default::default() };
+        let total = retry_busy(abort, || self.count_foreign_conflicts())?;
+        let mut summary = ForeignConflictSummary { total, ..Default::default() };
         let mut cursor: Option<(i64, i64, String)> = None;
         loop {
             if abort.load(Ordering::Relaxed) {
                 summary.aborted = true;
                 return Ok(summary);
             }
-            let page = self.identifier_conflicts_page(cursor.as_ref(), REPAIR_PAGE_SIZE)?;
+            let page = retry_busy(abort, || {
+                self.identifier_conflicts_page(cursor.as_ref(), REPAIR_PAGE_SIZE)
+            })?;
             if page.is_empty() {
                 return Ok(summary);
             }
@@ -1732,13 +1775,16 @@ impl Catalog {
                 if !is_foreign_conflict(&error) {
                     continue; // a UUID conflict: not this run's to decide, and not counted
                 }
-                match self.resolve_conflict(photo_id, volume_id, &relative_path, action.single(), true) {
+                let single = action.single();
+                match self.resolve_conflict(photo_id, volume_id, &relative_path, single, true, abort) {
                     Ok(_) => match action {
                         ForeignConflictAction::Overwrite => summary.overwritten += 1,
                         ForeignConflictAction::Dismiss => summary.dismissed += 1,
                     },
                     Err(CatalogError::Validation(_) | CatalogError::NotFound(_)) => summary.skipped += 1,
                     Err(CatalogError::Io(_)) => summary.failed += 1,
+                    // Locked through every retry: left queued, and the run carries on (#182).
+                    Err(e) if is_busy(&e) => summary.busy += 1,
                     Err(e) => return Err(e),
                 }
                 progress(&summary);
@@ -1838,11 +1884,16 @@ impl Catalog {
     /// files take turns owning the row. A primary copy on another volume is not checked: a
     /// copy of the photo on a second volume is a second location of the same row, and
     /// recording it moves nothing.
+    ///
+    /// "Still there" is decided by [`copy_still_in_place`] against `scanned`, the file being
+    /// upserted, not by `exists()` (#184): on a case-insensitive filesystem the old name of a
+    /// case-only rename still opens the renamed file.
     pub(super) fn primary_copy_left_in_place(
         &self,
         photo_id: i64,
         volume_id: i64,
         logical: bool,
+        scanned: &Path,
     ) -> Result<bool> {
         let on_volume: Option<PathBuf> = self
             .conn
@@ -1855,10 +1906,10 @@ impl Catalog {
                 Ok(Path::new(&r.get::<_, String>(0)?).join(r.get::<_, String>(1)?))
             })
             .optional()?;
-        if on_volume.is_some_and(|file| file.exists()) {
+        if on_volume.is_some_and(|file| copy_still_in_place(&file, scanned)) {
             return Ok(true);
         }
-        Ok(logical && self.to_absolute(&self.get_photo(photo_id)?.path).exists())
+        Ok(logical && copy_still_in_place(&self.to_absolute(&self.get_photo(photo_id)?.path), scanned))
     }
 
     /// Schema v23 (#146): give every row whose `photos.uuid` is not a photo identity the
@@ -2092,6 +2143,74 @@ fn identity_repair_page_sql(with_cursor: bool) -> String {
          ORDER BY q.photo_id, q.field, q.volume_id, q.relative_path
          LIMIT ?1"
     )
+}
+
+/// True when the file a row records at `recorded` is still there as a file of its own, beside
+/// `scanned` (#184).
+///
+/// `exists()` alone answers the wrong question on a case-insensitive filesystem (APFS and
+/// HFS+ by default, exFAT and vfat drives, a casefold ext4 or tmpfs directory): after
+/// `IMG.ARW` → `img.arw` the old name still opens the renamed file, so the file looked as if
+/// it had been left behind and got a second row. So when `recorded` opens the very file being
+/// scanned (one device and inode — the identity itself, not a name), it counts as still there
+/// only if its own names are still in their folders' listings: a second hard link is, and a
+/// name the filesystem merely folds onto the renamed file is not. A listing that cannot be
+/// read counts as listed, which keeps the copy apart — when uncertain, preserve.
+fn copy_still_in_place(recorded: &Path, scanned: &Path) -> bool {
+    if !recorded.exists() {
+        return false;
+    }
+    !(same_file(recorded, scanned) && reached_only_by_folding(recorded, scanned))
+}
+
+/// Whether `a` and `b` open one file: the same device and inode on Unix, the same canonical
+/// path elsewhere (Windows canonicalises to the name on disk). False when either is missing.
+fn same_file(a: &Path, b: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        match (std::fs::metadata(a), std::fs::metadata(b)) {
+            (Ok(a), Ok(b)) => a.dev() == b.dev() && a.ino() == b.ino(),
+            _ => false,
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+            (Ok(a), Ok(b)) => a == b,
+            _ => false,
+        }
+    }
+}
+
+/// True when some component of `recorded` that it does not share with `scanned` — its file
+/// name, or a folder renamed by case — is not in its parent's listing verbatim, so `recorded`
+/// reaches its file only through the filesystem folding names.
+fn reached_only_by_folding(recorded: &Path, scanned: &Path) -> bool {
+    let shared = recorded
+        .components()
+        .zip(scanned.components())
+        .take_while(|(a, b)| a == b)
+        .count();
+    let mut path = recorded.to_path_buf();
+    for _ in shared..recorded.components().count() {
+        if !listed_verbatim(&path) {
+            return true;
+        }
+        path.pop();
+    }
+    false
+}
+
+/// Whether `path`'s last component appears, byte for byte, in its parent folder's listing.
+fn listed_verbatim(path: &Path) -> bool {
+    let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
+        return true;
+    };
+    match std::fs::read_dir(parent) {
+        Ok(entries) => entries.flatten().any(|e| e.file_name() == name),
+        Err(_) => true,
+    }
 }
 
 fn now() -> i64 {
@@ -3500,6 +3619,162 @@ mod tests {
         }
     }
 
+    // --- A lock held past the busy timeout (#182) -------------------------------------------
+
+    /// A third connection holding the write lock, as the bundle importer's index phase does
+    /// across a whole import. Shared so a hook or a progress callback can release it at the
+    /// exact point a test needs.
+    type Holder = std::rc::Rc<std::cell::RefCell<Option<rusqlite::Connection>>>;
+
+    fn hold_write_lock(catalog: &Catalog) -> Holder {
+        let conn = rusqlite::Connection::open(catalog.db_path()).unwrap();
+        conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+        // Waits of 30 ms stand in for production's 5 s; the lock outlasts each of them.
+        catalog.conn().busy_timeout(std::time::Duration::from_millis(30)).unwrap();
+        std::rc::Rc::new(std::cell::RefCell::new(Some(conn)))
+    }
+
+    fn release(holder: &Holder) {
+        if let Some(conn) = holder.borrow_mut().take() {
+            conn.execute_batch("COMMIT").unwrap();
+        }
+    }
+
+    /// Removes the retry hook when a test ends, panicking or not.
+    struct HookGuard;
+    impl Drop for HookGuard {
+        fn drop(&mut self) {
+            super::super::busy::hook::clear();
+        }
+    }
+
+    fn unreachable_rows(catalog: &Catalog, root: &Path, tag: &str, n: usize) -> Vec<(i64, PathBuf)> {
+        (0..n)
+            .map(|i| {
+                let (id, path) = seed_photo(catalog, root, &format!("{tag}-{i}.arw"));
+                catalog.record_sidecar_identity(id, &path, &SidecarIdentity::Unreachable).unwrap();
+                (id, path)
+            })
+            .collect()
+    }
+
+    /// A pass that meets the lock past the busy timeout waits it out and retries the row,
+    /// instead of ending on "database is locked". The lock is released between the first
+    /// busy attempt and its retry, so the retry — not a lucky timing — is what binds it.
+    #[test]
+    fn a_pass_retries_a_row_whose_record_met_a_held_lock() {
+        let (catalog, root, _dir) = temp_catalog("busy-retry");
+        let seeded = unreachable_rows(&catalog, &root, "retry", 3);
+        let holder = hold_write_lock(&catalog);
+        let retries = std::rc::Rc::new(std::cell::Cell::new(0));
+        let _guard = HookGuard;
+        {
+            let (holder, retries) = (holder.clone(), retries.clone());
+            super::super::busy::hook::set(move || {
+                retries.set(retries.get() + 1);
+                release(&holder);
+            });
+        }
+
+        let summary = catalog.run_identity_repair(&AtomicBool::new(false), |_| {}).unwrap();
+
+        assert_eq!(retries.get(), 1, "the first record met the lock and was retried once");
+        assert_eq!((summary.bound, summary.busy, summary.aborted), (3, 0, false), "{summary:?}");
+        for (id, path) in &seeded {
+            assert!(queue_row(&catalog, *id, path).is_none(), "photo {id} is still queued");
+        }
+    }
+
+    /// A row whose record is locked through every retry is left exactly as it was, counted
+    /// `busy`, and the pass carries on with the next row. The next pass finds the sidecar the
+    /// first one wrote and records it bound.
+    #[test]
+    fn a_row_locked_through_every_retry_stays_queued_and_the_pass_carries_on() {
+        let (catalog, root, _dir) = temp_catalog("busy-defer");
+        let seeded = unreachable_rows(&catalog, &root, "defer", 3);
+        let before = queue_row(&catalog, seeded[0].0, &seeded[0].1).unwrap();
+        let holder = hold_write_lock(&catalog);
+
+        // Released only once the first row has been given up on.
+        let summary = catalog
+            .run_identity_repair(&AtomicBool::new(false), |s| {
+                if s.busy == 1 {
+                    release(&holder);
+                }
+            })
+            .unwrap();
+
+        assert_eq!((summary.bound, summary.busy, summary.done()), (2, 1, 3), "{summary:?}");
+        assert_eq!(
+            queue_row(&catalog, seeded[0].0, &seeded[0].1),
+            Some(before),
+            "the locked row is left as it was, version included"
+        );
+        assert!(crate::xmp::read_identifier(&seeded[0].1).is_some(), "its IO ran before the lock");
+        for (id, path) in &seeded[1..] {
+            assert!(queue_row(&catalog, *id, path).is_none(), "photo {id} after the lock was not bound");
+        }
+
+        let next = catalog.repair_pending_identity().unwrap();
+        assert_eq!((next.bound, next.busy), (1, 0), "{next:?}");
+        assert!(queue_row(&catalog, seeded[0].0, &seeded[0].1).is_none());
+    }
+
+    /// The bulk resolution does the same: an Overwrite whose record stays locked is counted
+    /// `busy` and the run goes on. The sidecar was written (after its backup), so a later run
+    /// skips the copy as no longer in conflict and the repair pass records it bound.
+    #[test]
+    fn a_bulk_run_leaves_a_locked_copy_queued_and_carries_on() {
+        let (catalog, root, _dir) = temp_catalog("busy-bulk");
+        let copies: Vec<_> = (0..3)
+            .map(|i| seed_conflicted_copy(&catalog, &root, &format!("b{i}.jpg"), &format!("dam:{i}")))
+            .collect();
+        let holder = hold_write_lock(&catalog);
+
+        let summary = catalog
+            .run_resolve_foreign_conflicts(ForeignConflictAction::Overwrite, &AtomicBool::new(false), |s| {
+                if s.busy == 1 {
+                    release(&holder);
+                }
+            })
+            .unwrap();
+
+        assert_eq!((summary.overwritten, summary.busy, summary.done()), (2, 1, 3), "{summary:?}");
+        let (id, path, uuid) = &copies[0];
+        assert!(queue_row(&catalog, *id, path).is_some_and(|(_, e, _)| e.starts_with(CONFLICT_PREFIX)));
+        assert_eq!(crate::xmp::read_identifier(path).as_deref(), Some(uuid.as_str()));
+        let mut backup = crate::xmp::sidecar_path(path).into_os_string();
+        backup.push(".chairphoto-backup");
+        assert!(PathBuf::from(&backup).exists(), "the foreign value is kept in the backup");
+
+        let again = catalog
+            .run_resolve_foreign_conflicts(ForeignConflictAction::Overwrite, &AtomicBool::new(false), |_| {})
+            .unwrap();
+        assert_eq!((again.overwritten, again.skipped), (0, 1), "{again:?}");
+        assert_eq!(catalog.repair_pending_identity().unwrap().bound, 1);
+        assert!(queue_row(&catalog, *id, path).is_none());
+    }
+
+    /// The IPTC half of the pass: a settle locked through every retry leaves the fields owed,
+    /// and the next pass settles them.
+    #[test]
+    fn owed_iptc_locked_through_every_retry_stays_owed() {
+        let (catalog, root, _dir) = temp_catalog("busy-iptc");
+        let (id, _) = seed_photo(&catalog, &root, "iptc.arw");
+        let f = crate::catalog::IptcFields { title: "T".into(), ..Default::default() };
+        catalog.set_iptc(id, &f).unwrap();
+        let holder = hold_write_lock(&catalog);
+
+        let summary = catalog.run_identity_repair(&AtomicBool::new(false), |_| {}).unwrap();
+        release(&holder);
+
+        assert_eq!((summary.iptc_written, summary.busy), (0, 1), "{summary:?}");
+        assert_eq!(catalog.owed_iptc(id).unwrap(), crate::catalog::IptcMask::TITLE);
+        let next = catalog.repair_pending_identity().unwrap();
+        assert_eq!((next.iptc_written, next.busy), (1, 0), "{next:?}");
+        assert!(catalog.owed_iptc(id).unwrap().is_empty());
+    }
+
     /// The pass stops at its abort flag between rows, not merely between pages: a cancel
     /// against an unmounted NAS must cost one file's timeout, not the rest of the page's.
     /// Counters stay partial and `aborted` says so — a UI that showed them as a finished
@@ -3766,6 +4041,147 @@ mod tests {
             )
             .unwrap();
         assert_eq!(catalog.scan_identity(Some("dam:1"), 9).unwrap(), None);
+    }
+
+    // --- The re-home guard and file identity (#184) ------------------------------------------
+
+    /// Catalogue `name` under `root` with its identity in its sidecar, as a scan leaves it.
+    fn bound_photo(catalog: &Catalog, root: &Path, name: &str) -> (i64, PathBuf, String) {
+        let path = root.join(name);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, b"raw-bytes").unwrap();
+        let up = catalog.upsert_photo(&path, None, 1, 9).unwrap();
+        crate::xmp::write_identifier(&path, &up.uuid).unwrap();
+        (up.id, path, up.uuid)
+    }
+
+    /// Through an intermediate name: on a case-insensitive filesystem a direct rename to a name
+    /// differing only in case is a rename of a file onto itself, which POSIX makes a no-op.
+    fn rename_with_sidecar(from: &Path, to: &Path) {
+        for (from, to) in [(from.to_path_buf(), to.to_path_buf()), (crate::xmp::sidecar_path(from), crate::xmp::sidecar_path(to))] {
+            let via = from.with_extension("renaming");
+            std::fs::rename(&from, &via).unwrap();
+            std::fs::rename(&via, to).unwrap();
+        }
+    }
+
+    fn scan(catalog: &Catalog, path: &Path) -> crate::catalog::UpsertResult {
+        let found = crate::xmp::read_identifier(path);
+        catalog.upsert_scanned_photo(path, None, 1, 9, found.as_deref()).unwrap()
+    }
+
+    fn photo_count(catalog: &Catalog) -> i64 {
+        catalog.conn().query_row("SELECT COUNT(*) FROM photos", [], |r| r.get(0)).unwrap()
+    }
+
+    /// A second name for the same file (a hard link) is a copy still in place: both names are
+    /// in the folder, so the new one gets a row of its own, as before #184. Comparing inodes
+    /// alone would call it a move, and the two names would then take turns owning the row.
+    #[cfg(unix)]
+    #[test]
+    fn a_hard_link_beside_the_original_is_kept_apart() {
+        let (catalog, root, _dir) = temp_catalog("rehome-hardlink");
+        let (id, original, _) = bound_photo(&catalog, &root, "IMG.ARW");
+        let link = root.join("img.arw");
+        std::fs::hard_link(&original, &link).unwrap();
+        std::fs::hard_link(crate::xmp::sidecar_path(&original), crate::xmp::sidecar_path(&link)).unwrap();
+
+        let up = scan(&catalog, &link);
+
+        assert!(up.created && up.id != id, "the original row was moved off a name still listed");
+        assert_eq!(catalog.get_photo(id).unwrap().path, "IMG.ARW");
+        assert_eq!(scan(&catalog, &original).id, id, "a rescan keeps each name on its own row");
+        assert_eq!(scan(&catalog, &link).id, up.id);
+    }
+
+    /// The other half of the rule, where no case folding is involved: the recorded name is gone
+    /// and the file is elsewhere (a plain move), so the row re-homes.
+    #[test]
+    fn a_moved_file_re_homes_its_row() {
+        let (catalog, root, _dir) = temp_catalog("rehome-moved");
+        let (id, original, uuid) = bound_photo(&catalog, &root, "a/IMG.ARW");
+        let moved = root.join("b/IMG.ARW");
+        std::fs::create_dir_all(moved.parent().unwrap()).unwrap();
+        rename_with_sidecar(&original, &moved);
+
+        let up = scan(&catalog, &moved);
+
+        assert_eq!((up.id, up.created, up.uuid.as_str()), (id, false, uuid.as_str()));
+        assert_eq!(catalog.get_photo(id).unwrap().path, "b/IMG.ARW");
+    }
+
+    /// The guard on a real case-insensitive filesystem: a casefold tmpfs, mounted in a private
+    /// user and mount namespace (`unshare -rm`), where this test binary runs
+    /// [`case_only_renames_on_a_casefold_mount`]. Skipped where unprivileged namespaces, tmpfs
+    /// casefold (Linux 6.13+) or `chattr` are not available.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_case_only_rename_on_a_case_insensitive_filesystem_re_homes_the_row() {
+        const NAME: &str = "a_case_only_rename_on_a_case_insensitive_filesystem_re_homes_the_row";
+        let dir = TestTmpDir::new("rehome-casefold-mount");
+        let mount = dir.path().join("mnt");
+        std::fs::create_dir_all(&mount).unwrap();
+        let script = r#"mount -t tmpfs -o casefold tmpfs "$1" 2>/dev/null || exit 77
+mkdir "$1/cf" && chattr +F "$1/cf" 2>/dev/null || exit 77
+CHAIRPHOTO_CASEFOLD_DIR="$1/cf" exec "$2" --exact "$3" --ignored --nocapture --test-threads=1"#;
+        let inner = "catalog::identity::tests::case_only_renames_on_a_casefold_mount";
+        let out = std::process::Command::new("unshare")
+            .args(["-rm", "sh", "-c", script, "sh"])
+            .arg(&mount)
+            .arg(std::env::current_exe().unwrap())
+            .arg(inner)
+            .output();
+        let out = match out {
+            Ok(out) if out.status.code() == Some(77) => {
+                println!("SKIPPED: {NAME} — no casefold tmpfs in a user namespace here");
+                return;
+            }
+            Ok(out) => out,
+            Err(e) => {
+                println!("SKIPPED: {NAME} — unshare unavailable: {e}");
+                return;
+            }
+        };
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        if stdout.contains("unshare: ") || stderr.contains("unshare: ") {
+            println!("SKIPPED: {NAME} — unshare refused: {stderr}");
+            return;
+        }
+        assert!(
+            out.status.success() && stdout.contains("1 passed"),
+            "the casefold run failed:\n{stdout}\n{stderr}"
+        );
+    }
+
+    /// Run by [`a_case_only_rename_on_a_case_insensitive_filesystem_re_homes_the_row`] inside its
+    /// namespace, with `CHAIRPHOTO_CASEFOLD_DIR` a casefold directory. A case-only rename of the
+    /// file, then of its folder, re-homes the row each time; no second row appears.
+    #[test]
+    #[ignore = "run inside a casefold mount by the test above"]
+    fn case_only_renames_on_a_casefold_mount() {
+        let base = PathBuf::from(std::env::var_os("CHAIRPHOTO_CASEFOLD_DIR").expect("run by the outer test"));
+        let root = base.join("photos");
+        std::fs::create_dir_all(&root).unwrap();
+        let db = TestTmpDir::new("rehome-casefold");
+        let catalog = Catalog::open(&db.path().join("test.chairphoto"), &root).unwrap();
+        let (id, original, uuid) = bound_photo(&catalog, &root, "Trip/IMG.ARW");
+        assert!(root.join("trip/img.arw").exists(), "{} is not case-insensitive", base.display());
+
+        let renamed = root.join("Trip/img.arw");
+        rename_with_sidecar(&original, &renamed);
+        let up = scan(&catalog, &renamed);
+        assert_eq!((up.id, up.created, up.uuid.as_str()), (id, false, uuid.as_str()), "file renamed by case");
+        assert_eq!(catalog.get_photo(id).unwrap().path, "Trip/img.arw");
+
+        std::fs::rename(root.join("Trip"), root.join("trip-renaming")).unwrap();
+        std::fs::rename(root.join("trip-renaming"), root.join("trip")).unwrap();
+        let moved = root.join("trip/img.arw");
+        let up = scan(&catalog, &moved);
+        assert_eq!((up.id, up.created), (id, false), "folder renamed by case");
+        assert_eq!(catalog.get_photo(id).unwrap().path, "trip/img.arw");
+        assert_eq!(photo_count(&catalog), 1);
+        assert_eq!(scan(&catalog, &moved).id, id, "a rescan finds it at its new name");
     }
 
     /// #146 (L5): Adopt stores the sidecar's identity lowercase, and the conflict it

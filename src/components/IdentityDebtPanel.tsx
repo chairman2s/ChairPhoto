@@ -154,10 +154,15 @@ export function repairSummaryLine(summary: IdentityRepairSummary | null): string
   const iptcWritten = summary.iptcWritten ?? 0;
   const iptcUnreachable = summary.iptcUnreachable ?? 0;
   const iptcFailed = summary.iptcFailed ?? 0;
+  const busy = summary.busy ?? 0;
   if (iptcWritten + iptcUnreachable + iptcFailed > 0) {
     parts.push(
       `IPTC written ${iptcWritten}, still unreachable ${iptcUnreachable}, failed ${iptcFailed}`,
     );
+  }
+  // #182: left queued because the catalog was locked; named only when it happened.
+  if (busy > 0) {
+    parts.push(`${busy} left queued while the catalog was busy`);
   }
   const done =
     summary.bound +
@@ -167,7 +172,8 @@ export function repairSummaryLine(summary: IdentityRepairSummary | null): string
     summary.superseded +
     iptcWritten +
     iptcUnreachable +
-    iptcFailed;
+    iptcFailed +
+    busy;
   const lead = summary.aborted ? `Stopped after ${done} of ${summary.total}` : "Finished";
   return `${lead} — ${parts.join(" · ")}`;
 }

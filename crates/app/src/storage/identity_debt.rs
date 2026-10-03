@@ -684,6 +684,10 @@ pub fn repair_summary_line(s: &IdentityRepairSummary) -> String {
             s.iptc_written, s.iptc_unreachable, s.iptc_failed
         ));
     }
+    // #182: left queued because another connection held the catalog's write lock.
+    if s.busy > 0 {
+        parts.push(format!("{} left queued while the catalog was busy", s.busy));
+    }
     let lead = if s.aborted {
         format!("Stopped after {} of {}", s.done(), s.total)
     } else {
@@ -1020,6 +1024,11 @@ mod tests {
         assert_eq!(
             repair_summary_line(&s),
             "Stopped after 4 of 10 — bound 2 · still unreachable 1 · conflict 0 · failed 0 · 1 decided elsewhere while the pass ran"
+        );
+        s.busy = 2;
+        assert_eq!(
+            repair_summary_line(&s),
+            "Stopped after 6 of 10 — bound 2 · still unreachable 1 · conflict 0 · failed 0 · 1 decided elsewhere while the pass ran · 2 left queued while the catalog was busy"
         );
         assert_eq!(repair_progress_line(0, 0), "Repairing…");
         assert_eq!(repair_progress_line(120, 74488), "Repairing… 120 of 74488");

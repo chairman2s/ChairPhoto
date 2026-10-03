@@ -305,6 +305,14 @@ describe("repairSummaryLine", () => {
     expect(line).toContain("Stopped after 4 of 9");
   });
 
+  // #182: rows left queued because the catalog was locked are named, and counted as done.
+  it("names rows left queued while the catalog was busy, only when there were some", () => {
+    expect(repairSummaryLine(summary({ bound: 1, total: 1 }))).not.toContain("busy");
+    const line = repairSummaryLine(summary({ bound: 1, busy: 2, total: 5, aborted: true }));
+    expect(line).toContain("2 left queued while the catalog was busy");
+    expect(line).toContain("Stopped after 3 of 5");
+  });
+
   it("names superseded rows only when there were some", () => {
     expect(repairSummaryLine(summary({ bound: 1, total: 1 }))).not.toContain("decided elsewhere");
     // A row somebody else decided under the pass is not a failure, and not an outcome the

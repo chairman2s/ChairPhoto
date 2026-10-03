@@ -183,6 +183,38 @@ fn monthly_ticks_mark_januaries_and_spans_beyond_180_months_go_yearly() {
 }
 
 #[test]
+fn a_single_month_plots_a_level_line_across_the_chart() {
+    // #179: one month (a January, so it has a tick) — React's `M 0 y L W y`, tick at W / 2.
+    let stats = CatalogStatsRaw {
+        first_month: Some("2026-01".into()),
+        last_month: Some("2026-01".into()),
+        timeline: vec![("2026-01".into(), 3)],
+        ..CatalogStatsRaw::default()
+    };
+    let d = Dashboard::derive(&stats, RateMetric::Keep);
+    assert_eq!(d.timeline.points.len(), 1, "the dashboard keeps the one month");
+    let plotted = d.timeline.plotted();
+    assert_eq!(plotted.len(), 3, "both ends of the line and the point between them");
+    assert!(plotted.iter().all(|p| p.value == 3 && p.key == "2026-01"), "a level line at the month's count");
+    assert!(plotted.iter().all(|p| p.readout == "Jan 2026 · 3 photos"), "hovering anywhere reads the month");
+    let ticks: Vec<&str> = plotted.iter().map(|p| p.tick.as_str()).collect();
+    assert_eq!(ticks, ["", "2026", ""], "the tick once, in the middle");
+    assert_eq!(d.timeline.peak_readout(), "Peak 3");
+
+    // Two or more points, and none, are plotted as they are.
+    let two = CatalogStatsRaw {
+        first_month: Some("2026-03".into()),
+        last_month: Some("2026-04".into()),
+        timeline: vec![("2026-03".into(), 1), ("2026-04".into(), 2)],
+        ..CatalogStatsRaw::default()
+    };
+    let d = Dashboard::derive(&two, RateMetric::Keep);
+    assert_eq!(d.timeline.plotted(), d.timeline.points);
+    let none = Dashboard::derive(&CatalogStatsRaw::default(), RateMetric::Keep);
+    assert!(none.timeline.plotted().is_empty());
+}
+
+#[test]
 fn buckets_follow_reacts_bounds() {
     assert_eq!(bucket_below(&FL_BUCKETS, 15.9), Some(0));
     assert_eq!(bucket_below(&FL_BUCKETS, 16.), Some(1));

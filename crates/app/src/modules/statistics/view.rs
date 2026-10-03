@@ -375,7 +375,8 @@ fn timeline_chart(t: &Timeline, colors: Colors) -> AnyElement {
         return no_data(colors);
     }
     let accent = hex(0x3B82F6);
-    let chart = AreaChart::new(t.points.clone())
+    // `plotted`, not `points`: a lone month becomes a level line (#179).
+    let chart = AreaChart::new(t.plotted())
         .id("stats-timeline-chart")
         .x(|p| SharedString::from(p.tick.clone()))
         .y(|p| p.value as f64)

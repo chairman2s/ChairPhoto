@@ -369,6 +369,86 @@ fn a_catalog_switch_closes_the_loupe_and_its_marks_fail_closed(cx: &mut TestAppC
     assert!(!app.wired.shell.read_with(cx, |s, _| s.loupe_open));
 }
 
+/// A catalog holding one video, `clip.mp4`, under `root` (written to disk, so its path
+/// resolves); its id.
+fn video_catalog(path: &std::path::Path, root: &std::path::Path) -> (chairphoto_core::catalog::Catalog, i64) {
+    std::fs::create_dir_all(root.join("2026")).unwrap();
+    std::fs::write(root.join("2026/clip.mp4"), b"not really a video").unwrap();
+    let catalog = chairphoto_core::catalog::Catalog::open(path, root).unwrap();
+    let id = catalog.upsert_photo(&root.join("2026/clip.mp4"), None, 0, 1).unwrap().id;
+    (catalog, id)
+}
+
+/// Press and release at each of `points` against the frame on screen, with no draw before or
+/// between (`window.click` draws first, so it would click the new frame's button).
+fn click_undrawn(app: &App, points: &[gpui_kit::Point<gpui_kit::Pixels>], cx: &mut TestAppContext) {
+    cx.update_window(app.window(), |_, window, cx| {
+        let modifiers = Modifiers::default();
+        for &at in points {
+            let down = MouseDownEvent { button: MouseButton::Left, position: at, modifiers, click_count: 1, first_mouse: false };
+            window.dispatch_event(down.to_platform_input(), cx);
+            let up = MouseUpEvent { button: MouseButton::Left, position: at, modifiers, click_count: 1 };
+            window.dispatch_event(up.to_platform_input(), cx);
+        }
+    })
+    .unwrap();
+    cx.run_until_parked();
+}
+
+/// #207, catalog identity: the loupe bar's rotate and the video's Play act on the row and
+/// the catalog the frame on screen was drawn with. Catalog B gives the video's id to its own
+/// video. The core switches to B, and the clicks land on A's frame:
+/// - `catalog:switched` withheld: the rows are still A's, and both fail closed against B.
+/// - the switch taken in and B's rows landed (`rows_from` is B), but not yet drawn: a click
+///   that read the catalog at click time would rotate and play B's video.
+fn loupe_actions_across_a_switch(delivered: bool, cx: &mut TestAppContext) {
+    let dir = TempDir::new(if delivered { "loupe-act-switch-ev" } else { "loupe-act-switch" });
+    let pool = Arc::new(FakePool::default());
+    let app = start_with_pool(cx, pool.clone());
+    let opened: Rc<RefCell<Vec<PathBuf>>> = Rc::default();
+    cx.update(|cx| {
+        let opened = opened.clone();
+        cx.set_global(SystemOpener(Rc::new(move |p, _| opened.borrow_mut().push(p.to_path_buf()))))
+    });
+    let (a, id) = video_catalog(&dir.0.join("a.chairphoto"), &dir.0.join("a"));
+    *app.state.catalog.lock().unwrap() = Some(a);
+    app.state.send(chairphoto_core::app::CoreEvent::CatalogSwitched("a".into()));
+    cx.run_until_parked();
+    select(&app, id, cx);
+    press(&app, "enter", cx);
+    let (rotate_at, play_at) = cx
+        .update_window(app.window(), |_, window, cx| {
+            window.render_frame(cx);
+            (window.find("loupe-rotate-right").bounds().center(), window.find("loupe-play").bounds().center())
+        })
+        .unwrap();
+
+    let (b, b_id) = video_catalog(&dir.0.join("b.chairphoto"), &dir.0.join("b"));
+    assert_eq!(b_id, id, "the ids collide");
+    core_switch(&app, b);
+    if delivered {
+        let b_from = chairphoto_core::app::catalog_identity(&app.state).unwrap();
+        app.wired.shell.update(cx, |s, _| s.set_rows_from_undrawn(b_from));
+    }
+    // Both on the same frame: the first click's answer redraws the window.
+    click_undrawn(&app, &[rotate_at, play_at], cx);
+    let rotation = app.state.catalog.lock().unwrap().as_ref().unwrap().photo_rotation(id).unwrap();
+    assert_eq!(rotation, 0, "delivered={delivered}: B's video was rotated");
+    assert!(opened.borrow().is_empty(), "delivered={delivered}: B's video was played: {:?}", opened.borrow());
+    let line = status(&app, cx);
+    assert!(line.starts_with("Could not rotate") || line.starts_with("Could not play"), "{line}");
+}
+
+#[gpui_kit::test]
+fn loupe_actions_never_reach_the_new_catalog_before_the_switch_event(cx: &mut TestAppContext) {
+    loupe_actions_across_a_switch(false, cx);
+}
+
+#[gpui_kit::test]
+fn loupe_actions_never_reach_the_new_catalog_after_the_switch_event(cx: &mut TestAppContext) {
+    loupe_actions_across_a_switch(true, cx);
+}
+
 /// #172: the loupe bar's rotate chips are icon chips (Lucide's rotate arrows — the UI font
 /// has no ↺ / ↻), named for tests and assistive tech, and still turn the photo; the key hint
 /// is App.tsx's, without "F faces" while the Faces module is off (its key would do nothing).

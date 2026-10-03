@@ -18,7 +18,7 @@
 //! | [`lock`] | Per-sidecar serialisation: the file lock and the write order (#149). |
 //! | `iptc.rs` | The `MANAGED` IPTC property table, [`write_iptc`], [`write_iptc_fields`], [`read_iptc_present`]. |
 //! | `keywords.rs` | [`write_keywords`] (export copies only: `dc:subject`, `lr:hierarchicalSubject`). |
-//! | `identity.rs` | [`read_identifier`], [`write_identifier`], [`overwrite_identifier`], [`write_import_batch`], [`read_import_batch`]. |
+//! | `identity.rs` | [`read_identifier`], [`read_identifiers`], [`write_identifier`], [`overwrite_identifier`], [`write_import_batch`], [`read_import_batch`]. |
 //! | `gps.rs` | [`write_gps`], [`read_gps`], [`decimal_to_dms_lat`] / [`decimal_to_dms_lng`]. |
 //! | `regions/mod.rs` | Face regions' public API: [`FaceRegion`], [`ReadRegion`], [`RegionSet`], [`RegionWriteError`], [`write_face_regions`], [`write_face_regions_gathered`], [`read_face_regions`], [`read_face_regions_in`], [`region_iou`]. |
 //! | `regions/frame.rs` | [`RegionFrame`], EXIF-orientation point maps, and which frame a `Regions` declares (`region_target`). |
@@ -53,7 +53,7 @@ mod test_xml;
 mod tests;
 
 pub use gps::{decimal_to_dms_lat, decimal_to_dms_lng, read_gps, write_gps};
-pub use identity::{overwrite_identifier, read_identifier, read_import_batch, write_identifier, write_import_batch};
+pub use identity::{overwrite_identifier, read_identifier, read_identifiers, read_import_batch, write_identifier, write_import_batch};
 pub use iptc::{read_iptc_present, write_iptc, write_iptc_fields};
 pub use keywords::write_keywords;
 pub use regions::{

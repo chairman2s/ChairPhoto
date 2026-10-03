@@ -1442,6 +1442,22 @@ impl Catalog {
                         target.display()
                     )));
                 }
+                // Overwrite replaces EVERY xmp:Identifier value, but `found` is only the
+                // first. In bulk, a sidecar with more than one value — a Bag a DAM appended
+                // to, a second Description — may hold another photo's UUID beside the DAM
+                // id; it is left for a person to look at (#150, review M1).
+                if foreign_only {
+                    let all = crate::xmp::read_identifiers(&target);
+                    if all.len() != 1 || all.iter().any(|v| is_photo_identity(v)) {
+                        return Err(CatalogError::Validation(format!(
+                            "{}'s sidecar carries {} identifier values ({}); a bulk Overwrite \
+                             replaces only a single non-UUID one",
+                            target.display(),
+                            all.len(),
+                            all.join(", ")
+                        )));
+                    }
+                }
                 let backup = crate::xmp::overwrite_identifier(&target, &catalog_uuid)
                     .map_err(CatalogError::Io)?;
                 outcome.sidecar_backup = backup.map(|p| p.to_string_lossy().to_string());
@@ -3937,6 +3953,64 @@ mod tests {
         assert_eq!(crate::xmp::read_identifier(&c_path).as_deref(), Some("dam:3"));
         assert_eq!(crate::xmp::read_identifier(&d_path).as_deref(), Some(OTHER));
         assert!(queue_row(&catalog, d, &d_path).is_some());
+    }
+
+    /// #150 (review M1): Overwrite replaces every `xmp:Identifier` value, while a conflict
+    /// records only the first. A sidecar whose DAM id sits beside another photo's UUID — in
+    /// one Bag, or in a second Description — is skipped in bulk, never overwritten, and a
+    /// sidecar with two non-UUID values is skipped too.
+    #[test]
+    fn bulk_overwrite_skips_a_sidecar_with_more_than_one_identifier_value() {
+        let (catalog, root, _dir) = temp_catalog("bulk-overwrite-multi");
+        const OTHER: &str = "0d9c8b7a-6f5e-4d3c-8b2a-190807060504";
+        let head = r#"<?xml version="1.0" encoding="UTF-8"?>
+<x:xmpmeta xmlns:x="adobe:ns:meta/"><rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#""#;
+        let bag = format!(
+            r#"{head}><rdf:Description rdf:about="" xmlns:xmp="http://ns.adobe.com/xap/1.0/">
+<xmp:Identifier><rdf:Bag><rdf:li>dam:asset/1</rdf:li><rdf:li>{OTHER}</rdf:li></rdf:Bag></xmp:Identifier>
+</rdf:Description></rdf:RDF></x:xmpmeta>"#
+        );
+        let two_descriptions = format!(
+            r#"{head}><rdf:Description rdf:about="" xmlns:xmp="http://ns.adobe.com/xap/1.0/" xmp:Identifier="dam:asset/2"/>
+<rdf:Description rdf:about="" xmlns:xmp="http://ns.adobe.com/xap/1.0/">
+<xmp:Identifier><rdf:Bag><rdf:li>{OTHER}</rdf:li></rdf:Bag></xmp:Identifier></rdf:Description>
+</rdf:RDF></x:xmpmeta>"#
+        );
+        let two_foreign = format!(
+            r#"{head}><rdf:Description rdf:about="" xmlns:xmp="http://ns.adobe.com/xap/1.0/">
+<xmp:Identifier><rdf:Bag><rdf:li>dam:asset/3</rdf:li><rdf:li>dam:asset/33</rdf:li></rdf:Bag></xmp:Identifier>
+</rdf:Description></rdf:RDF></x:xmpmeta>"#
+        );
+        let mut paths = Vec::new();
+        for (name, xml, first) in [
+            ("bag.arw", &bag, "dam:asset/1"),
+            ("two.arw", &two_descriptions, "dam:asset/2"),
+            ("foreign.arw", &two_foreign, "dam:asset/3"),
+        ] {
+            let path = root.join(name);
+            std::fs::write(&path, b"raw-bytes").unwrap();
+            std::fs::write(crate::xmp::sidecar_path(&path), xml).unwrap();
+            let up = catalog.upsert_photo(&path, None, 1, 9).unwrap();
+            let found = crate::xmp::read_identifier(&path);
+            assert_eq!(found.as_deref(), Some(first), "{name}: the first value is the one recorded");
+            let outcome = catalog.ensure_sidecar_identity(up.id, &path, &up.uuid, found.as_deref()).unwrap();
+            assert_eq!(outcome, SidecarIdentity::Conflict(first.to_string()));
+            paths.push(path);
+        }
+        assert_eq!(catalog.count_foreign_conflicts().unwrap(), 3);
+
+        let summary = catalog
+            .run_resolve_foreign_conflicts(ForeignConflictAction::Overwrite, &AtomicBool::new(false), |_| {})
+            .unwrap();
+        assert_eq!(summary, ForeignConflictSummary { total: 3, skipped: 3, ..Default::default() });
+        for path in &paths[..2] {
+            assert!(
+                crate::xmp::read_identifiers(path).iter().any(|v| v == OTHER),
+                "{}: the other photo's UUID is still in the sidecar",
+                path.display()
+            );
+        }
+        assert_eq!(crate::xmp::read_identifiers(&paths[2]), ["dam:asset/3", "dam:asset/33"]);
     }
 
     /// Dismiss in bulk pages through a queue longer than one page, interleaved with UUID

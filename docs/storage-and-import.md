@@ -243,7 +243,10 @@ non-UUID, and decides each exactly as a single resolution does: the queue row is
 Overwrite re-reads the sidecar and backs it up first, and a copy that is no longer a non-UUID
 conflict — resolved meanwhile, its sidecar now carrying a UUID or nothing, its file
 unreachable — is skipped, never acted on. A UUID conflict names another photo's identity and
-is never resolved in bulk. The run is its own job family, so it neither stops nor is stopped
+is never resolved in bulk. Overwrite replaces every `xmp:Identifier` value while a conflict
+records only the first, so a bulk Overwrite also skips a sidecar holding more than one value
+(a Bag a DAM appended to, a second `rdf:Description`): another photo's UUID may sit beside the
+DAM id (`xmp::read_identifiers`). The run is its own job family, so it neither stops nor is stopped
 by a repair pass (each queue row has an owner); a newer run, Cancel or a catalog switch stops
 it before its next copy, and a front end's start is bound to the catalog it read
 (`CATALOG_CHANGED` otherwise). The GPUI identity-debt panel does not offer it yet.

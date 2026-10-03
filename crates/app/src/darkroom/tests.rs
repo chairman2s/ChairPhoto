@@ -485,6 +485,83 @@ fn a_failed_first_write_keeps_the_created_version_for_the_retry(cx: &mut TestApp
     assert_eq!(rig.darkroom(cx).read_with(cx, |d, _| d.open.as_ref().unwrap().versions_len), 1);
 }
 
+// --- the develop session's order (#203) -------------------------------------------------------
+
+/// What the develop session's calls did, in the order the worker ran them, and the photo the
+/// session is claimed for afterwards — core's rule: an open claims, a close trips the claim.
+#[derive(Default)]
+struct SessionLog {
+    calls: Vec<String>,
+    claimed: Option<i64>,
+}
+
+fn record_session_calls(rig: &Rig, cx: &mut TestAppContext) -> Arc<std::sync::Mutex<SessionLog>> {
+    let log = Arc::new(std::sync::Mutex::new(SessionLog::default()));
+    let (on_open, on_close) = (log.clone(), log.clone());
+    let calls = super::session::DevelopCalls {
+        open: Arc::new(move |_, _, photo_id, _| {
+            let mut l = on_open.lock().unwrap();
+            l.calls.push(format!("open {photo_id}"));
+            l.claimed = Some(photo_id);
+            Ok(DevelopSource::Jpeg)
+        }),
+        close: Arc::new(move |_| {
+            let mut l = on_close.lock().unwrap();
+            l.calls.push("close".into());
+            l.claimed = None;
+            Ok(())
+        }),
+    };
+    rig.darkroom(cx).update(cx, |d, _| d.set_develop_calls(calls));
+    log
+}
+
+/// The Runner's workers may take what is queued now newest first: run it so, then the rest.
+fn work_newest_first_then_rest(cx: &mut TestAppContext) {
+    cx.update(|cx| Runner::get(cx).run_pending_reversed());
+    cx.run_until_parked();
+    work(cx);
+}
+
+/// **Forced order** (#203). ← Library and straight back to Develop: the close of the session
+/// left and the open of the new one are both on the pool, and the pool runs the newer first.
+/// The close still runs before the open, so it never trips the claim the open made (core's
+/// `prepare` then stops without a word: the RAW stays "preparing" and nothing autosaves).
+#[gpui_kit::test]
+fn a_quick_return_to_develop_opens_the_session_after_the_close(cx: &mut TestAppContext) {
+    let rig = rig("dk-session-reopen", 2, cx);
+    let p = rig.open_photo(cx).unwrap();
+    let log = record_session_calls(&rig, cx);
+    rig.app.wired.shell.update(cx, |s, cx| s.show_library(cx));
+    cx.run_until_parked();
+    rig.app.wired.shell.update(cx, |s, cx| s.open_develop(cx));
+    cx.run_until_parked();
+    assert_eq!(rig.open_photo(cx), Some(p));
+    work_newest_first_then_rest(cx);
+    let log = log.lock().unwrap();
+    assert_eq!(log.calls, ["close".to_string(), format!("open {p}")], "the close first");
+    assert_eq!(log.claimed, Some(p), "the session is held for the photo on the stage");
+}
+
+/// **Forced order** (#203). Two quick steps (→ →): the first step's open is overtaken on the
+/// pool by the second's. The opens run in the order made, so the session ends up claimed for
+/// the photo on the stage, not the one stepped past.
+#[gpui_kit::test]
+fn quick_steps_claim_the_session_for_the_last_photo(cx: &mut TestAppContext) {
+    let rig = rig("dk-session-steps", 3, cx);
+    let order = rig.app.wired.shell.read_with(cx, |s, _| s.library.photo_ids());
+    let log = record_session_calls(&rig, cx);
+    for _ in 0..2 {
+        assert!(rig.view(cx).update(cx, |v, cx| v.step(1, None, cx)));
+        cx.run_until_parked();
+    }
+    assert_eq!(rig.open_photo(cx), Some(order[2]));
+    work_newest_first_then_rest(cx);
+    let log = log.lock().unwrap();
+    assert_eq!(log.calls.last(), Some(&format!("open {}", order[2])), "{:?}", log.calls);
+    assert_eq!(log.claimed, Some(order[2]), "{:?}", log.calls);
+}
+
 /// The filmstrip: → steps to the next photo in the Library's order (saving first), arrows
 /// that belong to a slider are left alone, and the ends do not wrap.
 #[gpui_kit::test]

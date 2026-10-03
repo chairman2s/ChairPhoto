@@ -17,6 +17,10 @@
 //! creating "Version 1" would show the Original and make a second "Version 1" (#189). Until
 //! the read answers its record is not editable.
 //!
+//! The develop session's opens and closes go to the worker one at a time, in the order made
+//! (`Darkroom::session_call`), so a close or an older open never lands after a newer open and
+//! trips its claim (#203).
+//!
 //! # The record, the stage, the save
 //!
 //! Every control produces the next record ([`Darkroom::apply`], the record maths in
@@ -113,6 +117,20 @@ struct SettingChain {
     queued: VecDeque<SettingWrite>,
 }
 
+/// A call on the develop session, waiting for the one before it (`Darkroom::session_call`).
+enum SessionCall {
+    /// Claim it for open `seq`'s photo, with the neighbours to preload.
+    Open { seq: u64, from: CatalogIdentity, photo_id: i64, neighbours: Vec<i64> },
+    Close,
+}
+
+/// The develop session's calls, one on the worker at a time, in the order made.
+#[derive(Default)]
+struct SessionChain {
+    running: bool,
+    queued: VecDeque<SessionCall>,
+}
+
 /// "🖥 Loupe print" on or off (`"0"` off; anything else, or nothing stored, on).
 pub const PRINT_ON_LOUPE_KEY: &str = "basic-editor.printOnLoupe";
 
@@ -121,6 +139,24 @@ pub const AUTOSAVE_QUIET: Duration = Duration::from_millis(600);
 
 /// Where the `.cube` LUTs live: `app::luts_dir` in the app; a test's own folder in tests.
 pub type LutsDir = Arc<dyn Fn() -> Result<PathBuf, String> + Send + Sync>;
+
+/// The develop session's calls into core, run on a worker: claim it for a photo (with its
+/// neighbours to preload) and release it. `editing::develop_open` / `develop_close` in the
+/// app; tests record the order the worker runs them in.
+#[derive(Clone)]
+pub struct DevelopCalls {
+    pub open: Arc<dyn Fn(&AppState, CatalogIdentity, i64, &[i64]) -> Result<DevelopSource, String> + Send + Sync>,
+    pub close: Arc<dyn Fn(&AppState) -> Result<(), String> + Send + Sync>,
+}
+
+impl Default for DevelopCalls {
+    fn default() -> Self {
+        DevelopCalls {
+            open: Arc::new(|state, from, photo_id, neighbours| editing::develop_open(state, Some(from), photo_id, neighbours)),
+            close: Arc::new(editing::develop_close),
+        }
+    }
+}
 
 /// One photo in the Darkroom.
 pub struct OpenPhoto {
@@ -303,6 +339,7 @@ pub struct Darkroom {
     strip_claim: ClaimId,
     pool: Arc<dyn Submit>,
     luts_dir: LutsDir,
+    develop: DevelopCalls,
     pub open: Option<OpenPhoto>,
     /// Photos left (a step, ← Library) while a commit of theirs was on the worker. Each is
     /// kept until that commit answers, so a change made meanwhile is committed after it —
@@ -320,6 +357,8 @@ pub struct Darkroom {
     pub timing_log: bool,
     /// A develop session is held (opened and not closed yet).
     session_held: bool,
+    /// Its opens and closes, in order (see [`Darkroom::session_call`]).
+    session_calls: SessionChain,
     /// The composition overlay drawn in the crop box (`editor.crop_overlay`).
     pub overlay: CropOverlay,
     /// The user's presets (`basic-editor.presets`), read with the settings.
@@ -364,6 +403,7 @@ impl Darkroom {
             strip_claim,
             pool,
             luts_dir: Arc::new(chairphoto_core::app::luts_dir),
+            develop: DevelopCalls::default(),
             open: None,
             leaving: Vec::new(),
             seq: 0,
@@ -372,6 +412,7 @@ impl Darkroom {
             wb_prefer: WbPrefer::Kelvin,
             timing_log: false,
             session_held: false,
+            session_calls: SessionChain::default(),
             overlay: CropOverlay::Thirds,
             user_presets: Vec::new(),
             notice: None,
@@ -387,6 +428,12 @@ impl Darkroom {
     pub fn set_backends(&mut self, pool: Arc<dyn Submit>, luts_dir: LutsDir) {
         self.pool = pool;
         self.luts_dir = luts_dir;
+    }
+
+    /// Tests: claim and release the develop session through `calls`.
+    #[cfg(test)]
+    pub fn set_develop_calls(&mut self, calls: DevelopCalls) {
+        self.develop = calls;
     }
 
     pub fn shell(&self) -> &Entity<ShellState> {
@@ -632,15 +679,61 @@ impl Darkroom {
             None => Vec::new(),
         };
         self.session_held = true;
-        self.run(
-            seq,
-            move |state| editing::develop_open(state, Some(from), photo_id, &neighbours),
-            move |this, result, cx| match result {
-                Ok(source) => this.on_source(&source, None, cx),
-                Err(e) => eprintln!("darkroom: develop open photo {photo_id}: {e}"),
-            },
-            cx,
-        );
+        self.session_call(SessionCall::Open { seq, from, photo_id, neighbours }, cx);
+    }
+
+    /// Queue `call` on the develop session: it runs once every call made before it has
+    /// answered. The Runner's pool may run a newer task first, and core's open trips whatever
+    /// claim came before it while its close trips whatever claim is installed: a close (← Library)
+    /// or an earlier open (→ →) that ran after a newer open would abort that open's decode,
+    /// which then ends without a word — the RAW left "preparing", nothing autosaved (#203).
+    fn session_call(&mut self, call: SessionCall, cx: &mut Context<Self>) {
+        self.session_calls.queued.push_back(call);
+        if !self.session_calls.running {
+            self.next_session_call(cx);
+        }
+    }
+
+    /// The next queued session call to the worker. An open for a photo no longer open is
+    /// skipped: a newer open or a close follows it.
+    fn next_session_call(&mut self, cx: &mut Context<Self>) {
+        self.session_calls.running = false;
+        while let Some(call) = self.session_calls.queued.pop_front() {
+            let state = self.app.clone();
+            let develop = self.develop.clone();
+            match call {
+                SessionCall::Open { seq, .. } if !self.open.as_ref().is_some_and(|o| o.seq == seq) => continue,
+                SessionCall::Open { seq, from, photo_id, neighbours } => {
+                    let rx = Runner::get(cx).run(move || (develop.open)(&state, from, photo_id, &neighbours));
+                    cx.spawn(async move |this, cx| {
+                        let result = rx.await.unwrap_or_else(|_| Err("the worker stopped".into()));
+                        this.update(cx, |this, cx| {
+                            if this.open.as_ref().is_some_and(|o| o.seq == seq) {
+                                match result {
+                                    Ok(source) => this.on_source(&source, None, cx),
+                                    Err(e) => eprintln!("darkroom: develop open photo {photo_id}: {e}"),
+                                }
+                            }
+                            this.next_session_call(cx);
+                        })
+                        .ok();
+                    })
+                    .detach();
+                }
+                SessionCall::Close => {
+                    let rx = Runner::get(cx).run(move || (develop.close)(&state));
+                    cx.spawn(async move |this, cx| {
+                        if let Ok(Err(e)) = rx.await {
+                            eprintln!("darkroom: develop close: {e}");
+                        }
+                        this.update(cx, |this, cx| this.next_session_call(cx)).ok();
+                    })
+                    .detach();
+                }
+            }
+            self.session_calls.running = true;
+            return;
+        }
     }
 
     /// `develop.wbSlider`, `editor.renderTiming`, the crop overlay, the user presets, the
@@ -1153,14 +1246,7 @@ impl Darkroom {
         self.request_strip_thumbs(cx);
         if self.session_held {
             self.session_held = false;
-            Runner::get(cx).spawn({
-                let state = self.app.clone();
-                move || {
-                    if let Err(e) = editing::develop_close(&state) {
-                        eprintln!("darkroom: develop close: {e}");
-                    }
-                }
-            });
+            self.session_call(SessionCall::Close, cx);
         }
         if save && had_photo {
             self.shell.update(cx, |s, cx| s.refresh_rows(cx));

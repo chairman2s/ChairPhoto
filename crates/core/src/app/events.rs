@@ -103,12 +103,14 @@ core_events! {
 
 // ── Payloads that used to live beside their commands ─────────────────────────────────
 
-/// Progress event payload for batch caching, emitted as `cache:progress`.
+/// Progress event payload for batch caching, emitted as `cache:progress`. `job` is the
+/// warm-up's job id (`app::cache`), so a front end drops a superseded warm-up's stragglers.
 #[derive(Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CacheProgress {
     pub done: usize,
     pub total: usize,
+    pub job: u64,
 }
 
 /// Progress event payload for slideshow encoding, emitted as `slideshow:progress`. `done`/

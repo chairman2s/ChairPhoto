@@ -310,3 +310,89 @@ fn the_darkrooms_back_starts_the_transition(cx: &mut TestAppContext) {
     assert_eq!(written(cx), [r#"{"from":"develop","started":true}"#]);
     assert!(cx.update(|cx| ShellTimer::live(cx)));
 }
+
+// --- startup splash (#160) --------------------------------------------------------------
+
+fn splash(app: &App, cx: &mut TestAppContext) -> crate::shell::splash::Splash {
+    app.wired.model.read_with(cx, |m, _| m.splash.clone())
+}
+
+fn splash_line(app: &App, cx: &mut TestAppContext) -> Option<String> {
+    cx.update_window(app.window(), |_, window, cx| {
+        window.render_frame(cx);
+        window.try_find("splash-stage").and_then(|e| e.label().map(str::to_string))
+    })
+    .unwrap()
+}
+
+/// A launch without the default catalog (the headless tests) shows no splash.
+#[gpui_kit::test]
+fn no_boot_no_splash(cx: &mut TestAppContext) {
+    let app = start(cx);
+    assert!(!splash(&app, cx).showing());
+    assert_eq!(splash_line(&app, cx), None);
+}
+
+/// The boot after the catalog opened, stage by stage (App.tsx's `initCatalog()` chain):
+/// auto-tags on a worker — the monochrome tag reaches a B&W photo imported before the rule —
+/// then the catalog read (the modules start on it), then the first rows; "Ready", and gone
+/// after the fade.
+#[gpui_kit::test]
+fn the_splash_follows_the_boot_stages_then_fades(cx: &mut TestAppContext) {
+    use crate::shell::splash::{BootStage, Splash, FADE};
+    let dir = TempDir::new("splash");
+    let app = start(cx);
+    let root = dir.0.join("photos");
+    let db = dir.0.join("boot.chairphoto");
+    let catalog = chairphoto_core::catalog::Catalog::open(&db, &root).unwrap();
+    let id = catalog.upsert_photo(&root.join("2026/bw.ARW"), None, 0, 1).unwrap().id;
+    catalog.set_grayscale(id, true).unwrap();
+    *app.state.catalog.lock().unwrap() = Some(catalog);
+    let tags = |app: &App| -> Vec<String> {
+        let guard = app.state.catalog.lock().unwrap();
+        guard.as_ref().unwrap().get_photo_tags(id).unwrap().into_iter().map(|t| t.full_path).collect()
+    };
+    assert!(tags(&app).is_empty(), "the photo predates the rule");
+
+    app.wired.model.update(cx, |m, cx| {
+        m.splash = Splash::booting();
+        cx.notify();
+    });
+    assert_eq!(splash_line(&app, cx).as_deref(), Some("Opening catalog…"));
+    app.wired.model.update(cx, |m, cx| m.boot_after_open(Ok(db.clone()), cx));
+    assert_eq!(splash(&app, cx).stage(), Some(BootStage::UpdatingAutoTags));
+    assert_eq!(splash_line(&app, cx).as_deref(), Some("Updating auto-tags…"));
+    cx.run_until_parked(); // everything but the worker
+    assert_eq!(splash(&app, cx).stage(), Some(BootStage::UpdatingAutoTags), "still waiting for the auto-tags");
+    assert!(app.wired.model.read_with(cx, |m, _| m.catalog.is_none()), "nothing read before the auto-tags ran");
+
+    assert_eq!(cx.update(|cx| Runner::get(cx).run_pending()), 1, "apply_auto_tags, on a worker");
+    assert_eq!(tags(&app), ["Treatment/Black & White"]);
+    cx.run_until_parked();
+    work(cx);
+    let s = splash(&app, cx);
+    assert!(s.hiding(), "the catalog, the modules and the first rows are in: {s:?}");
+    assert_eq!(splash_line(&app, cx).as_deref(), Some("Ready"));
+    assert!(app.wired.shell.read_with(cx, |s, _| s.rows_loaded));
+
+    cx.executor().advance_clock(FADE);
+    cx.run_until_parked();
+    assert!(!splash(&app, cx).showing());
+    assert_eq!(splash_line(&app, cx), None, "gone after the fade");
+}
+
+/// A failed open ends the boot at once: the splash fades rather than hanging over the error.
+#[gpui_kit::test]
+fn a_failed_boot_never_leaves_the_splash_up(cx: &mut TestAppContext) {
+    use crate::shell::splash::{Splash, FADE};
+    let app = start(cx);
+    app.wired.model.update(cx, |m, cx| {
+        m.splash = Splash::booting();
+        m.boot_after_open(Err("disk full".into()), cx);
+    });
+    assert!(splash(&app, cx).hiding());
+    assert_eq!(crate::tests::status(&app, cx), "Failed to open catalog: disk full");
+    cx.executor().advance_clock(FADE);
+    cx.run_until_parked();
+    assert!(!splash(&app, cx).showing());
+}

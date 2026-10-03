@@ -686,7 +686,9 @@ impl Render for RootView {
             .child(title_bar)
             .child(body)
             .children(self.stacks.as_ref().map(|(dialog, _)| dialog.clone()))
-            .children(self.cull.as_ref().map(|(cull, _)| cull.clone()));
+            .children(self.cull.as_ref().map(|(cull, _)| cull.clone()))
+            // The startup splash, over everything until the boot is in (`shell::splash`).
+            .children(self.model.read(cx).splash.showing().then(|| self.render_splash(&self.model.read(cx).splash, colors)));
         let model = self.model.clone();
         on_not_yet_ported(root, move |what, ticket, _, cx| {
             model.update(cx, |m, cx| m.not_yet_ported(what, ticket, cx))

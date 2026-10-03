@@ -12,6 +12,7 @@ pub mod command_pill;
 pub mod inspector;
 pub mod layout_prefs;
 pub mod sidebar;
+pub mod splash;
 pub mod state;
 pub mod style;
 pub mod timing;

@@ -946,6 +946,8 @@ impl ShellState {
                 if landed {
                     self.rows_pending = None;
                     self.rows_loaded = true;
+                    // The splash waits for the first photo list (`shell::splash`).
+                    self.model.update(cx, |m, cx| m.boot_photos_loaded(cx));
                     // Every pane dropped out of the view (a filter the culling just failed,
                     // say): Compare ends rather than linger off screen swallowing the marks.
                     // React's `inCompare` required a pane; the grid's keys then marked the
@@ -961,7 +963,11 @@ impl ShellState {
             Err(e) if landed => {
                 self.rows_pending = None;
                 eprintln!("library: rows unavailable: {e}");
-                self.model.update(cx, |m, cx| m.set_status(format!("Could not list photos: {e}"), cx));
+                // A failed list ends the boot too: the splash never hangs over the error.
+                self.model.update(cx, |m, cx| {
+                    m.set_status(format!("Could not list photos: {e}"), cx);
+                    m.boot_photos_loaded(cx);
+                });
             }
             Err(_) => {}
         }

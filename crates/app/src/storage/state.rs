@@ -9,6 +9,13 @@
 //! and identity generations are tripped by a newer start, by Cancel and by the switch itself,
 //! so the old worker stops at its next file, op or copy rather than running on.
 //!
+//! **Cache warm-up.** A rescan's result starts `app::cache` (App.tsx `onScan` →
+//! `cacheImages(cachePreviews)`): thumbnails always, previews too while Import ▾ → "Cache
+//! previews on import" is on. It is claimed on the UI thread (`cache::claim_cache`, one abort
+//! lock), so a newer rescan's warm-up or a catalog switch trips it in the core; its
+//! `cache:progress` events move the status line on the bench only while their job id is the
+//! one followed, and only its own result ends it ("Cache ready", or "Cache failed: …").
+//!
 //! **Identity repair.** The pass's events carry its job id; this entity follows exactly one
 //! job. `identity:repair_done` is the required terminal signal. The job id reaches the UI
 //! thread by one channel and the events by another, so a terminal event can arrive before the
@@ -19,7 +26,7 @@
 use super::runner::Runner;
 use crate::model::{AppModel, AppModelEvent};
 use crate::shell::ShellState;
-use chairphoto_core::app::{scans, storage, AppState, CatalogIdentity, CoreEvent, IdentityRepairDone};
+use chairphoto_core::app::{cache, scans, storage, AppState, CatalogIdentity, CoreEvent, IdentityRepairDone};
 use chairphoto_core::bundle::importer::BundleImportResult;
 use chairphoto_core::catalog::IdentityRepairSummary;
 use chairphoto_core::scanner::ScanResult;
@@ -40,6 +47,16 @@ pub struct ImportJob {
     seq: u64,
     epoch: u64,
     pub kind: ImportKind,
+}
+
+/// The cache warm-up this entity follows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CacheJob {
+    /// The core job id its `cache:progress` events carry.
+    pub job: u64,
+    epoch: u64,
+    /// Whether it warms previews too ("Cache previews on import" when it started).
+    pub previews: bool,
 }
 
 /// The identity repair pass as the debt panel shows it.
@@ -83,6 +100,8 @@ pub struct StorageState {
     pub import: Option<ImportJob>,
     /// The running rescan's `(seq, epoch)`.
     scan: Option<(u64, u64)>,
+    /// The cache warm-up followed.
+    pub cache: Option<CacheJob>,
     /// The epoch of the back-up drain running now: overlapping triggers in one catalog start
     /// no second one (React's `reconciling` ref). A drain from before a catalog switch does
     /// not count — the switch tripped it in the core (`storage::ReconcileClaim`), so the new
@@ -120,6 +139,7 @@ impl StorageState {
             seq: 0,
             import: None,
             scan: None,
+            cache: None,
             reconciling: None,
             repair: RepairState::default(),
             last_dialog: None,
@@ -174,6 +194,7 @@ impl StorageState {
                 self.epoch += 1;
                 self.import = None;
                 self.scan = None;
+                self.cache = None;
                 self.repair = RepairState::default();
                 cx.emit(StorageEvent::CatalogSwitched);
                 cx.notify();
@@ -183,6 +204,12 @@ impl StorageState {
                     self.repair.progress = Some((p.done, p.total));
                     cx.notify();
                 }
+            }
+            // React's listener: "Caching d/t…", then "Cache ready (t)" — this warm-up's only.
+            CoreEvent::CacheProgress(p) if self.cache.is_some_and(|c| c.job == p.job) => {
+                let line =
+                    if p.done < p.total { format!("Caching {}/{}…", p.done, p.total) } else { format!("Cache ready ({})", p.total) };
+                self.status(line, cx);
             }
             CoreEvent::IdentityRepairDone(d) => match self.repair.job {
                 Some(job) if self.repair.running && job == d.job => self.end_repair(d.clone(), cx),
@@ -318,11 +345,50 @@ impl StorageState {
             return;
         }
         self.scan = None;
+        let scanned = result.is_ok();
         match result {
             Ok(r) => self.status(rescan_line(&r), cx),
             Err(e) => self.status(format!("Scan failed: {e}"), cx),
         }
         self.invalidate(cx);
+        if scanned {
+            self.start_cache(cx);
+        }
+    }
+
+    /// Pre-cache so browsing is instant (App.tsx `onScan`): thumbnails always, previews when
+    /// "Cache previews on import" is on. A newer start trips the one before it.
+    pub fn start_cache(&mut self, cx: &mut Context<Self>) {
+        let include_previews = self.shell.read(cx).cache_previews;
+        let claim = match cache::claim_cache(&self.app) {
+            Ok(c) => c,
+            Err(e) => return self.status(format!("Cache failed: {e}"), cx),
+        };
+        let token = CacheJob { job: claim.job, epoch: self.epoch, previews: include_previews };
+        self.cache = Some(token);
+        let state = self.app.clone();
+        let rx = Runner::get(cx).run(move || cache::cache_images_claimed(&state, &claim, include_previews));
+        cx.spawn(async move |this, cx| {
+            let result = rx.await.unwrap_or_else(|_| Err("the cache worker stopped".into()));
+            this.update(cx, |s, cx| s.finish_cache(token, result, cx)).ok();
+        })
+        .detach();
+    }
+
+    /// The warm-up's own result: the terminal signal, whatever its progress said.
+    fn finish_cache(&mut self, token: CacheJob, result: Result<cache::CacheResult, String>, cx: &mut Context<Self>) {
+        if self.cache != Some(token) || token.epoch != self.epoch {
+            return; // superseded by a newer warm-up, or by a catalog switch
+        }
+        self.cache = None;
+        match result {
+            Ok(_) => {
+                self.status("Cache ready".into(), cx);
+                // The B&W flags and the monochrome auto-tag changed.
+                self.invalidate(cx);
+            }
+            Err(e) => self.status(format!("Cache failed: {e}"), cx),
+        }
     }
 
     pub fn scanning(&self) -> bool {

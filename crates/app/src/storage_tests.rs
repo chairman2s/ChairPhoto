@@ -934,6 +934,94 @@ fn owed_action_across_a_switch(retry: bool, delivered: bool, cx: &mut TestAppCon
     }
 }
 
+/// Where `id` is in the frame drawn now.
+fn drawn_center(app: &App, id: &'static str, cx: &mut TestAppContext) -> gpui_kit::Point<gpui_kit::Pixels> {
+    cx.update_window(app.window(), |_, window, cx| {
+        window.render_frame(cx);
+        window.find(id).bounds().center()
+    })
+    .unwrap()
+}
+
+/// Press and release at `at` against the frame on screen, with no draw in between or before:
+/// what a click does when a list re-read has landed and notified but the window has not drawn
+/// it yet. (`window.click` draws first, so it would click the new frame's button.)
+fn click_undrawn(app: &App, at: gpui_kit::Point<gpui_kit::Pixels>, cx: &mut TestAppContext) {
+    use gpui_kit::{InputEvent as _, Modifiers, MouseButton, MouseDownEvent, MouseUpEvent};
+    cx.update_window(app.window(), |_, window, cx| {
+        let down = MouseDownEvent { button: MouseButton::Left, position: at, modifiers: Modifiers::default(), click_count: 1, first_mouse: false };
+        window.dispatch_event(down.to_platform_input(), cx);
+        let up = MouseUpEvent { button: MouseButton::Left, position: at, modifiers: Modifiers::default(), click_count: 1 };
+        window.dispatch_event(up.to_platform_input(), cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+}
+
+fn still_owed(app: &App) -> Vec<i64> {
+    chairphoto_core::app::with_catalog(&app.state, |c| c.list_owed_iptc_page(10, 0))
+        .unwrap()
+        .into_iter()
+        .map(|r| r.photo_id)
+        .collect()
+}
+
+/// Review of #153, M1 (its probe P3): a row's buttons act on the row they were drawn for.
+/// The list changes under the frame on screen (p0 left it; p1 is at index 0 now) and the
+/// click on p0's Dismiss lands before the next draw: p1 must not be dismissed.
+#[gpui_kit::test]
+fn an_owed_click_acts_on_the_row_drawn_not_the_row_now_at_its_index(cx: &mut TestAppContext) {
+    let dir = TempDir::new("debt-owed-index");
+    let app = start(cx);
+    let ids = catalog_owing_iptc(&app, &dir, 2, cx);
+    let panel = open_debt_panel(&app, cx);
+    let at = drawn_center(&app, "owed-dismiss-0", cx);
+    panel.read_with(cx, |p, _| assert_eq!(p.owed.as_ref().unwrap()[0].photo_id, ids[0]));
+    // A re-read lands (p0's debt was paid elsewhere, so p1 moves up). Without a notify, so the
+    // test window does not draw it: its notify would draw at once, where a real window draws
+    // at the next frame and dispatches input against the frame on screen until then.
+    panel.update(cx, |p, _| {
+        p.owed.as_mut().unwrap().remove(0);
+    });
+    let undrawn = cx.update_window(app.window(), |_, window, _| window.try_find("owed-row-1").is_some()).unwrap();
+    assert!(undrawn, "the precondition: the frame on screen still shows both rows");
+    click_undrawn(&app, at, cx);
+    work(cx);
+    assert!(still_owed(&app).contains(&ids[1]), "p1 was dismissed by a click on p0's row");
+}
+
+/// The same frame gap across a catalog switch: the panel drew A's row, the switch landed and
+/// B's list (same id, UUID and generation) replaced it with B's binding, and the click on
+/// A's row lands before the next draw. It is bound to A's row and A's catalog: B keeps its
+/// debt.
+#[gpui_kit::test]
+fn an_owed_click_in_the_frame_after_a_switch_never_reaches_the_new_catalog(cx: &mut TestAppContext) {
+    let dir = TempDir::new("debt-owed-switch-gap");
+    let app = start(cx);
+    let ids = catalog_owing_iptc(&app, &dir, 1, cx);
+    let panel = open_debt_panel(&app, cx);
+    let at = drawn_center(&app, "owed-dismiss-0", cx);
+    let shown = panel.read_with(cx, |p, _| p.owed.as_ref().unwrap()[0].clone());
+
+    let (b, b_ids) = colliding_catalog(&dir, "b", 1);
+    assert_eq!(b_ids, ids);
+    std::fs::create_dir_all(dir.0.join("b/2026")).unwrap();
+    std::fs::write(dir.0.join("b/2026/b0.ARW"), b"raw").unwrap();
+    b.conn().execute_batch(&format!("UPDATE photos SET uuid = '{}' WHERE id = {}", shown.uuid, b_ids[0])).unwrap();
+    b.set_iptc(b_ids[0], &chairphoto_core::catalog::IptcFields { title: "B's".into(), ..Default::default() }).unwrap();
+    core_switch(&app, b);
+    // The switch's re-read lands with B's rows and B's binding, undrawn (as above: no notify,
+    // which in the test window would draw at once).
+    let (b_from, b_rows) = chairphoto_core::app::iptc_owed::list_owed_iptc(&app.state, 100, 0).unwrap();
+    panel.update(cx, |p, _| {
+        p.owed = Some(b_rows);
+        p.owed_from = Some(b_from);
+    });
+    click_undrawn(&app, at, cx);
+    work(cx);
+    assert_eq!(still_owed(&app), b_ids, "B's debt was dismissed by a click on A's row");
+}
+
 #[gpui_kit::test]
 fn an_owed_dismiss_never_reaches_the_new_catalog_before_the_switch_event(cx: &mut TestAppContext) {
     owed_action_across_a_switch(false, false, cx);

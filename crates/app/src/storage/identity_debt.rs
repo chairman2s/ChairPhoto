@@ -213,9 +213,12 @@ impl IdentityDebtPanel {
     /// Dismiss (`retry == false`) or Retry one owed-IPTC row — in the catalog its row was
     /// read from (`CATALOG_CHANGED` once another is open), for the photo with its UUID. Then
     /// the counts are re-read: the panel's and the title bar's.
-    pub fn act_on_owed(&mut self, index: usize, retry: bool, cx: &mut Context<Self>) {
-        let Some(row) = self.owed.as_ref().and_then(|r| r.get(index)).cloned() else { return };
-        let Some(from) = self.owed_from else { return };
+    ///
+    /// `row` and `from` are what the button was drawn with, captured at render time — never
+    /// looked up by index at click time. A list re-read (or a catalog switch's) can land and
+    /// notify before the next draw, and a click against the frame on screen must still act
+    /// on the row the user saw, in the catalog it was read from (review of #153, M1).
+    pub fn act_on_owed(&mut self, row: OwedIptc, from: CatalogIdentity, retry: bool, cx: &mut Context<Self>) {
         if self.owed_busy.is_some() {
             return;
         }
@@ -295,7 +298,16 @@ impl IdentityDebtPanel {
                 .child(header("Detail", 160.))
                 .child(header("", 150.)),
         );
-        let enabled = self.owed_busy.is_none();
+        // Each button carries the row and the catalog it was drawn with (review of #153, M1).
+        let from = self.owed_from;
+        let enabled = self.owed_busy.is_none() && from.is_some();
+        let act = |row: OwedIptc, retry: bool| {
+            cx.listener(move |s: &mut Self, _: &gpui_kit::ClickEvent, _: &mut Window, cx: &mut Context<Self>| {
+                if let Some(from) = from {
+                    s.act_on_owed(row.clone(), from, retry, cx);
+                }
+            })
+        };
         let mut list = div().id("owed-rows").flex().flex_col().max_h(px(240.)).overflow_y_scroll();
         for (i, r) in rows.iter().enumerate() {
             let id = |what: &str| SharedString::from(format!("{what}-{i}"));
@@ -321,12 +333,12 @@ impl IdentityDebtPanel {
                             .child(ui::clickable(
                                 ui::chip(id("owed-retry"), "Retry", enabled, colors),
                                 enabled,
-                                cx.listener(move |s, _, _, cx| s.act_on_owed(i, true, cx)),
+                                act(r.clone(), true),
                             ))
                             .child(ui::clickable(
                                 ui::chip(id("owed-dismiss"), "Dismiss", enabled, colors),
                                 enabled,
-                                cx.listener(move |s, _, _, cx| s.act_on_owed(i, false, cx)),
+                                act(r.clone(), false),
                             )),
                     )
                     .test_support(),

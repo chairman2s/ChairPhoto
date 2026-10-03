@@ -817,7 +817,8 @@ fn resolve_across_a_switch(delivered: bool, cx: &mut TestAppContext) {
     };
     assert_eq!((b_row.volume_id, &b_row.relative_path), (a_row.volume_id, &a_row.relative_path), "the same copy coordinates");
 
-    let dismiss = |cx: &mut TestAppContext| panel.update(cx, |p, cx| p.resolve(0, IdentityConflictAction::Dismiss, cx));
+    let a_from = panel.read_with(cx, |p, _| p.rows_from.unwrap());
+    let dismiss = |cx: &mut TestAppContext| panel.update(cx, |p, cx| p.resolve(a_row.clone(), a_from, IdentityConflictAction::Dismiss, cx));
     if delivered {
         dismiss(cx);
         core_switch(&app, b);
@@ -1196,6 +1197,172 @@ fn an_owed_retry_never_reaches_the_new_catalog_before_the_switch_event(cx: &mut 
 #[gpui_kit::test]
 fn an_owed_retry_never_reaches_the_new_catalog_after_the_switch_event(cx: &mut TestAppContext) {
     owed_action_across_a_switch(true, true, cx);
+}
+
+// --- identity-queue clicks act on the copy drawn (#169) ---------------------------------------
+
+/// A catalog whose `n` copies are each in conflict, the queue panel open on them.
+fn panel_on_conflicts(
+    app: &App,
+    dir: &TempDir,
+    n: usize,
+    cx: &mut TestAppContext,
+) -> (Vec<i64>, Entity<crate::storage::identity_debt::IdentityDebtPanel>) {
+    let ids = open_catalog_with_photos(app, dir, n, cx);
+    record_conflicts(app.state.catalog.lock().unwrap().as_ref().unwrap(), &dir.0.join("photos"), &ids);
+    app.wired.model.update(cx, |m, cx| m.refresh(cx));
+    work(cx);
+    let panel = open_debt_panel(app, cx);
+    panel.read_with(cx, |p, _| assert_eq!(p.rows.as_ref().map(Vec::len), Some(n)));
+    (ids, panel)
+}
+
+/// The dismissed copies of the open catalog, as (photo id, relative path).
+fn dismissed_copies(app: &App) -> Vec<(i64, String)> {
+    use crate::storage::identity_debt::dismissed_field;
+    chairphoto_core::app::with_catalog(&app.state, |c| c.list_pending_identity_page(1000, 0, true))
+        .unwrap()
+        .into_iter()
+        .filter(|p| dismissed_field(p).is_some())
+        .map(|p| (p.photo_id, p.relative_path))
+        .collect()
+}
+
+/// A page re-read lands under the frame on screen (copy 0 left the queue; copy 1 is at index
+/// 0 now), undrawn: no notify, which in the test window would draw at once, where a real
+/// window draws at the next frame and dispatches input against the frame on screen until then.
+fn drop_first_row_undrawn(app: &App, panel: &Entity<crate::storage::identity_debt::IdentityDebtPanel>, cx: &mut TestAppContext) {
+    panel.update(cx, |p, _| {
+        p.rows.as_mut().unwrap().remove(0);
+    });
+    let undrawn = cx.update_window(app.window(), |_, window, _| window.try_find("debt-row-1").is_some()).unwrap();
+    assert!(undrawn, "the precondition: the frame on screen still shows both copies");
+}
+
+/// #169 (as #153's M1): Dismiss on copy 0, clicked against the frame on screen after a
+/// re-read moved copy 1 to index 0, dismisses copy 0 — never copy 1.
+#[gpui_kit::test]
+fn a_dismiss_click_acts_on_the_copy_drawn_not_the_copy_now_at_its_index(cx: &mut TestAppContext) {
+    let dir = TempDir::new("debt-index-dismiss");
+    let app = start(cx);
+    let (_, panel) = panel_on_conflicts(&app, &dir, 2, cx);
+    let at = drawn_center(&app, "dismiss-0", cx);
+    let (c0, c1) = panel.read_with(cx, |p, _| {
+        let r = p.rows.as_ref().unwrap();
+        ((r[0].photo_id, r[0].relative_path.clone()), (r[1].photo_id, r[1].relative_path.clone()))
+    });
+    drop_first_row_undrawn(&app, &panel, cx);
+    click_undrawn(&app, at, cx);
+    work(cx);
+    let dismissed = dismissed_copies(&app);
+    assert!(!dismissed.contains(&c1), "copy 1 was dismissed by a click on copy 0's row");
+    assert_eq!(dismissed, vec![c0], "the copy drawn was the one dismissed");
+}
+
+/// #169: Adopt, and Overwrite… then its confirm, clicked in the same frame gap act on copy 0.
+/// Neither copy's sidecar carries an identifier, so the core refuses either action naming the
+/// file it read: copy 0's, never copy 1's. Overwrite… arms the confirm for copy 0 too.
+#[gpui_kit::test]
+fn adopt_and_overwrite_clicks_act_on_the_copy_drawn(cx: &mut TestAppContext) {
+    use crate::storage::identity_debt::row_key;
+    let dir = TempDir::new("debt-index-adopt");
+    let app = start(cx);
+    let (_, panel) = panel_on_conflicts(&app, &dir, 2, cx);
+    let refusal = |cx: &mut TestAppContext| panel.read_with(cx, |p, _| p.action_error.clone().unwrap_or_default());
+
+    // Adopt.
+    let at = drawn_center(&app, "adopt-0", cx);
+    drop_first_row_undrawn(&app, &panel, cx);
+    click_undrawn(&app, at, cx);
+    work(cx);
+    let e = refusal(cx);
+    assert!(e.contains("p0.ARW") && !e.contains("p1.ARW"), "Adopt acted on another copy: {e}");
+
+    // Overwrite… arms the confirm for the copy drawn.
+    panel.update(cx, |p, cx| p.reload_page(cx));
+    work(cx);
+    let key0 = panel.read_with(cx, |p, _| row_key(&p.rows.as_ref().unwrap()[0]));
+    let at = drawn_center(&app, "overwrite-0", cx);
+    drop_first_row_undrawn(&app, &panel, cx);
+    click_undrawn(&app, at, cx);
+    panel.read_with(cx, |p, _| assert_eq!(p.confirm_overwrite.as_ref(), Some(&key0), "Overwrite… armed another copy"));
+
+    // Its confirm.
+    panel.update(cx, |p, cx| p.reload_page(cx));
+    work(cx);
+    let at = drawn_center(&app, "overwrite-confirm-0", cx);
+    drop_first_row_undrawn(&app, &panel, cx);
+    click_undrawn(&app, at, cx);
+    work(cx);
+    let e = refusal(cx);
+    assert!(e.contains("p0.ARW") && !e.contains("p1.ARW"), "Overwrite acted on another copy: {e}");
+}
+
+/// #169: the same frame gap across a catalog switch. The panel drew A's copy; the switch
+/// landed and B's queue (the same photo id, volume id and relative path, also in conflict)
+/// replaced it with B's binding, undrawn. The click on A's Dismiss is bound to A's copy and
+/// A's catalog: it fails closed and B's copy keeps its conflict.
+#[gpui_kit::test]
+fn a_resolution_click_in_the_frame_after_a_switch_never_reaches_the_new_catalog(cx: &mut TestAppContext) {
+    let dir = TempDir::new("debt-switch-gap");
+    let app = start(cx);
+    let (ids, panel) = panel_on_conflicts(&app, &dir, 1, cx);
+    let at = drawn_center(&app, "dismiss-0", cx);
+    let a_row = panel.read_with(cx, |p, _| p.rows.as_ref().unwrap()[0].clone());
+
+    let other = dir.0.join("other");
+    let b = Catalog::open(&other.join("b.chairphoto"), &other).unwrap();
+    let b_ids = vec![b.upsert_photo(&other.join("2026/p0.ARW"), None, 0, 1).unwrap().id];
+    assert_eq!(b_ids, ids, "the ids collide");
+    record_conflicts(&b, &other, &b_ids);
+    core_switch(&app, b);
+    let (b_from, b_rows) =
+        chairphoto_core::app::with_catalog_identified(&app.state, |c| c.list_pending_identity_page(500, 0, false)).unwrap();
+    assert_eq!(
+        (b_rows[0].photo_id, b_rows[0].volume_id, &b_rows[0].relative_path),
+        (a_row.photo_id, a_row.volume_id, &a_row.relative_path),
+        "the same copy coordinates"
+    );
+    panel.update(cx, |p, _| {
+        p.rows = Some(b_rows);
+        p.rows_from = Some(b_from);
+    });
+    click_undrawn(&app, at, cx);
+    work(cx);
+    assert_eq!(dismissed_copies(&app), vec![], "B's copy was dismissed by a click on A's row");
+    panel.read_with(cx, |p, _| assert_eq!(p.action_error.as_deref(), Some(chairphoto_core::app::CATALOG_CHANGED)));
+}
+
+/// #169: `catalog:switched` re-reads the identity queue (it named the old catalog's copies)
+/// and frees its buttons from a resolution still in flight on the old catalog, whose answer
+/// is dropped when it lands.
+#[gpui_kit::test]
+fn a_switch_re_reads_the_identity_queue_and_frees_its_buttons(cx: &mut TestAppContext) {
+    let dir = TempDir::new("debt-switch-reread");
+    let app = start(cx);
+    let (_, panel) = panel_on_conflicts(&app, &dir, 1, cx);
+    click(&app, "dismiss-0", cx); // queued on the manual runner: in flight
+    panel.read_with(cx, |p, _| assert!(p.resolving.is_some(), "the precondition: A's Dismiss is in flight"));
+
+    let other = dir.0.join("other");
+    let b = Catalog::open(&other.join("b.chairphoto"), &other).unwrap();
+    let b_ids: Vec<i64> = (0..3).map(|i| b.upsert_photo(&other.join(format!("2026/p{i}.ARW")), None, 0, 1).unwrap().id).collect();
+    record_conflicts(&b, &other, &b_ids);
+    core_switch(&app, b);
+    deliver_switch(&app, cx);
+    panel.read_with(cx, |p, _| assert_eq!(p.resolving, None, "B's buttons are free"));
+    // A resolution on B's queue is in flight (marked as `resolve` marks it) when A's Dismiss
+    // finally runs (failing closed: CATALOG_CHANGED) and its answer lands.
+    panel.update(cx, |p, _| p.resolving = Some("B's copy".into()));
+    work(cx);
+    let b_from = chairphoto_core::app::catalog_identity(&app.state).unwrap();
+    panel.read_with(cx, |p, _| {
+        assert_eq!(p.resolving.as_deref(), Some("B's copy"), "A's stale answer cleared B's busy flag");
+        assert_eq!(p.rows.as_ref().map(Vec::len), Some(3), "the queue was re-read from B");
+        assert_eq!(p.rows_from, Some(b_from));
+        assert!(p.action_error.is_none() && p.resolve_result.is_none(), "A's answer was shown on B's queue");
+    });
+    assert_eq!(dismissed_copies(&app), vec![], "B's copy was dismissed");
 }
 
 // --- the virtualised tables (#162) -----------------------------------------------------------

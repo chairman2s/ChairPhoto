@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import {
+  CatalogIdentity,
   IdentityConflictAction,
   IdentityDebtState,
   IdentityRepairDone,
@@ -16,10 +17,12 @@ import {
   Volume,
   cancelIdentityRepair,
   dismissOwedIptc,
+  getCatalogIdentity,
   identityRepairStatus,
   listOwedIptc,
   listPendingIdentity,
   listVolumes,
+  onCatalogSwitched,
   onIdentityRepairDone,
   onIdentityRepairProgress,
   repairPendingIdentity,
@@ -30,7 +33,12 @@ import {
 // The shared owned-listener utility (issue #13): an owner token per attempt, a registration
 // that resolves after teardown stopped rather than stored, job-id filtering, and a buffer
 // for a terminal event that beats the job id it belongs to.
-import { forJob, terminalBuffer, useOwnedListeners } from "../modules/ownedEvents";
+import {
+  forJob,
+  terminalBuffer,
+  useOwnedListeners,
+  useOwnedSubscription,
+} from "../modules/ownedEvents";
 
 export const STATE_LABEL: Record<IdentityDebtState, string> = {
   unreachable: "Unreachable",
@@ -295,6 +303,14 @@ export function owedActionMessage(done: OwedAction): string {
  * Resolving a conflict deliberately does NOT stop a running pass: the backend gives each
  * queue row an owner, so the decision wins and only that row's result is dropped
  * (`catalog/identity.rs` § Who owns a queue row). Both actions stay available at once.
+ *
+ * **Bound to one catalog (#164).** The panel captures the open catalog's identity when it
+ * opens and passes it to every read and action, so each fails closed ("The catalog changed
+ * since this was read") once another catalog is open — a switch publishes the new catalog
+ * before `catalog:switched` arrives, and a copied catalog has the same ids, paths, UUIDs and
+ * generations, so neither an id nor a UUID check can tell them apart. Nothing loads until
+ * the identity is known. On `catalog:switched` the panel closes: its rows name the old
+ * catalog's copies and photos.
  */
 export function IdentityDebtPanel({
   onClose,
@@ -325,16 +341,46 @@ export function IdentityDebtPanel({
   const [resolving, setResolving] = useState<string | null>(null);
   const [resolveResult, setResolveResult] = useState("");
 
+  /** The catalog this panel was opened on (#164), captured once; `null` until it is known,
+   *  and nothing is read before then. A ref too, for the loaders a pass's end calls. */
+  const [catalog, setCatalog] = useState<CatalogIdentity | null>(null);
+  const catalogRef = useRef<CatalogIdentity | null>(null);
+  useEffect(() => {
+    let live = true;
+    getCatalogIdentity()
+      .then((id) => {
+        if (!live) return;
+        catalogRef.current = id;
+        setCatalog(id);
+      })
+      .catch((e) => {
+        if (live) setSummaryError(String(e));
+      });
+    return () => {
+      live = false;
+    };
+  }, []);
+
+  // A switch closes the panel: every row names the old catalog's copies and photos. (An
+  // action pressed before this lands is refused by the backend: it is bound to `catalog`.)
+  const onCloseRef = useRef(onClose);
+  onCloseRef.current = onClose;
+  useOwnedSubscription(() => onCatalogSwitched(() => onCloseRef.current()), []);
+
   const reloadSummary = useCallback(() => {
+    const bound = catalogRef.current;
+    if (bound === null) return;
     setSummaryError("");
-    summarizePendingIdentity()
+    summarizePendingIdentity(bound)
       .then(setSummary)
       .catch((e) => setSummaryError(String(e)));
   }, []);
 
   const reloadPage = useCallback((p: number, includeDismissed: boolean) => {
+    const bound = catalogRef.current;
+    if (bound === null) return;
     setListError("");
-    listPendingIdentity(PAGE_SIZE, p * PAGE_SIZE, includeDismissed)
+    listPendingIdentity(PAGE_SIZE, p * PAGE_SIZE, includeDismissed, bound)
       .then(setRows)
       .catch((e) => setListError(String(e)));
   }, []);
@@ -355,9 +401,11 @@ export function IdentityDebtPanel({
   owedPageRef.current = owedPage;
 
   const reloadOwed = useCallback((p: number) => {
+    const bound = catalogRef.current;
+    if (bound === null) return;
     setOwedError("");
     const seq = ++owedSeqRef.current;
-    listOwedIptc(OWED_PAGE_SIZE, p * OWED_PAGE_SIZE)
+    listOwedIptc(OWED_PAGE_SIZE, p * OWED_PAGE_SIZE, bound)
       .then((rows) => {
         if (owedSeqRef.current === seq) setOwed(rows);
       })
@@ -368,17 +416,19 @@ export function IdentityDebtPanel({
 
   useEffect(() => {
     reloadOwed(owedPage);
-  }, [reloadOwed, owedPage]);
+  }, [reloadOwed, owedPage, catalog]);
 
-  const actOnOwed = async (row: OwedIptc, retry: boolean) => {
-    if (owedBusy !== null) return;
+  /** `row` and `bound` are what the button was rendered with: the row the user saw and the
+   *  catalog it was read from. */
+  const actOnOwed = async (row: OwedIptc, bound: CatalogIdentity | null, retry: boolean) => {
+    if (owedBusy !== null || bound === null) return;
     setOwedBusy(row.photoId);
     setOwedError("");
     setOwedResult("");
     try {
       const done: OwedAction = retry
-        ? { retried: await retryOwedIptc(row.photoId, row.uuid) }
-        : { dismissed: await dismissOwedIptc(row.photoId, row.uuid, row.generation) };
+        ? { retried: await retryOwedIptc(row.photoId, row.uuid, bound) }
+        : { dismissed: await dismissOwedIptc(row.photoId, row.uuid, row.generation, bound) };
       setOwedResult(owedActionMessage(done));
       reloadSummary();
       reloadOwed(owedPageRef.current);
@@ -397,13 +447,14 @@ export function IdentityDebtPanel({
 
   // Summary and volumes load once up front; the page reloads whenever `page` changes.
   useEffect(() => {
+    if (catalog === null) return;
     reloadSummary();
     listVolumes().then(setVolumes).catch(() => setVolumes([]));
-  }, [reloadSummary]);
+  }, [reloadSummary, catalog]);
 
   useEffect(() => {
     reloadPage(page, showDismissed);
-  }, [reloadPage, page, showDismissed]);
+  }, [reloadPage, page, showDismissed, catalog]);
 
   const volumeName = (id: number) => volumes.find((v) => v.id === id)?.name ?? `volume ${id}`;
 
@@ -589,13 +640,26 @@ export function IdentityDebtPanel({
 
   const rowKey = (p: PendingIdentity) => `${p.photoId}-${p.volumeId}-${p.relativePath}`;
 
-  const resolve = async (p: PendingIdentity, action: IdentityConflictAction) => {
+  /** `p` and `bound` are what the button was rendered with: the copy the user saw and the
+   *  catalog it was read from. */
+  const resolve = async (
+    p: PendingIdentity,
+    bound: CatalogIdentity | null,
+    action: IdentityConflictAction,
+  ) => {
+    if (bound === null) return;
     const key = rowKey(p);
     setResolving(key);
     setActionError("");
     setResolveResult("");
     try {
-      const outcome = await resolveIdentityConflict(p.photoId, p.volumeId, p.relativePath, action);
+      const outcome = await resolveIdentityConflict(
+        p.photoId,
+        p.volumeId,
+        p.relativePath,
+        action,
+        bound,
+      );
       setResolveResult(resolutionMessage(outcome));
       setConfirmOverwrite(null);
       // A resolved copy leaves (or joins) the queue, shifting every later offset — same
@@ -631,7 +695,7 @@ export function IdentityDebtPanel({
             <button
               className="chip chip-danger"
               disabled={busy}
-              onClick={() => resolve(p, "overwrite")}
+              onClick={() => resolve(p, catalog, "overwrite")}
             >
               Overwrite
             </button>
@@ -647,7 +711,7 @@ export function IdentityDebtPanel({
             className="chip"
             disabled={busy}
             title="The catalog takes the identity already in this copy's sidecar. Changes the catalog, never the file."
-            onClick={() => resolve(p, "adopt")}
+            onClick={() => resolve(p, catalog, "adopt")}
           >
             Adopt
           </button>
@@ -663,7 +727,7 @@ export function IdentityDebtPanel({
             className="chip"
             disabled={busy}
             title="Stop retrying this copy. Changes neither the catalog nor the file."
-            onClick={() => resolve(p, "dismiss")}
+            onClick={() => resolve(p, catalog, "dismiss")}
           >
             Dismiss
           </button>
@@ -676,7 +740,7 @@ export function IdentityDebtPanel({
           className="chip"
           disabled={busy}
           title="Put this copy back in the queue."
-          onClick={() => resolve(p, "restore")}
+          onClick={() => resolve(p, catalog, "restore")}
         >
           Restore
         </button>
@@ -830,7 +894,7 @@ export function IdentityDebtPanel({
                           className="chip"
                           disabled={owedBusy !== null}
                           title="Write the owed fields into this photo's sidecar now."
-                          onClick={() => actOnOwed(r, true)}
+                          onClick={() => actOnOwed(r, catalog, true)}
                         >
                           Retry
                         </button>
@@ -838,7 +902,7 @@ export function IdentityDebtPanel({
                           className="chip"
                           disabled={owedBusy !== null}
                           title="Stop owing these fields without writing. The catalog keeps its values."
-                          onClick={() => actOnOwed(r, false)}
+                          onClick={() => actOnOwed(r, catalog, false)}
                         >
                           Dismiss
                         </button>

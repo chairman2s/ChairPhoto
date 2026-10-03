@@ -7,6 +7,7 @@
 use super::*;
 use crate::app::storage;
 use crate::app::storage::EmptyTrashReport;
+use crate::app::CatalogIdentity;
 #[cfg(test)]
 use crate::app::storage::{delete_one_photos_copies, destroy_planned_photos, DeleteOutcome};
 use tauri::State;
@@ -195,14 +196,27 @@ async fn relocate_photo_in_state(
 /// `includeDismissed` switches the page from the active queue to every copy in it,
 /// including the ones a human dismissed (#33) — the only way back to a dismissal, so it is
 /// paired with Restore, not offered as a bare "show more".
+///
+/// `catalog` (#164), when given, binds the read to that catalog (see [`get_catalog_identity`]).
 #[tauri::command]
 pub async fn list_pending_identity(
     state: State<'_, AppState>,
     limit: i64,
     offset: i64,
     include_dismissed: bool,
+    catalog: Option<CatalogIdentity>,
 ) -> Result<Vec<crate::catalog::PendingIdentity>, String> {
-    with_catalog_blocking(&state, move |c| {
+    list_pending_identity_in_state(&state, limit, offset, include_dismissed, catalog).await
+}
+
+async fn list_pending_identity_in_state(
+    state: &AppState,
+    limit: i64,
+    offset: i64,
+    include_dismissed: bool,
+    catalog: Option<CatalogIdentity>,
+) -> Result<Vec<crate::catalog::PendingIdentity>, String> {
+    with_catalog_bound_blocking(state, catalog, move |c| {
         c.list_pending_identity_page(limit, offset, include_dismissed)
     })
     .await
@@ -211,11 +225,48 @@ pub async fn list_pending_identity(
 /// Cheap counts (total debt + conflicts) over the pending-identity queue, for a summary
 /// badge/header that shouldn't have to pull every row — the queue reached 74,488 rows on
 /// the 100k harness shape in #20. Prefer this over `list_pending_identity().len()`.
+///
+/// `catalog` (#164), when given, binds the read to that catalog (see [`get_catalog_identity`]).
 #[tauri::command]
 pub async fn summarize_pending_identity(
     state: State<'_, AppState>,
+    catalog: Option<CatalogIdentity>,
 ) -> Result<crate::catalog::PendingIdentitySummary, String> {
-    with_catalog_blocking(&state, |c| c.summarize_pending_identity()).await
+    summarize_pending_identity_in_state(&state, catalog).await
+}
+
+async fn summarize_pending_identity_in_state(
+    state: &AppState,
+    catalog: Option<CatalogIdentity>,
+) -> Result<crate::catalog::PendingIdentitySummary, String> {
+    with_catalog_bound_blocking(state, catalog, |c| c.summarize_pending_identity()).await
+}
+
+/// The open catalog's identity (#164), an opaque string. The identity-debt panel captures it
+/// when it opens and passes it to every read and action, so each one fails closed with
+/// `CATALOG_CHANGED` once another catalog is open — even one whose ids, paths and UUIDs are
+/// a byte copy of this one's, and even before `catalog:switched` reaches the UI (a switch
+/// publishes the new catalog first). The identity names this open handle, not the file: a
+/// switch away and back counts as a change too.
+#[tauri::command]
+pub async fn get_catalog_identity(state: State<'_, AppState>) -> Result<CatalogIdentity, String> {
+    crate::app::catalog_identity(state.inner())
+}
+
+/// [`with_catalog_blocking`], but bound to `expected` when given: under the same catalog
+/// lock as `f`, it fails closed with `CATALOG_CHANGED` when another catalog is open.
+async fn with_catalog_bound_blocking<T: Send + 'static>(
+    state: &AppState,
+    expected: Option<CatalogIdentity>,
+    f: impl FnOnce(&crate::catalog::Catalog) -> crate::catalog::Result<T> + Send + 'static,
+) -> Result<T, String> {
+    let Some(expected) = expected else {
+        return with_catalog_blocking(state, f).await;
+    };
+    let state = state.clone();
+    crate::app::spawn_blocking(move || crate::app::with_catalog_as(&state, expected, f))
+        .await
+        .map_err(|e| e.to_string())?
 }
 
 // ── The identity repair job (#34) ────────────────────────────────────────────
@@ -266,6 +317,10 @@ pub async fn identity_repair_status(
 /// `restore` a dismissed one. There is no default — the action is required, and an
 /// unrecognised one fails to deserialize rather than falling back to the destructive path.
 /// Runs on a blocking worker on a secondary connection (`app::identity`).
+///
+/// `catalog` (#164): the identity the row was read with. Given, the resolution fails closed
+/// with `CATALOG_CHANGED` once another catalog is open — the ids and path would name
+/// another copy there.
 #[tauri::command]
 pub async fn resolve_identity_conflict(
     state: State<'_, AppState>,
@@ -273,19 +328,42 @@ pub async fn resolve_identity_conflict(
     volume_id: i64,
     relative_path: String,
     action: crate::catalog::IdentityConflictAction,
+    catalog: Option<CatalogIdentity>,
 ) -> Result<crate::catalog::IdentityConflictOutcome, String> {
-    let state = state.inner().clone();
-    crate::app::spawn_blocking(move || {
-        crate::app::identity::resolve_identity_conflict(&state, photo_id, volume_id, &relative_path, action)
+    resolve_identity_conflict_in_state(&state, photo_id, volume_id, relative_path, action, catalog).await
+}
+
+async fn resolve_identity_conflict_in_state(
+    state: &AppState,
+    photo_id: i64,
+    volume_id: i64,
+    relative_path: String,
+    action: crate::catalog::IdentityConflictAction,
+    catalog: Option<CatalogIdentity>,
+) -> Result<crate::catalog::IdentityConflictOutcome, String> {
+    let state = state.clone();
+    crate::app::spawn_blocking(move || match catalog {
+        Some(expected) => crate::app::identity::resolve_identity_conflict_as(
+            &state,
+            expected,
+            photo_id,
+            volume_id,
+            &relative_path,
+            action,
+        ),
+        None => crate::app::identity::resolve_identity_conflict(&state, photo_id, volume_id, &relative_path, action),
     })
     .await
     .map_err(|e| e.to_string())?
 }
+
 // ── Owed IPTC per photo (#153) ───────────────────────────────────────────────
 //
 // The bodies are the core's `app::iptc_owed` (the GPUI identity-debt panel runs the same,
-// bound to the catalog its page was read from). This shell carries no catalog identity, so
-// Dismiss and Retry are guarded by the row's UUID (and Dismiss by its generation).
+// bound to the catalog its page was read from). Dismiss and Retry are guarded by the row's
+// UUID (and Dismiss by its generation), and — when the caller passes the `catalog` it read
+// the row with (#164; see `get_catalog_identity`) — by that catalog, so a byte copy of the
+// catalog, with the same ids, UUIDs and generations, is never touched.
 
 /// One page (`limit`/`offset`, in photo-id order) of the photos whose catalog IPTC has
 /// fields their sidecar has not received yet: id, UUID, path, owed fields, last error and
@@ -295,8 +373,18 @@ pub async fn list_owed_iptc(
     state: State<'_, AppState>,
     limit: i64,
     offset: i64,
+    catalog: Option<CatalogIdentity>,
 ) -> Result<Vec<crate::catalog::OwedIptc>, String> {
-    with_catalog_blocking(&state, move |c| c.list_owed_iptc_page(limit, offset)).await
+    list_owed_iptc_in_state(&state, limit, offset, catalog).await
+}
+
+async fn list_owed_iptc_in_state(
+    state: &AppState,
+    limit: i64,
+    offset: i64,
+    catalog: Option<CatalogIdentity>,
+) -> Result<Vec<crate::catalog::OwedIptc>, String> {
+    with_catalog_bound_blocking(state, catalog, move |c| c.list_owed_iptc_page(limit, offset)).await
 }
 
 /// Stop owing one photo's IPTC without writing (the catalog keeps its values). Answers
@@ -308,10 +396,21 @@ pub async fn dismiss_owed_iptc(
     photo_id: i64,
     uuid: String,
     generation: i64,
+    catalog: Option<CatalogIdentity>,
 ) -> Result<crate::catalog::OwedDismissal, String> {
-    let state = state.inner().clone();
+    dismiss_owed_iptc_in_state(&state, photo_id, uuid, generation, catalog).await
+}
+
+async fn dismiss_owed_iptc_in_state(
+    state: &AppState,
+    photo_id: i64,
+    uuid: String,
+    generation: i64,
+    catalog: Option<CatalogIdentity>,
+) -> Result<crate::catalog::OwedDismissal, String> {
+    let state = state.clone();
     crate::app::spawn_blocking(move || {
-        crate::app::iptc_owed::dismiss_owed_iptc_as(&state, None, photo_id, &uuid, generation)
+        crate::app::iptc_owed::dismiss_owed_iptc_as(&state, catalog, photo_id, &uuid, generation)
     })
     .await
     .map_err(|e| e.to_string())?
@@ -325,9 +424,19 @@ pub async fn retry_owed_iptc(
     state: State<'_, AppState>,
     photo_id: i64,
     uuid: String,
+    catalog: Option<CatalogIdentity>,
 ) -> Result<crate::app::iptc::IptcSaveOutcome, String> {
-    let state = state.inner().clone();
-    crate::app::spawn_blocking(move || crate::app::iptc_owed::retry_owed_iptc_as(&state, None, photo_id, &uuid))
+    retry_owed_iptc_in_state(&state, photo_id, uuid, catalog).await
+}
+
+async fn retry_owed_iptc_in_state(
+    state: &AppState,
+    photo_id: i64,
+    uuid: String,
+    catalog: Option<CatalogIdentity>,
+) -> Result<crate::app::iptc::IptcSaveOutcome, String> {
+    let state = state.clone();
+    crate::app::spawn_blocking(move || crate::app::iptc_owed::retry_owed_iptc_as(&state, catalog, photo_id, &uuid))
         .await
         .map_err(|e| e.to_string())?
 }
@@ -409,6 +518,130 @@ mod tests {
             "repairing the moved copy's debt must not bind the backup copy"
         );
         assert_eq!(catalog.count_pending_identity().unwrap(), 1);
+    }
+}
+
+/// #164: the identity-debt commands bound to the catalog their caller read from. The open
+/// catalog is swapped for a byte copy (`VACUUM INTO`: the same photo ids, volume ids,
+/// relative paths, UUIDs and owed generations), as a switch to a copied catalog publishes it
+/// before `catalog:switched` reaches the UI. Every read and action carrying the old identity
+/// fails closed and leaves the copy's debt as it was.
+#[cfg(test)]
+mod catalog_bound_debt_tests {
+    use super::*;
+    use crate::app::CATALOG_CHANGED;
+    use crate::catalog::{Catalog, IdentityConflictAction, IptcFields, SidecarIdentity};
+
+    struct Rig {
+        state: AppState,
+        /// The identity the panel captured, from catalog A.
+        a: CatalogIdentity,
+        photo_id: i64,
+        uuid: String,
+        generation: i64,
+        volume_id: i64,
+        relative_path: String,
+        _dir: crate::test_support::TestTmpDir,
+    }
+
+    /// Catalog A with one photo whose copy is in conflict and whose IPTC is owed; then A is
+    /// replaced, as the open catalog, by its byte copy B.
+    fn swapped_for_a_copy(tag: &str) -> Rig {
+        let dir = crate::test_support::TestTmpDir::new(&format!("bound-debt-{tag}"));
+        let root = dir.join("photos");
+        let file = root.join("2026/p0.ARW");
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, b"raw").unwrap();
+        let a = Catalog::open(&dir.join("a.chairphoto"), &root).unwrap();
+        let photo_id = a.upsert_photo(&file, None, 0, 1).unwrap().id;
+        a.record_sidecar_identity(photo_id, &file, &SidecarIdentity::Conflict("another photo's uuid".into()))
+            .unwrap();
+        a.set_iptc(photo_id, &IptcFields { title: "A's".into(), ..Default::default() }).unwrap();
+        let owed = a.list_owed_iptc_page(10, 0).unwrap().remove(0);
+        let copy = a.list_pending_identity_page(10, 0, false).unwrap().remove(0);
+        let b_path = dir.join("b.chairphoto");
+        a.conn().execute("VACUUM INTO ?1", [b_path.to_string_lossy()]).unwrap();
+        let b = Catalog::open(&b_path, &root).unwrap();
+        assert_eq!(b.list_owed_iptc_page(10, 0).unwrap(), vec![owed.clone()], "B is a copy of A");
+
+        let state = AppState::default();
+        *state.catalog.lock().unwrap() = Some(a);
+        // What the panel captures when it opens, through the IPC boundary and back.
+        let wire = serde_json::to_value(crate::app::catalog_identity(&state).unwrap()).unwrap();
+        assert!(wire.is_string(), "an identity crosses IPC as a string: {wire}");
+        let a_identity: CatalogIdentity = serde_json::from_value(wire).unwrap();
+        // The switch publishes B before `catalog:switched` reaches the UI.
+        *state.catalog.lock().unwrap() = Some(b);
+        Rig {
+            state,
+            a: a_identity,
+            photo_id,
+            uuid: owed.uuid,
+            generation: owed.generation,
+            volume_id: copy.volume_id,
+            relative_path: copy.relative_path,
+            _dir: dir,
+        }
+    }
+
+    fn b_debt(rig: &Rig) -> (usize, i64) {
+        let guard = rig.state.catalog.lock().unwrap();
+        let c = guard.as_ref().unwrap();
+        (c.list_owed_iptc_page(10, 0).unwrap().len(), c.summarize_pending_identity().unwrap().dismissed)
+    }
+
+    #[test]
+    fn reads_bound_to_the_old_catalog_fail_closed() {
+        let rig = swapped_for_a_copy("reads");
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let a = Some(rig.a);
+        assert_eq!(
+            rt.block_on(list_pending_identity_in_state(&rig.state, 10, 0, false, a)).unwrap_err(),
+            CATALOG_CHANGED
+        );
+        assert_eq!(rt.block_on(summarize_pending_identity_in_state(&rig.state, a)).unwrap_err(), CATALOG_CHANGED);
+        assert_eq!(rt.block_on(list_owed_iptc_in_state(&rig.state, 10, 0, a)).unwrap_err(), CATALOG_CHANGED);
+        // Unbound (the title bar's count) and bound to the open catalog, they read B.
+        let b = Some(crate::app::catalog_identity(&rig.state).unwrap());
+        assert_eq!(rt.block_on(summarize_pending_identity_in_state(&rig.state, None)).unwrap().iptc_owed, 1);
+        assert_eq!(rt.block_on(list_owed_iptc_in_state(&rig.state, 10, 0, b)).unwrap().len(), 1);
+        assert_eq!(rt.block_on(list_pending_identity_in_state(&rig.state, 10, 0, false, b)).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn actions_bound_to_the_old_catalog_never_touch_the_copy() {
+        let rig = swapped_for_a_copy("actions");
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let a = Some(rig.a);
+        let dismiss = rt.block_on(dismiss_owed_iptc_in_state(&rig.state, rig.photo_id, rig.uuid.clone(), rig.generation, a));
+        assert_eq!(dismiss.unwrap_err(), CATALOG_CHANGED);
+        let retry = rt.block_on(retry_owed_iptc_in_state(&rig.state, rig.photo_id, rig.uuid.clone(), a));
+        assert_eq!(retry.unwrap_err(), CATALOG_CHANGED);
+        let resolve = rt.block_on(resolve_identity_conflict_in_state(
+            &rig.state,
+            rig.photo_id,
+            rig.volume_id,
+            rig.relative_path.clone(),
+            IdentityConflictAction::Dismiss,
+            a,
+        ));
+        assert_eq!(resolve.unwrap_err(), CATALOG_CHANGED);
+        assert_eq!(b_debt(&rig), (1, 0), "the copy's owed IPTC and conflict are as they were");
+
+        // The control: bound to the open catalog, the same calls act.
+        let b = Some(crate::app::catalog_identity(&rig.state).unwrap());
+        let resolve = rt.block_on(resolve_identity_conflict_in_state(
+            &rig.state,
+            rig.photo_id,
+            rig.volume_id,
+            rig.relative_path.clone(),
+            IdentityConflictAction::Dismiss,
+            b,
+        ));
+        assert_eq!(resolve.unwrap().action, "dismiss");
+        let dismiss = rt.block_on(dismiss_owed_iptc_in_state(&rig.state, rig.photo_id, rig.uuid.clone(), rig.generation, b));
+        assert_eq!(dismiss.unwrap(), crate::catalog::OwedDismissal::Dismissed);
+        assert_eq!(b_debt(&rig), (0, 1));
     }
 }
 

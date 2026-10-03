@@ -132,8 +132,21 @@ impl IdentityDebtPanel {
                 // turn); it fails closed and its answer is dropped, so it must not keep the
                 // new list's buttons disabled (review of #153, N2).
                 this.owed_busy = None;
+                // The identity queue likewise (#169): its copies are another catalog's now.
+                // A resolution still in flight fails closed and its answer is dropped, so it
+                // must not keep the new queue's buttons disabled; an Overwrite awaiting its
+                // confirm names a copy of the old catalog.
+                this.rows = None;
+                this.rows_from = None;
+                this.page = 0;
+                this.resolving = None;
+                this.confirm_overwrite = None;
+                this.resolve_result = None;
+                this.action_error = None;
                 this.reload_summary(cx);
+                this.reload_page(cx);
                 this.reload_owed(cx);
+                this.load_volumes(cx);
             }
             _ => {}
         });
@@ -515,14 +528,16 @@ impl IdentityDebtPanel {
 
     /// Adopt / Overwrite / Dismiss / Restore one copy — in the catalog its row was read from
     /// (`CATALOG_CHANGED` once another is open: the ids and path would name another copy).
-    pub fn resolve(&mut self, index: usize, action: IdentityConflictAction, cx: &mut Context<Self>) {
-        let Some(p) = self.rows.as_ref().and_then(|r| r.get(index)).cloned() else { return };
-        let Some(from) = self.rows_from else { return };
-        let key = row_key(&p);
+    ///
+    /// `p` and `from` are what the button was drawn with, captured at render time — never
+    /// looked up by index at click time. A page re-read (or a catalog switch's) can land and
+    /// notify before the next draw, and a click against the frame on screen must still act on
+    /// the copy the user saw, in the catalog it was read from (#169, as #153's M1).
+    pub fn resolve(&mut self, p: PendingIdentity, from: CatalogIdentity, action: IdentityConflictAction, cx: &mut Context<Self>) {
         if self.resolving.is_some() {
             return;
         }
-        self.resolving = Some(key);
+        self.resolving = Some(row_key(&p));
         self.action_error = None;
         self.resolve_result = None;
         let state = self.app.clone();
@@ -540,10 +555,12 @@ impl IdentityDebtPanel {
         cx.spawn(async move |this, cx| {
             let result = rx.await.unwrap_or_else(|_| Err("the resolve worker stopped".into()));
             this.update(cx, |s, cx| {
-                s.resolving = None;
+                // An answer from before a catalog switch touches nothing: the switch freed the
+                // buttons, and a resolution on the new catalog's queue may be in flight now.
                 if s.storage.read(cx).epoch() != epoch {
                     return;
                 }
+                s.resolving = None;
                 match result {
                     Ok(outcome) => {
                         s.resolve_result = Some(resolution_message(&outcome));
@@ -563,12 +580,16 @@ impl IdentityDebtPanel {
         cx.notify();
     }
 
+    /// A copy's Resolve buttons. Each carries the copy and the catalog it was drawn with
+    /// (#169): a click acts on the copy the user saw, whatever has landed in `rows` since.
     fn row_actions(&self, i: usize, p: &PendingIdentity, colors: Colors, cx: &mut Context<Self>) -> gpui_kit::Div {
         let key = row_key(p);
-        let busy = self.resolving.as_deref() == Some(key.as_str());
+        let from = self.rows_from;
+        let busy = self.resolving.as_deref() == Some(key.as_str()) || from.is_none();
         let id = |what: &str| SharedString::from(format!("{what}-{i}"));
-        let action = |what: &str, label: &'static str, act: IdentityConflictAction, cx: &mut Context<Self>| {
-            ui::clickable(ui::chip(id(what), label, !busy, colors), !busy, cx.listener(move |s, _, _, cx| s.resolve(i, act, cx)))
+        let act = |act: IdentityConflictAction, cx: &mut Context<Self>| resolve_on_click(p.clone(), from, act, cx);
+        let action = |what: &str, label: &'static str, a: IdentityConflictAction, cx: &mut Context<Self>| {
+            ui::clickable(ui::chip(id(what), label, !busy, colors), !busy, act(a, cx))
         };
         if conflict_field(p).is_some() {
             if self.confirm_overwrite.as_deref() == Some(key.as_str()) {
@@ -578,7 +599,7 @@ impl IdentityDebtPanel {
                     .child(ui::clickable(
                         ui::danger_chip(id("overwrite-confirm"), "Overwrite", !busy, colors),
                         !busy,
-                        cx.listener(move |s, _, _, cx| s.resolve(i, IdentityConflictAction::Overwrite, cx)),
+                        act(IdentityConflictAction::Overwrite, cx),
                     ))
                     .child(ui::clickable(
                         ui::chip(id("overwrite-cancel"), "Cancel", !busy, colors),
@@ -596,7 +617,7 @@ impl IdentityDebtPanel {
                     ui::chip(id("overwrite"), "Overwrite…", !busy, colors),
                     !busy,
                     cx.listener(move |s, _, _, cx| {
-                        s.confirm_overwrite = s.rows.as_ref().and_then(|r| r.get(i)).map(row_key);
+                        s.confirm_overwrite = Some(key.clone());
                         cx.notify();
                     }),
                 ))
@@ -607,6 +628,21 @@ impl IdentityDebtPanel {
         }
         ui::row()
     }
+}
+
+/// A Resolve button's listener: it acts on `row`, in the catalog `from` it was read from —
+/// both captured when the button is drawn (#169).
+fn resolve_on_click(
+    row: PendingIdentity,
+    from: Option<CatalogIdentity>,
+    action: IdentityConflictAction,
+    cx: &mut Context<IdentityDebtPanel>,
+) -> Box<dyn Fn(&gpui_kit::ClickEvent, &mut Window, &mut gpui_kit::App)> {
+    Box::new(cx.listener(move |s: &mut IdentityDebtPanel, _: &gpui_kit::ClickEvent, _: &mut Window, cx: &mut Context<IdentityDebtPanel>| {
+        if let Some(from) = from {
+            s.resolve(row.clone(), from, action, cx);
+        }
+    }))
 }
 
 // --- React's pure helpers -----------------------------------------------------------------

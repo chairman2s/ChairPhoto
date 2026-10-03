@@ -33,6 +33,8 @@ vi.mock("@tauri-apps/api/core", async (importOriginal) => {
     invoke: (command: string, args: Record<string, unknown>) => {
       calls.push({ command, args: args ?? {} });
       switch (command) {
+        case "get_catalog_identity":
+          return Promise.resolve("catalog-a");
         case "summarize_pending_identity":
           return Promise.resolve(summary);
         case "list_pending_identity":
@@ -143,6 +145,8 @@ describe("resolving a conflict from the panel", () => {
       volumeId: 1,
       relativePath: "2026/03/DSC1.ARW",
       action: "adopt",
+      // The catalog the panel opened on (#164): ids and paths are per catalog.
+      catalog: "catalog-a",
     });
     // Debt is per copy, so the identity of the copy — not just the photo — must be on the
     // wire: photoId alone would resolve the wrong file on a photo with several copies.

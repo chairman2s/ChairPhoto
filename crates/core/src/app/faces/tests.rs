@@ -625,6 +625,34 @@ fn importing_a_region_on_a_rotated_photo_matches_the_face_in_the_display_frame()
     assert!(has_tag(&c, p, bob));
 }
 
+/// #154: a HEIC's display frame is its container's turn. Lightroom's stored-frame region for
+/// Bob, on a HEIC whose `irot` turns it as EXIF 6 would and whose EXIF says nothing, matches
+/// the face found turned 90° clockwise. On a HEIC whose EXIF says 6 while its container turns
+/// nothing, the turn is doubted and nothing is imported, though by EXIF alone it would match.
+#[test]
+fn importing_a_region_on_a_heic_follows_its_container() {
+    let fixtures = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/heif");
+    for (fixture, exif, imported) in [("rot90.heic", None, true), ("plain_e6.heic", Some(6), false)] {
+        let (c, root) = temp_catalog("import-heic");
+        let p = add_photo(&c, &root, "IMG_0001.HEIC");
+        let photo_path = root.join("IMG_0001.HEIC");
+        std::fs::copy(fixtures.join(fixture), &photo_path).unwrap();
+        std::fs::write(crate::xmp::sidecar_path(&photo_path), crate::xmp::region_fixtures::LIGHTROOM_ROTATED)
+            .unwrap();
+        c.conn()
+            .execute(
+                "UPDATE photos SET width = 6000, height = 4000, exif_orientation = ?2 WHERE id = ?1",
+                rusqlite::params![p, exif],
+            )
+            .unwrap();
+        let f = add_face(&c, p, "[0.7,0.225,0.1,0.15]");
+
+        import_regions(&c, c.conn(), p, &photo_path, "People");
+
+        assert_eq!(face_state(&c, f) == "confirmed", imported, "{fixture}");
+    }
+}
+
 /// Review #181 L3: the importer fails closed when the auto-tag check itself errors — the face
 /// stays unconfirmed, as for a refusal, rather than confirmed without its tag. The error is
 /// forced by shadowing `tags` with a TEMP table that `create_tag` can read (same ids) but

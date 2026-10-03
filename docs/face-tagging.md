@@ -138,22 +138,53 @@ Working Group schema that digiKam, Lightroom and Picasa all understand. The code
 `plugins/faces/regions.rs`.
 
 **The frame.** Face boxes are stored normalized in one canonical frame, the **display frame**:
-the photo as its own metadata orients it (the EXIF-oriented preview the indexer detects on),
+the photo as its own metadata orients it (the oriented preview the indexer detects on),
 **without** the non-destructive `user_rotation`. The loupe draws the picture with the user
 rotation applied, so the overlay turns each box by it for display and turns a box drawn on the
 rotated picture back before storing it. The user rotation lives only in the catalog — the
 original is never rewritten and the sidecar carries no orientation of ours — so the export
 ignores it too: other tools see the file unturned, and so must its regions.
 
-MWG regions use a different frame, the **stored frame**: MWG 2.0 § 5.9 requires region
-coordinates "relative to the stored image, prior to the application of the Exif Orientation
-tag", and `AppliedToDimensions` is the stored image's size. A scan records each photo's EXIF
+MWG regions use a different frame, the **stored frame**: region coordinates are measured on
+the stored image, before its EXIF Orientation is applied, and `AppliedToDimensions` is the
+stored image's size. This is the rule of the MWG *Guidelines for Handling Image Metadata* 2.0
+for image regions as we understand it. **Citation unverified:** earlier text here quoted it
+as § 5.9 ("relative to the stored image, prior to the application of the Exif Orientation
+tag"), but no copy of the guidelines was available offline to check the section number or
+the wording (#154; exiftool's `MWG.pm` only links the PDF). A scan records each photo's EXIF
 Orientation (`photos.exif_orientation`, 1–8, from exiftool's `EXIF:Orientation`; schema v26
 fills it for photos scanned earlier from the metadata they already stored). The export turns
 each box from the display frame into the stored frame by that orientation — all eight,
 mirrors included — and the import (`read_face_regions_in`) turns a region back before matching
 it to the detections. **An unknown orientation is never guessed:** the boxes are written and
 read as they are.
+
+**HEIF/HEIC** (#154) is turned by its container, not by EXIF: the `irot` (rotation) and `imir`
+(mirror) properties of the primary item, applied in the order the item lists them. The
+preview goes through ImageMagick's libheif delegate, which applies them once and leaves the
+EXIF Orientation unapplied (observed with ImageMagick 7.1.2-31 and libheif 1.23.4 on files in
+`crates/core/tests/fixtures/heif/`; a test pins it where `magick` decodes HEIC). So for a
+`.heic`/`.heif` the region writer reads the container (`metadata::heif`, the `meta` box only)
+and uses its turn as the orientation (`RegionFrame::with_container`): an EXIF Orientation that
+agrees, or none, is fine; one that **disagrees**, or a container that cannot be read, makes
+the turn **doubted**, and no region is written or imported for that photo — the preview
+follows one turn, a tool going by EXIF perhaps the other, and which frame is stored cannot
+be told. On 942 iPhone/iPad HEICs on the development machine the primary item's turn agreed
+with EXIF in 935 and 7 had no EXIF Orientation; none disagreed. (exiftool's
+`QuickTime:Rotation` is not always the primary's turn: on 27 recent iPhone files it reports
+another item's `irot`, 0, while the primary's is 270° anticlockwise.)
+
+**The preview cross-check** (#154, review L2). The stored size comes from metadata, and a
+writer that records it in the display frame defeats the swapped-dimensions rule below: the
+boxes would land in the wrong frame with no error. So the writer and the importer also take
+the size of the cached 2048 px preview the faces were found on
+(`thumbnails::cached_preview_size`, its header only; nothing is generated). When both sizes
+are known, the preview must have the stored aspect turned by the orientation — swapped for
+5–8, as is for 1–4 and for an unknown orientation — within 2%; otherwise the photo's region
+write is refused and its import reads nothing. With no cached preview the check is skipped
+and the rules below apply as before. On the development machine it refuses 6 of the 7 iPhone HEICs without EXIF
+Orientation: their pixels were re-rendered (cropped or turned upright, apparently by an edit
+on the phone) while their EXIF still records the original 4032×3024 size.
 
 **Structure.** `mwg-rs:AppliedToDimensions` records the stored pixel size — the photo's recorded
 `width` / `height` (EXIF `ExifImageWidth` / `ExifImageHeight`) — never swapped for the EXIF
@@ -173,6 +204,7 @@ frame the sidecar declares (`region_target`; the import reads by the same rule):
 | anything else, or a size without a usable `w`/`h` | any | **refused** |
 | any, with the photo's size unknown | 5–8 | **refused** — which frame is meant cannot be told |
 | any | unknown | as they are |
+| any | doubted (HEIF), or not the preview's frame | **refused** — the boxes' own frame is not known |
 
 A refused write fails with an error naming the sidecar and leaves it byte for byte as it was;
 a refused frame imports nothing.

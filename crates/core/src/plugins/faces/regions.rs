@@ -40,9 +40,11 @@ pub const SOURCE_XMP: &str = "xmp";
 /// (`photos.width`/`height`, EXIF `ExifImageWidth`/`Height`: the stored frame's).
 ///
 /// The writer turns the stored face boxes (EXIF-oriented, the frame the indexer detects on)
-/// into the stored frame MWG 2.0 § 5.9 measures regions in, and writes `AppliedToDimensions`
-/// in that frame; the importer turns them back. An orientation or size that is missing or
-/// out of range is `None` — unknown, never guessed (no more `(1, 1)` stand-in size).
+/// into the stored frame MWG measures regions in, and writes `AppliedToDimensions` in that
+/// frame; the importer turns them back. An orientation or size that is missing or out of
+/// range is `None` — unknown, never guessed (no more `(1, 1)` stand-in size). What the file
+/// itself adds — a HEIF's container turn, the preview's size — is [`FileProbe`]'s;
+/// [`photo_frame`] is both.
 ///
 /// **The non-destructive `user_rotation` plays no part.** It lives only in the catalog: the
 /// original is never rewritten and the sidecar carries no orientation of ours, so a tool
@@ -64,7 +66,51 @@ pub fn region_frame(conn: &Connection, photo_id: i64) -> rusqlite::Result<Region
     Ok(RegionFrame {
         orientation: orientation.filter(|o| (1..=8).contains(o)).map(|o| o as u8),
         stored_size: size(w).zip(size(h)),
+        ..RegionFrame::default()
     })
+}
+
+/// What a photo's file says of its frames beyond the catalog's record (#154). File IO, so it
+/// is read before the sidecar's file lock is taken and applied to the record under it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct FileProbe {
+    /// For a HEIF ([`heif::is_heif`](crate::metadata::heif::is_heif)): its container's turn
+    /// (`irot`/`imir`) as an EXIF Orientation code, or `Some(None)` when the container could
+    /// not be read. `None` for every other file, whose turn is its EXIF Orientation alone.
+    pub container: Option<Option<u8>>,
+    /// The cached preview's pixel size ([`thumbnails::cached_preview_size`](crate::thumbnails::cached_preview_size)):
+    /// the display frame the faces were measured in. `None` when the preview is not cached.
+    pub preview_size: Option<(u32, u32)>,
+}
+
+impl FileProbe {
+    /// Probe the photo at `path`: a HEIF's container (the `meta` box only) and the cached
+    /// preview's header. Nothing is decoded or generated.
+    pub fn of(path: &std::path::Path) -> Self {
+        let container = crate::metadata::heif::is_heif(path).then(|| {
+            crate::metadata::heif::container_orientation(path)
+                .map_err(|e| eprintln!("faces: the HEIF turn of {} is unknown: {e}", path.display()))
+                .ok()
+        });
+        Self { container, preview_size: crate::thumbnails::cached_preview_size(path) }
+    }
+
+    /// The catalog's `frame` with what the file says folded in: a HEIF's container turn
+    /// ([`RegionFrame::with_container`]: agreeing with EXIF, or doubted) and the preview size
+    /// the frame is cross-checked against.
+    pub fn apply(self, frame: RegionFrame) -> RegionFrame {
+        let frame = match self.container {
+            Some(container) => frame.with_container(container),
+            None => frame,
+        };
+        RegionFrame { display_size: self.preview_size, ..frame }
+    }
+}
+
+/// The photo's whole region frame: the catalog's record ([`region_frame`]) with the file's
+/// own say ([`FileProbe`]). For the import, which reads the sidecar without its file lock.
+pub fn photo_frame(conn: &Connection, photo_id: i64, path: &std::path::Path) -> rusqlite::Result<RegionFrame> {
+    Ok(FileProbe::of(path).apply(region_frame(conn, photo_id)?))
 }
 
 // ── Write path ──────────────────────────────────────────────────────────────────
@@ -247,6 +293,10 @@ fn face_regions(conn: &Connection, sql: &str, photo_id: i64) -> rusqlite::Result
 /// it described has been adopted (and now carries the marker) or removed, and keeping it would
 /// let a region another tool writes later at the same place, under the same name, be taken
 /// for ours.
+///
+/// The frame is the catalog's record with the file's own say ([`FileProbe`], #154): a HEIF
+/// whose container and EXIF disagree, or a photo whose cached preview is not the recorded
+/// size so turned, is refused with the sidecar left as it was.
 pub fn write_photo_regions<R>(
     conn: &Connection,
     photo_id: i64,
@@ -254,6 +304,21 @@ pub fn write_photo_regions<R>(
 ) -> Result<(), RegionWriteError>
 where
     R: FnOnce(i64) -> Result<Option<std::path::PathBuf>, String>,
+{
+    write_photo_regions_probed(conn, photo_id, resolve, FileProbe::of)
+}
+
+/// [`write_photo_regions`] with the file probed by `probe` (a test's stand-in for the HEIF
+/// container and the preview cache).
+pub(crate) fn write_photo_regions_probed<R, P>(
+    conn: &Connection,
+    photo_id: i64,
+    resolve: R,
+    probe: P,
+) -> Result<(), RegionWriteError>
+where
+    R: FnOnce(i64) -> Result<Option<std::path::PathBuf>, String>,
+    P: FnOnce(&std::path::Path) -> FileProbe,
 {
     super::store::ensure_schema(conn).map_err(|e| e.to_string())?;
     // Read only: the plugin never writes the core `settings` table; the catalog's open mints it.
@@ -263,6 +328,8 @@ where
     let Some(path) = resolve(photo_id)? else {
         return Ok(()); // offline — skip, re-sync later.
     };
+    // File IO, so before the sidecar's file lock: a HEIF's meta box and a preview's header.
+    let file = probe(&path);
     #[cfg(test)]
     tests::before_region_write(&path);
     // The set is read once the sidecar's file lock is held (#156): read before it, a face
@@ -274,7 +341,7 @@ where
         let regions = confirmed_regions(conn, photo_id).map_err(read)?;
         let retired = retired_faces(conn, photo_id, &regions).map_err(read)?;
         let legacy = legacy_regions(conn, photo_id).map_err(read)?;
-        let frame = region_frame(conn, photo_id).map_err(read)?;
+        let frame = file.apply(region_frame(conn, photo_id).map_err(read)?);
         Ok(crate::xmp::RegionSet { regions, retired, legacy, frame })
     })?;
     conn.execute_batch(&format!(
@@ -400,6 +467,7 @@ fn parse_bbox(s: &str) -> Option<(f32, f32, f32, f32)> {
 pub(crate) mod tests {
     use super::*;
     use crate::plugins::faces::store;
+    use crate::xmp::FrameDoubt;
 
     /// A hook [`write_photo_regions`] runs once its photo's path is resolved and before the
     /// sidecar is opened, once, for the photo path it names — so a test can act in the window
@@ -447,7 +515,7 @@ pub(crate) mod tests {
         .unwrap();
         assert_eq!(
             region_frame(&conn, 1).unwrap(),
-            RegionFrame { orientation: Some(6), stored_size: Some((6000, 4000)) },
+            RegionFrame { orientation: Some(6), stored_size: Some((6000, 4000)), ..Default::default() },
             "the user rotation plays no part"
         );
     }
@@ -537,6 +605,113 @@ pub(crate) mod tests {
         let frame = region_frame(&conn, 1).unwrap();
         let display = crate::xmp::read_face_regions_in(&photo_path, frame);
         assert!(near(display[0].bbox, (0.1, 0.2, 0.3, 0.4)), "{:?}", display[0].bbox);
+    }
+
+    // ── the file's own say: a HEIF's turn, the preview (#154) ──────────────────
+
+    /// A copy of a `tests/fixtures/heif` file (see its README) as photo 1 of a fresh catalog
+    /// that recorded `exif` and a 60x40 stored size, with Alice confirmed at the display box
+    /// (0.1, 0.2, 0.3, 0.4).
+    fn heif_photo(fixture: &str, exif: Option<i64>) -> (crate::test_support::TestTmpDir, std::path::PathBuf, Connection) {
+        let dir = crate::test_support::TestTmpDir::new("faces-regions-heif");
+        let photo = dir.join("IMG_0001.HEIC");
+        let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/heif").join(fixture);
+        std::fs::copy(source, &photo).unwrap();
+        let conn = mem_conn();
+        conn.execute(
+            "INSERT INTO photos (id, width, height, exif_orientation) VALUES (1, 60, 40, ?1)",
+            [exif],
+        )
+        .unwrap();
+        conn.execute("INSERT INTO tags (id, name, full_path) VALUES (10, 'Alice', 'People/Alice')", []).unwrap();
+        confirm(&conn, 1, 10, "[0.1,0.2,0.3,0.4]", "drawn", "confirmed");
+        (dir, photo, conn)
+    }
+
+    fn near(a: (f32, f32, f32, f32), b: (f32, f32, f32, f32)) -> bool {
+        [(a.0, b.0), (a.1, b.1), (a.2, b.2), (a.3, b.3)].iter().all(|(x, y)| (x - y).abs() < 1e-4)
+    }
+
+    /// A HEIC turned by its container (`irot`, as EXIF 6 would), with no EXIF Orientation or one
+    /// that agrees, is written in the stored frame the container turns from — the display box
+    /// turned back a quarter, as #136's JPEG — and read back into the display frame.
+    #[test]
+    fn a_heic_is_written_in_the_frame_its_container_turns() {
+        for (fixture, exif) in [("rot90.heic", None), ("rot90_e6.heic", Some(6))] {
+            let (_dir, photo, conn) = heif_photo(fixture, exif);
+            write_photo_regions(&conn, 1, |_| Ok(Some(photo.clone()))).unwrap_or_else(|e| panic!("{fixture}: {e}"));
+            let stored = crate::xmp::read_face_regions(&photo);
+            assert!(near(stored[0].bbox, (0.2, 0.6, 0.4, 0.3)), "{fixture}: {:?}", stored[0].bbox);
+            let frame = photo_frame(&conn, 1, &photo).unwrap();
+            assert_eq!(frame.orientation, Some(6), "{fixture}");
+            let display = crate::xmp::read_face_regions_in(&photo, frame);
+            assert!(near(display[0].bbox, (0.1, 0.2, 0.3, 0.4)), "{fixture}: {:?}", display[0].bbox);
+        }
+    }
+
+    /// A HEIC whose container and EXIF Orientation disagree — its preview turned by the one,
+    /// another tool perhaps by the other — or whose container cannot be read is never guessed
+    /// at: the write is refused, no sidecar is made, and the import reads nothing.
+    #[test]
+    fn a_heic_of_doubted_turn_is_refused() {
+        let cases = [
+            ("plain_e6.heic", Some(6), FrameDoubt::ContainerDisagrees { container: 1, exif: 6 }),
+            ("rot90_e1.heic", Some(1), FrameDoubt::ContainerDisagrees { container: 6, exif: 1 }),
+            ("rot90.heic", Some(8), FrameDoubt::ContainerDisagrees { container: 6, exif: 8 }),
+        ];
+        for (fixture, exif, doubt) in cases {
+            let (_dir, photo, conn) = heif_photo(fixture, exif);
+            let err = write_photo_regions(&conn, 1, |_| Ok(Some(photo.clone()))).expect_err(fixture);
+            assert!(matches!(err, RegionWriteError::Refused(_)), "{fixture}: {err:?}");
+            assert!(!crate::xmp::sidecar_path(&photo).exists(), "{fixture}: a sidecar was made");
+            assert_eq!(photo_frame(&conn, 1, &photo).unwrap().doubt, Some(doubt), "{fixture}");
+        }
+        // Not a HEIF inside: its container cannot be read.
+        let (_dir, photo, conn) = heif_photo("rot90.heic", Some(6));
+        std::fs::write(&photo, b"\xff\xd8\xff\xe0 a JPEG named .HEIC").unwrap();
+        let err = write_photo_regions(&conn, 1, |_| Ok(Some(photo.clone()))).expect_err("unreadable");
+        assert!(matches!(err, RegionWriteError::Refused(_)), "{err:?}");
+        assert_eq!(photo_frame(&conn, 1, &photo).unwrap().doubt, Some(FrameDoubt::ContainerUnreadable));
+    }
+
+    /// The preview the faces were found on reaches the frame (#154, review L2): a catalog that
+    /// recorded the display-frame size of a photo turned a quarter is refused through the
+    /// catalog's own write, and the same photo with a preview of its recorded frame is written.
+    #[test]
+    fn the_preview_size_reaches_the_region_frame() {
+        let dir = crate::test_support::TestTmpDir::new("faces-regions-preview");
+        let photo = dir.join("DSC33.ARW");
+        std::fs::write(&photo, b"raw").unwrap();
+        let conn = mem_conn();
+        conn.execute("INSERT INTO photos (id, width, height, exif_orientation) VALUES (1, 4000, 6000, 6)", []).unwrap();
+        conn.execute("INSERT INTO tags (id, name, full_path) VALUES (10, 'Alice', 'People/Alice')", []).unwrap();
+        confirm(&conn, 1, 10, "[0.1,0.2,0.3,0.4]", "drawn", "confirmed");
+        let preview = |size| move |_: &std::path::Path| FileProbe { container: None, preview_size: Some(size) };
+
+        let err = write_photo_regions_probed(&conn, 1, |_| Ok(Some(photo.clone())), preview((1365, 2048)))
+            .expect_err("the display-frame size");
+        assert!(matches!(err, RegionWriteError::Refused(_)), "{err:?}");
+        assert!(!crate::xmp::sidecar_path(&photo).exists());
+
+        conn.execute("UPDATE photos SET width = 6000, height = 4000 WHERE id = 1", []).unwrap();
+        write_photo_regions_probed(&conn, 1, |_| Ok(Some(photo.clone())), preview((1365, 2048))).unwrap();
+        let stored = crate::xmp::read_face_regions(&photo);
+        assert!(near(stored[0].bbox, (0.2, 0.6, 0.4, 0.3)), "{:?}", stored[0].bbox);
+    }
+
+    /// The probe folds a HEIF's turn in and carries the preview's size; a file that is not a
+    /// HEIF keeps the catalog's orientation.
+    #[test]
+    fn a_file_probe_applies_to_the_catalogs_frame() {
+        let record = RegionFrame { orientation: Some(6), stored_size: Some((6000, 4000)), ..Default::default() };
+        let plain = FileProbe { container: None, preview_size: Some((1365, 2048)) };
+        assert_eq!(plain.apply(record), RegionFrame { display_size: Some((1365, 2048)), ..record });
+        let heif = FileProbe { container: Some(Some(6)), preview_size: None };
+        assert_eq!(heif.apply(record), record);
+        let unread = FileProbe { container: Some(None), preview_size: None };
+        assert_eq!(unread.apply(record).doubt, Some(FrameDoubt::ContainerUnreadable));
+        assert!(!crate::metadata::heif::is_heif(std::path::Path::new("DSC.ARW")));
+        assert_eq!(FileProbe::of(std::path::Path::new("/nonexistent/DSC.ARW")), FileProbe::default());
     }
 
     // ── the pre-marker record (#135) ───────────────────────────────────────────
@@ -727,7 +902,7 @@ pub(crate) mod tests {
         .unwrap();
         // The pre-marker writer's Dora, unmarked; Dora has since been rejected.
         let ours = crate::xmp::FaceRegion { face_id: 0, name: "Dora".into(), bbox: (0.5, 0.5, 0.1, 0.1) };
-        let unmarked = crate::xmp::RegionFrame { orientation: None, stored_size: Some((6000, 4000)) };
+        let unmarked = crate::xmp::RegionFrame { orientation: None, stored_size: Some((6000, 4000)), ..Default::default() };
         let catalog = crate::catalog::read_catalog_uuid(&conn).unwrap().unwrap();
         crate::xmp::write_face_regions(&photo_path, &catalog, &[ours], &[], &[], unmarked).unwrap();
         let xml = std::fs::read_to_string(crate::xmp::sidecar_path(&photo_path)).unwrap();

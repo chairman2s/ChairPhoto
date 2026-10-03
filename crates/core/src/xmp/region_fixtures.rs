@@ -1,6 +1,7 @@
 //! Hand-written foreign sidecars carrying face regions — digiKam, Lightroom on a photo with
-//! EXIF Orientation 6, Microsoft Photo — and an independent reader for what the face-region
-//! writer leaves in them (#135, #136, #145, #147).
+//! EXIF Orientation 6, Microsoft Photo — sidecars written by real tools (exiftool, exiv2;
+//! #154), and an independent reader for what the face-region writer leaves in them (#135,
+//! #136, #145, #147).
 //!
 //! The reader is `roxmltree`, not the xml-rs parser ChairPhoto reads and writes sidecars
 //! with, so a bug the two would share cannot hide. Everything is matched by namespace URI:
@@ -115,6 +116,24 @@ pub(crate) const MS_PHOTO: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
 pub(crate) const FOREIGN_REGIONS: [(&str, &str); 3] =
     [("digikam", DIGIKAM), ("lightroom-o6", LIGHTROOM_ROTATED), ("ms-photo", MS_PHOTO)];
 
+// Sidecars written by real tools (#154), byte for byte as the tools wrote them; provenance in
+// `crates/core/tests/fixtures/faces/README.md`. Each holds Bob at stored-frame center
+// (0.325, 0.25), 0.15 x 0.1, `AppliedToDimensions` 600x400, `tiff:Orientation` 6: the values
+// were given by hand, the serialisation is the tool's.
+
+/// exiftool 13.55 creating a sidecar from a JPEG with EXIF Orientation 6: an `xpacket` with a
+/// BOM, single quotes, one `rdf:Description` per namespace (exif, tiff, dc, mwg-rs), structs
+/// as `rdf:parseType='Resource'` with element-form fields in alphabetical order.
+pub(crate) const EXIFTOOL_O6: &str = include_str!("../../tests/fixtures/faces/regions/exiftool-o6.xmp");
+
+/// exiv2 0.28.9 (`XMP Core 4.4.0-Exiv2`, the serialiser digiKam writes through) adding the
+/// region to a one-keyword sidecar: one `rdf:Description`, simple fields as attributes, the
+/// region a nested `rdf:Description` with attribute-form fields.
+pub(crate) const EXIV2_O6: &str = include_str!("../../tests/fixtures/faces/regions/exiv2-o6.xmp");
+
+/// The real tools' sidecars, by tool.
+pub(crate) const REAL_TOOL_REGIONS: [(&str, &str); 2] = [("exiftool 13.55", EXIFTOOL_O6), ("exiv2 0.28.9", EXIV2_O6)];
+
 /// One MWG region as the independent reader sees it: MWG's center form, unconverted.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct MwgRegion {
@@ -205,6 +224,12 @@ pub(crate) fn named<'a>(read: &'a MwgRead, name: &str) -> Vec<&'a MwgRegion> {
 /// expanded names, namespaced attributes and text, in document order — so a test can say a
 /// foreign structure came through a write unchanged without comparing prefixes or layout.
 pub(crate) fn subtree(xml: &str, ns: &str, local: &str) -> Vec<String> {
+    let doc = parse(xml);
+    doc.descendants().filter(|n| n.has_tag_name((ns, local))).map(canonical).collect()
+}
+
+/// [`subtree`]'s canonical text of one node.
+fn canonical(n: roxmltree::Node) -> String {
     fn walk(n: roxmltree::Node, out: &mut String) {
         if n.is_element() {
             let name = n.tag_name();
@@ -224,15 +249,29 @@ pub(crate) fn subtree(xml: &str, ns: &str, local: &str) -> Vec<String> {
             out.push_str(t.trim());
         }
     }
+    let mut s = String::new();
+    walk(n, &mut s);
+    s
+}
+
+/// Every property of every top-level `rdf:Description` but `mwg-rs:Regions` — attribute or
+/// element, in [`subtree`]'s canonical text, sorted: all a region write must leave as it was
+/// outside the regions (#154's real-tool sidecars, whose properties sit in either form).
+pub(crate) fn non_region_properties(xml: &str) -> Vec<String> {
     let doc = parse(xml);
-    doc.descendants()
-        .filter(|n| n.has_tag_name((ns, local)))
-        .map(|n| {
-            let mut s = String::new();
-            walk(n, &mut s);
-            s
-        })
-        .collect()
+    let mut out = Vec::new();
+    for desc in doc.descendants().filter(|n| {
+        n.has_tag_name((NS_RDF, "Description")) && n.parent().is_some_and(|p| p.has_tag_name((NS_RDF, "RDF")))
+    }) {
+        for a in desc.attributes().filter(|a| a.namespace() != Some(NS_RDF)) {
+            out.push(format!("{{{}}}{}={:?}", a.namespace().unwrap_or(""), a.name(), a.value()));
+        }
+        for c in desc.children().filter(|c| c.is_element() && !c.has_tag_name((NS_MWG_RS, "Regions"))) {
+            out.push(canonical(c));
+        }
+    }
+    out.sort();
+    out
 }
 
 /// The value of attribute `{ans}alocal` on every element `{ens}elocal`.
@@ -272,5 +311,11 @@ fn region_fixtures_read_as_written() {
     assert_eq!(subtree(MS_PHOTO, NS_MPRI, "Regions").len(), 1);
     for (layout, xml) in FOREIGN_REGIONS {
         assert_eq!(mwg(xml).rdf_elements, 1, "{layout}");
+    }
+    for (tool, xml) in REAL_TOOL_REGIONS {
+        let read = mwg(xml);
+        assert_eq!(read.dims, [Some(("600".into(), "400".into()))], "{tool}");
+        assert_eq!(read.regions, [MwgRegion { name: "Bob".into(), area: (0.325, 0.25, 0.15, 0.1), face_id: None }], "{tool}");
+        assert_eq!(read.rdf_elements, 1, "{tool}");
     }
 }

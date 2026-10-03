@@ -18,7 +18,7 @@ pub(super) fn read(path: &Path) -> String {
 
 /// An upright photo (EXIF Orientation 1) of a known stored size.
 pub(super) fn sized(w: u32, h: u32) -> RegionFrame {
-    RegionFrame { orientation: Some(1), stored_size: Some((w, h)) }
+    RegionFrame { orientation: Some(1), stored_size: Some((w, h)), ..Default::default() }
 }
 
 /// Every attribute in `xml`, namespace-resolved by an independent namespace-aware reader

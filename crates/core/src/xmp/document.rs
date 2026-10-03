@@ -945,7 +945,7 @@ mod tests {
         let gone = dir.join("unmounted").join("A.ARW");
         let uuid = "8d0a2c1e-4f5b-4c6d-9e7f-0a1b2c3d4e5f";
         let face = [FaceRegion { face_id: 1, name: "Ada".into(), bbox: (0.1, 0.1, 0.2, 0.2) }];
-        let frame = crate::xmp::RegionFrame { orientation: None, stored_size: Some((600, 400)) };
+        let frame = crate::xmp::RegionFrame { orientation: None, stored_size: Some((600, 400)), ..Default::default() };
         let title = IptcFields { title: "T".into(), ..Default::default() };
         let writes: Vec<(&str, Box<dyn Fn(&Path) -> Result<(), String>>)> = vec![
             ("identifier", Box::new(|p| crate::xmp::write_identifier(p, uuid))),

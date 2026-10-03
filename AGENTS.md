@@ -89,11 +89,14 @@ Read only the documents triggered by the task:
   regions, matching the catalog's record of what it exported. Every other region — another
   catalog's or a copied catalog's included — is foreign and preserved.
   MWG areas use normalized center coordinates in the stored frame — the image before its EXIF
-  Orientation is applied (MWG 2.0 § 5.9) — and `AppliedToDimensions` is the stored pixel size;
-  ChairPhoto's face boxes are in the EXIF-oriented frame and are converted on export and
-  import. An unknown orientation is never guessed. An existing `AppliedToDimensions` is never
-  rewritten: ChairPhoto writes into the frame it declares or refuses the write. When uncertain,
-  preserve.
+  Orientation is applied (the MWG 2.0 guidelines' region rule; section and wording unverified,
+  see `docs/face-tagging.md`) — and `AppliedToDimensions` is the stored pixel size;
+  ChairPhoto's face boxes are in the oriented preview's frame and are converted on export and
+  import. A HEIF's turn is its container's `irot`/`imir`. An unknown orientation is never
+  guessed; a HEIF whose container and EXIF disagree, or a preview whose aspect is not the
+  recorded size so turned, writes and imports no region. An existing `AppliedToDimensions` is
+  never rewritten: ChairPhoto writes into the frame it declares or refuses the write. When
+  uncertain, preserve.
 
 ### Background work and ownership
 

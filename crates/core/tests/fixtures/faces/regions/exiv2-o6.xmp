@@ -1,0 +1,41 @@
+<?xpacket begin="﻿" id="W5M0MpCehiHzreSzNTczkc9d"?>
+<x:xmpmeta xmlns:x="adobe:ns:meta/" x:xmptk="XMP Core 4.4.0-Exiv2">
+ <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
+  <rdf:Description rdf:about=""
+    xmlns:mwg-rs="http://www.metadataworkinggroup.com/schemas/regions/"
+    xmlns:stDim="http://ns.adobe.com/xap/1.0/sType/Dimensions#"
+    xmlns:stArea="http://ns.adobe.com/xmp/sType/Area#"
+    xmlns:tiff="http://ns.adobe.com/tiff/1.0/"
+    xmlns:dc="http://purl.org/dc/elements/1.1/"
+   tiff:Orientation="6">
+   <mwg-rs:Regions rdf:parseType="Resource">
+    <mwg-rs:AppliedToDimensions
+     stDim:w="600"
+     stDim:h="400"
+     stDim:unit="pixel"/>
+    <mwg-rs:RegionList>
+     <rdf:Bag>
+      <rdf:li>
+       <rdf:Description
+        mwg-rs:Name="Bob"
+        mwg-rs:Type="Face">
+       <mwg-rs:Area
+        stArea:x="0.325"
+        stArea:y="0.25"
+        stArea:w="0.15"
+        stArea:h="0.1"
+        stArea:unit="normalized"/>
+       </rdf:Description>
+      </rdf:li>
+     </rdf:Bag>
+    </mwg-rs:RegionList>
+   </mwg-rs:Regions>
+   <dc:subject>
+    <rdf:Bag>
+     <rdf:li>Family</rdf:li>
+    </rdf:Bag>
+   </dc:subject>
+  </rdf:Description>
+ </rdf:RDF>
+</x:xmpmeta>
+<?xpacket end="w"?>

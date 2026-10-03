@@ -55,6 +55,9 @@ pub struct MergeSummary {
     pub assignments_added: usize,
     /// `true` if the batch was inserted, `false` if it already existed (re-merge).
     pub batch_added: bool,
+    /// Photos with no identity (a blank uuid from a pre-#146 bundle) and no original in the
+    /// bundle, whose path another photo already holds: neither matched nor inserted (#150).
+    pub photos_skipped: usize,
 }
 
 impl Catalog {
@@ -283,10 +286,16 @@ impl MergeCtx<'_> {
     /// becomes a non-UUID `photos.uuid` again.
     ///
     /// A photo with an empty or blank uuid has no identity to match (#146 review N4), so it is
-    /// never matched to another catalog's such photo. It can only be the photo already at
-    /// its path — which is where the bundle importer has just indexed it, and where a second
-    /// row could not go anyway (`photos.path` is UNIQUE) — and otherwise it is inserted with a
-    /// fresh v4, as schema v23 does for such a row.
+    /// never matched to another catalog's such photo, and never to whatever photo this
+    /// catalog has at its path either (#150): that can be a different photo — the importer
+    /// renames a different-size collision to ` (n)`, and the photo already at the path is
+    /// the user's own. The bundle importer, which knows which row it indexed each blank-uuid
+    /// original into, hands merge that row's identity instead
+    /// (`bundle::importer::index_bundle_with`). A blank-uuid photo that still arrives here is
+    /// one without an original in the bundle: inserted with a fresh v4, as schema v23 does
+    /// for such a row, when its path is free, and otherwise skipped
+    /// ([`MergeSummary::photos_skipped`]) — a second row cannot take the path
+    /// (`photos.path` is UNIQUE), and nothing says the photo there is this one.
     fn merge_photo(&mut self, photo: &BundlePhoto, batch_id: i64) -> Result<()> {
         let (uuid, existing): (String, Option<i64>) = match super::photo_identity_for(&photo.uuid) {
             Some(uuid) => {
@@ -297,15 +306,25 @@ impl MergeCtx<'_> {
                 (uuid, existing)
             }
             None => {
-                let existing = self
+                let taken = self
                     .tx
                     .query_row(
-                        "SELECT id FROM photos WHERE path = ?1",
+                        "SELECT 1 FROM photos WHERE path = ?1",
                         params![photo.relative_path],
-                        |r| r.get(0),
+                        |_| Ok(()),
                     )
-                    .optional()?;
-                (uuid::Uuid::new_v4().to_string(), existing)
+                    .optional()?
+                    .is_some();
+                if taken {
+                    eprintln!(
+                        "bundle merge: a photo with no identity at {} was skipped: another \
+                         photo is at that path",
+                        photo.relative_path
+                    );
+                    self.summary.photos_skipped += 1;
+                    return Ok(());
+                }
+                (uuid::Uuid::new_v4().to_string(), None)
             }
         };
 

@@ -416,15 +416,21 @@ pub(crate) fn index_bundle_with(
     let mut indexed = 0;
     let folder_id = catalog.add_folder(dest_base).map_err(|e| e.to_string())?;
 
-    // Build a lookup table uuid → BundlePhoto for fast access during the upsert loop.
-    let bp_by_uuid: std::collections::HashMap<&str, &crate::bundle::BundlePhoto> = manifest
+    // Build a lookup table (uuid, relative path) → BundlePhoto for fast access during the
+    // upsert loop. Keyed by both because a pre-#146 bundle can carry several photos with a
+    // blank uuid, which the uuid alone would collapse into one (#150).
+    let bp_by_key: std::collections::HashMap<(&str, &str), &crate::bundle::BundlePhoto> = manifest
         .photos
         .iter()
-        .map(|bp| (bp.uuid.as_str(), bp))
+        .map(|bp| ((bp.uuid.as_str(), bp.relative_path.as_str()), bp))
         .collect();
 
     let mut newly_created: Vec<i64> = Vec::new();
     let mut upserted_copies: Vec<(i64, PathBuf)> = Vec::new();
+    // The identity of the row each blank-uuid original was indexed into, by the manifest's
+    // relative path: merge has no identity to match such a photo by, and the photo at its
+    // path need not be it (#150), so it is told which row the index phase chose.
+    let mut indexed_blank: std::collections::HashMap<&str, String> = std::collections::HashMap::new();
 
     let tx = catalog.begin().map_err(|e| e.to_string())?;
     for item in extracted {
@@ -490,6 +496,9 @@ pub(crate) fn index_bundle_with(
             );
         }
         upserted_copies.push((upsert.id, path.clone()));
+        if crate::catalog::photo_identity_for(&item.photo_uuid).is_none() {
+            indexed_blank.insert(item.relative_path.as_str(), upsert.uuid.clone());
+        }
 
         if upsert.created {
             newly_created.push(upsert.id);
@@ -498,7 +507,7 @@ pub(crate) fn index_bundle_with(
             // The F1c merge won't do this because the upsert already made the photo
             // "existing" (merge is additive; it never overwrites an existing row).
             // This mirrors E5's set_photo_metadata call after upsert.
-            if let Some(bp) = bp_by_uuid.get(item.photo_uuid.as_str()) {
+            if let Some(bp) = bp_by_key.get(&(item.photo_uuid.as_str(), item.relative_path.as_str())) {
                 // Rating / label / pick (non-zero or non-default only — zero/empty are
                 // already the column defaults from the INSERT in upsert_photo_with_identity).
                 if bp.rating != 0 || !bp.label.is_empty() || bp.pick_state != PickState::None {
@@ -565,14 +574,32 @@ pub(crate) fn index_bundle_with(
     tx.commit().map_err(|e| e.to_string())?;
 
     // Stopped early: Steps B and C cover only the photos indexed (see the docs).
-    let narrowed;
-    let manifest = if indexed < total {
-        let done: std::collections::HashSet<&str> = extracted[..indexed].iter().map(|i| i.photo_uuid.as_str()).collect();
-        narrowed = BundleManifest {
-            photos: manifest.photos.iter().filter(|p| done.contains(p.uuid.as_str())).cloned().collect(),
+    // A blank-uuid photo whose original was indexed carries, for the merge, the identity of
+    // the row it was indexed into (#150).
+    let prepared;
+    let manifest = if indexed < total || !indexed_blank.is_empty() {
+        let done: std::collections::HashSet<(&str, &str)> = extracted[..indexed]
+            .iter()
+            .map(|i| (i.photo_uuid.as_str(), i.relative_path.as_str()))
+            .collect();
+        prepared = BundleManifest {
+            photos: manifest
+                .photos
+                .iter()
+                .filter(|p| indexed == total || done.contains(&(p.uuid.as_str(), p.relative_path.as_str())))
+                .map(|p| {
+                    let mut p = p.clone();
+                    if crate::catalog::photo_identity_for(&p.uuid).is_none() {
+                        if let Some(identity) = indexed_blank.get(p.relative_path.as_str()) {
+                            p.uuid = identity.clone();
+                        }
+                    }
+                    p
+                })
+                .collect(),
             ..manifest.clone()
         };
-        &narrowed
+        &prepared
     } else {
         manifest
     };

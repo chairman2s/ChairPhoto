@@ -902,9 +902,66 @@ fn a_blank_uuid_is_no_identity_at_all() {
         .unwrap();
     assert_eq!(legacy, 0, "a blank value is not a legacy identifier");
 
-    // Re-merging one of them finds it where it is, rather than a second row (or a UNIQUE error).
+    // Re-merging one of them (no original in the bundle) finds a photo at its path, which
+    // nothing says is this one (#150): skipped, rather than a second row, a UNIQUE error or
+    // the bundle's state on the photo that is there.
     let s = catalog.merge_bundle(&bare_bundle(&[("", "a.jpg")])).unwrap();
-    assert_eq!((s.photos_existing, s.photos_added), (1, 0));
+    assert_eq!((s.photos_existing, s.photos_added, s.photos_skipped), (0, 0, 1));
+    assert_eq!(catalog.list_photos(&PhotoQuery::default()).unwrap().len(), 2);
+}
+
+/// #150 (the #146 N4 follow-up): a blank-uuid bundle photo must not be attached to a
+/// different photo at the same path. Here the library already has its own x.jpg (other
+/// bytes, other size, a rating) where the bundle's x.jpg would go, so the importer renames
+/// the copy to `x (2).jpg`. The bundle's tag and rating belong on that copy's row; merge used
+/// to match the blank-uuid photo by path and put the tag on the user's own photo.
+#[test]
+fn a_blank_uuid_bundle_photo_is_not_attached_to_the_photo_at_its_path() {
+    let (catalog, root) = temp_catalog("blank-uuid-path-collision");
+    let source = root.parent().unwrap().join("bundle-source");
+    let mut manifest = bare_bundle(&[("", "2020/01/01/x.jpg")]);
+    manifest.format_version = chairphoto_core::bundle::BUNDLE_FORMAT_VERSION;
+    manifest.photos[0].rating = 4;
+    manifest.photos[0].tag_uuids = vec!["3d1e0f2a-4b5c-4d6e-8f70-8192a3b4c5d6".into()];
+    manifest.taxonomy.push(chairphoto_core::bundle::BundleTag {
+        uuid: "3d1e0f2a-4b5c-4d6e-8f70-8192a3b4c5d6".into(),
+        full_path: "From the bundle".into(),
+        exportable: true,
+        terms: Vec::new(),
+    });
+    let f = source.join("x.jpg");
+    std::fs::create_dir_all(&source).unwrap();
+    std::fs::write(&f, b"the bundle's own bytes").unwrap();
+    let originals = std::collections::HashMap::from([(String::new(), Some(f))]);
+    let bundle = root.parent().unwrap().join("blank.chairphoto");
+    chairphoto_core::bundle::writer::write_bundle(
+        &chairphoto_core::bundle::writer::GatheredBundle { manifest, originals },
+        &bundle,
+        |_, _| {},
+    )
+    .unwrap();
+    let own = root.join("2020/01/01/x.jpg");
+    std::fs::create_dir_all(own.parent().unwrap()).unwrap();
+    std::fs::write(&own, b"mine").unwrap();
+    let mine = catalog.upsert_photo(&own, None, 1, 4).unwrap();
+    catalog.set_culling(mine.id, Some(2), None, None).unwrap();
+
+    let state = chairphoto_core::app::AppState::default();
+    *state.catalog.lock().unwrap() = Some(catalog);
+    chairphoto_core::app::bundles::import_bundle(&state, &bundle).unwrap();
+    let catalog = state.catalog.lock().unwrap().take().unwrap();
+
+    let tag = catalog.find_tag_id_by_path("From the bundle").unwrap().unwrap();
+    assert!(catalog.get_photo_tags(mine.id).unwrap().is_empty(), "the user's photo got the bundle's tag");
+    assert_eq!(catalog.get_photo(mine.id).unwrap().rating, 2);
+    let copy = catalog
+        .list_photos(&PhotoQuery::default())
+        .unwrap()
+        .into_iter()
+        .find(|p| p.path == "2020/01/01/x (2).jpg")
+        .expect("the bundle's copy is catalogued");
+    assert_eq!(copy.rating, 4);
+    assert_eq!(catalog.get_photo_tags(copy.id).unwrap().iter().map(|t| t.id).collect::<Vec<_>>(), [tag]);
     assert_eq!(catalog.list_photos(&PhotoQuery::default()).unwrap().len(), 2);
 }
 

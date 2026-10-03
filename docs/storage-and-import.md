@@ -277,9 +277,13 @@ random v4 per catalog would split that photo in two at the next merge. For the s
 merge and bundle import map an old bundle's non-UUID id through the same function
 (`catalog::photo_identity_for`) and record it as the row's legacy identifier: no path stores a
 non-UUID `photos.uuid` any more. An empty or whitespace-only value is no identity at all, not
-a legacy one: v23 gives such a row a random v4, merge never matches it to another catalog's (a
-blank-uuid bundle photo is only ever the photo already at its path, or a new row), and no
-lookup finds it. If v23 finds the v5 already held by another row (a migrated
+a legacy one: v23 gives such a row a random v4, merge never matches it to another catalog's,
+and no lookup finds it. Nor is a blank-uuid bundle photo matched to the photo at its path,
+which can be a different one (#150): the importer renames a different-size collision to
+` (n)`, so the user's own photo is what sits at the bundle's path. The importer tells merge
+which row it indexed each such original into, and the bundle's tags land there. A blank-uuid
+photo with no original in the bundle is inserted with a v4 if its path is free, and otherwise
+skipped and counted (`MergeSummary::photos_skipped`). If v23 finds the v5 already held by another row (a migrated
 catalog's bundle merged in first), the two rows claim one photo and it cannot tell which is
 right, so that row gets a v4 and its copies stay queued as conflicts. The legacy value itself
 is never a merge key or a deep-link target. Settings keyed by the photo's uuid (today only the

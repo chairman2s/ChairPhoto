@@ -156,7 +156,7 @@ section.
 | `src/theme/prefs.ts` | Shell | #113 | `machine_prefs.rs` | built |
 | `src/theme/apply.ts` | Shell | — | — | dropped |
 | `src/vite-env.d.ts` | Shell | — | — | dropped |
-| `src/components/CatalogGrid.tsx` | Library | #106, #158 | `library/grid.rs` | built |
+| `src/components/CatalogGrid.tsx` | Library | #106, #158 | `library/grid.rs` | checked |
 | `src/components/Thumbnail.tsx` | Library | #101, #106 | `library/grid.rs` | built |
 | `src/components/StackProposalsDialog.tsx` | Library | #106 | `library/stacks.rs` | built |
 | `src/components/TrashDialog.tsx` | Library | #114 | `storage/trash.rs` | built |
@@ -167,9 +167,9 @@ section.
 | `src/components/SignalsPanel.tsx` | Inspector and tags | #108 | `inspector/signals.rs` | checked |
 | `src/components/IptcPanel.tsx` | Inspector and tags | #108, #148 | `inspector/mod.rs` | built |
 | `src/components/MetadataPanel.tsx` | Inspector and tags | #108 | `inspector/render.rs` | built |
-| `src/components/VersionsPanel.tsx` | Inspector and tags | #108, #111 | `inspector/render.rs` | built |
-| `src/components/PublishedPanel.tsx` | Inspector and tags | #108 | `inspector/render.rs` | built |
-| `src/components/PublishDialog.tsx` | Inspector and tags | #122, #123 | `modules/panel.rs` | built |
+| `src/components/VersionsPanel.tsx` | Inspector and tags | #108, #111 | `inspector/render.rs` | checked |
+| `src/components/PublishedPanel.tsx` | Inspector and tags | #108 | `inspector/render.rs` | checked |
+| `src/components/PublishDialog.tsx` | Inspector and tags | #122, #123 | `modules/panel.rs` | checked |
 | `src/components/TagPanel.tsx` | Inspector and tags | #107 | `tags/panel.rs` | built |
 | `src/components/TagEditor.tsx` | Inspector and tags | #107 | `tags/editor.rs` | built |
 | `src/components/TagCreateModal.tsx` | Inspector and tags | #107 | `tags/create.rs` | built |
@@ -187,15 +187,15 @@ section.
 | `src/modules/loupe.ts` | Loupe and cull | #110 | `loupe/window.rs` | built |
 | `src/components/darkroom/DarkroomView.tsx` | Darkroom | #111, #112 | `darkroom/view.rs` | built |
 | `src/components/darkroom/DevelopSurface.tsx` | Darkroom | #111 | `darkroom/session.rs` | built |
-| `src/components/darkroom/Filmstrip.tsx` | Darkroom | #111, #134 | `DarkroomView::render_filmstrip` | built |
+| `src/components/darkroom/Filmstrip.tsx` | Darkroom | #111, #134 | `DarkroomView::render_filmstrip` | checked |
 | `src/components/darkroom/filmstrip.ts` | Darkroom | #111, #134 | `chairphoto_model::darkroom::filmstrip` | built |
 | `src/components/darkroom/ToneStrip.tsx` | Darkroom | #111 | `DarkroomView::render_tone_strip` | built |
 | `src/components/EditControls.tsx` | Darkroom | #111, #112 | `darkroom/view.rs` | built |
-| `src/components/darkroom/HistoryPanel.tsx` | Darkroom | #112 | `DarkroomView::render_history` | built |
-| `src/components/PresetBrowser.tsx` | Darkroom | #112 | `DarkroomView::render_presets` | built |
-| `src/components/darkroom/LensRail.tsx` | Darkroom | #112 | `DarkroomView::render_lens` | built |
-| `src/components/darkroom/RenderedImage.tsx` | Darkroom | #109, #112 | `loupe::duel::variant_image` | built |
-| `src/components/darkroom/ProofSheet.tsx` | Darkroom | #109, #112 | `loupe/proof_sheet.rs` | built |
+| `src/components/darkroom/HistoryPanel.tsx` | Darkroom | #112 | `DarkroomView::render_history` | checked |
+| `src/components/PresetBrowser.tsx` | Darkroom | #112 | `DarkroomView::render_presets` | checked |
+| `src/components/darkroom/LensRail.tsx` | Darkroom | #112 | `DarkroomView::render_lens` | checked |
+| `src/components/darkroom/RenderedImage.tsx` | Darkroom | #109, #112 | `loupe::duel::variant_image` | checked |
+| `src/components/darkroom/ProofSheet.tsx` | Darkroom | #109, #112 | `loupe/proof_sheet.rs` | checked |
 | `src/components/darkroom/DuelView.tsx` | Darkroom | #109, #112 | `loupe/duel.rs` | built |
 | `src/components/darkroom/GlSpike.tsx` | Darkroom | #98 | — | dropped |
 | `src/components/darkroom/developSource.ts` | Darkroom | #103 | `chairphoto_model::darkroom::develop_source` | built |
@@ -206,27 +206,27 @@ section.
 | `src/components/darkroom/renderTiming.ts` | Darkroom | #111 | `chairphoto_model::darkroom::render_timing` | built |
 | `src/modules/editing.ts` | Darkroom | #103, #111, #112 | `chairphoto_model::editing` | built |
 | `src/modules/presets.ts` | Darkroom | #103, #112 | `chairphoto_model::presets` | built |
-| `src/components/Preferences.tsx` | Preferences | #113, #161 | `preferences/` | built |
-| `src/components/SafetyPanel.tsx` | Preferences | #113 | `preferences/storage.rs` | built |
-| `src/components/ModulesPanel.tsx` | Preferences | #113, #122 | `modules/panel.rs` | built |
+| `src/components/Preferences.tsx` | Preferences | #113, #161 | `preferences/` | checked |
+| `src/components/SafetyPanel.tsx` | Preferences | #113 | `preferences/storage.rs` | checked |
+| `src/components/ModulesPanel.tsx` | Preferences | #113, #122 | `modules/panel.rs` | checked |
 | `src/components/ImportPanel.tsx` | Storage and import | #114 | `storage/import_panel.rs` | built |
-| `src/components/VolumesPanel.tsx` | Storage and import | #113, #114 | `storage/volumes.rs` | built |
+| `src/components/VolumesPanel.tsx` | Storage and import | #113, #114 | `storage/volumes.rs` | checked |
 | `src/components/IdentityDebtPanel.tsx` | Storage and import | #114 | `storage/identity_debt.rs` | built |
-| `src/components/CatalogSwitcher.tsx` | Storage and import | #114 | `storage/catalog_switcher.rs` | built |
-| `src/components/BatchesPanel.tsx` | Storage and import | #114 | `storage/batches.rs` | built |
+| `src/components/CatalogSwitcher.tsx` | Storage and import | #114 | `storage/catalog_switcher.rs` | checked |
+| `src/components/BatchesPanel.tsx` | Storage and import | #114 | `storage/batches.rs` | checked |
 | `src/components/BundleImportDialog.tsx` | Storage and import | #114 | `storage/bundle_import.rs` | built |
 | `src/components/BundleExportDialog.tsx` | Storage and import | #115 | `export/bundle.rs` | built |
-| `src/components/AlbumsPanel.tsx` | Albums and export | #115 | `albums/panel.rs` | built |
+| `src/components/AlbumsPanel.tsx` | Albums and export | #115 | `albums/panel.rs` | checked |
 | `src/components/SmartAlbumsPanel.tsx` | Albums and export | #115 | `albums/panel.rs` | built |
-| `src/components/SmartAlbumEditor.tsx` | Albums and export | #115 | `albums/smart_editor.rs` | built |
-| `src/components/ExportPanel.tsx` | Albums and export | #115 | `export/panel.rs` | built |
+| `src/components/SmartAlbumEditor.tsx` | Albums and export | #115 | `albums/smart_editor.rs` | checked |
+| `src/components/ExportPanel.tsx` | Albums and export | #115 | `export/panel.rs` | checked |
 | `src/modules/plugins/aiTagging.tsx` | Bundled modules | #126 | `modules/ai_tagging/` | built |
 | `src/modules/plugins/basicEditor.tsx` | Bundled modules | #104 | — | dropped |
-| `src/modules/plugins/collage.tsx` | Bundled modules | #125 | `modules/collage/mod.rs` | built |
-| `src/modules/plugins/CollageDialog.tsx` | Bundled modules | #125 | `modules/collage/view.rs` | built |
+| `src/modules/plugins/collage.tsx` | Bundled modules | #125 | `modules/collage/mod.rs` | checked |
+| `src/modules/plugins/CollageDialog.tsx` | Bundled modules | #125 | `modules/collage/view.rs` | checked |
 | `src/modules/plugins/collageTemplates.ts` | Bundled modules | #125 | `chairphoto_model::collage` | built |
-| `src/modules/plugins/slideshow.tsx` | Bundled modules | #125 | `modules/slideshow/mod.rs` | built |
-| `src/modules/plugins/SlideshowDialog.tsx` | Bundled modules | #125 | `modules/slideshow/view.rs` | built |
+| `src/modules/plugins/slideshow.tsx` | Bundled modules | #125 | `modules/slideshow/mod.rs` | checked |
+| `src/modules/plugins/SlideshowDialog.tsx` | Bundled modules | #125 | `modules/slideshow/view.rs` | checked |
 | `src/modules/plugins/localsend.tsx` | Bundled modules | #123 | `modules/localsend/mod.rs` | built |
 | `src/modules/plugins/SendToDevicePanel.tsx` | Bundled modules | #123 | `modules/localsend/send.rs` | built |
 | `src/modules/plugins/snapchat.tsx` | Bundled modules | #123 | `modules/localsend/mod.rs` | built |
@@ -239,7 +239,7 @@ section.
 | `src/modules/plugins/map.tsx` | Bundled modules | #119, #162 | `modules/map/` | built |
 | `src/modules/plugins/smartTagging.tsx` | Bundled modules | #126 | `modules/smart_tagging/` | built |
 | `src/modules/plugins/statistics.tsx` | Bundled modules | #127 | `modules/statistics/` | built |
-| `src/modules/plugins/tagGraph.tsx` | Bundled modules | #110, #121 | `modules/tag_graph/` | built |
+| `src/modules/plugins/tagGraph.tsx` | Bundled modules | #110, #121 | `modules/tag_graph/` | checked |
 | `src/modules/plugins/tagGraphBundle.ts` | Bundled modules | #121 | `chairphoto_model::tag_graph::bundle` | built |
 | `src/modules/api.ts` | Module infrastructure and core API | #99, #104 | — | dropped |
 | `src/modules/host.ts` | Module infrastructure and core API | #104, #122 | `modules/mod.rs` | built |
@@ -591,7 +591,8 @@ QuickTagGroups with Tag panel
 
 **Status:** built (#105, #107: `crates/app/src/shell/inspector.rs`;
 QuickTagGroups in `crates/app/src/tags/photo_tags.rs` with "Recently used" (10) and "⚙
-groups"), visually checked 2026-10-03 (#163) except QuickTagGroups (not reached);
+groups"), visually checked 2026-10-03 (#163), QuickTagGroups in a second pass
+(its empty-state line runs off the column, #176);
 in Compare the header follows the selection, not the focused pane (#170).
 Deliberate difference: the filename uses the UI sans, not the serif.
 
@@ -819,7 +820,8 @@ Reports the visible range for the status fetch.
 
 **Status:** built (#106, #158: `crates/app/src/library/grid.rs` `LibraryView`,
 `library/layout.rs`, `library/grid_menu.rs`), visually checked 2026-10-03 (#163);
-Ctrl-click, double-click and scrolling not exercised: virtualised `uniform_list` with
+Ctrl-click and double-click in a second pass; scrolling not exercised (eight photos fill
+one row): virtualised `uniform_list` with
 overscan 3, slider-driven columns, 3:2 tiles, opens at the newest photo, scrolls the active
 one into view, selected/active/rejected states, click/Ctrl/Shift selection, double-click →
 loupe, every badge with tooltips, filename, filter-worded empty state
@@ -1013,8 +1015,8 @@ ev: `rapidraw:progress` (one global listener, keyed by photo);
 
 **Port ticket:** Photo inspector
 
-**Status:** built, details tab visually checked 2026-10-03 (#163), the rest awaiting the
-visual check (#108: `crates/app/src/inspector/mod.rs`, `inspector/render.rs`;
+**Status:** built, details and tags tabs visually checked 2026-10-03 (#163),
+the rest awaiting the visual check (#108: `crates/app/src/inspector/mod.rs`, `inspector/render.rs`;
 tags tab = #107's `tags/photo_tags.rs` + inspector-slot module panels in `view.rs`): section
 state `inspector.section.<id>` per machine (#159, `MachinePrefs`, default collapsed);
 details (EXIF line, stars, Pick/Reject/None, labels, signals), Stack (View →
@@ -1102,9 +1104,10 @@ New-version input: Enter adds.
 **Port ticket:** Photo inspector
 
 **Status:** built (#108: `inspector/render.rs` `render_versions`;
-✎ opens the Darkroom, #111), awaiting the visual check.
+✎ opens the Darkroom, #111), visually checked 2026-10-03 (#163).
 The "enable Basic Editor" hint: dropped (decision #104: basicEditor folds into the Darkroom;
 ✎ shows when the `edit` feature is compiled in)
+Seen 2026-10-03: Original + Version 1 with ✎/⧉/✕ and the New version field.
 
 ### `src/components/PublishedPanel.tsx`
 
@@ -1121,7 +1124,8 @@ The "enable Basic Editor" hint: dropped (decision #104: basicEditor folds into t
 **Port ticket:** Photo inspector
 
 **Status:** built (#108: `inspector/render.rs` `render_publish`, `COMMON_PLATFORMS`),
-awaiting the visual check
+visually checked 2026-10-03 (#163)
+Seen 2026-10-03: "Not published yet", Mark as published with platform chips, Publish….
 
 ### `src/components/PublishDialog.tsx`
 
@@ -1138,7 +1142,10 @@ Close/backdrop.
 **Port ticket:** Photo inspector (targets via Module trait)
 
 **Status:** built (#122, #123: `crates/app/src/modules/panel.rs` `open_publish_dialog` /
-`PublishDialog`, targets from the Module trait), awaiting the visual check
+`PublishDialog`, targets from the Module trait), visually checked 2026-10-03 (#163)
+Seen 2026-10-03: target chips (Instagram, Device (LocalSend), Snapchat) and the Instagram
+form; the LocalSend/Snapchat chips not chosen (choosing one starts LAN discovery); nothing
+posted.
 
 ### `src/components/TagPanel.tsx`
 
@@ -1266,6 +1273,7 @@ The quick-tag bar refetches on close.
 
 **Status:** built (#107: `crates/app/src/tags/groups.rs`;
 the quick-tag block re-reads on every write), awaiting the visual check
+(its empty dialog was seen 2026-10-03, #163)
 
 ### `src/modules/tagPaste.ts`
 
@@ -1306,7 +1314,9 @@ Unavailable state with action buttons.
 **Port ticket:** Loupe
 
 **Status:** built (#109, #158: `crates/app/src/loupe/zoom.rs` `ZoomImage` / `ZoomShared` /
-`ZoomView`), awaiting the visual check: wheel/drag/double-click zoom, the tier swap, Fit N%,
+`ZoomView`), awaiting the visual check
+(wheel zoom toward the cursor and Fit N% seen 2026-10-03, #163):
+wheel/drag/double-click zoom, the tier swap, Fit N%,
 the override's hi-res, the shared view, and the unavailable state's Relocate…, Retrieve from
 NAS and Remove from catalog (#158: `RelocatePhoto` / `RetrieveFromNas` /
 `RemoveFromCatalog`, run by the root view on the inline loupe's photo,
@@ -1324,7 +1334,8 @@ Used only by CullSession.
 **Port ticket:** Loupe
 
 **Status:** built (#109: folded into `crates/app/src/loupe/cull.rs`, "No preview
-available"), awaiting the visual check
+available"), visually checked 2026-10-03 (#163);
+the frame is cropped instead of fitted (#174)
 
 ### `src/components/CompareView.tsx`
 
@@ -1348,8 +1359,9 @@ Empty "Nothing to compare… press C".
 **Port ticket:** Loupe
 
 **Status:** built (#109: `crates/app/src/loupe/compare_view.rs`, `loupe/compare.rs`;
-mode in machine prefs `panel.compareMode`), visually checked 2026-10-03 (#163: Duel mode;
-Grid mode and paging not exercised).
+mode in machine prefs `panel.compareMode`), visually checked 2026-10-03
+(#163: Duel and Grid mode; paging not exercised;
+a portrait frame in a narrow Grid pane is cropped, #175).
 Difference: no "Nothing to compare" state — Compare ends when no pane is left
 (`shell/state.rs:926-929`)
 
@@ -1381,7 +1393,8 @@ r/y/g/b/v label, n clears (all advance)
 **Port ticket:** Loupe
 
 **Status:** built (#109: `crates/app/src/loupe/cull.rs` `CullState` / `CullView`;
-keys in `loupe/mod.rs`, CULL context), awaiting the visual check
+keys in `loupe/mod.rs`, CULL context), visually checked 2026-10-03 (#163):
+HUD, help, rating with advance, summary; the frame is cropped instead of fitted (#174)
 
 ### `src/modules/compareDuel.ts`
 
@@ -1423,6 +1436,7 @@ with `Follow::Window`), awaiting the visual check: "No photo selected", the targ
 version render and hi-res zoom, a module card while one is up, the Darkroom's print (#112);
 loupe-slot panels per window (the faces overlay, #129);
 the theme is the app's, shared
+Not checked: needs the owner (window rule).
 
 ### `src/components/LoupeCardView.tsx`
 
@@ -1442,6 +1456,7 @@ a tile opens full-size with "← {title}" back.
 check: dot, title, subtitle, chips, stats, CONNECTED;
 "N photos" wall paged 48 at a time ("Show more (N left)");
 a tile opens full-size with "← {title}" and Esc back
+Not checked: needs the owner (window rule).
 
 ### `src/modules/loupe.ts`
 
@@ -1459,6 +1474,7 @@ ready handshake makes the main window resend.
 **Status:** built (#110: `crates/app/src/loupe/window.rs` `open`), awaiting the visual
 check: one 1280×800 window, opened or raised from More ⋯ or a module;
 shared entities replace the events and the ready handshake
+Not checked: needs the owner (window rule).
 
 ## Darkroom
 
@@ -1529,6 +1545,11 @@ Deliberate differences recorded in #112 (changes refused while a step/switch/for
 worker;
 undo with a pending change lands on H;
 the print is taken down on step/leave/switch).
+Visual check 2026-10-03 (#163): bar (Original/Version chips, rendering…, RAW badge, ◩
+Clipping toggle, Use as cover, + New version), version shelf, ToneStrip, actions, filmstrip
+and the whole rail seen on a RAW; 🖥 Loupe print not clicked (it opens the pop-out loupe,
+which needs the owner: window rule); Develop with the new engine and the error banner not
+reached.
 
 ### `src/components/darkroom/DevelopSurface.tsx`
 
@@ -1563,9 +1584,11 @@ Ignored with modifiers, while a proof sheet or duel is open, or in inputs.
 **Port ticket:** Darkroom stage
 
 **Status:** built (#111, #134: `DarkroomView::render_filmstrip` / `centre_strip` in
-`crates/app/src/darkroom/view.rs`), awaiting the visual check: ±40 window, current
+`crates/app/src/darkroom/view.rs`), visually checked 2026-10-03 (#163): ±40 window, current
 highlighted and centred, "<name> (i of N)", click steps (saves first), ←/→ guarded against
 modifiers, inputs and the proof/duel overlay, cover looks via `ImageStore::request_looks`.
+Seen 2026-10-03: the current frame highlighted and → stepping seen (eight frames do not
+overflow the strip, so centring was not exercised).
 
 ### `src/components/darkroom/filmstrip.ts`
 
@@ -1598,6 +1621,8 @@ double-click resets.
 **Status:** built (#111: `DarkroomView::render_tone_strip` +
 `chairphoto_model::darkroom::tone_strip`), awaiting the visual check: 8 zones filled by
 mass, drag ±2 EV at 60 px/EV, delta label, double-click resets.
+Visual check 2026-10-03 (#163): the 8 zones fill by mass and refill per photo; dragging not
+exercised.
 
 ### `src/components/EditControls.tsx`
 
@@ -1651,6 +1676,10 @@ B&W filters, split toning, LUT with "(missing)", Import…, amount;
 all 11 aspects;
 Output W × H.
 The dead `showBefore` is not ported (by design).
+Visual check 2026-10-03 (#163): ToneRail (Kelvin/Tint with K field), EffectsRail (B&W
+filters, Fade, Vignette, Grain, Split toning, LUT list with Import…), Crop & Rotate aspects,
+Overlay guides, Output W × H, Perspective and Straighten rails seen; stage zoom, crop
+handles and the level line not exercised. A long LUT name overflows the rail (#180).
 
 ### `src/components/darkroom/HistoryPanel.tsx`
 
@@ -1667,8 +1696,10 @@ empty-state text.
 **Port ticket:** Darkroom rails
 
 **Status:** built (#112: `DarkroomView::render_history` in
-`crates/app/src/darkroom/view/rails.rs`), awaiting the visual check: newest first, label +
+`crates/app/src/darkroom/view/rails.rs`), visually checked 2026-10-03 (#163): newest first, label +
 relative time, current/undone styling, click → `goto_step`, Ctrl+Z hint, empty state.
+Seen 2026-10-03: newest-first steps with dates and the empty state seen; click-to-step not
+exercised.
 
 ### `src/components/PresetBrowser.tsx`
 
@@ -1686,10 +1717,11 @@ User presets: ✎ rename modal, × delete (no confirm).
 **Port ticket:** Darkroom rails
 
 **Status:** built (#112: `DarkroomView::render_presets` in
-`crates/app/src/darkroom/view/rails.rs`), awaiting the visual check: collapsible, four
+`crates/app/src/darkroom/view/rails.rs`), visually checked 2026-10-03 (#163): collapsible, four
 categories, 320 px renders while open, active highlight, apply, ✎ rename (inline field
 rather than a modal;
 Enter/Esc), × delete.
+Seen 2026-10-03: four categories rendered at 320 px; apply, rename and delete not exercised.
 
 ### `src/components/darkroom/LensRail.tsx`
 
@@ -1703,8 +1735,9 @@ hint of what the file's tables fix (vignetting, distortion, CA) and their source
 **Port ticket:** Darkroom rails
 
 **Status:** built (#112: `DarkroomView::render_lens` +
-`chairphoto_model::darkroom::lens_rail`), awaiting the visual check: Correction on/off on
+`chairphoto_model::darkroom::lens_rail`), visually checked 2026-10-03 (#163): Correction on/off on
 the record's `lens.builtin`, hint of what the tables fix and their source.
+Seen 2026-10-03: "Correction off" with the Sony built-in tables hint.
 
 ### `src/components/darkroom/RenderedImage.tsx`
 
@@ -1718,9 +1751,10 @@ Used by presets, proof sheet and duel.
 **Port ticket:** Darkroom rails (images from Image layer)
 
 **Status:** built (#109, #112: `loupe::duel::variant_image` over
-`loupe::edit_renders::EditRenders`), awaiting the visual check;
+`loupe::edit_renders::EditRenders`), visually checked 2026-10-03 (#163);
 serves presets, proof sheet and duel.
 A failed render shows "—", as React did (#161: `variant_placeholder`).
+Seen 2026-10-03: through the preset tiles and the proof sheet.
 
 ### `src/components/darkroom/ProofSheet.tsx`
 
@@ -1736,11 +1770,13 @@ click adopts;
 **Port ticket:** Loupe (entry point in Darkroom rails)
 
 **Status:** built (#109, #112: `crates/app/src/loupe/proof_sheet.rs`, opened by
-`DarkroomView::open_proof_sheet`), awaiting the visual check: 320 px proofs with
+`DarkroomView::open_proof_sheet`), visually checked 2026-10-03 (#163): 320 px proofs with
 label/group, as-shot marked current, click adopts ("Proof: X"), ✕/backdrop/Esc close under
 its own `ProofSheet` key context.
 Deliberate keyboard difference recorded in #112 (Tab cycles, Enter/Space adopt the focused
 proof).
+Seen 2026-10-03: 12 proofs with labels and groups, As shot current, ✕/Esc close; adopting
+not exercised.
 
 ### `src/components/darkroom/DuelView.tsx`
 
@@ -1762,6 +1798,8 @@ hint "↓ same · Esc done".
 pills, two 1024 px variants, click or ← This one / This one →, ⑂ fork ("Kept as …"), "↓ same
 · Esc done";
 keys ←/→/↓/Esc under the `Duel` key context.
+Visual check 2026-10-03 (#163): bar, dimension pills and Esc match; the variants are cropped
+and the buttons sit over them (#178).
 
 ### `src/components/darkroom/GlSpike.tsx`
 
@@ -1968,7 +2006,7 @@ dialog `confirm`
 
 **Status:** built (#113: `crates/app/src/preferences/` — `storage.rs`, `tags.rs`,
 `editors.rs`, `appearance.rs`, `mod.rs`;
-#161: "Merge X away…"), awaiting the visual check: all five tabs plus one per enabled module
+#161: "Merge X away…"), visually checked 2026-10-03 (#163): all five tabs plus one per enabled module
 ("This module has no settings.");
 library root Set, Volumes, Safety, tiering (Save, Offload older now), Index existing NAS
 photos (Browse…, Enter indexes), Maintenance (confirm listing paths, Compact before →
@@ -1978,6 +2016,11 @@ last summary, Appearance per machine, "Merge X away…" opening the Tag panel's 
 over Preferences (live only while its tag is in the tag tree of the section's catalog;
 the section reports the merge with the Tag panel's `merge_summary` wording). dropped
 (decision: dev-only probe): GlSpike "Run WebGL probe" / `editor.glSpike.lastReport`.
+Seen 2026-10-03: every tab and the per-module tabs (AI Tagging, Obsidian, Map, Faces, Smart
+Tagging); Storage's Library, Volumes, Safety, tiering, Index existing NAS photos,
+Maintenance, Compact; Tags' three sections; Editors incl. RapidRAW and the Darkroom block;
+Appearance switching Standard ↔ Omarchy; no action button run. Checkbox labels oversized
+(#180).
 
 ### `src/components/SafetyPanel.tsx`
 
@@ -1996,6 +2039,7 @@ next steps and caveats.
 the visual check: At risk (oldest waiting), Edits not carried home, Unverified, Safe, No
 copy anywhere;
 "Show me" on At risk/Stale sets the storage-tier filter and closes Preferences.
+Visually checked 2026-10-03 (#163): the four buckets with counts and Show me.
 
 ### `src/components/ModulesPanel.tsx`
 
@@ -2014,12 +2058,14 @@ host enable/disable/grantPermissions/listModules (set_setting)
 **Port ticket:** Preferences (list, enable, requires, backend availability via Module trait)
 
 **Status:** built (#122: `crates/app/src/modules/panel.rs` `ModulesPanel`, Preferences →
-Modules in #113), awaiting the visual check: one row per compiled-in module with name,
+Modules in #113), visually checked 2026-10-03 (#163): one row per compiled-in module with name,
 description, "Requires:" (unmet marked), "backend … not included in this build", blocked
 reason, enabled checkbox;
 `modules.enabled`. dropped (decision: modules compiled-in, third-party JS dropped — #104):
 Installed/external modules, "external" badge, version, permission/network review,
 modules-directory hint, `modules.permissions`.
+Seen 2026-10-03: rows with descriptions, "Requires: LocalSend", "backend … not included in
+this build" for Flickr/SmugMug, enable toggles adding settings tabs.
 
 ## Storage and import
 
@@ -2066,11 +2112,12 @@ Add: name, base path (`~` expands), kind.
 **Port ticket:** Storage and import
 
 **Status:** built (#114: `crates/app/src/storage/volumes.rs` `VolumesPanel`, mounted in
-Preferences → Storage by #113), awaiting the visual check: name, kind, reachable/offline,
+Preferences → Storage by #113), visually checked 2026-10-03 (#163): name, kind, reachable/offline,
 base path;
 Remove behind a confirm except the library folder;
 Add with `~` expansion and kind;
 Enter adds.
+Seen 2026-10-03: the library-folder volume and the Add row; Add/Remove not exercised.
 
 ### `src/components/IdentityDebtPanel.tsx`
 
@@ -2109,6 +2156,8 @@ field, React's `rowHeight`) and the owed-IPTC list a `uniform_list`;
 only the rows on screen are built, and each row's buttons are built with it.
 Difference: the Resolve buttons stay on one line (no wrap, a 240 px column), as React's
 fixed row height assumed.
+Visual check 2026-10-03 (#163): summary, explanation, Start repair pass and the empty state
+seen; no debt in the isolated catalog, so the table and repair job were not exercised.
 
 ### `src/components/CatalogSwitcher.tsx`
 
@@ -2128,10 +2177,11 @@ App handles `catalog:switched`
 **Port ticket:** Storage and import
 
 **Status:** built (#114: `crates/app/src/storage/catalog_switcher.rs` `CatalogSwitcher`, the
-title bar's catalog pill), awaiting the visual check: recent catalogs (name, path, relative
+title bar's catalog pill), visually checked 2026-10-03 (#163): recent catalogs (name, path, relative
 last opened;
 click switches), New catalog (name, folder + Browse…, note, Create), busy and error;
 the folder expands `~` (React created a literal `~`).
+Seen 2026-10-03: recent catalogs and New catalog; switching and creating not exercised.
 
 ### `src/components/BatchesPanel.tsx`
 
@@ -2147,8 +2197,9 @@ click toggles the batch filter;
 **Port ticket:** Storage and import
 
 **Status:** built (#114: `crates/app/src/storage/batches.rs` `RootView::render_batches`),
-awaiting the visual check: label and count, click toggles the batch filter, ⬇ "Export as
+visually checked 2026-10-03 (#163): label and count, click toggles the batch filter, ⬇ "Export as
 bundle" per row, "No imports yet".
+Seen 2026-10-03: label, count and ⬇ export button in the sidebar; the bundle export not run.
 
 ### `src/components/BundleImportDialog.tsx`
 
@@ -2215,9 +2266,11 @@ clears the filter if active).
 **Port ticket:** Albums and export
 
 **Status:** built (#115: `crates/app/src/albums/panel.rs`, prompt `albums/prompt.rs`),
-awaiting the visual check: ＋ New album (inline name prompt), name toggles the filter, "+N"
+visually checked 2026-10-03 (#163): ＋ New album (inline name prompt), name toggles the filter, "+N"
 adds the selection, count, ⚙ Rename, ✕ Delete behind a confirm (clears an active filter),
 "No albums yet".
+Seen 2026-10-03: ＋ New album prompt, the new album's count, +N adding the selection, the
+filter chip; rename/delete not exercised; the +N sits off the row (#180).
 
 ### `src/components/SmartAlbumsPanel.tsx`
 
@@ -2260,10 +2313,12 @@ Save/Create.
 **Port ticket:** Albums and export
 
 **Status:** built (#115: `crates/app/src/albums/smart_editor.rs`, fields/operators
-`albums/rule.rs`), awaiting the visual check: name, AND-only rows over every listed field
+`albums/rule.rs`), visually checked 2026-10-03 (#163): name, AND-only rows over every listed field
 (grouped menu), field-specific operators, typed values (number, text, YYYY-MM-DD date,
 between pair, tag picker with counts, batch picker, enum), ✕ / "＋ Add condition", live count
 300 ms debounce, Save rule / Create then selects the album.
+Seen 2026-10-03: name, grouped field menu, Rating condition with a typed value and the live
+count (8 → 2); not saved.
 
 ### `src/components/ExportPanel.tsx`
 
@@ -2283,11 +2338,12 @@ Result: exported, skipped offline, failed.
 
 **Port ticket:** Albums and export
 
-**Status:** built (#115: `crates/app/src/export/panel.rs`), awaiting the visual check:
+**Status:** built (#115: `crates/app/src/export/panel.rs`), visually checked 2026-10-03 (#163):
 presets Hand-off / Show off with the version hint, destination default `~/Pictures/Export`
 (typed, not persisted), Reach hashtags (group, limit, live preview, Copy to the OS
 clipboard, `hashtags.txt`), "Export as bundle…" when a batch is the scope, result;
 adds Cancel.
+Seen 2026-10-03: presets, destination, Reach hashtags; no export run.
 
 ## Bundled modules
 
@@ -2354,6 +2410,9 @@ bulk cloud confirm, ✓/✓ all/✗/↳, groups, Re-run, Ask) and settings (per-
 URL/model/key, existing_only, min_confidence, prompt editor).
 Bodies in core `app::ai`.
 Difference: a cloud engine also needs its saved API key before any photo is sent.
+Visual check 2026-10-03 (#163): settings (engine, Ollama URL/model, Pick…, existing-only,
+min confidence, prompt editor) and the inspector panel (engine, model, Suggest tags, Region,
+Ask) seen; nothing sent to a provider.
 
 ### `src/modules/plugins/basicEditor.tsx`
 
@@ -2394,7 +2453,8 @@ Toolbar action "Make collage" ▦ → CollageDialog.
 **Port ticket:** Per-module ports (collage)
 
 **Status:** built (#125: `crates/app/src/modules/collage/mod.rs`, action "Make collage"),
-awaiting the visual check
+visually checked 2026-10-03 (#163)
+Seen 2026-10-03: "Make collage" in More ⋯ → Modules, and its fewer-than-2 message.
 
 ### `src/modules/plugins/CollageDialog.tsx`
 
@@ -2429,11 +2489,13 @@ wheel zooms a tile
 **Port ticket:** Per-module ports (collage)
 
 **Status:** built (#125: `crates/app/src/modules/collage/view.rs`, gestures in
-`chairphoto_model::collage`), awaiting the visual check.
+`chairphoto_model::collage`), visually checked 2026-10-03 (#163).
 Differences: the template menu is a row of chips, the colour input a hex field with
 swatches;
 every backend call is bound to the selection's catalog;
 a catalog switch closes the dialog.
+Seen 2026-10-03: templates, arrange controls, canvas with 8 tiles, aspect, width,
+background, border/radius, format, save target; not rendered.
 
 ### `src/modules/plugins/collageTemplates.ts`
 
@@ -2461,7 +2523,8 @@ Toolbar action "Make slideshow" ▶ → SlideshowDialog.
 **Port ticket:** Per-module ports (slideshow)
 
 **Status:** built (#125: `crates/app/src/modules/slideshow/mod.rs`, action "Make
-slideshow"), awaiting the visual check
+slideshow"), visually checked 2026-10-03 (#163)
+Seen 2026-10-03: "Make slideshow" in More ⋯ → Modules.
 
 ### `src/modules/plugins/SlideshowDialog.tsx`
 
@@ -2489,10 +2552,12 @@ get_thumbnail;
 **Port ticket:** Per-module ports (slideshow)
 
 **Status:** built (#125: `crates/app/src/modules/slideshow/view.rs`, options in
-`chairphoto_model::slideshow`), awaiting the visual check.
+`chairphoto_model::slideshow`), visually checked 2026-10-03 (#163).
 Differences: adds Cancel (a newer render or catalog switch also kills ffmpeg);
 progress always subscribed, so no indeterminate state;
 closing the dialog lets the render finish and reports on the status line.
+Seen 2026-10-03: photo order, duration, orientation/resolution, crossfade, Ken Burns, frame
+rate, output folder; not rendered.
 
 ### `src/modules/plugins/localsend.tsx`
 
@@ -2507,6 +2572,8 @@ Publish target "Device (LocalSend)" = SendToDevicePanel, records no publication.
 
 **Status:** built (#123: `crates/app/src/modules/localsend/mod.rs`, publish target "Device
 (LocalSend)"), awaiting the visual check
+Visual check 2026-10-03 (#163): only the publish target chip "Device (LocalSend)" was seen;
+the form was not opened, since showing it starts LAN discovery.
 
 ### `src/modules/plugins/SendToDevicePanel.tsx`
 
@@ -2556,6 +2623,8 @@ record_publication
 % preflight in `chairphoto_model::publishing`), awaiting the visual check.
 Difference: records a publication only for photos that reached the device (React recorded
 every selected one).
+Visual check 2026-10-03 (#163): only the publish target chip and "Requires: LocalSend" were
+seen; the form was not opened (LAN discovery).
 
 ### `src/modules/plugins/obsidian.tsx`
 
@@ -2582,6 +2651,8 @@ Keys `obsidian.vault`, `obsidian.folder`, `obsidian.note.<uuid>`, `obsidian.tagn
 URIs via `App::open_url`;
 writes bound by `CatalogIdentity`;
 settings validated.
+Visual check 2026-10-03 (#163): settings (vault, notes folder, Save) and the inspector
+"Create note in Obsidian" seen; not clicked (no Obsidian launch).
 
 ### `src/modules/plugins/publishing.tsx`
 
@@ -2640,6 +2711,8 @@ bodies in core `app::{oauth, flickr, uploads}`), awaiting the visual check.
 Registers without the opt-in `flickr` feature and is refused with the reason;
 the import is bound to the catalog it matched;
 Flickr thumbnails only from `*.staticflickr.com` over HTTPS, ≤ 1 MiB, no redirects.
+Visual check 2026-10-03 (#163): in the default build it lists as "backend “flickr” not
+included in this build" and cannot be enabled; its settings and import were not reachable.
 
 ### `src/modules/plugins/smugmug.tsx`
 
@@ -2658,6 +2731,8 @@ smugmug_list_albums, smugmug_create_album, post_to_smugmug
 `app::{oauth, smugmug, uploads}`), awaiting the visual check.
 Registers without the opt-in `smugmug` feature and is refused with the reason;
 the publish is a cancellable job.
+Visual check 2026-10-03 (#163): in the default build it lists as "backend “smugmug” not
+included in this build" and cannot be enabled.
 
 ### `src/modules/plugins/instagram.tsx`
 
@@ -2681,6 +2756,8 @@ behind `InstagramDriver`), awaiting the visual check.
 Differences: Cancel until Chrome has the render;
 the confirmation records the composed photo+version in its own catalog;
 Post is refused while a review is open.
+Visual check 2026-10-03 (#163): the Publish dialog's Instagram form (version, caption,
+publish-automatically, Post to Instagram) seen; nothing posted.
 
 ### `src/modules/plugins/faces.tsx`
 
@@ -2743,6 +2820,10 @@ Differences: `faces.showBoxes` in machine prefs;
 boxes hidden over an edited version's render;
 avatars uniformly scaled (React stretched);
 People writes wait while a match runs.
+Visual check 2026-10-03 (#163): settings (models ready, inference, speed, people root,
+threshold), the inspector block's empty state and the People view (tabs, empty state,
+Refresh) seen; indexing, matching and the loupe overlay not run (no faces indexed). The rail
+button has no icon (#173).
 
 ### `src/modules/plugins/map.tsx`
 
@@ -2792,6 +2873,10 @@ Changes: tiles ask per host, remembered per machine (`map.tileHosts`, decision #
 graticule until allowed;
 toasts are status lines.
 Not ported: spiderfy (dead in React: `clusterclick` was switched off).
+Visual check 2026-10-03 (#163), tiles blocked in the agent's prefs: cluster marker, Fences
+card, + / −, "N photos with GPS", "Map tiles off", the marker's filmstrip ("4 photos at this
+location", quiet select, Show in Library, ×) and the settings (tile URL, tile servers,
+reverse geocoding) seen; no tiles loaded, no geocoding run.
 
 ### `src/modules/plugins/smartTagging.tsx`
 
@@ -2827,6 +2912,8 @@ fails closed)
 MB), Index/Cancel with re-attach, Suggest, ✓/✗) and settings (model path, Train classifiers,
 Delete index);
 `smarttags:index_done` ends a run.
+Visual check 2026-10-03 (#163): settings (model ready, path, Save, Train classifiers, Delete
+index) and the inspector's Index/Suggest seen; no index run.
 
 ### `src/modules/plugins/statistics.tsx`
 
@@ -2863,6 +2950,9 @@ filters), lenses, focal/rating/ISO/aperture/shutter bars, cull survival, ≥ 4�
 keeper analysis, 16-scope cache cleared on switch.
 Differences: the timeline readout is the chart tooltip;
 grow-in animations and star-label tinting not ported.
+Visual check 2026-10-03 (#163): scope chip, cards, facts, timeline, clock, weekday bars,
+camera donut and list, top tags, lenses, focal bars seen; a one-month scope draws an empty
+timeline (#179); the rail button has no icon (#173).
 
 ### `src/modules/plugins/tagGraph.tsx`
 
@@ -2899,13 +2989,16 @@ Open loupe window and the `showInLoupe` mirror: [Pop-out loupe window][t110]
 
 **Status:** built (#121: `crates/app/src/modules/tag_graph/` view.rs/paint.rs/raster.rs over
 `chairphoto_model::tag_graph`;
-Open loupe window and the `show_in_loupe` mirror #110), awaiting the visual check:
+Open loupe window and the `show_in_loupe` mirror #110), visually checked 2026-10-03 (#163):
 Communities ring, breadcrumbs, toggles, communities list, link strength,
 zoom/pan/select/hover, legend, −/＋/Fit/Re-center, inspector actions (Focus on branch, Filter
 library, Isolate/Show all, top photos), Esc.
 Labels horizontal, edges soft while zooming ([#120][t120]). dropped (decision: [#120][t120],
 Communities only): Photo ↔ tag mode with Freeze layout, Thumbnails, node drag,
 `photo_tag_graph`.
+Seen 2026-10-03: node-type toggles, communities list, link strength, Communities ring,
+legend, −/＋/Fit/Re-center, a selected tag's card (chips, stats, connected, top photos) and
+its actions; Open loupe window not clicked (pop-out, needs the owner).
 
 ### `src/modules/plugins/tagGraphBundle.ts`
 

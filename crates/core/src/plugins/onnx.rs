@@ -198,7 +198,9 @@ pub fn ensure_available() -> Result<&'static str, String> {
 /// force-CPU settings are owned by each plugin. It returns whether its provider was
 /// registered, which is returned alongside the session so callers can report GPU-vs-CPU.
 /// Registering must never be fatal — a provider that fails to attach leaves the builder on
-/// CPU.
+/// CPU — and neither may building on it: a provider that registers but then fails the build
+/// (the CUDA provider attaches, then session creation fails on the GPU, #210) is dropped and
+/// the session built again on CPU ([`with_cpu_fallback`]), reported as not registered.
 #[cfg(any(feature = "faces", feature = "smarttags"))]
 pub fn build_session<F>(
     model_path: &std::path::Path,
@@ -209,15 +211,37 @@ where
     F: FnOnce(&mut ort::session::builder::SessionBuilder) -> bool,
 {
     ensure_available()?;
-    let mut builder = ort::session::Session::builder()
-        .map_err(|e| e.to_string())?
-        .with_intra_threads(intra_threads.max(1))
-        .map_err(|e| e.to_string())?;
-    let registered = register_ep(&mut builder);
-    let session = builder
-        .commit_from_file(model_path)
-        .map_err(|e| e.to_string())?;
-    Ok((session, registered))
+    let mut register_ep = Some(register_ep);
+    with_cpu_fallback(|try_ep| {
+        let builder = ort::session::Session::builder()
+            .map_err(|e| e.to_string())
+            .and_then(|b| b.with_intra_threads(intra_threads.max(1)).map_err(|e| e.to_string()));
+        let mut builder = match builder {
+            Ok(b) => b,
+            Err(e) => return (Err(e), false),
+        };
+        let registered = try_ep && register_ep.take().is_some_and(|register| register(&mut builder));
+        (builder.commit_from_file(model_path).map_err(|e| e.to_string()), registered)
+    })
+}
+
+/// Build with the execution provider, and once more without it when a build that registered
+/// it fails. `attempt(try_ep)` builds a session — registering the provider only when `try_ep`
+/// — and answers the outcome with whether the provider registered. A build that fails with
+/// nothing registered fails as it is: the provider is not why, and a CPU retry would fail the
+/// same way. Returns the value and whether it runs on the provider.
+#[cfg(any(feature = "faces", feature = "smarttags"))]
+pub fn with_cpu_fallback<S>(
+    mut attempt: impl FnMut(bool) -> (Result<S, String>, bool),
+) -> Result<(S, bool), String> {
+    match attempt(true) {
+        (Ok(session), registered) => Ok((session, registered)),
+        (Err(e), true) => {
+            eprintln!("onnx: the session did not build on its execution provider ({e}); building it on CPU");
+            attempt(false).0.map(|session| (session, false))
+        }
+        (Err(e), false) => Err(e),
+    }
 }
 
 // ── Keyed session-pool cache (issue #18) ────────────────────────────────────────
@@ -391,6 +415,44 @@ mod tests {
             err.contains("OrtGetApiBase"),
             "error should name the missing symbol, got: {err}"
         );
+    }
+
+    // ── The CPU fallback of a provider that fails the build (#210) ─────────────
+    //
+    // The policy with a fake builder: no GPU, no runtime. Each attempt records whether it
+    // was allowed the provider.
+
+    /// The provider registers but the build fails (CUDA attached, the GPU session did not
+    /// build): built again without it, on CPU, and reported as CPU.
+    #[cfg(any(feature = "faces", feature = "smarttags"))]
+    #[test]
+    fn a_build_that_fails_on_its_provider_is_retried_on_cpu() {
+        let mut tries = Vec::new();
+        let got = with_cpu_fallback(|try_ep| {
+            tries.push(try_ep);
+            if try_ep { (Err("CUDA failure 100: no CUDA-capable device".to_string()), true) } else { (Ok("cpu"), false) }
+        });
+        assert_eq!(got, Ok(("cpu", false)));
+        assert_eq!(tries, [true, false]);
+    }
+
+    /// A build on the provider that works is kept; a failure with nothing registered is not
+    /// retried (CPU is what failed); a CPU retry that fails too reports its own error.
+    #[cfg(any(feature = "faces", feature = "smarttags"))]
+    #[test]
+    fn only_a_failure_on_the_provider_is_retried() {
+        let mut tries = Vec::new();
+        assert_eq!(with_cpu_fallback(|t| { tries.push(t); (Ok("gpu"), true) }), Ok(("gpu", true)));
+        assert_eq!(tries, [true]);
+
+        let mut tries = Vec::new();
+        let got: Result<(&str, bool), String> = with_cpu_fallback(|t| { tries.push(t); (Err("bad model".into()), false) });
+        assert_eq!(got, Err("bad model".to_string()));
+        assert_eq!(tries, [true], "no provider registered: no retry");
+
+        let got: Result<(&str, bool), String> =
+            with_cpu_fallback(|t| (Err(if t { "on gpu" } else { "on cpu" }.to_string()), t));
+        assert_eq!(got, Err("on cpu".to_string()));
     }
 
     // ── KeyedCache (issue #18) ──────────────────────────────────────────────────

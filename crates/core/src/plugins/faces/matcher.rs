@@ -153,6 +153,9 @@ pub enum MatchPhase {
     Constrained,
     Open,
     Cluster,
+    /// After the pipeline: the match job writes the face regions of the photos this run
+    /// seeded (#210, `app::faces::matching`). The matcher itself never reports it.
+    Regions,
 }
 
 impl MatchPhase {
@@ -162,6 +165,7 @@ impl MatchPhase {
             MatchPhase::Constrained => "matching tagged photos",
             MatchPhase::Open => "matching known people",
             MatchPhase::Cluster => "clustering unknowns",
+            MatchPhase::Regions => "writing face regions",
         }
     }
 }
@@ -214,6 +218,19 @@ pub fn run_matching_with_progress(
     now: i64,
     progress: MatchProgress,
 ) -> rusqlite::Result<MatchOutcome> {
+    run_matching_seeded(conn, settings, now, progress).map(|(outcome, _)| outcome)
+}
+
+/// [`run_matching_with_progress`], also returning the photos whose face this run's auto-seed
+/// confirmed (one face each), in candidate order: the match job writes their face regions
+/// once the pipeline is done (#210). Every other step only suggests or clusters, which no
+/// sidecar records.
+pub fn run_matching_seeded(
+    conn: &Connection,
+    settings: &MatchSettings,
+    now: i64,
+    progress: MatchProgress,
+) -> rusqlite::Result<(MatchOutcome, Vec<i64>)> {
     super::store::ensure_schema(conn)?;
 
     let mut outcome = MatchOutcome::default();
@@ -237,9 +254,10 @@ pub fn run_matching_with_progress(
     let person_tags = person_tag_ids(conn, &settings.people_root)?;
 
     // Step 1 — auto-seed.
-    outcome.seeded = auto_seed(conn, &person_tags, now, progress)?;
+    let seeded = auto_seed(conn, &person_tags, now, progress)?;
+    outcome.seeded = seeded.len();
     if cancelled.get() {
-        return Ok(outcome);
+        return Ok((outcome, seeded));
     }
 
     // Clear stale suggestions/cluster assignments so the run is idempotent and never stacks
@@ -269,7 +287,7 @@ pub fn run_matching_with_progress(
             progress,
         )?;
         if cancelled.get() {
-            return Ok(outcome);
+            return Ok((outcome, seeded));
         }
 
         // Step 4 — open matching: nearest centroid above threshold for the remainder.
@@ -283,7 +301,7 @@ pub fn run_matching_with_progress(
             progress,
         )?;
         if cancelled.get() {
-            return Ok(outcome);
+            return Ok((outcome, seeded));
         }
     }
 
@@ -291,7 +309,7 @@ pub fn run_matching_with_progress(
     outcome.clustered =
         cluster_leftovers(conn, &pending, settings.threshold, &resolved, now, progress)?;
 
-    Ok(outcome)
+    Ok((outcome, seeded))
 }
 
 // ── Person-tag resolution ───────────────────────────────────────────────────────
@@ -341,15 +359,16 @@ fn photo_person_tags(
 
 /// Auto-seed: a photo with **exactly one** detected face and **exactly one** assigned person
 /// tag becomes a confirmed seed for that person. Skips photos already carrying a confirmed/
-/// ignored/manual face (idempotent), and honours rejection memory. Returns the seed count.
+/// ignored/manual face (idempotent), and honours rejection memory. Returns the photos it
+/// seeded (one face each).
 fn auto_seed(
     conn: &Connection,
     person_tags: &std::collections::HashSet<i64>,
     now: i64,
     progress: MatchProgress,
-) -> rusqlite::Result<usize> {
+) -> rusqlite::Result<Vec<i64>> {
     if person_tags.is_empty() {
-        return Ok(0);
+        return Ok(Vec::new());
     }
 
     // Candidate photos: exactly one face row, and that face is still unassigned (not already
@@ -365,9 +384,9 @@ fn auto_seed(
         .collect::<rusqlite::Result<_>>()?;
 
     if !progress(MatchPhase::Seed, 0, candidates.len()) {
-        return Ok(0);
+        return Ok(Vec::new());
     }
-    let mut seeded = 0usize;
+    let mut seeded = Vec::new();
     for (done, &(photo_id, face_id)) in candidates.iter().enumerate() {
         if !progress(MatchPhase::Seed, done + 1, candidates.len()) {
             break;
@@ -386,7 +405,7 @@ fn auto_seed(
 
         let _ = now; // seeds carry no created_at rewrite; timestamp reserved for future audit.
         if write_seed(conn, face_id, tag_id)? {
-            seeded += 1;
+            seeded.push(photo_id);
         }
     }
     Ok(seeded)

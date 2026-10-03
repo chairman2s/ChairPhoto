@@ -105,6 +105,14 @@ and again at the next phase boundary, and a catalog switch stops it the same way
 stop, not a rollback: the pass is idempotent, so suggestions already written stay and a re-run
 recomputes the rest.
 
+Auto-seeding confirms faces, so the run ends by writing the face regions of the photos it seeded
+(#210; phase "writing face regions"), through the face verbs' own write — merge-safe, backed up
+before ChairPhoto's first write to a sidecar, refused where the sidecar's frame cannot hold the
+boxes. It runs on the job's own connection and reads each photo's set under the sidecar's file
+lock, so a face verb writing the same sidecar meanwhile is ordered with it. A cancel or a switch
+stops it at the next photo; a photo it did not reach, or that was offline, keeps its seed out of
+the sidecar until the next face write for that photo, as do seeds of runs before #210.
+
 ## Indexing
 
 A background worker with its own catalog connection, bounded parallelism,
@@ -313,7 +321,8 @@ full current confirmed set right after the verb, so the sidecar stays in sync. T
 writes only the photos it actually changed, after its transaction commits: a sidecar that cannot
 be written (offline volume) must not roll back a confirmation the catalog already recorded. An
 offline photo's write is skipped, not queued: its sidecar catches up at the next face write for
-that photo.
+that photo. The matching job writes the photos its auto-seed confirmed when it ends (see
+"Seeding and matching").
 
 **Reads** happen during indexing: existing `mwg-rs:Regions` are parsed and IoU-matched
 (≥ 0.5, greedy best-first, one-to-one) against the photo's still-unassigned detections. A named
@@ -366,8 +375,19 @@ enables `ort/cuda`. Off by default so the standard build stays CPU-only and port
 explicitly per session (`engine::try_register_cuda`) rather than through
 `with_execution_providers`, precisely so a registration failure is observable. If the runtime,
 driver, GPU or **cuDNN 9** is missing, registration returns an error, the reason is logged, and
-inference continues on CPU. `engine::active_ep()` reports where inference actually ran, so the UI
-can be honest about it.
+inference continues on CPU. A provider that registers but whose session then fails to build is
+dropped and the session built again on CPU (`onnx::with_cpu_fallback`, #210), so indexing does
+not fail on it. `engine::active_ep()` reports where inference actually ran, so the UI can be
+honest about it.
+
+A session build on CUDA runs under a **crash marker** (`crash_marker`, kind `onnx-cuda-session`):
+native CUDA init can take the process down rather than return an error. After two such crashes
+with the same ONNX Runtime and NVIDIA driver versions (the subject, read from
+`/proc/driver/nvidia/version`), CUDA is skipped and sessions build on CPU until either version
+changes; a clean build clears the strikes. Inference itself is not under the marker — a marker
+write per face would put file I/O on the hot path, and the documented failure is CUDA's init.
+A cuDNN repair alone does not change the subject: clearing the app data's `crash-markers/`
+retries CUDA.
 
 Setting `faces.force_cpu = "true"` skips CUDA registration even in a `faces-cuda` build — useful
 when the GPU is needed elsewhere or to compare the two directly.

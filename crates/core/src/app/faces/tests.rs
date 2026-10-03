@@ -1200,6 +1200,125 @@ fn a_decision_made_during_a_match_run_is_never_overwritten() {
     }
 }
 
+// --- the matching job's seeds reach the sidecar (#210) --------------------------------------
+
+/// A photo with one detected face and one person tag (Alice): the run seeds it.
+fn seed_candidate(c: &Catalog, root: &std::path::Path, name: &str, alice: i64) -> i64 {
+    let p = add_photo(c, root, name);
+    add_face(c, p, "[0.1,0.1,0.2,0.2]");
+    c.assign_tag(p, alice).unwrap();
+    p
+}
+
+/// The seeded faces' regions are written at the end of the run, through the face verbs' own
+/// write: into a foreign sidecar, kept and backed up first; into a new sidecar; and not into
+/// one whose declared frame cannot hold the boxes (left byte for byte). A suggestion is not
+/// exported. The write reports its own phase while the job owns its slot.
+#[test]
+fn the_match_job_writes_the_faces_it_seeded() {
+    let (c, root) = temp_catalog("match-seed-regions");
+    let alice = c.create_tag("People/Alice").unwrap();
+    let foreign = seed_candidate(&c, &root, "foreign.NEF", alice);
+    seed_foreign_sidecar(&root.join("foreign.NEF"));
+    let fresh = seed_candidate(&c, &root, "fresh.NEF", alice);
+    let square = seed_candidate(&c, &root, "square.NEF", alice);
+    // Turned a quarter, stored 6000×4000, but the sidecar declares a square frame: refused.
+    c.conn()
+        .execute("UPDATE photos SET exif_orientation = 6, width = 6000, height = 4000 WHERE id = ?1", [square])
+        .unwrap();
+    let square_xml = r#"<x:xmpmeta xmlns:x="adobe:ns:meta/"><rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"><rdf:Description rdf:about="" xmlns:mwg-rs="http://www.metadataworkinggroup.com/schemas/regions/" xmlns:stDim="http://ns.adobe.com/xap/1.0/sType/Dimensions#"><mwg-rs:Regions rdf:parseType="Resource"><mwg-rs:AppliedToDimensions stDim:w="5000" stDim:h="5000" stDim:unit="pixel"/><mwg-rs:RegionList><rdf:Bag/></mwg-rs:RegionList></mwg-rs:Regions></rdf:Description></rdf:RDF></x:xmpmeta>"#;
+    std::fs::write(crate::xmp::sidecar_path(&root.join("square.NEF")), square_xml).unwrap();
+    // Two faces: not a seed, only suggested (Alice's centroid needs an embedding: none here).
+    let two = add_photo(&c, &root, "two.NEF");
+    add_face(&c, two, "[0.1,0.1,0.2,0.2]");
+    add_face(&c, two, "[0.5,0.1,0.2,0.2]");
+
+    let state = state_with(c);
+    let claim = begin_match_job(&state, None).unwrap();
+    let recorder = MatchRecorder { state: state.clone(), seen: Default::default() };
+    run_match_job(&recorder, claim);
+
+    let seen = recorder.seen.lock().unwrap();
+    let CoreEvent::FacesMatchDone(d) = &seen.last().unwrap().2 else { panic!("the end") };
+    assert!(d.ok, "{d:?}");
+    assert_eq!(d.outcome.as_ref().map(|o| o.seeded), Some(3));
+    let writing: Vec<(usize, usize, bool)> = seen
+        .iter()
+        .filter_map(|(_, busy, e)| match e {
+            CoreEvent::FacesMatchProgress(p) if p.phase == matcher::MatchPhase::Regions.label() => Some((p.done, p.total, *busy)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(writing.first(), Some(&(0, 3, true)), "{writing:?}");
+    assert_eq!(writing.last(), Some(&(3, 3, true)), "{writing:?}");
+    drop(seen);
+
+    let guard = state.catalog.lock().unwrap();
+    let c = guard.as_ref().unwrap();
+    assert_foreign_kept(&root.join("foreign.NEF"), &["Alice"]);
+    let backup = root.join("foreign.NEF.xmp.chairphoto-backup");
+    assert!(backup.exists(), "the foreign sidecar is backed up before ChairPhoto's first write");
+    seed_foreign_sidecar(&root.join("original.NEF"));
+    assert_eq!(std::fs::read(&backup).unwrap(), std::fs::read(root.join("original.NEF.xmp")).unwrap(), "as it was");
+    let names = |name: &str| -> Vec<String> {
+        crate::xmp::read_face_regions(&root.join(name)).into_iter().map(|r| r.name).collect()
+    };
+    assert_eq!(names("fresh.NEF"), ["Alice"]);
+    assert_eq!(
+        std::fs::read_to_string(crate::xmp::sidecar_path(&root.join("square.NEF"))).unwrap(),
+        square_xml,
+        "a frame the boxes cannot be placed in: refused, untouched"
+    );
+    assert!(!crate::xmp::sidecar_path(&root.join("two.NEF")).exists(), "nothing confirmed there, nothing written");
+    assert_consistent(c, &root, fresh, "fresh.NEF");
+    assert_eq!(faces_for_photo(c, foreign).unwrap()[0].state, "confirmed");
+}
+
+/// A cancel or a catalog switch during the write stops it at the next photo: the photo in
+/// flight is written, the rest are not, and the run still ends with its one terminal event.
+#[test]
+fn the_seeded_regions_write_stops_on_a_cancel_or_a_switch() {
+    for switch in [false, true] {
+        let (c, root) = temp_catalog(if switch { "match-seed-switch" } else { "match-seed-cancel" });
+        let alice = c.create_tag("People/Alice").unwrap();
+        let names = ["s1.NEF", "s2.NEF", "s3.NEF"];
+        for name in names {
+            seed_candidate(&c, &root, name, alice);
+        }
+        let state = state_with(c);
+        let claim = begin_match_job(&state, None).unwrap();
+
+        struct StopAtWrite {
+            state: AppState,
+            switch: bool,
+            done: std::sync::Mutex<Option<FacesMatchDone>>,
+        }
+        impl EventSink for StopAtWrite {
+            fn send(&self, event: CoreEvent) {
+                match event {
+                    CoreEvent::FacesMatchProgress(p) if p.phase == matcher::MatchPhase::Regions.label() && p.done == 0 => {
+                        if self.switch {
+                            detach_catalog_and_trip_jobs(&self.state).unwrap();
+                        } else {
+                            cancel_match(&self.state).unwrap();
+                        }
+                    }
+                    CoreEvent::FacesMatchDone(d) => *self.done.lock().unwrap() = Some(d),
+                    _ => {}
+                }
+            }
+        }
+        let sink = StopAtWrite { state: state.clone(), switch, done: Default::default() };
+        run_match_job(&sink, claim);
+
+        let done = sink.done.lock().unwrap().take().expect("the run ended");
+        assert!(done.aborted && !done.ok, "switch={switch}: {done:?}");
+        let written: Vec<&str> =
+            names.into_iter().filter(|n| crate::xmp::sidecar_path(&root.join(n)).exists()).collect();
+        assert_eq!(written.len(), 1, "switch={switch}: only the photo in flight: {written:?}");
+    }
+}
+
 // --- the People view's verbs (#130) ---------------------------------------------------------
 
 fn put_in_cluster(c: &Catalog, face: i64, cluster: i64) {

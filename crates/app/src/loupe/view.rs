@@ -47,10 +47,10 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::rc::Rc;
 
-/// How far the loupe preloads ahead and behind (React prefetched +1…+5, −1, −2).
 /// The loupe's button for a video (decision #97: poster frame + the system player).
 pub const PLAY_LABEL: &str = "▶ Play in system player";
 
+/// How far the loupe preloads ahead and behind (React prefetched +1…+5, −1, −2).
 pub const PRELOAD_AHEAD: usize = 5;
 pub const PRELOAD_BEHIND: usize = 2;
 

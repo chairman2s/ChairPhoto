@@ -126,8 +126,14 @@ impl RootView {
             this.update(cx, |this, cx| match result {
                 Ok(s) => {
                     // Gone from the library: unselected now, before the refresh lands, so the
-                    // next rating or flag key cannot reach them.
-                    this.shell.update(cx, |sh, cx| sh.select_with(cx, |l| l.unselect(&ids_done)));
+                    // next rating or flag key cannot reach them — but only while the rows shown
+                    // are still the catalog this trash was bound to. A delivered switch since
+                    // means `ids_done` name another (unrelated) catalog's colliding ids now
+                    // (#193): unselecting them would touch that catalog's selection for no
+                    // reason of its own.
+                    if this.shell.read(cx).rows_from() == Some(from) {
+                        this.shell.update(cx, |sh, cx| sh.select_with(cx, |l| l.unselect(&ids_done)));
+                    }
                     let extra = if s.cascaded > 0 { format!(" (+{} stacked)", s.cascaded) } else { String::new() };
                     this.photo_status(format!("Moved {} to the trash{extra}.", s.trashed), cx);
                     this.photos_changed(cx);
@@ -177,8 +183,17 @@ impl RootView {
             let result = rx.await.unwrap_or_else(|_| Err("the relocate worker stopped".into()));
             this.update(cx, |this, cx| match result {
                 Ok(()) => {
-                    this.images.update(cx, |s, cx| s.invalidate(id, cx));
-                    this.photos_changed(cx);
+                    // The relocate itself is bound to `from` and already failed closed if
+                    // another catalog opened meanwhile (`storage::relocate_photo`); this is
+                    // only the success arm's own UI side effects. If the rows shown have since
+                    // moved to another catalog (a delivered switch), `id` now names that
+                    // catalog's own, unrelated photo (#193) — invalidating its images and
+                    // refreshing a view this relocate never touched would be acting on it for
+                    // no reason of its own.
+                    if this.shell.read(cx).rows_from() == Some(from) {
+                        this.images.update(cx, |s, cx| s.invalidate(id, cx));
+                        this.photos_changed(cx);
+                    }
                     this.photo_status("Photo relocated to its new file.".into(), cx);
                 }
                 Err(e) => this.photo_status(format!("Couldn't relocate: {e}"), cx),
@@ -197,8 +212,13 @@ impl RootView {
             let result = rx.await.unwrap_or_else(|_| Err("the retrieve worker stopped".into()));
             this.update(cx, |this, cx| match result {
                 Ok(()) => {
-                    this.images.update(cx, |s, cx| s.invalidate(id, cx));
-                    this.photos_changed(cx);
+                    // As relocate's success arm (#193): the restore itself is bound to `from`
+                    // and already fails closed across a switch; this only keeps the UI side
+                    // effects off a view that has since moved to another (unrelated) catalog.
+                    if this.shell.read(cx).rows_from() == Some(from) {
+                        this.images.update(cx, |s, cx| s.invalidate(id, cx));
+                        this.photos_changed(cx);
+                    }
                     this.photo_status("Retrieved from NAS.".into(), cx);
                 }
                 Err(e) => this.photo_status(format!("Couldn't retrieve from NAS: {e}"), cx),
@@ -246,7 +266,12 @@ impl RootView {
             let result = run.await;
             this.update(cx, |this, cx| match result {
                 Ok(()) => {
-                    this.shell.update(cx, |sh, cx| sh.select_with(cx, |l| l.unselect(&[id])));
+                    // As trash's unselect (#193): only while the rows shown are still the
+                    // catalog this remove was bound to, so `id` names the photo actually
+                    // removed, not another catalog's colliding one.
+                    if this.shell.read(cx).rows_from() == Some(from) {
+                        this.shell.update(cx, |sh, cx| sh.select_with(cx, |l| l.unselect(&[id])));
+                    }
                     this.photos_changed(cx);
                     this.photo_status("Removed from catalog (files left untouched).".into(), cx);
                 }

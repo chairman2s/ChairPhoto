@@ -2,7 +2,8 @@
 //!
 //! Every release before #138 wrote sidecars through `xmltree` 0.11, which keys attributes by
 //! local name and writes them back unprefixed. A sidecar such a release rewrote carries
-//! `parseType="Resource"` for `rdf:parseType`, `about=""` for `rdf:about`, and the MWG struct
+//! `parseType="Resource"` for `rdf:parseType`, `about` for `rdf:about` (next to an empty
+//! `rdf:about` the writer then inserted, see [`drop_shadowed_about`]), and the MWG struct
 //! fields of an attribute-form `AppliedToDimensions` / `Area` (`w="6000"`, `x="0.5"`) in no
 //! namespace. The face-region reader and writer then see no struct at all: every face write on
 //! the photo is refused ("mwg-rs:Regions is not a struct") and import reads no regions
@@ -12,7 +13,7 @@
 //!
 //! | Unprefixed attribute | On | Becomes |
 //! |---|---|---|
-//! | `about` | `rdf:Description` | `rdf:about` |
+//! | `about` | `rdf:Description` | `rdf:about` (replacing an empty or equal `rdf:about`) |
 //! | `parseType` | a property element or `rdf:li` | `rdf:parseType` |
 //! | `w`, `h`, `unit` | `mwg-rs:AppliedToDimensions` (or its one nested `rdf:Description`) | `stDim:w`, `stDim:h`, `stDim:unit` |
 //! | `x`, `y`, `w`, `h`, `unit` | `mwg-rs:Area` (or its one nested `rdf:Description`) | `stArea:x` … `stArea:unit` |
@@ -33,7 +34,7 @@
 use xmltree::{Element, Namespace, XMLNode};
 use super::dom::{child, is_rdf, prefix_for_ns};
 use super::ns::{NS_MWG_RS, NS_RDF, NS_STAREA, NS_STDIM};
-use super::parse::ns_attr;
+use super::parse::{attr_is, ns_attr};
 
 /// Restore the prefixes a pre-#138 ChairPhoto writer dropped under `rdf` (see the module docs),
 /// in place. `Ok(true)` when anything was repaired, `Ok(false)` when nothing needed it, `Err`
@@ -60,6 +61,7 @@ fn repaired(rdf: &Element) -> Result<Option<Element>, String> {
 /// Repair `e` (a node element or property element below `rdf:RDF`) and everything under it.
 fn repair_node(e: &mut Element, count: &mut usize) -> Result<(), String> {
     if is_rdf(e, "Description") {
+        drop_shadowed_about(e, count)?;
         restore(e, "about", NS_RDF, "rdf", count)?;
     } else if !is_rdf(e, "Bag") && !is_rdf(e, "Seq") && !is_rdf(e, "Alt") {
         restore(e, "parseType", NS_RDF, "rdf", count)?;
@@ -91,6 +93,28 @@ fn repair_node(e: &mut Element, count: &mut usize) -> Result<(), String> {
             repair_node(c, count)?;
         }
     }
+    Ok(())
+}
+
+/// The released writers parsed with xmltree (turning `rdf:about` into `about`) and then ensured
+/// `rdf:about` with `entry("rdf:about").or_insert("")`, so every Description they rewrote carries
+/// both: `about` with the original value, `rdf:about=""` (#143 review, H1). When `rdf:about` is
+/// empty or equal to `about`, the pair is that writer's: keep the original value as `rdf:about`
+/// and drop `about`. Two different non-empty values are not its shape, and are ambiguous.
+fn drop_shadowed_about(e: &mut Element, count: &mut usize) -> Result<(), String> {
+    let Some(original) = e.attributes.get("about").cloned() else {
+        return Ok(());
+    };
+    let Some(key) = e.attributes.keys().find(|k| attr_is(e, k, NS_RDF, "about")).cloned() else {
+        return Ok(());
+    };
+    let inserted = &e.attributes[&key];
+    if !inserted.is_empty() && *inserted != original {
+        return Err(format!("rdf:Description has about={original:?} and rdf:about={inserted:?}"));
+    }
+    e.attributes.remove("about");
+    e.attributes.insert(key, original);
+    *count += 1;
     Ok(())
 }
 
@@ -130,15 +154,16 @@ mod tests {
 
     const NS_DARKTABLE: &str = "http://darktable.sf.net/";
 
-    /// The shape the face-regions review (R4) produced by running xmltree 0.11's parse + write
-    /// — what every pre-#138 writer did — over a sidecar with regions: every attribute prefix
-    /// dropped. Bob is digiKam's region (attribute-form Area, with a `digiKam:Confidence` that
-    /// lost its prefix too), Ann the pre-marker ChairPhoto writer's, darktable's history is
-    /// foreign, and `chairphoto:LastWrite` (an element) survived.
+    /// The damage a released pre-#138 writer did, written by hand (the other fixtures are made
+    /// by running that writer's own sequence, [`released_rewrite`]): every attribute prefix
+    /// dropped, and `rdf:about` both turned into `about` and inserted again, empty. Bob is
+    /// digiKam's region (attribute-form Area, with a `digiKam:Confidence` that lost its prefix
+    /// too), Ann the pre-marker ChairPhoto writer's, darktable's history is foreign, and
+    /// `chairphoto:LastWrite` (an element) survived.
     const DAMAGED: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
 <x:xmpmeta xmlns:x="adobe:ns:meta/">
  <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
-  <rdf:Description about=""
+  <rdf:Description about="" rdf:about=""
     xmlns:darktable="http://darktable.sf.net/"
     xmlns:chairphoto="https://chairphoto.local/ns/1.0/"
     xmlns:mwg-rs="http://www.metadataworkinggroup.com/schemas/regions/"
@@ -173,6 +198,32 @@ mod tests {
   </rdf:Description>
  </rdf:RDF>
 </x:xmpmeta>"#;
+
+    /// [`DAMAGED`] as it was before a released build rewrote it.
+    fn intact() -> String {
+        DAMAGED
+            .replace(r#"about="" rdf:about="""#, r#"rdf:about="""#)
+            .replace(r#"parseType="Resource""#, r#"rdf:parseType="Resource""#)
+            .replace(r#"w="6000" h="4000" unit="pixel""#, r#"stDim:w="6000" stDim:h="4000" stDim:unit="pixel""#)
+            .replace(
+                r#"x="0.8" y="0.7" w="0.1" h="0.2" unit="normalized" Confidence="87""#,
+                r#"stArea:x="0.8" stArea:y="0.7" stArea:w="0.1" stArea:h="0.2" stArea:unit="normalized" digiKam:Confidence="87""#,
+            )
+    }
+
+    /// What one write by a released pre-#138 build did to `xml` (v2026.8.0
+    /// `src-tauri/src/xmp/mod.rs:66-75`): `xmltree` 0.11's parse (attribute keys by local name),
+    /// `rdf:about` ensured on the first Description with `entry(..).or_insert_with(String::new)`,
+    /// and `xmltree`'s write.
+    fn released_rewrite(xml: &str) -> String {
+        let mut root = xmltree::Element::parse(xml.as_bytes()).unwrap();
+        let rdf = root.get_mut_child("RDF").unwrap();
+        let desc = rdf.get_mut_child("Description").unwrap();
+        desc.attributes.entry("rdf:about".to_string()).or_insert_with(String::new);
+        let mut out = Vec::new();
+        root.write(&mut out).unwrap();
+        String::from_utf8(out).unwrap()
+    }
 
     fn carl() -> FaceRegion {
         FaceRegion { face_id: 7, name: "Carl".into(), bbox: (0.5, 0.1, 0.1, 0.15) }
@@ -220,37 +271,51 @@ mod tests {
         assert_eq!(backup, DAMAGED);
     }
 
-    /// The same, with the damage done the way R4 did it: the intact sidecar run through
-    /// `xmltree` 0.11's own parse + write, as every pre-#138 writer did, rather than by hand.
+    /// The same, with the damage made by the released writer's own sequence ([`released_rewrite`])
+    /// once and twice, the way the review's probe r1/r1b made it: `about=""` next to an empty
+    /// `rdf:about` (#143 review, H1).
     #[test]
-    fn a_face_write_repairs_what_xmltree_0_11_wrote() {
-        let intact = DAMAGED
-            .replace(r#"about="""#, r#"rdf:about="""#)
-            .replace(r#"parseType="Resource""#, r#"rdf:parseType="Resource""#)
-            .replace(r#"w="6000" h="4000" unit="pixel""#, r#"stDim:w="6000" stDim:h="4000" stDim:unit="pixel""#)
-            .replace(
-                r#"x="0.8" y="0.7" w="0.1" h="0.2" unit="normalized" Confidence="87""#,
-                r#"stArea:x="0.8" stArea:y="0.7" stArea:w="0.1" stArea:h="0.2" stArea:unit="normalized" digiKam:Confidence="87""#,
-            );
-        let mut damaged = Vec::new();
-        xmltree::Element::parse(intact.as_bytes()).unwrap().write(&mut damaged).unwrap();
-        let damaged = String::from_utf8(damaged).unwrap();
-        assert!(!damaged.contains("rdf:parseType") && damaged.contains(r#" parseType="Resource""#), "{damaged}");
+    fn a_face_write_repairs_what_a_released_build_wrote() {
+        let once = released_rewrite(&intact());
+        let twice = released_rewrite(&once);
+        for (case, damaged) in [("once", once), ("twice", twice)] {
+            assert!(!damaged.contains("rdf:parseType") && damaged.contains(r#" parseType="Resource""#), "{damaged}");
+            assert!(damaged.contains(r#" about="""#) && damaged.contains(r#"rdf:about="""#), "{damaged}");
 
-        let (_dir, photo) = seeded_photo("xmp-143-xmltree", &damaged);
+            let (_dir, photo) = seeded_photo(&format!("xmp-143-released-{case}"), &damaged);
+            write_face_regions(&photo, CAT, &[carl()], &[], &[], sized(6000, 4000)).unwrap();
+
+            let xml = read(&sidecar_path(&photo));
+            let read_back = mwg(&xml);
+            assert_eq!(read_back.dims, [Some(("6000".to_string(), "4000".to_string()))], "{case}: {xml}");
+            assert_eq!(named(&read_back, "Bob")[0].area, (0.8, 0.7, 0.1, 0.2), "{case}: {xml}");
+            assert_eq!(named(&read_back, "Ann")[0].area, (0.25, 0.35, 0.1, 0.1), "{case}: {xml}");
+            assert_eq!(region_names(&photo), ["Ann", "Bob", "Carl"], "{case}");
+            let abouts: Vec<_> = namespaced_attributes(&xml).into_iter().filter(|a| a.3 == "about").collect();
+            assert_eq!(abouts.len(), 1, "{case}: one about, in rdf: {abouts:?}\n{xml}");
+            assert!(has_attr(&xml, (NS_RDF, "Description"), (NS_RDF, "about"), ""), "{case}: {xml}");
+        }
+    }
+
+    /// A Description whose original `rdf:about` was not empty (old Photoshop wrote
+    /// `rdf:about="uuid:…"`): the released writer left `about="uuid:…" rdf:about=""`. The
+    /// original value is the unprefixed one, and it is what the repair keeps.
+    #[test]
+    fn a_non_empty_about_the_released_writer_shadowed_is_kept() {
+        let damaged = released_rewrite(&intact().replace(r#"rdf:about="""#, r#"rdf:about="uuid:faf5bdd5-ba3d""#));
+        assert!(damaged.contains(r#"about="uuid:faf5bdd5-ba3d""#) && damaged.contains(r#"rdf:about="""#), "{damaged}");
+        let (_dir, photo) = seeded_photo("xmp-143-about-uuid", &damaged);
         write_face_regions(&photo, CAT, &[carl()], &[], &[], sized(6000, 4000)).unwrap();
 
         let xml = read(&sidecar_path(&photo));
-        let read_back = mwg(&xml);
-        assert_eq!(read_back.dims, [Some(("6000".to_string(), "4000".to_string()))], "{xml}");
-        assert_eq!(named(&read_back, "Bob")[0].area, (0.8, 0.7, 0.1, 0.2), "{xml}");
-        assert_eq!(named(&read_back, "Ann")[0].area, (0.25, 0.35, 0.1, 0.1), "{xml}");
+        let abouts: Vec<_> = namespaced_attributes(&xml).into_iter().filter(|a| a.3 == "about").collect();
+        assert_eq!(abouts.len(), 1, "{abouts:?}\n{xml}");
+        assert!(has_attr(&xml, (NS_RDF, "Description"), (NS_RDF, "about"), "uuid:faf5bdd5-ba3d"), "{xml}");
         assert_eq!(region_names(&photo), ["Ann", "Bob", "Carl"]);
-        assert!(has_attr(&xml, (NS_RDF, "Description"), (NS_RDF, "about"), ""), "{xml}");
     }
 
     /// When the damage is ambiguous (an element with both `parseType` and `rdf:parseType`, an
-    /// Area field twice), or the file was never written by ChairPhoto (no
+    /// Area field twice, two different non-empty abouts), or the file was never written by ChairPhoto (no
     /// `chairphoto:LastWrite`, so the damage is not ours), nothing is repaired: the face write
     /// is refused as before and the sidecar is left byte for byte.
     #[test]
@@ -262,6 +327,7 @@ mod tests {
             )),
             ("area-field-twice", DAMAGED.replace(r#"x="0.8""#, r#"x="0.8" stArea:x="0.8""#)),
             ("never-ours", DAMAGED.replace("<chairphoto:LastWrite>1727000000</chairphoto:LastWrite>", "")),
+            ("two-different-abouts", DAMAGED.replace(r#"about="" rdf:about="""#, r#"about="uuid:a" rdf:about="uuid:b""#)),
         ];
         for (case, sidecar) in cases {
             assert_ne!(sidecar, DAMAGED, "{case}: the fixture changed");

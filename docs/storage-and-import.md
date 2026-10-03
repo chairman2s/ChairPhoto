@@ -103,7 +103,8 @@ Face-region and GPS writes log the failure, and the catalog stays authoritative.
 
 Every release before #138 parsed and wrote sidecars with `xmltree` 0.11, which drops attribute
 prefixes. Each write it made turned `rdf:parseType="Resource"` into `parseType="Resource"`,
-`rdf:about=""` into `about=""`, and an attribute-form MWG `AppliedToDimensions` or `Area`
+turned `rdf:about` into both an unprefixed `about` (with the original value) and an empty
+`rdf:about=""` (the writer re-inserted one after parsing), and an attribute-form MWG `AppliedToDimensions` or `Area`
 (`stDim:w`, `stArea:x`, …) into no-namespace `w`, `x`, …. The same happened to every other
 prefixed attribute in the file, foreign ones included (`digiKam:Confidence`). On such a file
 the face-region writer refuses every write ("mwg-rs:Regions is not a struct") and the reader
@@ -116,7 +117,7 @@ restores; nothing else is touched:
 
 | Unprefixed | On | Restored as |
 |---|---|---|
-| `about` | `rdf:Description` | `rdf:about` |
+| `about` | `rdf:Description` | `rdf:about`, replacing an empty or equal `rdf:about` |
 | `parseType` | a property element or `rdf:li` | `rdf:parseType` |
 | `w`, `h`, `unit` | `mwg-rs:AppliedToDimensions` | `stDim:` |
 | `x`, `y`, `w`, `h`, `unit` | `mwg-rs:Area` | `stArea:` |
@@ -125,7 +126,8 @@ The first two are how RDF/XML itself reads an unqualified `about` or `parseType`
 fields have no other meaning on those elements. Attributes whose namespace is lost for good,
 such as `Confidence`, stay as they are. The repair runs only when it is unambiguous. If any
 element already carries the attribute that would be restored (`parseType` beside
-`rdf:parseType`, `x` beside `stArea:x`), nothing is repaired and the write is refused as
+`rdf:parseType`, `x` beside `stArea:x`, `about` beside a different non-empty `rdf:about`),
+nothing is repaired and the write is refused as
 before. A repair counts as a first write for the backup rule: the damaged file is copied to
 `<sidecar>.chairphoto-backup` first, unless a backup already exists, and an existing backup is
 never replaced. Reads do not repair. A damaged sidecar's regions become readable after the

@@ -252,9 +252,10 @@ impl SidecarDocument {
         self.root.write(&mut buf).map_err(|e| e.to_string())?;
         let written = write_atomically(&self.folder, &self.original, &self.path, &buf);
         let Self { folder, _turn, .. } = self;
-        drop(_turn); // the sweep below needs no file lock: it touches no sidecar
+        drop(_turn);
         if written.is_ok() {
-            folder.sweep_stale_temps();
+            // Off this thread: a caller may hold the catalog lock (#155 review, L3).
+            sweep_later(folder);
         }
         written
     }
@@ -572,26 +573,72 @@ fn is_temp_name(name: &std::ffi::OsStr) -> bool {
 /// any clock skew between the machines sharing a NAS folder.
 const STALE_TEMP_AGE: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
 
-/// The folders this process has swept (by the path they were opened at): each is listed at
-/// most once per run, so a folder of thousands of photos is not listed on every save.
+/// The folders this process has swept or queued for a sweep (by the path they were opened
+/// at): each is listed at most once per run, so a folder of thousands of photos is not
+/// listed on every save.
 static SWEPT: std::sync::Mutex<std::collections::BTreeSet<PathBuf>> =
     std::sync::Mutex::new(std::collections::BTreeSet::new());
+
+/// How many folders may wait for the sweeper at once. Each holds its directory handle while
+/// it waits, so the queue is bounded; a folder that finds it full is not marked swept and is
+/// queued again by a later write.
+const SWEEP_QUEUE: usize = 64;
+
+/// Queue `folder` for a sweep ([`Folder::sweep_stale_temps`]) on the sweeper thread, unless
+/// it was swept or queued before in this run. Never blocks and never lists: the sweep runs on
+/// a thread of its own, so it never holds a lock its caller holds — a face-region, GPS or
+/// identity-Overwrite write commits under the catalog lock, and listing a large folder on a
+/// NAS there would stall every other catalog user (#155 review, L3).
+fn sweep_later(folder: Folder) {
+    let path = folder.path.clone();
+    if !SWEPT.lock().unwrap_or_else(|e| e.into_inner()).insert(path.clone()) {
+        return;
+    }
+    let queued = sweeper().is_some_and(|tx| tx.try_send(folder).is_ok());
+    if !queued {
+        SWEPT.lock().unwrap_or_else(|e| e.into_inner()).remove(&path);
+    }
+}
+
+/// The sweeper thread's queue, started on first use; `None` if the thread cannot be started
+/// (the sweep is best effort).
+fn sweeper() -> Option<&'static std::sync::mpsc::SyncSender<Folder>> {
+    static SWEEPER: std::sync::OnceLock<Option<std::sync::mpsc::SyncSender<Folder>>> = std::sync::OnceLock::new();
+    SWEEPER
+        .get_or_init(|| {
+            let (tx, rx) = std::sync::mpsc::sync_channel::<Folder>(SWEEP_QUEUE);
+            std::thread::Builder::new()
+                .name("sidecar-temp-sweep".into())
+                .spawn(move || {
+                    for folder in rx {
+                        folder.sweep_stale_temps();
+                    }
+                })
+                .ok()
+                .map(|_| tx)
+        })
+        .as_ref()
+}
+
+#[cfg(test)]
+pub(super) static SWEEPS_DONE: std::sync::Mutex<Vec<(PathBuf, std::thread::ThreadId)>> =
+    std::sync::Mutex::new(Vec::new());
 
 impl Folder {
     /// Remove the temp files ([`is_temp_name`]) older than [`STALE_TEMP_AGE`] in this folder:
     /// left by a write killed between its create and its rename, never another write in
-    /// progress (#155 R4). Called after a successful commit, once per folder per run, with no
-    /// lock held. Best effort: a file that cannot be read or removed is left.
+    /// progress (#155 R4). Runs on the sweeper thread ([`sweep_later`]), queued by a
+    /// successful commit once per folder per run, with no lock held. Best effort: a file that
+    /// cannot be read or removed is left.
     fn sweep_stale_temps(&self) {
-        if !SWEPT.lock().unwrap_or_else(|e| e.into_inner()).insert(self.path.clone()) {
-            return;
-        }
         let now = std::time::SystemTime::now();
         for name in self.temp_names() {
             if self.is_stale_temp(&name, now) {
                 let _ = self.remove(&name);
             }
         }
+        #[cfg(test)]
+        SWEEPS_DONE.lock().unwrap().push((self.path.clone(), std::thread::current().id()));
     }
 
     /// Whether `name` is a regular file last modified more than [`STALE_TEMP_AGE`] before
@@ -1234,6 +1281,7 @@ mod tests {
         let mut doc = SidecarDocument::open(&p).unwrap();
         set_prop(&mut doc, "Foo", "bar");
         doc.commit().unwrap();
+        wait_swept(&dir);
 
         assert!(!crashed.exists() && !other_sidecars.exists(), "a day-old temp stayed");
         assert!(fresh.exists(), "a fresh temp (a write in progress?) was removed");
@@ -1245,7 +1293,51 @@ mod tests {
         let later = temp_path(&xmp);
         aged(&later);
         SidecarDocument::open(&p).unwrap().commit().unwrap();
+        std::thread::sleep(Duration::from_millis(200));
+        assert_eq!(sweeps_of(&dir).len(), 1, "the folder was listed again");
         assert!(later.exists(), "the folder was listed again");
+    }
+
+    /// The sweeps of `folder` done so far, with the thread that listed it.
+    fn sweeps_of(folder: &Path) -> Vec<std::thread::ThreadId> {
+        SWEEPS_DONE.lock().unwrap().iter().filter(|(p, _)| p == folder).map(|(_, t)| *t).collect()
+    }
+
+    /// Wait (5 s at most) for `folder`'s sweep; the thread that ran it.
+    fn wait_swept(folder: &Path) -> std::thread::ThreadId {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some(t) = sweeps_of(folder).first() {
+                return *t;
+            }
+            assert!(std::time::Instant::now() < deadline, "{} was never swept", folder.display());
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// #155 review L3: a write that commits under the catalog lock (here a GPS write, as
+    /// `map` makes it) returns without listing its folder; the sweep runs on another thread,
+    /// which holds no lock of the caller's.
+    #[test]
+    fn the_sweep_never_runs_on_the_committing_thread() {
+        let (dir, p) = photo("doc-155-l3", "W.ARW");
+        let stale = temp_path(&sidecar_path(&p));
+        std::fs::write(&stale, "<half").unwrap();
+        std::fs::File::options().write(true).open(&stale).unwrap()
+            .set_modified(std::time::SystemTime::now() - STALE_TEMP_AGE - Duration::from_secs(60)).unwrap();
+        let catalog = crate::catalog::Catalog::open(&dir.join("c.chairphoto"), &dir).unwrap();
+        let state = crate::app::AppState::default();
+        *state.catalog.lock().unwrap() = Some(catalog);
+
+        let committer = std::thread::current().id();
+        crate::app::with_catalog(&state, |_| {
+            crate::xmp::write_gps(&p, 59.9, 10.7).unwrap();
+            assert!(sweeps_of(&dir).iter().all(|t| *t != committer), "the commit listed its folder under the catalog lock");
+            Ok(())
+        })
+        .unwrap();
+        assert_ne!(wait_swept(&dir), committer, "the sweep ran on the committing thread");
+        assert!(!stale.exists(), "the day-old temp stayed");
     }
 
     /// #155 review L1: a FIFO named like a day-old temp neither hangs the commit's sweep (an
@@ -1257,16 +1349,15 @@ mod tests {
         let fifo = dir.join(".V.ARW.xmp.1-abcdefabcdef.chairphoto-tmp");
         let folder = rustix::fs::open(&*dir, rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::DIRECTORY, rustix::fs::Mode::empty()).unwrap();
         rustix::fs::mknodat(&folder, fifo.file_name().unwrap(), rustix::fs::FileType::Fifo, rustix::fs::Mode::from_raw_mode(0o644), 0).unwrap();
-        let (tx, rx) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
-            let committed = SidecarDocument::open(&p).and_then(|d| d.commit());
-            let _ = tx.send(committed);
-        });
-        let finished = rx.recv_timeout(Duration::from_secs(5));
-        if finished.is_err() {
-            let _ = std::fs::OpenOptions::new().write(true).open(&fifo); // release the stuck open
+        SidecarDocument::open(&p).and_then(|d| d.commit()).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while sweeps_of(&dir).is_empty() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
         }
-        finished.expect("the commit's sweep hung on a FIFO named like a temp").unwrap();
+        if sweeps_of(&dir).is_empty() {
+            let _ = std::fs::OpenOptions::new().write(true).open(&fifo); // release the stuck open
+            panic!("the sweep hung on a FIFO named like a temp");
+        }
         let kind = std::fs::symlink_metadata(&fifo).expect("the FIFO was removed").file_type();
         assert!(std::os::unix::fs::FileTypeExt::is_fifo(&kind));
     }

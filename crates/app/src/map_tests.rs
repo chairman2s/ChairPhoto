@@ -356,11 +356,15 @@ fn machine_hosts(cx: &mut TestAppContext) -> Option<String> {
     cx.update(|cx| MachinePrefs::read(cx, MACHINE_TILE_HOSTS))
 }
 
-/// Gate #119: the migration emptied the catalog's old answers without waiting for the
-/// machine's copy to be written, whose failure was only logged — a failed write lost the
-/// remembered decisions. Here every write fails (the store's directory is a file): the
-/// answers apply for the session, and the catalog keeps its copy. Once the store can be
-/// written, the next read of the catalog saves the answers and only then empties the copy.
+/// Gate #119, and #214's fail-closed fix. Here every write fails (the store's directory is
+/// a file): the catalog keeps its copy (gate #119, unchanged), and — unlike before #214 —
+/// the merge is not applied to this machine's answers either, in memory or on disk: the map
+/// still asks about the legacy hosts, and the failure is surfaced
+/// (`MapState::consent_write_error`). `MachinePrefs`'s own cache (`machine_hosts`) shows the
+/// attempted value regardless (`set_then` fills it in before it knows whether the write will
+/// land), which is why this test checks the file on disk and the module's own state, not it.
+/// Once the store can be written, the next read of the catalog merges, saves and only then
+/// empties the copy.
 #[gpui_kit::test]
 fn a_failed_machine_prefs_write_keeps_the_catalogs_old_answers(cx: &mut TestAppContext) {
     let dir = TempDir::new("map-migrate-fail");
@@ -377,15 +381,24 @@ fn a_failed_machine_prefs_write_keeps_the_catalogs_old_answers(cx: &mut TestAppC
     cx.update(|cx| ModuleRegistry::enable(&app.wired.modules, MAP_MODULE_ID, cx));
     work(&app, cx);
     let setting = |app: &App| app.state.catalog.lock().unwrap().as_ref().unwrap().get_setting(LEGACY_HOSTS).unwrap();
-    assert_eq!(machine_hosts(cx).as_deref(), Some(legacy), "merged for this session");
     assert!(!prefs.exists(), "the write failed");
-    assert_eq!(setting(&app).as_deref(), Some(legacy), "the catalog's answers were dropped though nothing was saved");
+    assert_eq!(setting(&app).as_deref(), Some(legacy), "the catalog keeps its answers: nothing was saved");
+    let map_state_entity = map_state_via_settings(&app, cx);
+    assert!(
+        map_state_entity.read_with(cx, |s, _| s.host_consent().is_empty()),
+        "#214: not merged in memory either, so the legacy hosts still ask"
+    );
+    assert!(
+        map_state_entity.read_with(cx, |s, _| s.consent_write_error().is_some()),
+        "the failed write is surfaced"
+    );
 
     std::fs::remove_file(&blocker).unwrap();
     open_catalog_with_photos(&app, &dir, 1, cx); // the same catalog, read again
     work(&app, cx);
     assert_eq!(MachinePrefs::load(prefs).get(MACHINE_TILE_HOSTS), Some(legacy), "saved now");
     assert_eq!(setting(&app).as_deref(), Some("{}"), "and only then emptied");
+    assert_eq!(machine_hosts(cx).as_deref(), Some(legacy), "the machine's copy matches what was saved");
 }
 
 /// Answers stored per catalog by the first port move to this machine on each catalog's
@@ -495,49 +508,92 @@ enum Prefs {
     WriteFails,
 }
 
-/// **#198** (review batch 6's probe). The machine's preferences cannot be saved, so the
-/// catalog keeps its old answers (gate #119) and every read of it merges them again. The
-/// user sends `b.example` back to "ask"; the same catalog is read again (a switch back, a
-/// finished scan): the host still asks, and nothing is fetched from it.
-fn ask_again_survives_a_reread(prefs: Prefs, cx: &mut TestAppContext) {
-    let dir = TempDir::new("map-ask-again");
+/// **#214** (a doubt the #198 fix reported). The machine's preferences cannot be saved (in
+/// memory only, or every write fails): the merge is held out of memory until it is durable
+/// (`MapState::migrate_consent`'s doc comment), so the catalog's legacy Allow for `b.example`
+/// is never applied, not even for this session. The host asks on the first read, and keeps
+/// asking across repeated reads of the same catalog ("restarts") while the store stays
+/// broken — never silently re-allowed, since nothing was ever merged for a reset to undo.
+/// The failure is surfaced (`consent_write_error`); the catalog keeps its old answer (gate
+/// #119) so a store that starts working still merges it.
+fn an_undurable_store_never_merges_the_catalogs_legacy_allow(prefs: Prefs, cx: &mut TestAppContext) {
+    let dir = TempDir::new("map-undurable");
     let fake = Arc::new(FakeTiles::default());
     cx.update(|cx| cx.set_global(MapTiles(fake.clone())));
     let app = start(cx);
-    if let Prefs::WriteFails = prefs {
+    let prefs_path = if let Prefs::WriteFails = prefs {
         let blocker = dir.0.join("blocker");
         std::fs::write(&blocker, "a file where the store's directory should be").unwrap();
-        cx.update(|cx| cx.set_global(MachinePrefs::load(blocker.join(MACHINE_PREFS_FILE))));
-    }
+        let path = blocker.join(MACHINE_PREFS_FILE);
+        cx.update(|cx| cx.set_global(MachinePrefs::load(path.clone())));
+        Some(path)
+    } else {
+        None
+    };
     open_catalog_with_photos(&app, &dir, 1, cx);
     seed_b(&app);
     work(&app, cx);
     cx.update(|cx| ModuleRegistry::enable(&app.wired.modules, MAP_MODULE_ID, cx));
     work(&app, cx);
-    assert_eq!(machine_hosts(cx).as_deref(), Some(B_LEGACY), "merged for this session");
     let m = Map { app, fake, ids: Vec::new() };
-
-    ask_again_for_b(&m.app, cx);
     let before = m.fake.count();
+    show_map(&m.app, cx);
     asks_for_b(&m, before, cx);
-    let setting = m.setting(LEGACY_HOSTS);
-    assert_eq!(setting.as_deref(), Some(B_LEGACY), "the catalog kept its copy (nothing was saved)");
+    let state = map_state(&m, cx);
+    assert!(state.read_with(cx, |s, _| s.host_consent().is_empty()), "never merged, not even in memory");
+    assert!(state.read_with(cx, |s, _| s.consent_write_error().is_some()), "the failed write is surfaced");
+    assert_eq!(m.setting(LEGACY_HOSTS).as_deref(), Some(B_LEGACY), "the catalog kept its old answer");
+    if let Some(path) = &prefs_path {
+        // The actual file on disk — not `MachinePrefs`'s own in-memory cache, which `set_then`
+        // fills in with the attempted value before it knows whether the write will land — never
+        // got the merge either.
+        assert!(!path.exists(), "the write failed: no file, let alone one with the merge");
+    }
 
-    open_catalog_with_photos(&m.app, &dir, 1, cx); // the same catalog, read again
+    // A "restart": the same catalog read again, the store still just as broken. Still asks,
+    // never silently re-allowed — there was never a merge, in memory or on disk, for a reset
+    // to have to survive.
+    open_catalog_with_photos(&m.app, &dir, 1, cx);
     work(&m.app, cx);
     show_map(&m.app, cx);
     asks_for_b(&m, before, cx);
-    assert_eq!(machine_hosts(cx).as_deref(), Some(r#"{"b.example":"ask"}"#));
+    let state = map_state(&m, cx);
+    assert!(state.read_with(cx, |s, _| s.host_consent().is_empty()), "still never merged after the \"restart\"");
 }
 
 #[gpui_kit::test]
-fn ask_again_survives_a_reread_when_prefs_are_in_memory(cx: &mut TestAppContext) {
-    ask_again_survives_a_reread(Prefs::InMemory, cx);
+fn an_undurable_store_never_merges_the_catalogs_legacy_allow_in_memory(cx: &mut TestAppContext) {
+    an_undurable_store_never_merges_the_catalogs_legacy_allow(Prefs::InMemory, cx);
 }
 
 #[gpui_kit::test]
-fn ask_again_survives_a_reread_when_prefs_cannot_be_saved(cx: &mut TestAppContext) {
-    ask_again_survives_a_reread(Prefs::WriteFails, cx);
+fn an_undurable_store_never_merges_the_catalogs_legacy_allow_when_writes_fail(cx: &mut TestAppContext) {
+    an_undurable_store_never_merges_the_catalogs_legacy_allow(Prefs::WriteFails, cx);
+}
+
+/// **#214**: unlike the legacy migration, the user's own Allow/Block/Ask again
+/// ([`MapState::set_consent`]) is not held back — it is not an invisible background merge —
+/// but a write that cannot be saved is still surfaced, so the user knows that answer will be
+/// asked again after a restart.
+#[gpui_kit::test]
+fn a_failed_set_consent_write_still_applies_but_is_surfaced(cx: &mut TestAppContext) {
+    let dir = TempDir::new("map-set-consent-fail");
+    cx.update(|cx| cx.set_global(MapTiles(Arc::new(FakeTiles::default()))));
+    let app = start(cx);
+    let blocker = dir.0.join("blocker");
+    std::fs::write(&blocker, "a file where the store's directory should be").unwrap();
+    cx.update(|cx| cx.set_global(MachinePrefs::load(blocker.join(MACHINE_PREFS_FILE))));
+    open_catalog_with_photos(&app, &dir, 1, cx);
+    work(&app, cx);
+    cx.update(|cx| ModuleRegistry::enable(&app.wired.modules, MAP_MODULE_ID, cx));
+    work(&app, cx);
+    let state = map_state_via_settings(&app, cx);
+    assert!(state.read_with(cx, |s, _| s.consent_write_error().is_none()), "nothing attempted yet");
+
+    state.update(cx, |s, cx| s.set_consent("tile.example", Some(true), cx));
+    assert_eq!(state.read_with(cx, |s, _| s.host_consent().get("tile.example")), Consent::Allowed, "applied at once");
+    work(&app, cx);
+    assert!(state.read_with(cx, |s, _| s.consent_write_error().is_some()), "the failed write is surfaced");
 }
 
 /// **#198**, the success path: the machine's copy is saved, but the core switches to
@@ -1176,6 +1232,23 @@ fn with_fake_geocode(cx: &mut TestAppContext) -> Arc<FakeGeocode> {
 
 fn map_state(m: &Map, cx: &mut TestAppContext) -> Entity<crate::modules::map::state::MapState> {
     m.view(cx).read_with(cx, |v, _| v.state.clone())
+}
+
+/// The map module's state, through its settings panel — for a test that never opens the map
+/// view itself (the module is enabled, but no [`Map`]/[`MapView`] exists yet).
+fn map_state_via_settings(app: &App, cx: &mut TestAppContext) -> Entity<crate::modules::map::state::MapState> {
+    let modules = app.wired.modules.clone();
+    let settings = cx
+        .update_window(app.window(), |_, window, cx| {
+            ModuleRegistry::settings_views(&modules, &MAP_MODULE_ID.into(), window, cx)
+                .into_iter()
+                .next()
+                .expect("the map settings panel")
+                .downcast::<crate::modules::map::settings::MapSettings>()
+                .expect("a MapSettings")
+        })
+        .unwrap();
+    settings.read_with(cx, |s, _| s.state.clone())
 }
 
 /// Review #119: Geocode all ran on the core runtime with no owner. Disabling the module now

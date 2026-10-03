@@ -24,6 +24,19 @@
 //! ([`MapState::reload_settings`]). The tile URL stays a catalog setting (`map.tileUrl`, as
 //! in React): consent is keyed by the host the URL names, so it need not move with it.
 //! Until a catalog's settings are read the host is not known and nothing is fetched.
+//!
+//! **Fail closed on an undurable store** (#214). The machine's preferences can be in-memory
+//! only (no app data dir) or simply fail to write (a bad path, a full disk); either way
+//! nothing from this session survives a restart — a fresh process finds the store empty
+//! again. A legacy merge applied in memory anyway would then replay forever on every launch
+//! while the store stays broken, silently re-allowing a host the user explicitly reset,
+//! since that reset is exactly as undurable as the merge it would undo. So
+//! [`MapState::migrate_consent`] holds the merge out of memory until its write is confirmed
+//! durable: on failure the catalog keeps its old answers (as before) but this machine's
+//! answers are untouched, so the affected hosts simply keep asking. [`MapState::set_consent`]
+//! (the user's own Allow/Block/Ask again) still applies at once — it is not an invisible
+//! background merge — but a write that fails is surfaced the same way:
+//! [`MapState::consent_write_error`], which Preferences' Map tab shows.
 
 use super::logic::{Consent, HostConsent, MACHINE_TILE_HOSTS, TILE_HOSTS_KEY, TILE_URL_KEY};
 use crate::machine_prefs::MachinePrefs;
@@ -90,6 +103,9 @@ pub struct MapState {
     settings_from: Option<CatalogIdentity>,
     /// This machine's per-host answers.
     consent: HostConsent,
+    /// The most recent machine-prefs write for tile consent that failed (#214), surfaced in
+    /// Preferences' Map tab. Cleared by the next write that succeeds.
+    consent_write_error: Option<String>,
     pub source: TileSource,
     /// Why the stored tile URL was refused (the default is used meanwhile).
     pub source_error: Option<String>,
@@ -221,6 +237,7 @@ impl MapState {
             stored: None,
             settings_from: None,
             consent: HostConsent::parse(MachinePrefs::read(cx, MACHINE_TILE_HOSTS).as_deref()),
+            consent_write_error: None,
             source: TileSource::default(),
             source_error: None,
             applying: None,
@@ -396,29 +413,63 @@ impl MapState {
     /// the catalog's copy — in the catalog it was read from — so it is merged once, and a
     /// later change in Preferences is not undone by the next read.
     ///
-    /// The catalog's copy is emptied only **after** the machine's copy is on disk
-    /// ([`MachinePrefs::set_then`], off the UI thread): if that write fails (or the
-    /// preferences live in memory only), the catalog keeps its answers and the next read
-    /// merges them again, so a remembered decision is never lost (gate #119). The copy also
-    /// survives when a switch lands before the clear, which `with_catalog_as(from)` then
-    /// refuses. Either way a re-merge must not undo the user's "Ask again": that is stored
-    /// as an explicit "ask" entry ([`HostConsent::forget`]), which the merge leaves alone
-    /// (#198), so a reset host is never allowed again without asking.
+    /// The merge is applied to this machine's answers, and the catalog's copy emptied, only
+    /// **after** the machine's copy is confirmed on disk ([`MachinePrefs::set_then`], off the
+    /// UI thread) — never optimistically (#214): a store that cannot durably remember the
+    /// merge (in memory only, or a write that fails) must not apply it in memory either, or
+    /// a restart — which finds the store empty again — replays the merge forever, silently
+    /// re-allowing a host the user reset in a session just as undurable. On failure the
+    /// catalog keeps its answers (gate #119) and the next read tries again, unmerged in the
+    /// meantime: the affected hosts simply keep asking, and [`Self::consent_write_error`]
+    /// says why. The copy also survives when a switch lands before the clear, which
+    /// `with_catalog_as(from)` then refuses. A successful re-merge must not undo the user's
+    /// "Ask again" meanwhile: that is stored as an explicit "ask" entry
+    /// ([`HostConsent::forget`]), which the merge leaves alone (#198).
     fn migrate_consent(&mut self, from: CatalogIdentity, legacy: Option<&str>, cx: &mut Context<Self>) {
         let legacy = HostConsent::parse(legacy);
         if legacy.is_empty() {
             return;
         }
-        self.consent.merge_legacy(&legacy);
+        // Always attempted, even when the merge turns out to be a no-op (every host already
+        // settled, or asking again): the catalog may still be holding a copy a previous
+        // switch-interrupted clear (#198) left behind, and this is what finally clears it.
+        let mut merged = self.consent.clone();
+        merged.merge_legacy(&legacy);
+        let json = merged.to_json();
         let (app, key) = (self.app.clone(), self.settings.key(TILE_HOSTS_KEY));
-        MachinePrefs::set_then(cx, MACHINE_TILE_HOSTS, &self.consent.to_json(), move |saved| match saved {
-            Ok(()) => {
+        let (tx, rx) = futures::channel::oneshot::channel();
+        MachinePrefs::set_then(cx, MACHINE_TILE_HOSTS, &json, move |saved| {
+            // Still off the UI thread, same as before #214: the clear is catalog I/O, and
+            // only happens once the write is confirmed. `tx` just reports the outcome back so
+            // the in-memory answers change only once the merge is durable too.
+            if saved.is_ok() {
                 if let Err(e) = with_catalog_as(&app, from, |c| c.set_setting(&key, "{}")) {
                     eprintln!("map: could not empty the catalog's old tile answers: {e}");
                 }
             }
-            Err(e) => eprintln!("map: kept the catalog's old tile answers; this machine's copy is not saved: {e}"),
+            let _ = tx.send(saved);
         });
+        cx.spawn(async move |this, cx| {
+            let Ok(saved) = rx.await else { return };
+            this.update(cx, |s, cx| {
+                match saved {
+                    Ok(()) => {
+                        s.consent = merged;
+                        s.consent_write_error = None;
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "map: this machine's preferences could not be written, so the catalog's old tile \
+                             answers were not merged ({e}); the affected hosts will ask again"
+                        );
+                        s.consent_write_error = Some(e);
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
     }
 
     /// Every host's answer on this machine (Preferences shows and edits them).
@@ -426,14 +477,36 @@ impl MapState {
         &self.consent
     }
 
+    /// The most recent machine-prefs write for tile consent (a migration or a Preferences
+    /// edit) that failed, if any (#214) — shown in Preferences' Map tab so the user knows an
+    /// answer, or a legacy migration, is not guaranteed to survive a restart.
+    pub fn consent_write_error(&self) -> Option<&str> {
+        self.consent_write_error.as_deref()
+    }
+
     /// Remember the answer for `host` on this machine (the consent prompt, or Preferences);
-    /// `None` is "Ask again", remembered as such.
+    /// `None` is "Ask again", remembered as such. Applied at once — unlike the legacy merge
+    /// (#214), this is the user's own decision, not an invisible background one — but a
+    /// write that fails is still surfaced ([`Self::consent_write_error`]).
     pub fn set_consent(&mut self, host: &str, allowed: Option<bool>, cx: &mut Context<Self>) {
         match allowed {
             Some(a) => self.consent.set(host, a),
             None => self.consent.forget(host),
         }
-        MachinePrefs::set(cx, MACHINE_TILE_HOSTS, &self.consent.to_json());
+        let json = self.consent.to_json();
+        let (tx, rx) = futures::channel::oneshot::channel();
+        MachinePrefs::set_then(cx, MACHINE_TILE_HOSTS, &json, move |saved| {
+            let _ = tx.send(saved);
+        });
+        cx.spawn(async move |this, cx| {
+            let Ok(saved) = rx.await else { return };
+            this.update(cx, |s, cx| {
+                s.consent_write_error = saved.err();
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
         cx.notify();
     }
 

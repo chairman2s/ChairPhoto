@@ -99,6 +99,38 @@ to reach the disk). The save reports the sidecar pending, a single-photo geocode
 error saying so, and geocode-all does not count that photo as filled.
 Face-region and GPS writes log the failure, and the catalog stays authoritative.
 
+### Sidecars damaged by releases before #138
+
+Every release before #138 parsed and wrote sidecars with `xmltree` 0.11, which drops attribute
+prefixes. Each write it made turned `rdf:parseType="Resource"` into `parseType="Resource"`,
+`rdf:about=""` into `about=""`, and an attribute-form MWG `AppliedToDimensions` or `Area`
+(`stDim:w`, `stArea:x`, …) into no-namespace `w`, `x`, …. The same happened to every other
+prefixed attribute in the file, foreign ones included (`digiKam:Confidence`). On such a file
+the face-region writer refuses every write ("mwg-rs:Regions is not a struct") and the reader
+finds no regions.
+
+When a writer opens a sidecar that carries `chairphoto:LastWrite`, which means a ChairPhoto
+release wrote the damage, `SidecarDocument::open` restores those known attributes in memory
+before the writer runs (`xmp/repair.rs`, #143). The table below lists every attribute it
+restores; nothing else is touched:
+
+| Unprefixed | On | Restored as |
+|---|---|---|
+| `about` | `rdf:Description` | `rdf:about` |
+| `parseType` | a property element or `rdf:li` | `rdf:parseType` |
+| `w`, `h`, `unit` | `mwg-rs:AppliedToDimensions` | `stDim:` |
+| `x`, `y`, `w`, `h`, `unit` | `mwg-rs:Area` | `stArea:` |
+
+The first two are how RDF/XML itself reads an unqualified `about` or `parseType`. The MWG
+fields have no other meaning on those elements. Attributes whose namespace is lost for good,
+such as `Confidence`, stay as they are. The repair runs only when it is unambiguous. If any
+element already carries the attribute that would be restored (`parseType` beside
+`rdf:parseType`, `x` beside `stArea:x`), nothing is repaired and the write is refused as
+before. A repair counts as a first write for the backup rule: the damaged file is copied to
+`<sidecar>.chairphoto-backup` first, unless a backup already exists, and an existing backup is
+never replaced. Reads do not repair. A damaged sidecar's regions become readable after the
+first ChairPhoto write to it.
+
 ### The repair pass is a job
 
 The queue reached 74,488 rows on the 100k harness shape, and every row is a sidecar parse

@@ -54,6 +54,12 @@ describe("iptcSaveStatus", () => {
     expect(iptcSaveStatus({ sidecar: "unchanged", reason: null })).toBe(
       "Saved (no sidecar change needed)",
     );
+    // #223 F3: a write attempted and failed, whose debt was dismissed meanwhile, also
+    // settles "unchanged" (nothing owed either way) but carries a reason — say the write
+    // failed, not that none was needed.
+    expect(iptcSaveStatus({ sidecar: "unchanged", reason: "read-only" })).toBe(
+      "Saved to catalog; the sidecar write failed (read-only)",
+    );
     expect(iptcSaveStatus({ sidecar: "pending", reason: "read-only" })).toBe(
       "Saved to catalog; sidecar pending (read-only)",
     );

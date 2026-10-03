@@ -7,15 +7,18 @@
 //!   named apart — a split — or ignored), and Review suggestions (the queue: the "Confirm all
 //!   ≥ X%" slider and per-row ✓ / ✕). Each tab is one virtualised `uniform_list` of uniform
 //!   rows, so a catalog with thousands of clusters or suggestions builds only what shows.
-//! - **Avatars through the image layer.** A face is cropped from its photo's thumbnail (the
-//!   `Thumb` tier, as React's `thumb://`), turned by the photo's user rotation. A cover
-//!   version's thumbnail is not the original's frame (#152), so for a photo whose thumbnail
-//!   is one the face is cut from its `Preview` tier instead (rv151 L4: the original's frame,
-//!   right for a cropped cover and a tone-only one alike; a larger decode, on the pool). The
-//!   list's decoration reports the rows on screen; the view's [`ClaimId`] holds exactly their
-//!   thumbnails (and those previews) plus an overscan, so what scrolls away — or the whole
-//!   view, when the stage leaves it or it is released — is released (queued renders
-//!   cancelled).
+//! - **Avatars through the image layer.** A face is placed and cropped out of its photo's
+//!   thumbnail (the `Thumb` tier, as React's `thumb://`), turned by the photo's user
+//!   rotation. A cover version's thumbnail is not the original's frame (#152), so for a
+//!   photo whose thumbnail is one, the avatar is a small square already cut and sized for it
+//!   on the pool worker instead (rv151 L4 kept the source — the original's frame, right for
+//!   a cropped cover and a tone-only one alike — but #223 F1 replaced claiming the whole
+//!   `Preview` tier for it: that could exceed the image budget with many covered avatars on
+//!   screen, which evicts without regard to claims, and never settle). The list's decoration
+//!   reports the rows on screen; the view's [`ClaimId`] holds exactly their thumbnails (and
+//!   avatar crops) plus an overscan, so what scrolls away — or the whole view, when the stage
+//!   leaves it or it is released — is released (queued renders cancelled, though a crop
+//!   already on a worker runs to completion unclaimed, same as any tier).
 //! - **The naming dialog** (`NameClusterModal`): a field with a type-ahead over the people
 //!   root's tags; Enter saves, Esc cancels (taken before any binding while the field has
 //!   focus), a suggestion's click fills the field.
@@ -23,6 +26,7 @@
 use super::logic::{avatar_placement, name_suggestions, reaches, rotate_box};
 use super::people::{NameTarget, People, Tab};
 use crate::image_store::{ClaimId, ImageState, ImageStore};
+use crate::loupe::zoom::fitted;
 use crate::shell::style::Colors;
 use crate::storage::ui;
 use chairphoto_core::app::faces::{FaceBboxJson, Verdict};
@@ -32,8 +36,8 @@ use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::slider::{Slider, SliderEvent, SliderState};
 use gpui_kit::prelude::*;
 use gpui_kit::{
-    div, img, px, AnyElement, App, Bounds, Context, Entity, Focusable as _, FontWeight, Pixels, Point, SharedString,
-    Subscription, TestSupportExt as _, UniformListDecoration, UniformListScrollHandle, WeakEntity, Window,
+    div, img, px, AnyElement, App, Bounds, Context, Entity, Focusable as _, FontWeight, ObjectFit, Pixels, Point,
+    SharedString, Subscription, TestSupportExt as _, UniformListDecoration, UniformListScrollHandle, WeakEntity, Window,
 };
 use std::ops::Range;
 
@@ -53,6 +57,16 @@ enum Rows {
     Suggestions,
 }
 
+/// One avatar's identity and geometry, as a row names it: which face of which photo, and
+/// its box in the photo's canonical (unrotated) frame plus the photo's user rotation.
+#[derive(Clone, Copy, Debug)]
+struct AvatarRef {
+    photo: i64,
+    face: i64,
+    bbox: FaceBboxJson,
+    rotation: i64,
+}
+
 pub struct PeopleView {
     pub people: Entity<People>,
     images: Option<Entity<ImageStore>>,
@@ -62,8 +76,8 @@ pub struct PeopleView {
     slider: Entity<SliderState>,
     /// Columns the last frame used.
     cols: usize,
-    /// The list shown last frame and its photo ids per row (for the decoration).
-    rows: (Option<Rows>, Vec<Vec<i64>>),
+    /// The list shown last frame and its avatars per row (for the decoration).
+    rows: (Option<Rows>, Vec<Vec<AvatarRef>>),
     /// The naming dialog the field was last cleared for.
     naming_open: bool,
     _subscriptions: Vec<Subscription>,
@@ -129,22 +143,31 @@ impl PeopleView {
         }
     }
 
-    /// The thumbnails this view holds now (tests).
+    /// The thumbnails and avatar crops this view holds now (tests).
     pub fn held(&self, cx: &App) -> Vec<i64> {
         let (Some(images), Some(claim)) = (&self.images, self.claim) else { return Vec::new() };
-        let mut ids: Vec<i64> = images.read(cx).claim(claim).into_iter().map(|(p, _)| p).collect();
+        let img = images.read(cx);
+        let mut ids: Vec<i64> = img.claim(claim).into_iter().map(|(p, _)| p).collect();
+        ids.extend(img.avatar_claim(claim).into_iter().map(|k| k.photo));
         ids.sort();
+        ids.dedup();
         ids
     }
 
     fn release(&mut self, cx: &mut Context<Self>) {
         if let (Some(images), Some(claim)) = (&self.images, self.claim) {
-            images.update(cx, |s, _| s.set_claim(claim, []));
+            images.update(cx, |s, _| {
+                s.set_claim(claim, []);
+                s.set_avatar_claim(claim, []);
+            });
         }
     }
 
     /// The rows on screen (from the list's decoration, once per frame): hold their
-    /// thumbnails and the overscan's, most urgent first, and let go of the rest.
+    /// thumbnails and the overscan's, most urgent first, and let go of the rest. A cover
+    /// thumbnail is not the original's frame, so its avatar is a small crop of the face
+    /// instead (#223 F1: never the whole `Preview` tier — People never holds a full
+    /// preview), cut on the pool like any tier, kept apart from the thumbnails' claim.
     fn on_visible(&mut self, range: Range<usize>, cx: &mut Context<Self>) {
         let (Some(images), Some(claim)) = (self.images.clone(), self.claim) else { return };
         let rows = &self.rows.1;
@@ -158,37 +181,44 @@ impl PeopleView {
                 order.push(range.start - d);
             }
         }
-        let mut wanted: Vec<(i64, ImageKind)> = Vec::new();
+        let mut thumbs: Vec<(i64, ImageKind)> = Vec::new();
+        let mut avatars: Vec<AvatarRef> = Vec::new();
         for r in order {
-            for &p in &rows[r] {
-                if !wanted.contains(&(p, ImageKind::Thumb)) {
-                    wanted.push((p, ImageKind::Thumb));
+            for &a in &rows[r] {
+                if !thumbs.contains(&(a.photo, ImageKind::Thumb)) {
+                    thumbs.push((a.photo, ImageKind::Thumb));
+                }
+                if !avatars.iter().any(|b: &AvatarRef| b.photo == a.photo && b.face == a.face) {
+                    avatars.push(a);
                 }
             }
         }
         images.update(cx, |s, _| {
-            // A cover thumbnail is not the original's frame: its avatar is cut from the
-            // preview instead (rv151 L4), decoded on the pool like any tier.
-            let previews: Vec<(i64, ImageKind)> = wanted
+            s.set_claim(claim, thumbs.iter().copied());
+            s.request_batch(&thumbs);
+            // Only once the thumbnail is known to be a cover render (rv151 L4) — not before,
+            // so a plain card never claims a crop it will not use.
+            let crops: Vec<(i64, i64, (f32, f32, f32, f32))> = avatars
                 .iter()
-                .filter(|&&(p, _)| matches!(s.peek(p, ImageKind::Thumb), ImageState::Ready(l) if l.cover))
-                .map(|&(p, _)| (p, ImageKind::Preview))
+                .filter(|a| matches!(s.peek(a.photo, ImageKind::Thumb), ImageState::Ready(l) if l.cover))
+                .map(|a| (a.photo, a.face, rotate_box((a.bbox.x, a.bbox.y, a.bbox.w, a.bbox.h), a.rotation)))
                 .collect();
-            wanted.extend(previews);
-            s.set_claim(claim, wanted.iter().copied());
-            s.request_batch(&wanted);
+            let claimed: Vec<_> = crops.iter().map(|&(p, f, _)| s.avatar_key(p, f)).collect();
+            s.set_avatar_claim(claim, claimed);
+            s.request_avatar_batch(&crops);
         });
     }
 
-    /// What an avatar of `photo` is cut from: its thumbnail, or — when that is the cover
-    /// version's render — its preview, the original's frame (rv151 L4). Empty until it lands.
-    fn thumb(&self, photo: i64, cx: &mut Context<Self>) -> ImageState {
+    /// What an avatar of `photo`'s `face` draws from: its thumbnail (placed by its box), or
+    /// — when that thumbnail is the cover version's render — the small crop already cut and
+    /// sized for it (rv151 L4, #223 F1). Empty until it lands.
+    fn avatar_source(&self, photo: i64, face: i64, cx: &mut Context<Self>) -> AvatarSource {
         match &self.images {
             Some(i) => i.update(cx, |s, _| match s.get(photo, ImageKind::Thumb) {
-                ImageState::Ready(l) if l.cover => s.get(photo, ImageKind::Preview),
-                other => other,
+                ImageState::Ready(l) if l.cover => AvatarSource::Crop(s.get_avatar(photo, face)),
+                other => AvatarSource::Plain(other),
             }),
-            None => ImageState::Absent,
+            None => AvatarSource::Plain(ImageState::Absent),
         }
     }
 
@@ -209,27 +239,46 @@ impl PeopleView {
     }
 }
 
-/// A face cropped from its photo's thumbnail (or preview, [`PeopleView::thumb`]), in a round
-/// `size` square. Never from a cover version's render (#152): the version may be cropped or
-/// turned, so the face's box, in the original's frame, would cut out something else — the
-/// circle stays empty until the original's frame is there.
-fn avatar(photo: i64, state: ImageState, bbox: FaceBboxJson, rotation: i64, size: f32, colors: Colors) -> AnyElement {
+/// What [`PeopleView::avatar_source`] found: a plain thumbnail, placed by the face's box
+/// (unchanged, #223 F1 scope: a non-cover avatar already uses a small tier, shared with the
+/// grid), or a crop already cut and sized for the avatar (the cover case).
+enum AvatarSource {
+    Plain(ImageState),
+    Crop(ImageState),
+}
+
+/// A face cropped from its photo's thumbnail, or a crop already cut for it ([`AvatarSource`]),
+/// in a round `size` square. Never from a cover version's render as the whole-thumbnail case
+/// (#152): the version may be cropped or turned, so the face's box, in the original's frame,
+/// would cut out something else — the circle stays empty until the crop (the original's
+/// frame) lands.
+fn avatar(photo: i64, source: AvatarSource, bbox: FaceBboxJson, rotation: i64, size: f32, colors: Colors) -> AnyElement {
     let mut d = div().flex_none().size(px(size)).rounded_full().overflow_hidden().relative().bg(colors.elev);
-    if let ImageState::Ready(loaded) = state.filter(|l| !l.cover) {
-        let s = loaded.image.size(0);
-        let natural = (s.width.0 as f32, s.height.0 as f32);
-        let b = rotate_box((bbox.x, bbox.y, bbox.w, bbox.h), rotation);
-        let (l, t, w, h) = avatar_placement(b, natural, size);
-        d = d.child(
-            img(loaded.image)
-                .id(SharedString::from(format!("faces-avatar-{photo}")))
-                .absolute()
-                .left(px(l))
-                .top(px(t))
-                .w(px(w))
-                .h(px(h))
-                .test_support(),
-        );
+    match source {
+        // Already a size×size crop with the face filling it: no placement math, just fill
+        // the circle (same aspect ratio, so `Cover` is a plain fill).
+        AvatarSource::Crop(ImageState::Ready(loaded)) => {
+            d = d.child(fitted(SharedString::from(format!("faces-avatar-{photo}")), loaded.image, ObjectFit::Cover));
+        }
+        AvatarSource::Crop(_) => {}
+        AvatarSource::Plain(state) => {
+            if let ImageState::Ready(loaded) = state.filter(|l| !l.cover) {
+                let s = loaded.image.size(0);
+                let natural = (s.width.0 as f32, s.height.0 as f32);
+                let b = rotate_box((bbox.x, bbox.y, bbox.w, bbox.h), rotation);
+                let (l, t, w, h) = avatar_placement(b, natural, size);
+                d = d.child(
+                    img(loaded.image)
+                        .id(SharedString::from(format!("faces-avatar-{photo}")))
+                        .absolute()
+                        .left(px(l))
+                        .top(px(t))
+                        .w(px(w))
+                        .h(px(h))
+                        .test_support(),
+                );
+            }
+        }
     }
     d.into_any_element()
 }
@@ -298,7 +347,12 @@ impl PeopleView {
     }
 
     /// The rows of the list shown now, and its toolbar.
-    fn content(&mut self, window: &mut Window, colors: Colors, cx: &mut Context<Self>) -> (Option<AnyElement>, Option<(Rows, Vec<Vec<i64>>, f32)>, Option<AnyElement>) {
+    fn content(
+        &mut self,
+        window: &mut Window,
+        colors: Colors,
+        cx: &mut Context<Self>,
+    ) -> (Option<AnyElement>, Option<(Rows, Vec<Vec<AvatarRef>>, f32)>, Option<AnyElement>) {
         let cols = self.columns(window);
         if cols != self.cols {
             self.cols = cols;
@@ -306,7 +360,7 @@ impl PeopleView {
         }
         let p = self.people.read(cx);
         let Some(data) = &p.data else { return (None, None, None) };
-        let chunk = |ids: Vec<i64>| -> Vec<Vec<i64>> { ids.chunks(cols).map(|c| c.to_vec()).collect() };
+        let chunk = |ids: Vec<AvatarRef>| -> Vec<Vec<AvatarRef>> { ids.chunks(cols).map(|c| c.to_vec()).collect() };
         if let Some(sheet) = &p.sheet {
             let picked = sheet.picked.len();
             let free = !p.busy && !p.matching(cx);
@@ -339,7 +393,11 @@ impl PeopleView {
                     move |_, _, cx| people.update(cx, |p, cx| p.ignore_picked(cx))
                 }))
                 .into_any_element();
-            let ids = sheet.faces.as_ref().map(|f| f.iter().map(|f| f.photo_id).collect()).unwrap_or_default();
+            let ids = sheet
+                .faces
+                .as_ref()
+                .map(|f| f.iter().map(|f| AvatarRef { photo: f.photo_id, face: f.face_id, bbox: f.bbox, rotation: f.rotation }).collect())
+                .unwrap_or_default();
             return (Some(bar), Some((Rows::Sheet, chunk(ids), CARD_H)), None);
         }
         match p.tab {
@@ -348,7 +406,12 @@ impl PeopleView {
                     let e = ui::empty("faces-people-empty", "No named people yet. Index faces and run matching to populate this view, or name a cluster.", colors);
                     return (None, None, Some(e));
                 }
-                (None, Some((Rows::People, chunk(data.people.iter().map(|x| x.avatar_photo_id).collect()), CARD_H)), None)
+                let ids = data
+                    .people
+                    .iter()
+                    .map(|x| AvatarRef { photo: x.avatar_photo_id, face: x.avatar_face_id, bbox: x.avatar_bbox, rotation: x.avatar_rotation })
+                    .collect();
+                (None, Some((Rows::People, chunk(ids), CARD_H)), None)
             }
             Tab::Clusters => {
                 let picked = p.picked_clusters.len();
@@ -367,7 +430,12 @@ impl PeopleView {
                 if data.clusters.is_empty() {
                     return (Some(bar), None, Some(ui::empty("faces-clusters-empty", "No unnamed clusters.", colors)));
                 }
-                (Some(bar), Some((Rows::Clusters, chunk(data.clusters.iter().map(|c| c.avatar_photo_id).collect()), CARD_H)), None)
+                let ids = data
+                    .clusters
+                    .iter()
+                    .map(|c| AvatarRef { photo: c.avatar_photo_id, face: c.avatar_face_id, bbox: c.avatar_bbox, rotation: c.avatar_rotation })
+                    .collect();
+                (Some(bar), Some((Rows::Clusters, chunk(ids), CARD_H)), None)
             }
             Tab::Suggestions => {
                 let above = p.above_threshold().len();
@@ -389,7 +457,12 @@ impl PeopleView {
                 if data.suggestions.is_empty() {
                     return (Some(bar), None, Some(ui::empty("faces-suggestions-empty", "No pending suggestions.", colors)));
                 }
-                (Some(bar), Some((Rows::Suggestions, data.suggestions.iter().map(|s| vec![s.photo_id]).collect(), ROW_H)), None)
+                let rows = data
+                    .suggestions
+                    .iter()
+                    .map(|s| vec![AvatarRef { photo: s.photo_id, face: s.face_id, bbox: s.bbox, rotation: s.rotation }])
+                    .collect();
+                (Some(bar), Some((Rows::Suggestions, rows, ROW_H)), None)
             }
         }
     }
@@ -427,11 +500,11 @@ impl PeopleView {
         match kind {
             Rows::People => {
                 let x = data.people.get(i)?.clone();
-                let thumb = self.thumb(x.avatar_photo_id, cx);
+                let source = self.avatar_source(x.avatar_photo_id, x.avatar_face_id, cx);
                 let tag = x.tag_id;
                 Some(
                     card(format!("faces-person-{tag}"), format!("Filter Library to {}", x.full_path), false, false, colors)
-                        .child(avatar(x.avatar_photo_id, thumb, x.avatar_bbox, x.avatar_rotation, 72., colors))
+                        .child(avatar(x.avatar_photo_id, source, x.avatar_bbox, x.avatar_rotation, 72., colors))
                         .child(div().text_size(px(12.)).font_weight(FontWeight::SEMIBOLD).text_color(colors.txt).max_w(px(96.)).truncate().child(x.name.clone()))
                         .child(small(format!("{} · {}", plural(x.photo_count, "photo", "photos"), plural(x.face_count, "face", "faces")), colors))
                         .on_click(move |_, _, cx| people.update(cx, |p, cx| p.filter_by_person(tag, cx)))
@@ -443,7 +516,7 @@ impl PeopleView {
                 let c = data.clusters.get(i)?.clone();
                 let picked = p.picked_clusters.contains(&c.cluster_id);
                 let free = !p.matching(cx);
-                let thumb = self.thumb(c.avatar_photo_id, cx);
+                let source = self.avatar_source(c.avatar_photo_id, c.avatar_face_id, cx);
                 let id = c.cluster_id;
                 let toggle = {
                     let people = people.clone();
@@ -474,7 +547,7 @@ impl PeopleView {
                 };
                 Some(
                     card(format!("faces-cluster-{id}"), format!("Name this cluster ({})", plural(c.member_count, "face", "faces")), true, picked, colors)
-                        .child(avatar(c.avatar_photo_id, thumb, c.avatar_bbox, c.avatar_rotation, 64., colors))
+                        .child(avatar(c.avatar_photo_id, source, c.avatar_bbox, c.avatar_rotation, 64., colors))
                         .child(small(plural(c.member_count, "face", "faces"), colors))
                         .child(ui::row().gap(px(6.)).child(toggle).child(open))
                         .when(free, |d| d.on_click(move |_, _, cx| people.update(cx, |p, cx| p.name_cluster(id, cx))))
@@ -486,11 +559,11 @@ impl PeopleView {
                 let sheet = p.sheet.as_ref()?;
                 let f = sheet.faces.as_ref()?.get(i)?.clone();
                 let picked = sheet.picked.contains(&f.face_id);
-                let thumb = self.thumb(f.photo_id, cx);
+                let source = self.avatar_source(f.photo_id, f.face_id, cx);
                 let id = f.face_id;
                 Some(
                     card(format!("faces-face-{id}"), if picked { "Picked face" } else { "Face" }, false, picked, colors)
-                        .child(avatar(f.photo_id, thumb, f.bbox, f.rotation, 72., colors))
+                        .child(avatar(f.photo_id, source, f.bbox, f.rotation, 72., colors))
                         .child(small(if picked { "✓ picked" } else { "click to pick" }, colors))
                         .on_click(move |_, _, cx| people.update(cx, |p, cx| p.toggle_face(id, cx)))
                         .test_support()
@@ -507,7 +580,7 @@ impl PeopleView {
         let e = p.data.as_ref()?.suggestions.get(i)?.clone();
         let below = !reaches(e.confidence, p.threshold);
         let free = !p.busy && !p.matching(cx);
-        let thumb = self.thumb(e.photo_id, cx);
+        let source = self.avatar_source(e.photo_id, e.face_id, cx);
         let face = e.face_id;
         let pct = (e.confidence * 100.).round() as i64;
         let verdict = |id: String, label: &'static str, color, v: Verdict| {
@@ -530,7 +603,7 @@ impl PeopleView {
                 .border_b_1()
                 .border_color(colors.line)
                 .when(below, |d| d.opacity(0.55))
-                .child(avatar(e.photo_id, thumb, e.bbox, e.rotation, 52., colors))
+                .child(avatar(e.photo_id, source, e.bbox, e.rotation, 52., colors))
                 .child(
                     div()
                         .flex()

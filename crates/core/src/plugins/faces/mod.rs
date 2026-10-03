@@ -22,7 +22,10 @@
 //!   merge-safe `mwg-rs:Regions` (via `crate::xmp`) on confirm/unconfirm, and import existing
 //!   foreign regions as confirmed faces (IoU-match to detections, `source='xmp'`). Pure over
 //!   SQLite — no model dependency.
+/// - [`avatar`] — the People view's avatar crop (#223 F1), rendered on the image-pool worker
+///   from a face's box instead of claiming the whole `Preview` tier. No model dependency.
 
+pub mod avatar;
 pub mod engine;
 pub mod indexer;
 pub mod matcher;

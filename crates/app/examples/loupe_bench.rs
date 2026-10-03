@@ -124,7 +124,7 @@ fn main() {
     let mut in_flight: HashSet<i64> = HashSet::new();
     let key = |id| ImageKey { photo: id, kind: ImageKind::Preview, version: 0 };
     let (mut preloaded, mut cold, mut flying) = (Vec::new(), Vec::new(), Vec::new());
-    let land = |lru: &mut ImageLru, in_flight: &mut HashSet<i64>, (id, r): (i64, Result<Loaded, String>)| {
+    let land = |lru: &mut ImageLru<ImageKey>, in_flight: &mut HashSet<i64>, (id, r): (i64, Result<Loaded, String>)| {
         in_flight.remove(&id);
         match r {
             Ok(l) => {

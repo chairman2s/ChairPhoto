@@ -11,6 +11,7 @@
 //! Catalog work runs on `Runner::manual` ([`work`]); images on a hand-answered `FakePool`.
 
 use super::*;
+use crate::image_store::ImageState;
 use crate::image_tests::{pixels, FakePool};
 use crate::loupe::zoom::{ZoomImage, ZoomView};
 use crate::machine_prefs::MachinePrefs;
@@ -1628,10 +1629,24 @@ fn writes_wait_for_a_running_match_and_its_end_rereads(cx: &mut TestAppContext) 
     people.read_with(cx, |p, _| assert!(p.naming.is_some()));
 }
 
-/// #152, rv151 L4: a card's avatar is a face cut by the face's box, which is in the
-/// original's frame. A cover version's thumbnail (possibly cropped) is not cut: the face is
-/// cut from the photo's preview instead, asked for (and held) once the thumbnail turns out to
-/// be a cover render, the circle empty until it lands. A plain thumbnail is cut directly.
+/// The avatar job the pool holds for `photo` (and, if several, `face`): #223 F1's crop,
+/// found among every job submitted so far (answering an already-answered one is a no-op).
+fn avatar_job(pool: &FakePool, photo: i64) -> JobKey {
+    pool.batches
+        .lock()
+        .unwrap()
+        .iter()
+        .flatten()
+        .find(|k| matches!(k, JobKey::Avatar(j) if j.photo_id == photo))
+        .cloned()
+        .expect("an avatar crop job for the photo")
+}
+
+/// #152, rv151 L4, #223 F1: a card's avatar is a face cut by the face's box, which is in the
+/// original's frame. A cover version's thumbnail (possibly cropped) is not cut directly: the
+/// face is a small crop cut on the pool worker instead — never the whole `Preview` tier
+/// (F1) — asked for (and held) once the thumbnail turns out to be a cover render, the circle
+/// empty until it lands. A plain thumbnail is cut directly (unchanged).
 #[gpui_kit::test]
 fn an_avatar_is_not_cut_from_a_cover_thumbnail(cx: &mut TestAppContext) {
     let f = open_faces(2, true, "people-cover-avatar", cx);
@@ -1642,23 +1657,33 @@ fn an_avatar_is_not_cut_from_a_cover_thumbnail(cx: &mut TestAppContext) {
     let (view, people) = f.people(cx);
     assert_eq!(people.read_with(cx, |p, _| p.data.as_ref().unwrap().people[0].avatar_photo_id), photo);
     let thumb = JobKey::photo(photo, ImageKind::Thumb);
-    let preview = JobKey::photo(photo, ImageKind::Preview);
     let images = f.app.wired.images.clone();
     assert!(!images.read_with(cx, |s, _| s.is_pending(photo, ImageKind::Preview)), "no preview for a plain card");
     f.pool.finish(&thumb, Ok(cover_pixels(400, 200)));
     work(&f.app, cx);
     assert!(f.present(&format!("faces-person-{alice}"), cx), "the card is drawn");
     assert!(!f.present(&format!("faces-avatar-{photo}"), cx), "no face cut from the cover's thumbnail");
-    assert!(images.read_with(cx, |s, _| s.is_pending(photo, ImageKind::Preview)), "the preview is asked for");
+    assert!(
+        !images.read_with(cx, |s, _| s.is_pending(photo, ImageKind::Preview)),
+        "F1: the avatar never claims the whole Preview tier"
+    );
+    let crop = avatar_job(&f.pool, photo);
+    assert!(matches!(&crop, JobKey::Avatar(j) if j.face_id == face), "the crop names this face");
     assert!(view.read_with(cx, |v, cx| v.held(cx)).contains(&photo));
 
-    // The preview (the original's frame; portrait here, to tell it from the thumbnail) lands:
-    // the face is cut from it.
-    f.pool.finish(&preview, Ok(pixels(200, 400)));
+    // The crop lands: the face is cut from it, and the main store never cached a Preview
+    // tier for this photo at all (F1's point: People never holds a full preview).
+    f.pool.finish(&crop, Ok(pixels(144, 144)));
     work(&f.app, cx);
-    let cut = f.bounds(&format!("faces-avatar-{photo}"), cx);
-    let aspect = f32::from(cut.size.width) / f32::from(cut.size.height);
-    assert!((aspect - 0.5).abs() < 0.01, "cut from the preview (aspect {aspect})");
+    assert!(f.present(&format!("faces-avatar-{photo}"), cx), "the crop is drawn");
+    assert!(
+        !matches!(images.read_with(cx, |s, _| s.peek(photo, ImageKind::Preview)), ImageState::Ready(_)),
+        "no full preview was ever cached for this photo's avatar"
+    );
+    assert!(
+        matches!(images.read_with(cx, |s, _| s.peek_avatar(photo, face)), ImageState::Ready(_)),
+        "the crop is cached under its own small avatar entry"
+    );
 
     // The cover taken off: the plain thumbnail, cut by the box.
     let images = f.app.wired.images.clone();
@@ -1702,4 +1727,72 @@ fn avatars_are_claimed_for_the_visible_rows_and_released(cx: &mut TestAppContext
     f.app.wired.shell.update(cx, |s, cx| s.show_library(cx));
     work(&f.app, cx);
     assert!(view.read_with(cx, |v, cx| v.held(cx)).is_empty(), "off stage: nothing held");
+}
+
+/// #223 F1 (review `agent-notes/reviews/claude-old-images.log`, probe P1): People-view
+/// avatars for cover photos used to claim the whole `Preview` tier — tens of MB each — so
+/// many covered avatars on screen could exceed the image budget, which evicts without
+/// regard to claims; the evicted ones were asked for again every frame and the view never
+/// settled (24 covered avatars at 64 MB previews submitted [12, 12, 25, 12, 12, 25] jobs per
+/// round on the probe, only 11 ever drawn). The crop renders only the avatar's own small
+/// square instead, so many cover avatars on the avatar cache's own (much smaller) budget
+/// settle, and every one draws.
+#[gpui_kit::test]
+fn many_cover_avatars_settle_without_claiming_the_preview_tier(cx: &mut TestAppContext) {
+    let n = 24;
+    let f = open_faces(n, true, "people-cover-budget", cx);
+    let faces: Vec<i64> = f
+        .ids
+        .iter()
+        .enumerate()
+        .map(|(i, &photo)| {
+            let tag = with_cat(&f.app, |c| c.create_tag(&format!("People/P{i:02}")).unwrap());
+            let face = add_face(&f.app, photo, "[0.1,0.1,0.2,0.2]");
+            confirm_as(&f.app, face, tag);
+            face
+        })
+        .collect();
+    let (view, _people) = f.people(cx);
+    for &photo in &f.ids {
+        f.pool.finish(&JobKey::photo(photo, ImageKind::Thumb), Ok(cover_pixels(400, 200)));
+    }
+    work(&f.app, cx);
+
+    // Every avatar crop job answered, round after round: a settled view asks for nothing
+    // already cached or pending, so submissions must reach zero, not resubmit forever.
+    let mut per_round = Vec::new();
+    for _round in 0..4 {
+        let before = f.pool.submitted();
+        let crops: Vec<JobKey> =
+            f.pool.batches.lock().unwrap().iter().flatten().filter(|k| matches!(k, JobKey::Avatar(_))).cloned().collect();
+        for key in crops {
+            f.pool.finish(&key, Ok(pixels(144, 144)));
+        }
+        cx.run_until_parked();
+        work(&f.app, cx);
+        per_round.push(f.pool.submitted() - before);
+    }
+    assert_eq!(per_round.last(), Some(&0), "avatar crops are asked again every round: {per_round:?}");
+
+    let shown = f.ids.iter().filter(|&&p| f.present(&format!("faces-avatar-{p}"), cx)).count();
+    assert_eq!(shown, n, "every avatar drew: {shown} of {n}");
+    assert!(view.read_with(cx, |v, cx| v.held(cx)).len() <= n, "held settles, not growing without bound");
+
+    // The point of F1: none of this ever claimed (or cached) the whole Preview tier.
+    for &photo in &f.ids {
+        assert!(
+            !f.app.wired.images.read_with(cx, |s, _| s.is_pending(photo, ImageKind::Preview)),
+            "photo {photo}: no avatar ever claims the whole Preview tier"
+        );
+        assert!(
+            !matches!(f.app.wired.images.read_with(cx, |s, _| s.peek(photo, ImageKind::Preview)), ImageState::Ready(_)),
+            "photo {photo}: no Preview tier was ever cached for its avatar"
+        );
+    }
+    for (&photo, &face) in f.ids.iter().zip(&faces) {
+        assert!(
+            matches!(f.app.wired.images.read_with(cx, |s, _| s.peek_avatar(photo, face)), ImageState::Ready(_)),
+            "photo {photo}: its avatar crop is cached"
+        );
+    }
 }

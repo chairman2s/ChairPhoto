@@ -164,27 +164,17 @@ pub async fn relocate_photo(
     relocate_photo_in_state(&state, photo_id, path).await
 }
 
+/// The body is the core's [`storage::relocate_photo`] (the GPUI app's Relocate… runs the
+/// same one), on the blocking pool: the sidecar IO must not run on an async worker.
 async fn relocate_photo_in_state(
     state: &AppState,
     photo_id: i64,
     path: PathBuf,
 ) -> Result<(), String> {
-    let target = path.clone();
-    let bind_path = path.clone();
-    let (uuid, db_path, root) = with_catalog_blocking(state, move |c| {
-        let uuid = c.relocate_photo(photo_id, &target)?;
-        Ok((uuid, c.db_path().to_path_buf(), c.root().to_path_buf()))
-    })
-    .await?;
-    // The file usually already carries the UUID (its sidecar moved with it); a sidecar
-    // holding somebody else's identity is left alone and recorded as a conflict.
-    let outcome = crate::app::spawn_blocking(move || {
-        let found = crate::xmp::read_identifier(&bind_path);
-        crate::catalog::bind_sidecar_identity(&bind_path, &uuid, found.as_deref())
-    })
-    .await
-    .map_err(|e| e.to_string())?;
-    record_identity_on_catalog(db_path, root, photo_id, path, outcome).await
+    let state = state.clone();
+    crate::app::spawn_blocking(move || storage::relocate_photo(&state, None, photo_id, &path))
+        .await
+        .map_err(|e| e.to_string())?
 }
 
 /// Sidecar identity fields that are in the catalog but not (yet) in XMP: photo UUID
@@ -340,23 +330,6 @@ pub async fn retry_owed_iptc(
     crate::app::spawn_blocking(move || crate::app::iptc_owed::retry_owed_iptc_as(&state, None, photo_id, &uuid))
         .await
         .map_err(|e| e.to_string())?
-}
-
-async fn record_identity_on_catalog(
-    db_path: PathBuf,
-    root: PathBuf,
-    photo_id: i64,
-    target_path: PathBuf,
-    outcome: crate::catalog::SidecarIdentity,
-) -> Result<(), String> {
-    crate::app::spawn_blocking(move || {
-        let catalog = Catalog::open_secondary(&db_path, &root).map_err(|e| e.to_string())?;
-        catalog
-            .record_sidecar_identity(photo_id, &target_path, &outcome)
-            .map_err(|e| e.to_string())
-    })
-    .await
-    .map_err(|e| e.to_string())?
 }
 
 #[cfg(test)]

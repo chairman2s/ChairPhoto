@@ -18,10 +18,12 @@
 //! - **Position.** Opens scrolled to the newest photo (the rows are oldest first) unless a
 //!   photo is active; scrolls the active photo into view whenever it changes.
 //! - **Keys** ([`crate::library::bindings`]) and clicks act on the session through the
-//!   shell: selection verbs, and culling marks through `ShellState::apply_mark`.
+//!   shell: selection verbs, and culling marks through `ShellState::apply_mark`. A
+//!   right-click opens the context menu ([`crate::library::grid_menu`]).
 
 use crate::image_store::{ImageState, ImageStore};
 use crate::keymap::contexts;
+use crate::library::grid_menu::GridMenu;
 use crate::library::layout::{self, GAP, NAME_H, OVERSCAN_ROWS};
 use crate::library::*;
 use crate::shell::actions::{OpenCompare, ToggleLoupe};
@@ -35,7 +37,7 @@ use chairphoto_model::library::session::{LibrarySession, SelectMods};
 use gpui_kit::prelude::*;
 use gpui_kit::{
     div, img, px, uniform_list, AnyElement, App, Bounds, ClickEvent, Context, Entity, FocusHandle, Hsla,
-    MouseButton, ObjectFit, Pixels, Point, ScrollStrategy, SharedString, Subscription, TestSupportExt as _,
+    MouseButton, MouseDownEvent, ObjectFit, Pixels, Point, ScrollStrategy, SharedString, Subscription, TestSupportExt as _,
     UniformListDecoration, UniformListScrollHandle, WeakEntity, Window,
 };
 use std::collections::HashSet;
@@ -43,7 +45,7 @@ use std::ops::Range;
 
 /// The grid. See the module docs.
 pub struct LibraryView {
-    shell: Entity<ShellState>,
+    pub(super) shell: Entity<ShellState>,
     images: Entity<ImageStore>,
     focus: FocusHandle,
     scroll: UniformListScrollHandle,
@@ -60,12 +62,20 @@ pub struct LibraryView {
     scrolled_for: Option<(i64, usize)>,
     /// Rows visible in the last frame, for Page Up/Down.
     visible_rows: usize,
+    /// The right-click menu while it is open ([`crate::library::grid_menu`]).
+    pub(super) menu: Option<GridMenu>,
     _observers: [Subscription; 2],
 }
 
 impl LibraryView {
     pub fn new(shell: Entity<ShellState>, images: Entity<ImageStore>, cx: &mut Context<Self>) -> Self {
-        let _observers = [cx.observe(&shell, |_, _, cx| cx.notify()), cx.observe(&images, |_, _, cx| cx.notify())];
+        let _observers = [
+            cx.observe(&shell, |this, _, cx| {
+                this.check_menu(cx);
+                cx.notify()
+            }),
+            cx.observe(&images, |_, _, cx| cx.notify()),
+        ];
         Self {
             shell,
             images,
@@ -77,6 +87,7 @@ impl LibraryView {
             opened_at_bottom: false,
             scrolled_for: None,
             visible_rows: 1,
+            menu: None,
             _observers,
         }
     }
@@ -129,11 +140,10 @@ impl LibraryView {
         self.shell.update(cx, |s, cx| s.select_with(cx, |l| l.select(id, mods)));
     }
 
-    /// Right-click selects the photo (React opened the context menu on it; the menu's
-    /// commands — trash, reveal, relocate, retrieve, remove — are Storage and import's, #114).
-    fn on_tile_right_click(&mut self, id: i64, window: &mut Window, cx: &mut Context<Self>) {
+    /// Right-click opens the context menu on the photo ([`crate::library::grid_menu`]).
+    fn on_tile_right_click(&mut self, id: i64, event: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         self.focus.focus(window, cx);
-        self.shell.update(cx, |s, cx| s.select_with(cx, |l| l.select(id, SelectMods::default())));
+        self.open_menu(id, event.position, cx);
     }
 
     fn has_active(&self, cx: &Context<Self>) -> bool {
@@ -449,7 +459,7 @@ impl LibraryView {
             .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| this.on_tile_click(id, event, window, cx)))
             .on_mouse_down(
                 MouseButton::Right,
-                cx.listener(move |this, _, window, cx| this.on_tile_right_click(id, window, cx)),
+                cx.listener(move |this, event: &MouseDownEvent, window, cx| this.on_tile_right_click(id, event, window, cx)),
             )
             .test_support()
             .into_any_element()
@@ -586,6 +596,7 @@ impl Render for LibraryView {
             .on_action(cx.listener(|this, _: &PageDown, _, cx| this.page(1, cx)))
             .on_action(cx.listener(|this, _: &PageUp, _, cx| this.page(-1, cx)))
             .on_action(cx.listener(|this, _: &SelectAll, _, cx| this.select(cx, |l| l.select_all())))
+            .on_action(cx.listener(|this, _: &CloseMenu, _, cx| this.close_menu(cx)))
             .on_action(cx.listener(|this, _: &Rate0, _, cx| this.mark(Mark::Rating(0), cx)))
             .on_action(cx.listener(|this, _: &Rate1, _, cx| this.mark(Mark::Rating(1), cx)))
             .on_action(cx.listener(|this, _: &Rate2, _, cx| this.mark(Mark::Rating(2), cx)))
@@ -666,6 +677,7 @@ impl Render for LibraryView {
         .flex_1()
         .min_h_0()
         .w_full();
-        root.px(px(12.)).pt(px(8.)).child(list)
+        let menu = self.render_menu(colors, cx);
+        root.px(px(12.)).pt(px(8.)).child(list).children(menu)
     }
 }

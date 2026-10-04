@@ -107,17 +107,23 @@ cargo run --release -p chairphoto-app --bin chairphoto
 ```
 
 It opens your real catalog by default (`~/Pictures/Raw`, changeable in Preferences). To try
-it without touching your own library, point it at throwaway data directories instead:
+it without touching your own library, point it at throwaway directories instead — all three
+variables, not just the first two:
 
 ```bash
-XDG_DATA_HOME=/tmp/cp-data XDG_CACHE_HOME=/tmp/cp-cache \
+XDG_DATA_HOME=/tmp/cp-data XDG_CACHE_HOME=/tmp/cp-cache CHAIRPHOTO_LIBRARY_ROOT=/tmp/cp-photos \
   cargo run --release -p chairphoto-app --bin chairphoto
 ```
 
-That isolates the catalog database and caches ChairPhoto keeps under
-`$XDG_DATA_HOME`/`$XDG_CACHE_HOME` (both default to `~/.local/share` / `~/.local/cache`),
-which is the same mechanism this project's own agents use to avoid ever touching the real
-library during development.
+`XDG_DATA_HOME`/`XDG_CACHE_HOME` (both default to `~/.local/share`/`~/.cache`) isolate the
+catalog database and the image caches. On their own, though, a brand new catalog still roots
+itself at the real `~/Pictures/Raw` (`crates/core/src/app/catalogs.rs`) — the scratch database
+would browse, scan and write XMP sidecars into your actual library. `CHAIRPHOTO_LIBRARY_ROOT`
+closes that gap: a development-only override, honoured only while the catalog has no stored
+root yet, so it can set where a *fresh* catalog starts but can never redirect one that already
+exists. (This project's own agent-driving skill, `.claude/skills/chairphoto-app/app.sh`, takes
+the same idea further — seeding `catalog_root` straight into the database so a scratch
+instance opens already pointed at its pre-populated agent library.)
 
 Checks:
 

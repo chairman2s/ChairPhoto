@@ -22,10 +22,10 @@
 //! colliding pairs only, so re-importing a card whose every file collides reads a few KB of
 //! each file rather than hashing the card and its library copies. Both sides of a pair are
 //! read by the same pass with the same arguments, so one file's bytes always give one
-//! answer. A bundle's original arrives as bytes in memory ([`find_in_library`]): a library
-//! file holding exactly those bytes is the same photo, and otherwise exiftool reads the
-//! bytes from stdin with the same arguments — they are never written to disk to be
-//! compared. A file exiftool cannot read (or no exiftool at all) has no capture time: with
+//! answer. A bundle's original arrives as bytes in memory ([`find_in_library`]): exiftool
+//! reads them from stdin in the same process that reads the library files — they are never
+//! written to disk to be compared — and the stamps decide first; a library file holding
+//! exactly those bytes is the same photo all the same. A file exiftool cannot read (or no exiftool at all) has no capture time: with
 //! the other side's time known that is a difference, and with neither known the contents
 //! decide.
 
@@ -137,16 +137,32 @@ pub fn read_capture_stamps(paths: &[PathBuf], abort: &AtomicBool) -> Option<Hash
 /// stdin with the command [`read_capture_stamps`] uses: nothing is written to disk. Bytes
 /// exiftool cannot read (or no exiftool) have no capture time.
 pub fn read_capture_stamp_of(bytes: &[u8]) -> CaptureStamp {
+    read_stamps_with_bytes(bytes, &[]).0
+}
+
+/// The [`CaptureStamp`] of `bytes`, read from stdin, and of each of `paths`, read **by the
+/// same exiftool process** ([`stamp_command`], `exiftool … -- - <paths>`): one exiftool, one
+/// version and one set of arguments for both sides of a comparison. Paths beyond one
+/// [`STAMP_BATCH`] are read by [`read_capture_stamps`]'s further processes, with the same
+/// command. Whatever exiftool cannot read (or no exiftool) has no capture time.
+fn read_stamps_with_bytes(bytes: &[u8], paths: &[PathBuf]) -> (CaptureStamp, HashMap<PathBuf, CaptureStamp>) {
     use std::io::Write;
     use std::process::Stdio;
 
+    let (first, rest) = paths.split_at(paths.len().min(STAMP_BATCH - 1));
+    let mut stamps = if rest.is_empty() {
+        HashMap::new()
+    } else {
+        read_capture_stamps(rest, &AtomicBool::new(false)).unwrap_or_default()
+    };
     let mut cmd = stamp_command();
-    cmd.arg("-").stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null());
-    let Ok(mut child) = cmd.spawn() else { return CaptureStamp::default() };
+    cmd.args(["--", "-"]).args(first);
+    cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null());
+    let Ok(mut child) = cmd.spawn() else { return (CaptureStamp::default(), stamps) };
     let Some(mut stdin) = child.stdin.take() else {
         let _ = child.kill();
         let _ = child.wait();
-        return CaptureStamp::default();
+        return (CaptureStamp::default(), stamps);
     };
     // Fed from another thread while this one drains stdout, so neither pipe can fill and
     // stall the other. exiftool may stop reading once it has what it needs; the broken pipe
@@ -157,13 +173,20 @@ pub fn read_capture_stamp_of(bytes: &[u8]) -> CaptureStamp {
         });
         child.wait_with_output()
     });
-    let Ok(output) = output else { return CaptureStamp::default() };
-    match serde_json::from_slice(&output.stdout) {
-        Ok(serde_json::Value::Array(objects)) => {
-            objects.first().and_then(|v| v.as_object()).map(parse_stamp).unwrap_or_default()
+    let mut arriving = CaptureStamp::default();
+    let Ok(output) = output else { return (arriving, stamps) };
+    if let Ok(serde_json::Value::Array(objects)) = serde_json::from_slice(&output.stdout) {
+        for obj in objects.iter().filter_map(|v| v.as_object()) {
+            match obj.get("SourceFile").and_then(|v| v.as_str()) {
+                Some("-") => arriving = parse_stamp(obj),
+                Some(path) => {
+                    stamps.insert(PathBuf::from(path), parse_stamp(obj));
+                }
+                None => {}
+            }
         }
-        _ => CaptureStamp::default(),
     }
+    (arriving, stamps)
 }
 
 fn parse_stamp(obj: &serde_json::Map<String, serde_json::Value>) -> CaptureStamp {
@@ -238,23 +261,33 @@ fn is_same_photo(a: &Path, sa: &CaptureStamp, b: &Path, sb: &CaptureStamp) -> bo
 }
 
 /// Which of `candidates` (the library files a bundle original may already be,
-/// [`same_size_candidates`]) is the photo whose bytes are `bytes`, by #246's rule, without
-/// writing those bytes anywhere: `Some(Some(path))` the same photo, `Some(None)` a different
-/// one, `None` once `abort` is set.
+/// [`same_size_candidates`], so of its size) is the photo whose bytes are `bytes`, by #246's
+/// rule, without writing those bytes anywhere: `Some(Some(path))` the same photo,
+/// `Some(None)` a different one, `None` once `abort` is set.
 ///
-/// A candidate holding exactly these bytes is the same photo — under the rule identical
-/// bytes always are (one reader gives them one stamp, or their equal contents decide) — and
-/// is found by a streamed comparison that stops at the first differing byte, so re-importing
-/// a bundle the library already holds starts no exiftool at all. Only when no candidate is
-/// byte-identical are the stamps read: the bytes' own by exiftool from stdin
-/// ([`read_capture_stamp_of`]), the candidates' from their paths, with the same command. A
-/// pair with no capture time on either side is then different: its contents were just
-/// compared.
+/// The stamps decide first, as for a card (L-d of the second #246 review): the bytes' own
+/// read by exiftool from stdin and the candidates' from their paths, by one exiftool process
+/// ([`read_stamps_with_bytes`]) — a few KB of each file, so re-importing 2000 RAWs from a NAS
+/// reads 2000 headers, not 120 GB. Only where the stamps do not say "the same capture" are the
+/// contents compared, streamed and stopping at the first differing byte, because identical
+/// bytes are always the same photo: with no capture time on either side that compare is the
+/// rule itself (and reads the whole file when it matches); where the stamps differ it guards
+/// against a read that failed on one side only, and stops within the first bytes for two
+/// genuinely different captures, whose headers differ.
 pub fn find_in_library(bytes: &[u8], candidates: &[PathBuf], abort: &AtomicBool) -> Option<Option<PathBuf>> {
     // No collision is no decision: there is nothing for a stop to interrupt (the caller reads
     // `abort` between originals).
     if candidates.is_empty() {
         return Some(None);
+    }
+    if abort.load(Ordering::Relaxed) {
+        return None;
+    }
+    let (arriving, stamps) = read_stamps_with_bytes(bytes, candidates);
+    let none = CaptureStamp::default();
+    let verdict = |c: &PathBuf| same_capture(&arriving, stamps.get(c).unwrap_or(&none));
+    if let Some(c) = candidates.iter().find(|c| verdict(c) == Some(true)) {
+        return Some(Some(c.clone()));
     }
     for c in candidates {
         if abort.load(Ordering::Relaxed) {
@@ -264,23 +297,14 @@ pub fn find_in_library(bytes: &[u8], candidates: &[PathBuf], abort: &AtomicBool)
             return Some(Some(c.clone()));
         }
     }
-    if abort.load(Ordering::Relaxed) {
-        return None;
-    }
-    let arriving = read_capture_stamp_of(bytes);
-    if !arriving.has_capture_time() {
-        // No capture time: only a candidate without one either could be this photo, and the
-        // contents decide that pair — they were just found to differ.
-        return Some(None);
-    }
-    let stamps = read_capture_stamps(candidates, abort)?;
-    let none = CaptureStamp::default();
-    Some(
-        candidates
-            .iter()
-            .find(|c| same_capture(&arriving, stamps.get(*c).unwrap_or(&none)) == Some(true))
-            .cloned(),
-    )
+    Some(None)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Bytes [`holds_bytes`] read on this thread: what a test counts to tell a stamp decision
+    /// from a contents compare.
+    static BYTES_COMPARED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 /// Whether the file at `path` holds exactly `bytes`, read in chunks and stopping at the first
@@ -299,6 +323,8 @@ fn holds_bytes(path: &Path, bytes: &[u8]) -> bool {
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
             Err(_) => return false,
         };
+        #[cfg(test)]
+        BYTES_COMPARED.with(|c| c.set(c.get() + n as u64));
         if n == 0 {
             return rest.is_empty();
         }
@@ -754,6 +780,37 @@ mod tests {
         assert_eq!(from_bytes.time.as_deref(), Some("2026:06:28 12:00:00"));
         assert_eq!(Some(&from_bytes), from_path.get(&a));
         assert_eq!(read_capture_stamp_of(b"not an image"), CaptureStamp::default());
+    }
+
+    /// L-d of the second #246 review: with a capture time on both sides the stamps decide and
+    /// no library file is read whole — a re-import of byte-identical stamped originals
+    /// compares no content at all; with none on either side the contents decide, read in
+    /// full when they match. The bytes' stamp and the library file's come from one exiftool
+    /// process and agree.
+    #[test]
+    fn the_stamps_decide_before_any_contents_are_compared() {
+        if !test_files::exiftool_available("the_stamps_decide_before_any_contents_are_compared") {
+            return;
+        }
+        let dir = temp("stamps-first");
+        let lib = dir.join("DSC1.jpg");
+        test_files::stamped_jpeg(&lib, "2026:06:28 12:00:00", "123", "4711");
+        let bytes = std::fs::read(&lib).unwrap();
+        let (arriving, stamps) = read_stamps_with_bytes(&bytes, std::slice::from_ref(&lib));
+        assert!(arriving.has_capture_time());
+        assert_eq!(stamps.get(&lib), Some(&arriving), "one process, one answer");
+
+        let compared = || BYTES_COMPARED.with(|c| c.get());
+        let never = AtomicBool::new(false);
+        let before = compared();
+        assert_eq!(find_in_library(&bytes, std::slice::from_ref(&lib), &never), Some(Some(lib.clone())));
+        assert_eq!(compared(), before, "decided by the stamps, no content read");
+
+        let png = dir.join("a.png");
+        std::fs::write(&png, b"bytes one").unwrap();
+        let before = compared();
+        assert_eq!(find_in_library(b"bytes one", std::slice::from_ref(&png), &never), Some(Some(png.clone())));
+        assert_eq!(compared() - before, 9, "no capture time: the contents decide, whole");
     }
 
     /// Bytes held in memory are matched without being written anywhere: to a byte-identical

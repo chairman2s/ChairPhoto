@@ -814,10 +814,14 @@ The importer (`bundle/importer.rs`) runs in three phases:
    a collision is decided by card ingest's rule (#246): the same name, size and capture →
    already imported, skip; anything else → rename with ` (n)` suffix; never overwrite. The
    bundle's side is read from the original's bytes in memory (the manifest carries no
-   capture time or serial), never written anywhere to be compared: a library file holding
-   exactly those bytes is the same photo, and otherwise exiftool reads the bytes from stdin
-   with the arguments it reads the library file with (`same_photo::find_in_library`). So
-   re-importing a bundle the library already holds writes nothing to the library's disk.
+   capture time or serial), never written anywhere to be compared: one exiftool process
+   reads the bytes from stdin and the library files from their paths, with one set of
+   arguments, and the stamps decide first, as for a card (`same_photo::find_in_library`).
+   Only where they do not say "the same capture" are the contents compared, streamed and
+   stopping at the first differing byte — byte-identical is always the same photo — so a
+   re-import of RAWs that carry a capture time reads their headers, not every library
+   copy whole. Re-importing a bundle the library already holds writes nothing to the
+   library's disk.
    A file found already there is not touched by this phase, its sidecar included: the
    index phase binds an identity to it — the row's, through `ensure_sidecar_identity` —
    and only when no row of **another** identity holds the file. One that does is the

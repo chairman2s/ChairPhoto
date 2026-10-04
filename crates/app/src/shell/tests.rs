@@ -151,7 +151,7 @@ fn layout_changes_are_written_with_reacts_keys(cx: &mut TestAppContext) {
 
     // A fresh launch on the same file opens with all of it.
     let again = MachinePrefs::load(path.clone());
-    let restored = crate::shell::layout_prefs::restore(|k| again.get(k).map(str::to_string));
+    let restored = crate::shell::layout_prefs::restore(|k| again.get(k));
     assert_eq!(restored.layout.left_w, w1);
     assert_eq!(restored.inspector_tab, InspectorTab::Versions);
     assert!(!restored.sections_open[1]);

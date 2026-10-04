@@ -11,6 +11,8 @@
 //!      sub-second, camera serial; the contents when neither has a capture time) →
 //!      already imported, skip.
 //!    - Any other collision → rename with ` (n)` suffix (never overwrite).
+//!    A collision is decided against the original's bytes in memory, never by unpacking
+//!    them beside the library file first.
 //!    Sidecars (`<entry>.xmp`) are extracted beside their original.
 //!    Progress events (`import:progress {done, total}`) stream the copy phase.
 //! 3. **Index** (on a secondary connection, off the main catalog lock) — call
@@ -128,19 +130,6 @@ pub fn extract_originals(
         .map(|(extracted, result, _)| (extracted, result))
 }
 
-/// An original that arrived at a name the library already uses at its size, unpacked beside
-/// it under a hidden name until #246's rule says whether it is that photo.
-struct Staged<'m> {
-    bp: &'m crate::bundle::BundlePhoto,
-    arc_orig: String,
-    /// The unpacked bytes, `<dir>/.chairphoto-import-<filename>`: hidden from a scan, and
-    /// keeping the extension so exiftool reads it as it reads the library file.
-    staged: PathBuf,
-    /// Where it lands if it is a different photo (its ` (n)` name is found then).
-    dest: PathBuf,
-    candidates: Vec<PathBuf>,
-}
-
 /// [`extract_originals`], stopping before the next original once `abort` is set (a Cancel,
 /// a newer import or a catalog switch). The third value is whether it stopped early.
 ///
@@ -152,12 +141,11 @@ struct Staged<'m> {
 /// then the same captures at their names, skipped, bound by UUID and indexed. A rescan also
 /// picks them up under the bundle's identity.
 ///
-/// The bundle's side of a collision is read from the original itself, unpacked beside the
-/// library file under a hidden name: the manifest carries no capture time or serial, and
-/// reading both files with the same exiftool pass means one file's bytes always give one
-/// answer. The collisions are decided together, in one batched read, once every original has
-/// been through the loop; an unpacked original the stop leaves undecided is removed (it was
-/// never placed in the library).
+/// A collision is decided as each original comes out of the bundle, against its bytes in
+/// memory ([`same_photo::find_in_library`](crate::scanner::same_photo::find_in_library)):
+/// the manifest carries no capture time or serial, and the bytes are never written anywhere
+/// to be compared, so re-importing a bundle the library already holds writes nothing to the
+/// library's disk.
 pub fn extract_originals_abortable(
     manifest: &BundleManifest,
     archive: &mut ZipArchive<std::fs::File>,
@@ -175,16 +163,9 @@ pub fn extract_originals_abortable(
         merge: MergeSummary::default(),
     };
     let mut extracted: Vec<ExtractedItem> = Vec::new();
-    let mut staged: Vec<Staged> = Vec::new();
-    let drop_staged = |staged: &[Staged]| {
-        for s in staged {
-            let _ = std::fs::remove_file(&s.staged);
-        }
-    };
 
     for (i, bp) in manifest.photos.iter().enumerate() {
         if abort.load(std::sync::atomic::Ordering::Relaxed) {
-            drop_staged(&staged);
             return Ok((extracted, result, true));
         }
         on_progress(i + 1, total);
@@ -254,24 +235,26 @@ pub fn extract_originals_abortable(
 
         let dest = dir.join(filename);
 
-        // A same-name, same-size file may be this photo, already imported (#246): unpack it
-        // beside the library file, to be decided with the others after the loop.
+        // A same-name, same-size file may be this photo, already imported (#246): decided
+        // now, against the bytes in memory.
         let candidates = same_photo::same_size_candidates(&dest, orig_bytes.len() as u64);
-        if !candidates.is_empty() {
-            let mut hidden = std::ffi::OsString::from(".chairphoto-import-");
-            hidden.push(filename);
-            let staged_path = dir.join(hidden);
-            if let Err(e) = std::fs::write(&staged_path, &orig_bytes) {
-                eprintln!("bundle import: write {} failed: {e}", staged_path.display());
-                let _ = std::fs::remove_file(&staged_path);
-                result.errors += 1;
-                continue;
-            }
-            staged.push(Staged { bp, arc_orig, staged: staged_path, dest, candidates });
+        let Some(already) = same_photo::find_in_library(&orig_bytes, &candidates, abort) else {
+            return Ok((extracted, result, true));
+        };
+        if let Some(existing) = already {
+            // The same capture is already in the library: skip the copy.
+            result.skipped_duplicate += 1;
+            bind_existing(&existing, bp);
+            // Still record as extracted so the indexer can upsert its location.
+            extracted.push(ExtractedItem {
+                dest: existing,
+                photo_uuid: bp.uuid.clone(),
+                relative_path: bp.relative_path.clone(),
+            });
             continue;
         }
 
-        // Any other collision (another size) is a different photo → ` (n)`.
+        // Any other collision is a different photo → ` (n)`.
         let Some(dest) = unique_free_name(bp, &dest, &mut result) else { continue };
         if let Err(e) = std::fs::write(&dest, &orig_bytes) {
             eprintln!(
@@ -286,49 +269,6 @@ pub fn extract_originals_abortable(
             dest,
             photo_uuid: bp.uuid.clone(),
             relative_path: bp.relative_path.clone(),
-        });
-    }
-
-    // Decide the collisions together: one batched metadata read over them all.
-    let arrivals: Vec<same_photo::Arrival> = staged
-        .iter()
-        .map(|s| same_photo::Arrival { file: s.staged.clone(), candidates: s.candidates.clone() })
-        .collect();
-    let Some(decided) = same_photo::find_already_imported(&arrivals, abort) else {
-        drop_staged(&staged);
-        return Ok((extracted, result, true));
-    };
-    for (s, already) in staged.iter().zip(decided) {
-        if let Some(existing) = already {
-            // The same capture is already in the library: skip the copy.
-            let _ = std::fs::remove_file(&s.staged);
-            result.skipped_duplicate += 1;
-            bind_existing(&existing, s.bp);
-            // Still record as extracted so the indexer can upsert its location.
-            extracted.push(ExtractedItem {
-                dest: existing,
-                photo_uuid: s.bp.uuid.clone(),
-                relative_path: s.bp.relative_path.clone(),
-            });
-            continue;
-        }
-        // A different photo under a name already used: kept beside it as ` (n)`.
-        let Some(dest) = unique_free_name(s.bp, &s.dest, &mut result) else {
-            let _ = std::fs::remove_file(&s.staged);
-            continue;
-        };
-        if let Err(e) = std::fs::rename(&s.staged, &dest) {
-            eprintln!("bundle import: placing {} failed: {e}", dest.display());
-            let _ = std::fs::remove_file(&s.staged);
-            result.errors += 1;
-            continue;
-        }
-        result.copied += 1;
-        place_sidecar(archive, &s.arc_orig, &dest, s.bp);
-        extracted.push(ExtractedItem {
-            dest,
-            photo_uuid: s.bp.uuid.clone(),
-            relative_path: s.bp.relative_path.clone(),
         });
     }
 
@@ -1094,10 +1034,10 @@ mod tests {
         assert!(!root.join("2026/06/29/DSC1 (3).jpg").exists());
     }
 
-    /// An abort before the collisions are decided — between originals, or during the
-    /// decision — leaves no staged file and copies nothing of them.
+    /// An abort while a collision is being decided copies nothing of it and leaves nothing
+    /// beside the library's files; an original decided before the stop stays placed.
     #[test]
-    fn an_abort_removes_the_staged_originals() {
+    fn an_abort_during_a_collision_copies_nothing_of_it() {
         let src = temp_dir("246-abort-src");
         let (a, b) = (src.join("a/DSC1.ARW"), src.join("b/DSC2.ARW"));
         for p in [&a, &b] {
@@ -1111,13 +1051,13 @@ mod tests {
                 (plain_photo("uuid-246-b", "2026/06/28/DSC2.ARW"), Some(b)),
             ],
         );
-        // Abort after the first original (in the loop), and after the last (at the decision).
-        for stop_after in [1, 2] {
+        // Abort as the first original's collision is decided, and as the second's.
+        for (stop_after, placed) in [(1, &[][..]), (2, &["DSC1 (2).ARW", "DSC1 (2).ARW.xmp"][..])] {
             let (manifest, mut archive) = open_bundle(&bundle_path).unwrap();
             let dest_base = temp_dir("246-abort-dest");
             let date_dir = dest_base.join("2026/06/28");
             std::fs::create_dir_all(&date_dir).unwrap();
-            // Same size as the bundle's "FAKE RAW BYTES", other bytes: both are staged.
+            // Same size as the bundle's "FAKE RAW BYTES", other bytes: both collide.
             for name in ["DSC1.ARW", "DSC2.ARW"] {
                 std::fs::write(date_dir.join(name), b"OTHER RAWBYTES").unwrap();
             }
@@ -1129,14 +1069,61 @@ mod tests {
                     }
                 })
                 .unwrap();
-            assert!(aborted && partial.copied == 0, "stop after {stop_after}");
+            assert!(aborted && partial.copied == stop_after - 1, "stop after {stop_after}: {partial:?}");
             let mut names: Vec<String> = std::fs::read_dir(&date_dir)
                 .unwrap()
                 .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
                 .collect();
             names.sort();
-            assert_eq!(names, ["DSC1.ARW", "DSC2.ARW"], "only the library's own files (stop after {stop_after})");
+            let mut expected: Vec<&str> = ["DSC1.ARW", "DSC2.ARW"].into_iter().chain(placed.iter().copied()).collect();
+            expected.sort();
+            assert_eq!(names, expected, "stop after {stop_after}");
         }
+    }
+
+    /// Every file and directory under `root`, with its size and modification time: a
+    /// directory's mtime moves when an entry is created or removed in it, so a file written
+    /// and removed again between two snapshots still shows.
+    fn tree_snapshot(root: &Path) -> Vec<(PathBuf, u64, std::time::SystemTime)> {
+        let mut out: Vec<_> = walkdir::WalkDir::new(root)
+            .into_iter()
+            .map(|e| e.unwrap())
+            .map(|e| {
+                let md = e.metadata().unwrap();
+                (e.path().to_path_buf(), md.len(), md.modified().unwrap())
+            })
+            .collect();
+        out.sort();
+        out
+    }
+
+    /// M-1 of the #246 review: re-importing a bundle the library already holds writes nothing
+    /// to the library's disk — no copy of an original is unpacked there to be compared, at
+    /// any point of the unpack — and skips every original.
+    #[test]
+    fn re_importing_a_bundle_writes_nothing_to_the_library() {
+        let src = temp_dir("246-again-src");
+        let mut photos = Vec::new();
+        for (i, name) in ["DSC1.ARW", "DSC2.ARW", "DSC3.ARW"].into_iter().enumerate() {
+            let p = src.join(name);
+            std::fs::write(&p, format!("FAKE RAW BYTES {i}")).unwrap();
+            photos.push((plain_photo(&format!("uuid-246-again-{i}"), &format!("2026/06/28/{name}")), Some(p)));
+        }
+        let bundle_path = bundle_of("246-again", photos);
+        let (catalog, root) = temp_catalog("246-again");
+        let (manifest, mut archive) = open_bundle(&bundle_path).unwrap();
+        let (extracted, partial) = extract_originals(&manifest, &mut archive, &root, |_, _| {}).unwrap();
+        assert_eq!(partial.copied, 3);
+        index_bundle(&catalog, &manifest, &extracted, &root, partial).unwrap();
+
+        let before = tree_snapshot(&root);
+        let (manifest, mut archive) = open_bundle(&bundle_path).unwrap();
+        let (_, again) = extract_originals(&manifest, &mut archive, &root, |_, _| {
+            assert_eq!(tree_snapshot(&root), before, "the library is unchanged during the unpack");
+        })
+        .unwrap();
+        assert_eq!((again.skipped_duplicate, again.copied, again.errors), (3, 0, 0));
+        assert_eq!(tree_snapshot(&root), before, "the library is unchanged after the unpack");
     }
 
     #[test]

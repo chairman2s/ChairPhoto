@@ -799,9 +799,11 @@ The importer (`bundle/importer.rs`) runs in three phases:
 2. **Copy** (off the catalog lock) — extract `originals/` into `<root>/YYYY/MM/DD/`;
    a collision is decided by card ingest's rule (#246): the same name, size and capture →
    already imported, skip; anything else → rename with ` (n)` suffix; never overwrite. The
-   bundle's side is read from the original itself, unpacked beside the library file under a
-   hidden `.chairphoto-import-<name>` until it is decided (the manifest carries no capture
-   time or serial); one that a stop leaves undecided is removed.
+   bundle's side is read from the original's bytes in memory (the manifest carries no
+   capture time or serial), never written anywhere to be compared: a library file holding
+   exactly those bytes is the same photo, and otherwise exiftool reads the bytes from stdin
+   with the arguments it reads the library file with (`same_photo::find_in_library`). So
+   re-importing a bundle the library already holds writes nothing to the library's disk.
    Writes a UUID sidecar beside each original so the index phase can match by identity.
 3. **Index** (secondary connection, off the main lock) — `upsert_photo_with_identity` for
    each extracted file, giving a row created for the bundle's own photo the bundle's full

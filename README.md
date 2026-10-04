@@ -65,10 +65,10 @@ At build time ChairPhoto additionally needs a Rust toolchain, `clang`/`libclang`
 LibRaw bindings, plus zlib), and the fontconfig/freetype headers — `zed-font-kit` (gpui's
 font matcher) probes for them while building, but neither library is linked or loaded at run
 time (confirmed on the release binary with `readelf`/`strings`; see `packaging/PKGBUILD`). At
-run time the GPUI front end needs a Vulkan driver, `libxkbcommon`, and `libxcb` — linked
-unconditionally, so it's needed whether you run Wayland or X11. A Wayland session additionally
-dlopens the Wayland client libraries; X11/XWayland alone needs nothing more. No browser engine
-of any kind.
+run time the GPUI front end needs a Vulkan driver, `libxkbcommon`, `libxkbcommon-x11`, and
+`libxcb` — linked unconditionally, so all of them are needed whether you run Wayland or X11.
+A Wayland session additionally dlopens the Wayland client libraries; X11/XWayland alone needs
+nothing more. No browser engine of any kind.
 
 ### Arch Linux
 
@@ -115,9 +115,12 @@ it without touching your own library, point it at throwaway directories instead 
 variables, not just the first two:
 
 ```bash
-XDG_DATA_HOME=/tmp/cp-data XDG_CACHE_HOME=/tmp/cp-cache CHAIRPHOTO_LIBRARY_ROOT=/tmp/cp-photos \
+XDG_DATA_HOME=~/cp-trial/data XDG_CACHE_HOME=~/cp-trial/cache CHAIRPHOTO_LIBRARY_ROOT=~/cp-trial/photos \
   cargo run --release -p chairphoto-app --bin chairphoto
 ```
+
+(Under `$HOME`, not `/tmp`: AGENTS.md notes `/tmp` is a quota-limited tmpfs and the image
+cache can get large.)
 
 `XDG_DATA_HOME`/`XDG_CACHE_HOME` (both default to `~/.local/share`/`~/.cache`) isolate the
 catalog database and the image caches. On their own, though, a brand new catalog still roots
@@ -128,6 +131,11 @@ root yet, so it can set where a *fresh* catalog starts but can never redirect on
 exists. (This project's own agent-driving skill, `.claude/skills/chairphoto-app/app.sh`, takes
 the same idea further — seeding `catalog_root` straight into the database so a scratch
 instance opens already pointed at its pre-populated agent library.)
+
+None of this scopes Export or Collage, though: both default their destination folder to the
+real `~/Pictures/Export` regardless of `CHAIRPHOTO_LIBRARY_ROOT` (`export/panel.rs`'s
+`DEFAULT_DEST`, `modules/collage/view.rs`). A trial export or collage render should pick a
+different destination explicitly rather than accept that default.
 
 Checks:
 

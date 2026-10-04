@@ -305,9 +305,10 @@ restarts at `0`, so it is not a patch/minor distinction and carries no compatibi
   `version.workspace = true` instead of carrying its own. `packaging/PKGBUILD`'s `pkgver`
   must match it — `prepare()` asserts this on every build — so bump both together; there is
   no other manifest to keep in step.
-- Tag a release `v2026.8.0`, matching `Cargo.toml` and `PKGBUILD` exactly. The current
-  release is `2026.8.0`; the next one bumps `[workspace.package] version` and `pkgver`
-  together (see `packaging/README.md` "Cutting a release").
+- Tag a release `vYEAR.MONTH.RELEASE`, matching `Cargo.toml` and `PKGBUILD` exactly. The last
+  tagged release is `v2026.8.0`; `[workspace.package] version` and `pkgver` are already bumped
+  together to `2026.10.0` for the next one — tagging `v2026.10.0` is what's left (see
+  `packaging/README.md` "Cutting a release").
 
 ## Runtime Notes
 

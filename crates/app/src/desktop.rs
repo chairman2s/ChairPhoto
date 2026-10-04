@@ -25,9 +25,14 @@
 //! **Stale pre-#167 entry.** The handler file and binary were renamed from `chairphoto-gpui`
 //! at #167; a developer who opted in before that rename has a `chairphoto-gpui-handler.desktop`
 //! and possibly a `mimeapps.list` default pointing at it, which would otherwise outrank the
-//! packaged entry forever. Registering the current handler also removes both, best-effort and
-//! only when they are recognisably ChairPhoto's own (never `xdg-mime`/`xdg-settings` — the
-//! default is edited as plain text).
+//! packaged entry forever. Registering the current handler also removes both, best-effort:
+//! the file only when it is recognisably ChairPhoto's own, and the default line only when the
+//! file is confirmed ChairPhoto's own (and then removed) or is simply absent — never when a
+//! same-named file exists but is someone else's, since the default would then name a real,
+//! foreign handler. Never runs `xdg-mime`/`xdg-settings` — `mimeapps.list` is rewritten
+//! directly as text, via a temp file and rename next to the real destination (its target, if
+//! it is a symlink) so a crash mid-write can't truncate it, and every other line, section,
+//! and line ending is preserved byte-for-byte.
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -157,47 +162,80 @@ pub fn register_dev_handler(
 /// happens to share the name. Best-effort: a missing file, an unreadable `mimeapps.list`, or
 /// any I/O error just means nothing to clean up here; this never fails registration.
 ///
+/// The default line is dropped only when [`STALE_HANDLER_FILE`] is confirmed ChairPhoto's own
+/// (and then removed) **or is simply absent** — never when a same-named `.desktop` file
+/// exists but is someone else's: the default would then point at a real, foreign handler, not
+/// a stale one.
+///
 /// Never runs `xdg-mime`/`xdg-settings` — the default is edited directly as text, so no
 /// external tool touches the real `mimeapps.list` outside what this function reads/writes
 /// itself (tests point `config_home` at a scratch directory).
 fn clean_stale_handler(data_home: &Path, config_home: &Path) {
     let stale = data_home.join("applications").join(STALE_HANDLER_FILE);
     // `symlink_metadata` does not follow a symlink, so a symlink planted at this exact name
-    // is left alone rather than removed or read through.
-    if let Ok(meta) = std::fs::symlink_metadata(&stale) {
-        if meta.is_file() {
-            if let Ok(content) = std::fs::read_to_string(&stale) {
-                if is_own_entry(&content) {
+    // is left alone rather than removed or read through — and, since its content is never
+    // read, it counts as "not confirmed ours" below, same as an unreadable file.
+    let stale_is_own_or_absent = match std::fs::symlink_metadata(&stale) {
+        Ok(meta) if meta.is_file() => match std::fs::read_to_string(&stale) {
+            Ok(content) => {
+                let own = is_own_entry(&content);
+                if own {
                     let _ = std::fs::remove_file(&stale);
                 }
+                own
             }
-        }
+            Err(_) => false,
+        },
+        Ok(_) => false, // present but not a plain file (e.g. a symlink): not confirmed ours
+        Err(_) => true, // absent: nothing foreign to protect, the stale default can go too
+    };
+    if !stale_is_own_or_absent {
+        return;
     }
 
     let mimeapps = config_home.join("mimeapps.list");
     if let Ok(content) = std::fs::read_to_string(&mimeapps) {
         if let Some(updated) = remove_stale_default(&content) {
-            let _ = std::fs::write(&mimeapps, updated);
+            let _ = write_mimeapps(&mimeapps, &updated);
         }
     }
 }
 
-/// Whether a desktop-entry's content is recognisably ChairPhoto's own dev handler (the shape
-/// [`handler_entry`] writes), not merely a file that happens to share a name.
+/// Overwrite `path`'s content with `content`: a temp file next to the real destination, then
+/// a rename, so a crash mid-write never leaves a truncated `mimeapps.list` behind (unlike a
+/// plain truncating `fs::write`). If `path` is a symlink, the real destination is resolved
+/// through it first, so the rename lands on the symlink's *target* and the symlink itself is
+/// left exactly as it was — the same "edit the target" behaviour `xdg-mime` itself has.
+fn write_mimeapps(path: &Path, content: &str) -> io::Result<()> {
+    let real = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let dir = real.parent().map(Path::to_path_buf).unwrap_or_else(|| PathBuf::from("."));
+    let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos();
+    let tmp = dir.join(format!(".mimeapps.list.chairphoto-tmp-{}-{nanos}", std::process::id()));
+    std::fs::write(&tmp, content)?;
+    std::fs::rename(&tmp, &real)
+}
+
+/// Whether a desktop-entry's content is recognisably ChairPhoto's own dev handler: either the
+/// shape [`handler_entry`] writes today, or the pre-#167 shape (`Name=ChairPhoto (GPUI dev
+/// build)`, before the `chairphoto-gpui` → `chairphoto` rename) that [`STALE_HANDLER_FILE`]
+/// is the only file this module can ever name. Not merely a file that happens to share a name.
 fn is_own_entry(content: &str) -> bool {
-    content.contains("\nName=ChairPhoto (dev build)\n") && content.contains(SCHEME_MIME)
+    (content.contains("\nName=ChairPhoto (dev build)\n") || content.contains("\nName=ChairPhoto (GPUI dev build)\n"))
+        && content.contains(SCHEME_MIME)
 }
 
 /// Remove `x-scheme-handler/chairphoto=chairphoto-gpui-handler.desktop` from
 /// `[Default Applications]` in a `mimeapps.list`'s text, if present there; `None` if nothing
 /// changed (including when the key is present but points elsewhere — someone else's default
-/// is left alone). Every other line, section and ordering is preserved byte-for-byte.
+/// is left alone, and a same-named key outside `[Default Applications]`, e.g. in `[Added
+/// Associations]`, is left alone too). Every other line, section and ordering is preserved
+/// byte-for-byte, CRLF line endings and a missing final newline included.
 fn remove_stale_default(content: &str) -> Option<String> {
     let target = format!("{SCHEME_MIME}={STALE_HANDLER_FILE}");
     let mut in_default = false;
     let mut changed = false;
     let mut out = String::with_capacity(content.len());
-    for line in content.lines() {
+    for (line, terminator) in lines_with_terminators(content) {
         let trimmed = line.trim();
         if trimmed.starts_with('[') {
             in_default = trimmed == "[Default Applications]";
@@ -206,9 +244,35 @@ fn remove_stale_default(content: &str) -> Option<String> {
             continue;
         }
         out.push_str(line);
-        out.push('\n');
+        out.push_str(terminator);
     }
     changed.then_some(out)
+}
+
+/// Splits `content` into `(line, terminator)` pairs — `terminator` is `"\r\n"`, `"\n"`, or
+/// `""` for a final line with no trailing newline — such that concatenating `line` +
+/// `terminator` for every pair reproduces `content` exactly. `str::lines` alone can't do
+/// this: it discards both the line-ending style and whether the last line had one.
+fn lines_with_terminators(content: &str) -> Vec<(&str, &str)> {
+    let mut out = Vec::new();
+    let mut rest = content;
+    while !rest.is_empty() {
+        match rest.find('\n') {
+            Some(idx) => {
+                let (line, after) = rest.split_at(idx);
+                rest = &after[1..]; // skip the '\n'
+                match line.strip_suffix('\r') {
+                    Some(line) => out.push((line, "\r\n")),
+                    None => out.push((line, "\n")),
+                }
+            }
+            None => {
+                out.push((rest, ""));
+                rest = "";
+            }
+        }
+    }
+    out
 }
 
 /// Make [`HANDLER_FILE`] the scheme's default handler (`xdg-mime default`, which writes the
@@ -328,6 +392,20 @@ mod tests {
 
     // --- stale pre-#167 handler + mimeapps default cleanup (L6) --------------------------
 
+    /// The literal pre-#167 handler entry text, copied from `handler_entry` as it read at
+    /// `aa9438f^:crates/app/src/desktop.rs` (before the `chairphoto-gpui` → `chairphoto`
+    /// rename changed the `Name=` line this module writes). Built from the literal text, not
+    /// by calling the *current* `handler_entry()`, so this fixture still matches what a real
+    /// pre-rename dev build actually wrote even if `handler_entry`'s shape changes again later.
+    const STALE_PRE_RENAME_ENTRY: &str = "[Desktop Entry]\n\
+         Type=Application\n\
+         Name=ChairPhoto (GPUI dev build)\n\
+         Exec=/old/chairphoto-gpui %u\n\
+         Terminal=false\n\
+         NoDisplay=true\n\
+         MimeType=x-scheme-handler/chairphoto;\n\
+         StartupWMClass=chairphoto\n";
+
     /// A ChairPhoto-shaped stale entry, and a `mimeapps.list` default pointing at it, are
     /// both removed when the current handler registers — and the new entry still gets
     /// written and claimed, same as any other registration.
@@ -337,7 +415,7 @@ mod tests {
         let apps = home.0.join("applications");
         std::fs::create_dir_all(&apps).unwrap();
         let stale = apps.join(STALE_HANDLER_FILE);
-        std::fs::write(&stale, handler_entry(Path::new("/old/chairphoto-gpui")).unwrap()).unwrap();
+        std::fs::write(&stale, STALE_PRE_RENAME_ENTRY).unwrap();
         let config = home.0.join("config");
         std::fs::create_dir_all(&config).unwrap();
         let mimeapps = config.join("mimeapps.list");
@@ -409,5 +487,135 @@ mod tests {
         register_dev_handler(&home.0, &home.0, Path::new("/a/chairphoto"), false, || panic!("claimed")).unwrap();
 
         assert!(stale.exists(), "nothing is cleaned up without the opt-in");
+    }
+
+    /// A default line for the stale scheme that sits outside `[Default Applications]` (e.g.
+    /// under `[Added Associations]`, which uses the same `key=value.desktop;` shape) must
+    /// survive: the cleanup only ever touches the default, not an association list. Mutation
+    /// check: dropping `remove_stale_default`'s `in_default &&` guard makes this fail (the
+    /// line would be stripped regardless of section).
+    #[test]
+    fn a_matching_line_outside_default_applications_is_left_alone() {
+        let home = Home::new("stale-outside-section");
+        let apps = home.0.join("applications");
+        std::fs::create_dir_all(&apps).unwrap();
+        std::fs::write(&apps.join(STALE_HANDLER_FILE), STALE_PRE_RENAME_ENTRY).unwrap();
+        let config = home.0.join("config");
+        std::fs::create_dir_all(&config).unwrap();
+        let mimeapps = config.join("mimeapps.list");
+        let original = "[Added Associations]\nx-scheme-handler/chairphoto=chairphoto-gpui-handler.desktop\n\
+             \n[Default Applications]\ntext/html=firefox.desktop\n";
+        std::fs::write(&mimeapps, original).unwrap();
+
+        register_dev_handler(&home.0, &config, Path::new("/a/chairphoto"), true, || {}).unwrap();
+
+        let updated = std::fs::read_to_string(&mimeapps).unwrap();
+        assert_eq!(updated, original, "a same-shaped line outside [Default Applications] must survive:\n{updated}");
+    }
+
+    /// CRLF line endings in the original `mimeapps.list` survive the rewrite — the file is
+    /// reassembled from each line's own terminator, not rewritten with a blanket `\n`.
+    #[test]
+    fn a_crlf_mimeapps_list_keeps_its_line_endings() {
+        let home = Home::new("stale-crlf");
+        let config = home.0.join("config");
+        std::fs::create_dir_all(&config).unwrap();
+        let mimeapps = config.join("mimeapps.list");
+        let original = "[Added Associations]\r\ntext/plain=kate.desktop;\r\n\r\n\
+             [Default Applications]\r\nx-scheme-handler/chairphoto=chairphoto-gpui-handler.desktop\r\n\
+             text/html=firefox.desktop\r\n";
+        std::fs::write(&mimeapps, original).unwrap();
+
+        register_dev_handler(&home.0, &config, Path::new("/a/chairphoto"), true, || {}).unwrap();
+
+        let updated = std::fs::read_to_string(&mimeapps).unwrap();
+        assert_eq!(
+            updated,
+            "[Added Associations]\r\ntext/plain=kate.desktop;\r\n\r\n[Default Applications]\r\ntext/html=firefox.desktop\r\n",
+            "the stale line is removed and every surviving line keeps its \\r\\n:\n{updated:?}"
+        );
+    }
+
+    /// A `mimeapps.list` with no trailing newline keeps it that way after the stale line (not
+    /// the last line) is removed.
+    #[test]
+    fn a_mimeapps_list_without_a_final_newline_keeps_it_that_way() {
+        let home = Home::new("stale-no-final-newline");
+        let config = home.0.join("config");
+        std::fs::create_dir_all(&config).unwrap();
+        let mimeapps = config.join("mimeapps.list");
+        // No trailing '\n' after the last line.
+        let original = "[Default Applications]\nx-scheme-handler/chairphoto=chairphoto-gpui-handler.desktop\ntext/html=firefox.desktop";
+        std::fs::write(&mimeapps, original).unwrap();
+
+        register_dev_handler(&home.0, &config, Path::new("/a/chairphoto"), true, || {}).unwrap();
+
+        let updated = std::fs::read_to_string(&mimeapps).unwrap();
+        assert_eq!(updated, "[Default Applications]\ntext/html=firefox.desktop", "no newline is added:\n{updated:?}");
+    }
+
+    /// A same-named `.desktop` file that is foreign (not ChairPhoto's own) protects its
+    /// `mimeapps.list` default line too: the default genuinely points at a real, foreign
+    /// handler, so removing the line would be wrong, not just removing the file. Mutation
+    /// check: always treating the stale file as "own or absent" for this gate (i.e. removing
+    /// the `!stale_is_own_or_absent { return; }` early return in `clean_stale_handler`) makes
+    /// this fail.
+    #[test]
+    fn a_foreign_entrys_mimeapps_default_line_is_also_left_alone() {
+        let home = Home::new("stale-foreign-default");
+        let apps = home.0.join("applications");
+        std::fs::create_dir_all(&apps).unwrap();
+        let stale = apps.join(STALE_HANDLER_FILE);
+        std::fs::write(&stale, "[Desktop Entry]\nName=Someone Else's App\nExec=other %u\n").unwrap();
+        let config = home.0.join("config");
+        std::fs::create_dir_all(&config).unwrap();
+        let mimeapps = config.join("mimeapps.list");
+        let original = "[Default Applications]\nx-scheme-handler/chairphoto=chairphoto-gpui-handler.desktop\n";
+        std::fs::write(&mimeapps, original).unwrap();
+
+        register_dev_handler(&home.0, &config, Path::new("/a/chairphoto"), true, || {}).unwrap();
+
+        assert!(stale.exists(), "the foreign file must survive");
+        assert_eq!(
+            std::fs::read_to_string(&mimeapps).unwrap(),
+            original,
+            "the default line naming a real, foreign handler must survive"
+        );
+    }
+
+    /// A `mimeapps.list` that doesn't exist at all is simply left missing — matching the
+    /// pre-existing `read_to_string` short-circuit — and the "absent" branch of the ownership
+    /// gate is exercised without a stale `.desktop` file either.
+    #[test]
+    fn a_missing_mimeapps_list_is_not_created() {
+        let home = Home::new("stale-missing-mimeapps");
+        let config = home.0.join("config");
+        std::fs::create_dir_all(&config).unwrap();
+
+        register_dev_handler(&home.0, &config, Path::new("/a/chairphoto"), true, || {}).unwrap();
+
+        assert!(!config.join("mimeapps.list").exists(), "a missing mimeapps.list is not created");
+    }
+
+    /// A symlinked `mimeapps.list` stays a symlink: the rewrite edits the target file, not
+    /// the link, matching `xdg-mime`'s own "edit the target" behaviour.
+    #[test]
+    fn a_symlinked_mimeapps_list_keeps_the_symlink_and_edits_its_target() {
+        let home = Home::new("stale-symlink");
+        let config = home.0.join("config");
+        std::fs::create_dir_all(&config).unwrap();
+        let real = home.0.join("real-mimeapps.list");
+        let original = "[Default Applications]\nx-scheme-handler/chairphoto=chairphoto-gpui-handler.desktop\ntext/html=firefox.desktop\n";
+        std::fs::write(&real, original).unwrap();
+        let link = config.join("mimeapps.list");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        register_dev_handler(&home.0, &config, Path::new("/a/chairphoto"), true, || {}).unwrap();
+
+        assert!(std::fs::symlink_metadata(&link).unwrap().file_type().is_symlink(), "mimeapps.list must stay a symlink");
+        assert_eq!(std::fs::read_link(&link).unwrap(), real, "the symlink must still point at the same target");
+        let updated = std::fs::read_to_string(&real).unwrap();
+        assert!(!updated.contains("chairphoto-gpui-handler.desktop"), "the real target is the one that gets edited:\n{updated}");
+        assert!(updated.contains("text/html=firefox.desktop"), "other defaults in the target survive:\n{updated}");
     }
 }

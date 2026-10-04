@@ -1677,6 +1677,29 @@ fn a_finished_repair_pass_resets_the_debt_panels_scroll_to_the_top(cx: &mut Test
     assert!(after.contains(&0), "the re-read page must open at the top, not the old scroll offset: {after:?}");
 }
 
+/// #197 L5 follow-up: `debt-prev`/`debt-next` draw an icon beside "Prev"/"Next" (no literal
+/// "←"/"→" character in the visible text since #197), but without an explicit `aria_label`
+/// their accessible name was not implicitly "Prev"/"Next" either — `icon_label_chip`'s
+/// icon+text composite derives no accessible name of its own, so it read as nothing at all.
+/// Both now set `aria_label` explicitly, restoring the arrow semantic the pre-#197 literal
+/// "← Prev" text carried (the owed-IPTC list's `owed-prev`/`owed-next` share the exact same
+/// fix, in the same file, but are a separate tab this test does not open).
+/// (Mutation-checked: dropping either `.aria_label(...)` call leaves that chip's accessible
+/// name `None`, not "← Prev"/"Next →"; this fails.)
+#[gpui_kit::test]
+fn the_debt_paging_chips_have_explicit_accessible_names(cx: &mut TestAppContext) {
+    const N: usize = 2;
+    let dir = TempDir::new("debt-paging-aria");
+    let app = start(cx);
+    catalog_with_debt(&app, &dir, N, cx);
+    open_debt_panel(&app, cx);
+    let mut label = |id: &'static str| {
+        cx.update_window(app.window(), |_, window, _| window.find(id).label().map(str::to_string)).unwrap()
+    };
+    assert_eq!(label("debt-prev").as_deref(), Some("← Prev"));
+    assert_eq!(label("debt-next").as_deref(), Some("Next →"));
+}
+
 /// The panel re-attaches to a pass already running when it opens (claimed elsewhere — by an
 /// earlier panel), follows its job id, and ends with its terminal event.
 #[gpui_kit::test]

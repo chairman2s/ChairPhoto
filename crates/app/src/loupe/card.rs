@@ -288,7 +288,8 @@ impl CardView {
                     .child(ui::clickable(
                         // "← {title}": the UI font has no U+2190, and the fallback font it
                         // reaches for draws it tiny (#197) — Lucide's arrow instead.
-                        ui::icon_label_chip("loupe-card-back", IconName::ArrowLeft, false, card.title.clone(), true, colors),
+                        ui::icon_label_chip("loupe-card-back", IconName::ArrowLeft, false, card.title.clone(), true, colors)
+                            .aria_label(format!("← {}", card.title)),
                         true,
                         cx.listener(|this, _, _, cx| this.view(None, cx)),
                     ))

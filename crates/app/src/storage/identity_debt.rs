@@ -397,12 +397,12 @@ impl IdentityDebtPanel {
                         .test_support(),
                 )
                 .child(ui::clickable(
-                    ui::icon_label_chip("owed-prev", IconName::ArrowLeft, false, "Prev", can_prev, colors),
+                    ui::icon_label_chip("owed-prev", IconName::ArrowLeft, false, "Prev", can_prev, colors).aria_label("← Prev"),
                     can_prev,
                     cx.listener(|s, _, _, cx| s.set_owed_page(s.owed_page - 1, cx)),
                 ))
                 .child(ui::clickable(
-                    ui::icon_label_chip("owed-next", IconName::ArrowRight, true, "Next", can_next, colors),
+                    ui::icon_label_chip("owed-next", IconName::ArrowRight, true, "Next", can_next, colors).aria_label("Next →"),
                     can_next,
                     cx.listener(|s, _, _, cx| s.set_owed_page(s.owed_page + 1, cx)),
                 )),
@@ -976,12 +976,12 @@ impl Render for IdentityDebtPanel {
             ui::row()
                 .child(div().id("debt-paging").child(ui::sub(paging_label(self.page * PAGE_SIZE, shown, total), colors)).test_support())
                 .child(ui::clickable(
-                    ui::icon_label_chip("debt-prev", IconName::ArrowLeft, false, "Prev", can_prev, colors),
+                    ui::icon_label_chip("debt-prev", IconName::ArrowLeft, false, "Prev", can_prev, colors).aria_label("← Prev"),
                     can_prev,
                     cx.listener(|s, _, _, cx| s.set_page(s.page - 1, cx)),
                 ))
                 .child(ui::clickable(
-                    ui::icon_label_chip("debt-next", IconName::ArrowRight, true, "Next", can_next, colors),
+                    ui::icon_label_chip("debt-next", IconName::ArrowRight, true, "Next", can_next, colors).aria_label("Next →"),
                     can_next,
                     cx.listener(|s, _, _, cx| s.set_page(s.page + 1, cx)),
                 )),

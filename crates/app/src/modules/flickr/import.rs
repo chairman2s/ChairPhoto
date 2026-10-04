@@ -19,6 +19,7 @@ use crate::loupe::zoom::fitted;
 use chairphoto_core::app::flickr::{import_apply, import_preview, FlickrApi, FlickrImportMatch, FlickrImportResult, ImportApplied};
 use chairphoto_core::app::{AppState, CatalogIdentity, CoreEvent};
 use chairphoto_core::image_pool::ImageKind;
+use gpui_kit::assets::IconName;
 use gpui_kit::prelude::*;
 use gpui_kit::{div, px, AnyElement, Context, Entity, Image, ImageFormat, ObjectFit, SharedString, Subscription, TestSupportExt as _, Window};
 use std::collections::HashMap;
@@ -364,7 +365,11 @@ impl Render for ImportPublishedPanel {
                 list = list.child(
                     ui::row()
                         .child(self.flickr_thumb(&m.thumb_url, "", MATCH_THUMB, colors))
-                        .child(div().text_color(colors.mute).child("→"))
+                        .child(
+                            div()
+                                .text_color(colors.mute)
+                                .child(ui::sized_icon(format!("flickr-import-match-arrow-{}", m.flickr_id), IconName::ArrowRight)),
+                        )
                         .child(self.thumb(m.catalog_id, MATCH_THUMB, colors, cx))
                         .child(
                             div()
@@ -394,7 +399,11 @@ impl Render for ImportPublishedPanel {
                 list = list.child(
                     ui::row()
                         .child(self.flickr_thumb(&m.thumb_url, "", MATCH_THUMB, colors))
-                        .child(div().text_color(colors.mute).child("→"))
+                        .child(
+                            div()
+                                .text_color(colors.mute)
+                                .child(ui::sized_icon(format!("flickr-import-resolved-arrow-{flickr_id}"), IconName::ArrowRight)),
+                        )
                         .child(self.thumb(m.catalog_id, MATCH_THUMB, colors, cx))
                         .child(div().flex_1().min_w_0().text_size(px(11.)).child(file_name(&m.catalog_path)))
                         .child(ui::clickable(

@@ -316,7 +316,7 @@ impl PeopleView {
                 .py(px(8.))
                 // "← Clusters": the UI font has no U+2190, and the fallback font it reaches
                 // for draws it tiny (#197) — Lucide's arrow instead.
-                .child(ui::clickable(ui::icon_label_chip("faces-sheet-back", IconName::ArrowLeft, false, "Clusters", true, colors), true, {
+                .child(ui::clickable(ui::icon_label_chip("faces-sheet-back", IconName::ArrowLeft, false, "Clusters", true, colors).aria_label("← Clusters"), true, {
                     let people = people.clone();
                     move |_, _, cx| people.update(cx, |p, cx| p.close_cluster(cx))
                 }))

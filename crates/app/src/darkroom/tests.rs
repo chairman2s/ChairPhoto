@@ -1693,6 +1693,25 @@ fn the_duel_pick_buttons_draw_normal_sized_arrow_icons(cx: &mut TestAppContext) 
     .unwrap();
 }
 
+/// #197 L5: `dk-back` ("← Library") drew its arrow as the literal "←" character — the UI
+/// font lacks U+2190, so the fallback font it reaches for draws it at a fraction of the
+/// surrounding text's size, the same bug #197 fixed for the duel, the cull help and the other
+/// back chips (owed-prev/next, debt-prev/next, faces-sheet-back, loupe-card-back). It now
+/// draws Lucide's `ArrowLeft` beside "Library", like those, with an explicit accessible name
+/// that keeps the arrow semantic — matching this same follow-up's restoration of the other
+/// back chips' accessible names.
+/// (Mutation-checked: dropping the `.aria_label("← Library")` call leaves the chip with
+/// whatever its children's own implicit accessible name derives to instead, which is not
+/// "← Library"; this fails.)
+#[gpui_kit::test]
+fn dk_back_draws_an_icon_and_keeps_its_accessible_name(cx: &mut TestAppContext) {
+    let rig = rig("dk-back-aria", 1, cx);
+    rig.render(cx);
+    let label =
+        cx.update_window(rig.app.window(), |_, window, _| window.find("dk-back").label().map(str::to_string)).unwrap();
+    assert_eq!(label.as_deref(), Some("← Library"));
+}
+
 /// The proof sheet's cells share the duel's picture helper: a portrait proof's picture element
 /// is laid out as its 3:2 cell, not taller (it paints with `cover` there, as React's
 /// `.dk-proof-cell img` does — the fit mode itself is not observable here).

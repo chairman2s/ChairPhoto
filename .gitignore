@@ -6,6 +6,9 @@ logs
 # ignored so `git add -A` there cannot sweep them in.
 node_modules
 dist
+# The same for the removed Tauri shell's own build output and generated schemas.
+/src-tauri/target/
+/src-tauri/gen/
 
 # Cargo's build output for the workspace (crates/core, crates/model, crates/app)
 /target/

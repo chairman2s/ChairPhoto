@@ -1,24 +1,22 @@
 [package]
 name = "chairphoto-core"
-# Internal crate, never published on its own: the app's version is the shell's
-# (`src-tauri/Cargo.toml`, see AGENTS.md § Versioning), so this one carries none.
+# Internal crate, never published on its own, so it carries no version: the app's version is
+# the release's (`packaging/PKGBUILD`'s `pkgver` since the Tauri shell's manifest went in #165).
 version = "0.0.0"
 publish = false
-description = "ChairPhoto's Tauri-free core: catalog, import, XMP, decode, jobs and module backends"
+description = "ChairPhoto's core: catalog, import, XMP, decode, jobs and module backends"
 authors = ["Andreas Henden <chairman2s.ah+github@gmail.com>"]
 license = "GPL-3.0-only"
 readme = "../../README.md"
 edition = "2021"
 
-# Everything except the Tauri shell (`src-tauri/`: `run()`, `commands/`, `protocol.rs` and the
-# Tauri plugins). Must build with no `tauri` dependency — `cargo tree -p chairphoto-core -e all
-# | grep -ci tauri` is 0 (issue #95).
+# Everything the app does, with no UI toolkit: the GPUI front end (`crates/app`) calls it
+# directly.
 [lib]
 name = "chairphoto_core"
 
 [features]
-# The same names as the shell's features, which forward to these (`module-fetch` is the one
-# shell-only feature: it gates a command, `commands/net.rs`, and nothing in this crate).
+# The same names as the GPUI app's features (`crates/app/Cargo.toml`), which forward to these.
 default = ["ai", "edit", "raw", "instagram", "collage", "slideshow", "localsend", "map", "faces", "smarttags"]
 ai = ["dep:reqwest"]
 # Send a photo to a device on the LAN over LocalSend's documented v2 HTTP protocol (UDP
@@ -212,6 +210,5 @@ libc = { version = "0.2", optional = true }
 # synced relative to it (`openat`/`renameat`), so a volume unmounted in between cannot turn
 # the write into one on the disk under an empty mount point. Already resolved in Cargo.lock
 # at 1.1.4 with `fs` and `std` via async-io (`cargo tree --workspace -i rustix`), in the
-# Linux trees of the Tauri shell (zbus) and the GPUI app (smol) alike, so there it adds no
-# download and no compile unit to either binary.
+# GPUI app's Linux tree (smol), so there it adds no download and no compile unit.
 rustix = { version = "1.1", default-features = false, features = ["fs", "std"] }

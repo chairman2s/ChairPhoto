@@ -1,8 +1,8 @@
 [package]
 name = "chairphoto-app"
-# Internal crate, never published on its own: the app's version is the shell's
-# (`src-tauri/Cargo.toml`, see AGENTS.md § Versioning) until the GPUI cutover makes this the
-# shipped binary.
+# Never published on its own. It carries no version yet: the release's version is
+# `packaging/PKGBUILD`'s `pkgver` since the Tauri shell's manifest went (#165), until the
+# packaging ticket (#167) gives the workspace a single version source.
 version = "0.0.0"
 publish = false
 description = "ChairPhoto's native GPUI front end (docs/plans/gpui)"
@@ -16,8 +16,8 @@ edition = "2021"
 [lib]
 name = "chairphoto_app"
 
-# `chairphoto-gpui`, not `chairphoto`, while the Tauri shell still ships that name. The
-# cutover (map #92, Phase 6) renames it.
+# `chairphoto-gpui`, the name the Tauri shell's `chairphoto` left free. The packaging ticket
+# (#167) renames it together with the PKGBUILD and the desktop file that launch it.
 [[bin]]
 name = "chairphoto-gpui"
 path = "src/main.rs"
@@ -38,9 +38,8 @@ name = "darkroom_bench"
 required-features = ["edit"]
 
 [features]
-# The same names as the core's features, forwarded one by one (the Tauri shell does the same),
-# and the same default set as the Tauri shell's minus `module-fetch`, which gates a Tauri
-# command and nothing in the core.
+# The same names as the core's features, forwarded one by one, with the core's default set plus
+# the app-only `tag-graph`.
 default = ["ai", "edit", "raw", "instagram", "collage", "slideshow", "localsend", "map", "faces", "smarttags", "tag-graph"]
 ai = ["chairphoto-core/ai"]
 localsend = ["chairphoto-core/localsend"]

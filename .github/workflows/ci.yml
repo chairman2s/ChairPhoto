@@ -68,6 +68,14 @@ jobs:
             done
           done
 
+      # tag-graph is app-only (crates/app/Cargo.toml: no matching chairphoto-core feature,
+      # it only pulls in tiny-skia for the edge raster), so it runs against chairphoto-app
+      # alone rather than joining the loop above, which checks both packages.
+      - name: Check the app-only tag-graph feature
+        env:
+          RUSTFLAGS: "-D warnings"
+        run: cargo check -p chairphoto-app --no-default-features --features tag-graph --all-targets
+
       # The tree is rustc-warning-clean and should stay that way.
       - name: Deny rustc warnings
         env:

@@ -274,6 +274,15 @@ impl Drop for FrameDir {
 /// either way; what changes is only where the sweep looks and whether it must also check who
 /// owns what it finds there.
 fn frame_dir_root() -> (PathBuf, bool) {
+    // A test's own scratch root (#211 nit), never the real cache dir: cargo test gives each
+    // test function its own thread, so `tests::set_test_frame_root`'s thread-local is already
+    // exactly test-scoped, the same reasoning `BEFORE_SETTLE`/`ON_RETRY` rely on elsewhere.
+    #[cfg(all(test, unix))]
+    if let Some(root) = tests::TEST_FRAME_ROOT.with(|c| c.borrow().clone()) {
+        // Standing in for `cache_dir()`, not for the final root: the same
+        // `chairphoto/slideshow` nesting (and the shared-temp-root comparison) applies.
+        return frame_dir_root_in(root, &std::env::temp_dir());
+    }
     frame_dir_root_in(crate::thumbnails::cache_dir(), &std::env::temp_dir())
 }
 
@@ -332,8 +341,27 @@ mod tests {
     use super::*;
     use crate::catalog::Catalog;
     use crate::test_support::TestTmpDir;
+    use std::cell::RefCell;
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
     use std::sync::Mutex;
+
+    thread_local! {
+        /// Where this thread's [`super::frame_dir_root`] looks instead of the real cache dir
+        /// (#211 nit): before this, every test that reached `FrameDir::create()` through
+        /// `claim_slideshow(..).run_with(..)` wrote its frames — and ran the stale-dir sweep —
+        /// under the real `~/.cache`, since `frame_dir_root()` always called the production
+        /// `crate::thumbnails::cache_dir()`. Thread-local, not a `Mutex`: cargo test gives each
+        /// test function its own thread, so [`setup`] setting this once is already exactly
+        /// test-scoped; a test that spawns its own thread (the forced-interleaving case below)
+        /// sets it again there, since a thread-local starts empty on a new thread.
+        pub(super) static TEST_FRAME_ROOT: RefCell<Option<PathBuf>> = RefCell::new(None);
+    }
+
+    /// Point this thread's `FrameDir::create()` calls at `root` (a scratch directory under a
+    /// test's own [`TestTmpDir`]) instead of the real cache dir.
+    fn set_test_frame_root(root: &Path) {
+        TEST_FRAME_ROOT.with(|c| *c.borrow_mut() = Some(root.to_path_buf()));
+    }
 
     #[derive(Default)]
     struct Progress(Mutex<Vec<(u32, u32, u64)>>);
@@ -376,6 +404,9 @@ mod tests {
 
     fn setup(tag: &str, photos: usize) -> (TestTmpDir, AppState, Arc<Progress>, Vec<i64>) {
         let dir = TestTmpDir::new(&format!("slideshow-{tag}"));
+        // Every render this test makes writes its frames (and runs the sweep) under this
+        // scratch cache, never the real ~/.cache (#211 nit).
+        set_test_frame_root(&dir.join("cache"));
         let root = dir.join("library");
         std::fs::create_dir_all(&root).unwrap();
         let state = AppState::default();
@@ -422,6 +453,10 @@ mod tests {
 
     /// #211: frames render into the app's cache dir, not `std::env::temp_dir()` — on this
     /// machine `/tmp` is a quota-limited tmpfs that a long slideshow's frames could fill.
+    /// `frame_dir_root_only_falls_back_to_the_shared_temp_root_when_the_cache_dir_did_too`
+    /// proves that branch itself, purely; this is the end-to-end wiring check — that a real
+    /// `run_with` actually lands its frames under what `frame_dir_root()` computes — so it
+    /// runs through its own scratch cache (#211 nit, `setup`), never the real `~/.cache`.
     #[test]
     fn frames_render_into_the_cache_dir_not_the_system_temp_dir() {
         let (dir, state, _progress, ids) = setup("cachedir", 1);
@@ -430,12 +465,11 @@ mod tests {
         let dirs = Arc::new(Mutex::new(Vec::new()));
         job.run_with(&recording_frames(dirs.clone())).unwrap();
         let (frame_dir, _mode) = dirs.lock().unwrap()[0].clone();
-        let cache_root = crate::thumbnails::cache_dir().join("chairphoto").join("slideshow");
+        // The expected root is this test's own scratch cache, nested exactly the way
+        // `frame_dir_root_in`'s non-fallback branch nests the real one.
+        let cache_root = dir.join("cache").join("chairphoto").join("slideshow");
         assert!(frame_dir.starts_with(&cache_root), "{frame_dir:?} is under the cache dir {cache_root:?}");
-        let tmp_root = std::env::temp_dir();
-        if tmp_root != cache_root {
-            assert!(!frame_dir.starts_with(&tmp_root), "{frame_dir:?} is not under the system temp dir {tmp_root:?}");
-        }
+        assert!(!frame_dir.starts_with(crate::thumbnails::cache_dir()), "{frame_dir:?} must not be under the real cache dir");
     }
 
     /// #212 Nit-1: a slideshow frame is an engine-2 render too (`export::write_item_jpeg` →
@@ -514,7 +548,13 @@ mod tests {
         let (c_abort, c_job) = (jc.abort_handle(), jc.job);
         let c_seen = Arc::new(Mutex::new(Vec::new()));
         let c_writer = recording_frames(c_seen.clone());
-        let c_run = std::thread::spawn(move || jc.run_with(&c_writer));
+        let c_cache = c_dir.join("cache");
+        let c_run = std::thread::spawn(move || {
+            // A thread-local starts empty on a new thread; this one's `FrameDir::create()`
+            // needs its own scratch root set, not just the main test thread's (#211 nit).
+            set_test_frame_root(&c_cache);
+            jc.run_with(&c_writer)
+        });
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         while !c_progress.0.lock().unwrap().iter().any(|p| p.2 == c_job) {
             assert!(std::time::Instant::now() < deadline && !c_run.is_finished(), "C's ffmpeg never started");
@@ -661,7 +701,12 @@ mod tests {
             let job = claim_slideshow(&state, None, &ids, opts(), out.to_str().unwrap(), Some(fake_ffmpeg(true))).unwrap();
             let (handle, id) = (job.abort_handle(), job.job);
             let started = std::time::Instant::now();
-            let runner = std::thread::spawn(move || job.run_with(&copy_frames()));
+            let cache = dir.join("cache");
+            let runner = std::thread::spawn(move || {
+                // A thread-local starts empty on a new thread (#211 nit).
+                set_test_frame_root(&cache);
+                job.run_with(&copy_frames())
+            });
             // Wait for ffmpeg's own "started" line (its first progress, this job's id), so the
             // trip below lands while it runs, not before it was spawned.
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
@@ -698,13 +743,20 @@ mod tests {
         let out = dir.join("out");
         let a = claim_slideshow(&a_state, None, &a_ids, opts(), out.to_str().unwrap(), Some(fixture("ffmpeg-stall"))).unwrap();
         let (a_abort, a_job) = (a.abort_handle(), a.job);
-        let a_run = std::thread::spawn(move || a.run_with(&copy_frames()));
+        let a_cache = dir.join("cache");
+        let a_run = std::thread::spawn(move || {
+            // A thread-local starts empty on a new thread (#211 nit).
+            set_test_frame_root(&a_cache);
+            a.run_with(&copy_frames())
+        });
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         while !a_progress.0.lock().unwrap().iter().any(|p| p.2 == a_job) {
             assert!(std::time::Instant::now() < deadline && !a_run.is_finished(), "A's ffmpeg never started");
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
         let b = claim_slideshow(&b_state, None, &b_ids, opts(), out.to_str().unwrap(), Some(fake_ffmpeg(false))).unwrap();
+        // The main test thread's thread-local still points at B's own setup call (the last
+        // one it made) — this is B's scratch cache, correctly.
         let b_movie = b.run_with(&copy_frames()).unwrap();
         a_abort.store(true, Ordering::Relaxed);
         assert_eq!(a_run.join().unwrap().unwrap_err(), SLIDESHOW_CANCELLED);

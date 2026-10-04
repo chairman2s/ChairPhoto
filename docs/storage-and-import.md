@@ -811,6 +811,12 @@ The importer (`bundle/importer.rs`) runs in three phases:
    exactly those bytes is the same photo, and otherwise exiftool reads the bytes from stdin
    with the arguments it reads the library file with (`same_photo::find_in_library`). So
    re-importing a bundle the library already holds writes nothing to the library's disk.
+   A file found already there is not touched by this phase, its sidecar included: the
+   index phase binds an identity to it — the row's, through `ensure_sidecar_identity` —
+   and only when no row of **another** identity holds the file. One that does is the
+   owner's photo (the same capture imported separately on each side): it is neither
+   upserted nor bound, its sidecar never receives the bundle's identity (even when it
+   lacks one, as identity debt), and the bundle's photo is kept apart (below).
    Writes a UUID sidecar beside each original so the index phase can match by identity.
 3. **Index** (secondary connection, off the main lock) — `upsert_photo_with_identity` for
    each extracted file, giving a row created for the bundle's own photo the bundle's full

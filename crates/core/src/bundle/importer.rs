@@ -104,6 +104,10 @@ pub struct ExtractedItem {
     pub photo_uuid: String,
     /// The catalog-root-relative logical path from the manifest (for the date tree).
     pub relative_path: String,
+    /// `dest` was in the library before this import: the same capture, found there and not
+    /// copied (#246). Its sidecar is the owner's, so the index phase binds an identity to it
+    /// only when no row of another identity holds the file ([`index_bundle`]).
+    pub already_in_library: bool,
 }
 
 /// Extract originals from `archive` into `dest_base` under a `YYYY/MM/DD` tree,
@@ -242,14 +246,15 @@ pub fn extract_originals_abortable(
             return Ok((extracted, result, true));
         };
         if let Some(existing) = already {
-            // The same capture is already in the library: skip the copy.
+            // The same capture is already in the library: skip the copy. Nothing is written
+            // beside it here — not even the bundle's identity into its sidecar: the index
+            // phase decides that, knowing which row holds the file.
             result.skipped_duplicate += 1;
-            bind_existing(&existing, bp);
-            // Still record as extracted so the indexer can upsert its location.
             extracted.push(ExtractedItem {
                 dest: existing,
                 photo_uuid: bp.uuid.clone(),
                 relative_path: bp.relative_path.clone(),
+                already_in_library: true,
             });
             continue;
         }
@@ -274,30 +279,11 @@ pub fn extract_originals_abortable(
             dest,
             photo_uuid: bp.uuid.clone(),
             relative_path: bp.relative_path.clone(),
+            already_in_library: false,
         });
     }
 
     Ok((extracted, result, false))
-}
-
-/// A bundle original found already in the library at `existing`: put the bundle's identity
-/// in its sidecar so the upsert can match by it. The file was here before this import, so it
-/// may already carry a *different* identity — `bind_sidecar_identity` leaves that one alone
-/// rather than overwriting another photo's identity on the strength of a filename collision.
-/// The copy phase holds no catalog connection, so an unbound identity is only reported here;
-/// index_bundle records it durably. A blank manifest uuid is no identity (#146 N4): the
-/// indexer mints one.
-fn bind_existing(existing: &Path, bp: &crate::bundle::BundlePhoto) {
-    if let Some(identity) = crate::catalog::photo_identity_for(&bp.uuid) {
-        let found = crate::xmp::read_identifier(existing);
-        let outcome = crate::catalog::bind_sidecar_identity(existing, &identity, found.as_deref());
-        if outcome != crate::catalog::SidecarIdentity::Bound {
-            eprintln!(
-                "bundle import: identity not bound for {} ({outcome:?}) — queued for repair",
-                existing.display()
-            );
-        }
-    }
 }
 
 /// The sidecar of an original just placed at `dest` — the UUID must land in it so that
@@ -470,6 +456,24 @@ pub(crate) fn index_bundle_with(
         }
         indexed += 1;
         let path = &item.dest;
+
+        // A file the library already had (#246) that a row of another identity holds is that
+        // row's photo, not the bundle's: the same capture imported separately on each side.
+        // It is kept apart — no upsert, no identity bound into the owner's sidecar (which may
+        // lack one, as identity debt) — and the merge counts the bundle's photo kept apart
+        // when no row holds its identity (`MergeSummary::photos_kept_apart`).
+        if item.already_in_library {
+            if let Some(held_by) = held_by_another_identity(catalog, path, &item.photo_uuid)? {
+                eprintln!(
+                    "bundle import: {} is already photo {held_by}'s; bundle photo {} kept apart",
+                    path.display(),
+                    item.photo_uuid
+                );
+                after_each(indexed);
+                continue;
+            }
+        }
+
         let meta = std::fs::metadata(path).map_err(|e| e.to_string())?;
         let mtime_ns = meta
             .modified()
@@ -739,6 +743,23 @@ pub(crate) fn index_bundle_with(
     merge_summary.photos_existing = merge_summary.photos_existing.saturating_sub(newly_created.len());
     partial_result.merge = merge_summary;
     Ok(Indexed { result: partial_result, indexed, total })
+}
+
+/// The identity of the row at `path` when it is not the bundle photo's (`bundle_uuid`, as
+/// [`crate::catalog::photo_identity_for`] reads it), else `None` — also when no row is
+/// there, or the bundle photo has no identity (a pre-#146 blank uuid, which the importer
+/// resolves to the row at its path, #150).
+fn held_by_another_identity(catalog: &Catalog, path: &Path, bundle_uuid: &str) -> Result<Option<String>, String> {
+    use rusqlite::OptionalExtension;
+    let Some(identity) = crate::catalog::photo_identity_for(bundle_uuid) else { return Ok(None) };
+    // Outside the root: the upsert reports that, per photo.
+    let Ok(relative) = catalog.to_relative(path) else { return Ok(None) };
+    let held: Option<String> = catalog
+        .conn()
+        .query_row("SELECT uuid FROM photos WHERE path = ?1", [&relative], |r| r.get(0))
+        .optional()
+        .map_err(|e| e.to_string())?;
+    Ok(held.filter(|uuid| *uuid != identity))
 }
 
 /// Fill an existing photo's blank IPTC fields with the bundle's `offered` values (#185):
@@ -1512,6 +1533,67 @@ mod tests {
         assert_eq!((after.uuid.as_str(), after.rating, after.label.as_str()), (OURS, 0, ""));
         assert_eq!(catalog.get_iptc(row.id).unwrap(), Default::default());
         assert_eq!(crate::xmp::read_identifier(&original).as_deref(), Some(OURS));
+    }
+
+    /// M-3 of the #246/#185 review: the library's photo has a row of its own identity but its
+    /// sidecar is gone (identity debt), and the bundle brings the same bytes under another
+    /// identity. The owner's sidecar never receives the bundle's identity — not while
+    /// unpacking, not while indexing — the bundle's photo is kept apart and counted once, and
+    /// the row is untouched.
+    #[test]
+    fn a_foreign_identity_never_lands_in_the_owners_sidecar() {
+        const THEIRS: &str = "6f1c1f0e-2b7a-4c3d-9e8f-0a1b2c3d4e5f";
+        const OURS: &str = "7a2d2f1f-3c8b-4d4e-8f90-1b2c3d4e5f60";
+        let (catalog, root) = temp_catalog("185-foreign");
+        let original = root.join("2026/06/28/DSC01234.ARW");
+        std::fs::create_dir_all(original.parent().unwrap()).unwrap();
+        std::fs::write(&original, b"FAKE RAW BYTES").unwrap();
+        let row = catalog.upsert_photo_with_identity(&original, None, 1, 14, Some(OURS)).unwrap();
+        catalog.set_culling(row.id, Some(5), None, None).unwrap();
+        let sidecar = root.join("2026/06/28/DSC01234.ARW.xmp");
+        assert!(!sidecar.exists(), "the owner's sidecar is missing");
+
+        let bundle_path = make_test_bundle("185-foreign", THEIRS, "2026/06/28/DSC01234.ARW");
+        let (manifest, mut archive) = open_bundle(&bundle_path).unwrap();
+        let (extracted, partial) = extract_originals(&manifest, &mut archive, &root, |_, _| {}).unwrap();
+        assert_eq!(partial.skipped_duplicate, 1);
+        assert!(!sidecar.exists(), "unpacking writes no sidecar for the owner's file");
+        let result = index_bundle(&catalog, &manifest, &extracted, &root, partial).unwrap();
+        assert_eq!((result.merge.photos_kept_apart, result.merge.photos_added), (1, 0), "{:?}", result.merge);
+
+        assert_ne!(crate::xmp::read_identifier(&original).as_deref(), Some(THEIRS));
+        assert!(!sidecar.exists(), "indexing writes no sidecar for the owner's file either");
+        assert_eq!(catalog.count_photos(&Default::default()).unwrap(), 1);
+        let after = catalog.get_photo(row.id).unwrap();
+        assert_eq!((after.uuid.as_str(), after.rating), (OURS, 5));
+        assert_eq!(catalog.get_iptc(row.id).unwrap(), Default::default());
+        let conflicts: Vec<_> = catalog
+            .list_pending_identity()
+            .unwrap()
+            .into_iter()
+            .filter(|r| r.error.contains(THEIRS))
+            .collect();
+        assert!(conflicts.is_empty(), "no conflict naming the bundle's identity: {conflicts:?}");
+    }
+
+    /// The library file the bundle's photo is found at, with no row at all, takes the bundle's
+    /// identity in its sidecar during indexing — the binding the unpack no longer does.
+    #[test]
+    fn a_found_file_with_no_row_is_bound_to_the_bundles_identity_when_indexed() {
+        const THEIRS: &str = "6f1c1f0e-2b7a-4c3d-9e8f-0a1b2c3d4e5f";
+        let (catalog, root) = temp_catalog("185-unrowed");
+        let original = root.join("2026/06/28/DSC01234.ARW");
+        std::fs::create_dir_all(original.parent().unwrap()).unwrap();
+        std::fs::write(&original, b"FAKE RAW BYTES").unwrap();
+
+        let bundle_path = make_test_bundle("185-unrowed", THEIRS, "2026/06/28/DSC01234.ARW");
+        let (manifest, mut archive) = open_bundle(&bundle_path).unwrap();
+        let (extracted, partial) = extract_originals(&manifest, &mut archive, &root, |_, _| {}).unwrap();
+        assert_eq!(partial.skipped_duplicate, 1);
+        assert_eq!(crate::xmp::read_identifier(&original), None, "not bound while unpacking");
+        index_bundle(&catalog, &manifest, &extracted, &root, partial).unwrap();
+        assert_eq!(crate::xmp::read_identifier(&original).as_deref(), Some(THEIRS));
+        assert_eq!(catalog.get_photo_by_uuid(THEIRS).unwrap().path, "2026/06/28/DSC01234.ARW");
     }
 
     #[test]

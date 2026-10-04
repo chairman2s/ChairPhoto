@@ -35,15 +35,22 @@ pub async fn open_default_catalog(state: &AppState) -> Result<PathBuf, String> {
     // existing catalog away from its real root. Meant for development/trial runs (see
     // README.md "Try it without touching your own library"); change the root of a real
     // catalog through Preferences / `set_library_root` instead.
-    let default_root = std::env::var_os("CHAIRPHOTO_LIBRARY_ROOT")
-        .filter(|v| !v.is_empty())
-        .map(PathBuf::from)
-        .unwrap_or_else(|| expand_home("~/Pictures/Raw"));
+    //
+    // See `library_root_override` for `~` expansion and the absolute-path requirement.
+    let default_root = library_root_override().unwrap_or_else(|| expand_home("~/Pictures/Raw"));
 
-    // Create the default root directory off the UI thread.
+    // Create the default root directory off the UI thread — but only for a catalog that
+    // does not exist yet. `Catalog::open`'s `INSERT ... ON CONFLICT(key) DO NOTHING` means
+    // an existing catalog keeps its stored root and never reads `default_root` at all, so
+    // creating this directory for it would just leave a stray empty one behind.
     let _ = spawn_blocking({
+        let path = catalog_path.clone();
         let root = default_root.clone();
-        move || std::fs::create_dir_all(&root).ok()
+        move || {
+            if !path.exists() {
+                std::fs::create_dir_all(&root).ok();
+            }
+        }
     })
     .await;
 
@@ -85,6 +92,32 @@ pub async fn open_default_catalog(state: &AppState) -> Result<PathBuf, String> {
     }
 
     Ok(catalog_path)
+}
+
+/// `CHAIRPHOTO_LIBRARY_ROOT`, resolved to an absolute override for a *fresh* catalog's
+/// default root, or `None` when it is unset, empty, or rejected — callers fall back to the
+/// real `~/Pictures/Raw` default. See [`open_default_catalog`] for why this can never move
+/// an *existing* catalog's root.
+///
+/// A leading `~`/`~/` is expanded against `HOME` ([`expand_home`]), same as the real
+/// default. A value that is still not absolute afterwards — a bare relative path, or `~`
+/// unexpandable because `HOME` is unset — is rejected (logged, not silently dropped) rather
+/// than stored: a relative `catalog_root` would resolve differently depending on the
+/// process's launch cwd, silently moving scans and sidecar writes to wherever that happens
+/// to be later. Pure (no I/O beyond reading the environment), so this is unit-tested
+/// directly without going through a catalog open.
+fn library_root_override() -> Option<PathBuf> {
+    let value = std::env::var_os("CHAIRPHOTO_LIBRARY_ROOT").filter(|v| !v.is_empty())?;
+    let expanded = expand_home(&value.to_string_lossy());
+    if expanded.is_absolute() {
+        Some(expanded)
+    } else {
+        eprintln!(
+            "CHAIRPHOTO_LIBRARY_ROOT={value:?} is not an absolute path (after `~` expansion); \
+             ignoring it and using the default library root instead"
+        );
+        None
+    }
 }
 
 /// Detach a Phase B enrichment worker for the given catalog `path`/`root` on the core
@@ -745,6 +778,45 @@ mod catalog_registry_tests {
         assert_eq!(catalog.root(), lib.as_path(), "a fresh catalog adopts CHAIRPHOTO_LIBRARY_ROOT");
     }
 
+    /// A leading `~/` in `CHAIRPHOTO_LIBRARY_ROOT` is expanded against `HOME`, not stored
+    /// literally: a prior bug stored `~/probe-photos` verbatim, so the root silently moved
+    /// with the process's launch directory (a literal `~` resolved relative to the cwd).
+    /// Exercised directly against the pure helper — no catalog, no filesystem — so a
+    /// relative-path mutation of the real-default fallback below can't accidentally create a
+    /// directory relative to the test binary's cwd.
+    #[test]
+    fn library_root_override_expands_a_leading_tilde() {
+        let scratch_home = std::env::temp_dir().join(format!("cp-catalogs-tilde-{}", std::process::id()));
+        let _g = EnvGuard::set_all(&[
+            ("HOME", scratch_home.to_str().unwrap()),
+            ("CHAIRPHOTO_LIBRARY_ROOT", "~/scratch-tilde-photos"),
+        ]);
+
+        assert_eq!(
+            library_root_override(),
+            Some(scratch_home.join("scratch-tilde-photos")),
+            "`~/` must expand against HOME, not be stored literally"
+        );
+    }
+
+    /// A relative `CHAIRPHOTO_LIBRARY_ROOT` (no leading `/` or `~`) is rejected: `None`,
+    /// falling back to the real `~/Pictures/Raw` default — a relative root would otherwise
+    /// resolve differently depending on whatever directory the process happens to be
+    /// launched from later.
+    #[test]
+    fn library_root_override_rejects_a_relative_path() {
+        let _g = EnvGuard::set("CHAIRPHOTO_LIBRARY_ROOT", "relative-photos");
+
+        assert_eq!(library_root_override(), None, "a relative CHAIRPHOTO_LIBRARY_ROOT must be rejected");
+    }
+
+    /// Unset (or empty) is also `None` — the override is additive, never forced.
+    #[test]
+    fn library_root_override_is_none_when_unset_or_empty() {
+        let _g = EnvGuard::set_all(&[("CHAIRPHOTO_LIBRARY_ROOT", "")]);
+        assert_eq!(library_root_override(), None, "an empty value must be treated as unset");
+    }
+
     /// Reopening an existing catalog must never move its already-stored root, even if
     /// `CHAIRPHOTO_LIBRARY_ROOT` now names something else: `Catalog::open`'s
     /// `INSERT ... ON CONFLICT(key) DO NOTHING` (catalog/mod.rs) means the env var is read
@@ -772,12 +844,20 @@ mod catalog_registry_tests {
         let guard = state.catalog.lock().unwrap();
         let catalog = guard.as_ref().unwrap();
         assert_eq!(catalog.root(), first_lib.as_path(), "an existing catalog keeps its stored root");
+        assert!(!other_lib.exists(), "the ignored override's directory must not be created either");
     }
 
     /// Without the env var, a fresh catalog still roots at `~/Pictures/Raw` — the override
     /// is additive, not a replacement for the real default. `HOME` is also overridden to a
     /// scratch directory here: this must never resolve `~` against the real home and create
     /// a `Pictures/Raw` there.
+    ///
+    /// "Without the env var" is simulated by setting it to `""` *through `EnvGuard`* rather
+    /// than calling `std::env::remove_var` directly: the production code already treats an
+    /// empty value the same as unset (`.filter(|v| !v.is_empty())`), and routing the change
+    /// through the guard means a developer's real `CHAIRPHOTO_LIBRARY_ROOT`, if any was
+    /// exported in the shell this test process inherited, is restored when the guard drops
+    /// instead of staying removed for the rest of the test binary's run.
     #[test]
     fn without_the_env_var_a_fresh_catalog_keeps_the_real_default() {
         let xdg = temp_xdg("library-root-unset");
@@ -785,8 +865,8 @@ mod catalog_registry_tests {
         let _g = EnvGuard::set_all(&[
             ("XDG_DATA_HOME", xdg.to_str().unwrap()),
             ("HOME", scratch_home.to_str().unwrap()),
+            ("CHAIRPHOTO_LIBRARY_ROOT", ""),
         ]);
-        std::env::remove_var("CHAIRPHOTO_LIBRARY_ROOT");
 
         let state = AppState::default();
         crate::app::runtime().block_on(open_default_catalog(&state)).unwrap();

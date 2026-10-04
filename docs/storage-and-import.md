@@ -680,9 +680,15 @@ Two modes over the same core location model:
   capture time (a PNG, a stripped JPEG) their contents are compared by streamed SHA-256
   instead. Anything else —
   another size, another sub-second, another body — is a different photo, copied as ` (n)`
-  with its own row and UUID; nothing is ever overwritten: the name is claimed by an
-  exclusive create (`same_photo::create_new_file`), so a file that appears there after the
-  name was found free sends the copy on to the next free name. A name is free only when
+  with its own row and UUID; nothing is ever overwritten (`same_photo::create_new_file`):
+  the copy is written to a hidden temporary file in the same folder
+  (`.<name>.chairphoto-part-…`, never indexed), synced, and then given its name without
+  replacing anything — `renameat2(RENAME_NOREPLACE)` on Linux, else a hard link — so a file
+  that appears there after the name was found free sends the copy on to the next free name,
+  and a crash mid-copy leaves at most the hidden temporary file, never a short original at
+  a library name. On a filesystem with neither (exFAT, FAT) the name is claimed by an
+  exclusive create and the temporary file copied in: still no overwrite, but without that
+  crash guarantee. A name is free only when
   nothing is at it and nothing at its sidecar's name (`<name>.xmp`) either: a sidecar with
   no original beside it (another tool's, or one whose original was removed) belongs to some
   other photo, and a new file placed beside it would adopt its identity and metadata. File mtime is never evidence (a

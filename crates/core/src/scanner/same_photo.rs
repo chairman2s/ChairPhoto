@@ -464,11 +464,22 @@ fn name_free(path: &Path) -> bool {
 }
 
 /// Create a new file at `wanted`, or at the next free ` (n)` name beside it, and fill it with
-/// `fill`; returns where it landed. An existing file is never replaced: the name is claimed
-/// by an exclusive create (`O_CREAT|O_EXCL`), so a file that appears there between finding
-/// the name free and claiming it — another import, another program — makes this one move on
-/// to the next free name instead of overwriting it. The contents are synced before the name
-/// is reported placed; a fill that fails removes the file it created (and only that one).
+/// `fill`; returns where it landed. An existing file is never replaced, and no library name
+/// ever holds a partly written file:
+///
+/// - The contents are written to a hidden temporary file in the same folder
+///   (`.<name>.chairphoto-part-…`, which no scan indexes) and synced.
+/// - Then the temporary file is given the free name without replacing anything: on Linux by
+///   `renameat2(RENAME_NOREPLACE)`, else (or where the filesystem does not support that, an
+///   NFS mount) by a hard link and the removal of the temporary name. A name taken between
+///   finding it free and placing the file — another import, another program — fails that
+///   step with "exists", and the next free name is tried.
+/// - On a filesystem with neither (exFAT, FAT), the name is claimed by an exclusive create
+///   (`O_CREAT|O_EXCL`) and the synced temporary file copied into it: still never an
+///   overwrite, but a crash mid-copy can leave a short file there, as before.
+///
+/// A fill or placement that fails removes the temporary file (and only files this call
+/// created). A crash before the placement leaves only the hidden temporary file.
 pub fn create_new_file(
     wanted: &Path,
     fill: impl FnMut(&mut std::fs::File) -> std::io::Result<()>,
@@ -484,25 +495,115 @@ fn create_new_with(
     mut fill: impl FnMut(&mut std::fs::File) -> std::io::Result<()>,
 ) -> std::io::Result<PathBuf> {
     use std::io::{Error, ErrorKind};
+    let (part, mut file) = create_part(wanted)?;
+    if let Err(e) = fill(&mut file).and_then(|()| file.sync_all()) {
+        drop(file);
+        let _ = std::fs::remove_file(&part);
+        return Err(e);
+    }
+    drop(file);
     // Each lost race means another file now holds a name; a bound keeps a pathological
     // directory from spinning here.
     for _ in 0..100 {
         let Some(candidate) = next_free(wanted) else { break };
-        let mut file = match std::fs::OpenOptions::new().write(true).create_new(true).open(&candidate) {
-            Ok(file) => file,
+        match place_no_replace(&part, &candidate) {
+            Ok(()) => return Ok(candidate),
             Err(e) if e.kind() == ErrorKind::AlreadyExists => continue,
-            Err(e) => return Err(e),
-        };
-        return match fill(&mut file).and_then(|()| file.sync_all()) {
-            Ok(()) => Ok(candidate),
             Err(e) => {
-                drop(file);
-                let _ = std::fs::remove_file(&candidate);
-                Err(e)
+                let _ = std::fs::remove_file(&part);
+                return Err(e);
             }
-        };
+        }
     }
+    let _ = std::fs::remove_file(&part);
     Err(Error::new(ErrorKind::AlreadyExists, format!("no free name beside {}", wanted.display())))
+}
+
+/// A new hidden temporary file beside `wanted`, created exclusively under a name unique to
+/// this process and call.
+fn create_part(wanted: &Path) -> std::io::Result<(PathBuf, std::fs::File)> {
+    use std::sync::atomic::AtomicU64;
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let dir = wanted.parent().unwrap_or_else(|| Path::new("."));
+    let name = wanted.file_name().and_then(|s| s.to_str()).unwrap_or("file");
+    loop {
+        let n = NEXT.fetch_add(1, Ordering::Relaxed);
+        let part = dir.join(format!(".{name}.chairphoto-part-{}-{n}", std::process::id()));
+        match std::fs::OpenOptions::new().write(true).create_new(true).open(&part) {
+            Ok(file) => return Ok((part, file)),
+            // Left by a crashed run of a process that had this id: take the next number.
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+/// Give the file at `part` the name `to` without replacing a file there (`AlreadyExists`
+/// when one is), in one step where the filesystem allows ([`create_new_file`]). On success
+/// `part` is gone.
+fn place_no_replace(part: &Path, to: &Path) -> std::io::Result<()> {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        use rustix::fs::{renameat_with, RenameFlags, CWD};
+        use rustix::io::Errno;
+        match renameat_with(CWD, part, CWD, to, RenameFlags::NOREPLACE) {
+            Ok(()) => return Ok(()),
+            // Not supported by this kernel or filesystem: fall through to a hard link.
+            Err(Errno::INVAL | Errno::NOSYS | Errno::OPNOTSUPP) => {}
+            Err(e) => return Err(e.into()),
+        }
+    }
+    place_by_link(part, to)
+}
+
+/// [`place_no_replace`] by a hard link (which fails with "exists" rather than replace) and
+/// the removal of `part`; on a filesystem without hard links, [`place_by_copy`].
+fn place_by_link(part: &Path, to: &Path) -> std::io::Result<()> {
+    match std::fs::hard_link(part, to) {
+        Ok(()) => {
+            // The file is placed; a temporary name that will not go is only litter.
+            let _ = std::fs::remove_file(part);
+            Ok(())
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Err(e),
+        Err(e) if links_unsupported(&e) => place_by_copy(part, to),
+        Err(e) => Err(e),
+    }
+}
+
+/// Whether a failed hard link means the filesystem has none (`EPERM`, `EOPNOTSUPP`, `ENOSYS`
+/// on Unix; any "unsupported" elsewhere).
+fn links_unsupported(e: &std::io::Error) -> bool {
+    #[cfg(unix)]
+    if let Some(code) = e.raw_os_error() {
+        let errno = rustix::io::Errno::from_raw_os_error(code);
+        return matches!(errno, rustix::io::Errno::PERM | rustix::io::Errno::OPNOTSUPP | rustix::io::Errno::NOSYS);
+    }
+    e.kind() == std::io::ErrorKind::Unsupported
+}
+
+/// [`place_no_replace`] on a filesystem with neither no-replace rename nor hard links: claim
+/// `to` with an exclusive create and copy `part` into it, keeping its permissions; synced.
+/// A failed copy removes `to` (created here) and keeps `part` for the caller to remove.
+fn place_by_copy(part: &Path, to: &Path) -> std::io::Result<()> {
+    let mut out = std::fs::OpenOptions::new().write(true).create_new(true).open(to)?;
+    let copied = (|| {
+        let mut input = std::fs::File::open(part)?;
+        std::io::copy(&mut input, &mut out)?;
+        out.set_permissions(input.metadata()?.permissions())?;
+        out.sync_all()
+    })();
+    match copied {
+        Ok(()) => {
+            let _ = std::fs::remove_file(part);
+            Ok(())
+        }
+        Err(e) => {
+            drop(out);
+            let _ = std::fs::remove_file(to);
+            Err(e)
+        }
+    }
 }
 
 /// Test files carrying a capture stamp, shared by the card-ingest and bundle-import tests.
@@ -743,6 +844,59 @@ mod tests {
         assert_eq!(err.to_string(), "card pulled");
         assert!(!dir.join("DSC1 (2).ARW").exists());
         assert_eq!(std::fs::read(&wanted).unwrap(), b"library");
+        assert_eq!(names(&dir), ["DSC1.ARW"], "no temporary file left");
+    }
+
+    fn names(dir: &Path) -> Vec<String> {
+        let mut out: Vec<String> =
+            std::fs::read_dir(dir).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+        out.sort();
+        out
+    }
+
+    /// N-b of the second #246 review: while the contents are written no library name holds
+    /// them — only a hidden temporary file does — so a crash mid-copy never leaves a short
+    /// original at a name a scan would index. The placed file has the contents, and the
+    /// temporary file is gone.
+    #[test]
+    fn no_library_name_holds_a_partly_written_file() {
+        let dir = temp("part");
+        let wanted = dir.join("DSC1.ARW");
+        std::fs::write(&wanted, b"library").unwrap();
+        let placed = create_new_file(&wanted, |f| {
+            use std::io::Write;
+            f.write_all(b"half")?;
+            let during = names(&dir);
+            assert_eq!(during.len(), 2, "{during:?}");
+            assert_eq!(during[1], "DSC1.ARW");
+            assert!(during[0].starts_with(".DSC1.ARW.chairphoto-part-"), "{during:?}");
+            f.write_all(b" and half")
+        })
+        .unwrap();
+        assert_eq!(placed, dir.join("DSC1 (2).ARW"));
+        assert_eq!(std::fs::read(&placed).unwrap(), b"half and half");
+        assert_eq!(names(&dir), ["DSC1 (2).ARW", "DSC1.ARW"]);
+    }
+
+    /// Each way of placing the temporary file refuses a taken name and keeps both files.
+    #[test]
+    fn every_placement_refuses_a_taken_name() {
+        let dir = temp("placements");
+        let taken = dir.join("taken");
+        std::fs::write(&taken, b"theirs").unwrap();
+        type Place = fn(&Path, &Path) -> std::io::Result<()>;
+        for (how, place) in [("no-replace", place_no_replace as Place), ("link", place_by_link), ("copy", place_by_copy)] {
+            let part = dir.join(format!(".part-{how}"));
+            std::fs::write(&part, b"ours").unwrap();
+            let err = place(&part, &taken).unwrap_err();
+            assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists, "{how}");
+            assert_eq!(std::fs::read(&taken).unwrap(), b"theirs", "{how}");
+            assert_eq!(std::fs::read(&part).unwrap(), b"ours", "{how}");
+            let free = dir.join(format!("free-{how}"));
+            place(&part, &free).unwrap();
+            assert_eq!(std::fs::read(&free).unwrap(), b"ours", "{how}");
+            assert!(!part.exists(), "{how}: the temporary name is gone");
+        }
     }
 
     /// The stamps exiftool reads: the capture time, its sub-second and the serial, for the

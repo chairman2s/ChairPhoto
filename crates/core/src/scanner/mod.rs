@@ -721,15 +721,18 @@ pub fn copy_from_card_abortable(
             continue;
         };
         // A different photo under a name already used is kept beside it as ` (n)`, or an
-        // error if no free name is found — never an overwrite.
-        let Some(dest) = same_photo::unique_dest(&dir.join(filename)) else {
+        // error if no free name is found — never an overwrite, even of a file placed there
+        // after the name was found free. The copy keeps the source's permissions, as
+        // `fs::copy` did.
+        let placed = same_photo::create_new_file(&dir.join(filename), |out| {
+            let mut input = std::fs::File::open(src)?;
+            std::io::copy(&mut input, out)?;
+            out.set_permissions(input.metadata()?.permissions())
+        });
+        let Ok(dest) = placed else {
             result.errors += 1;
             continue;
         };
-        if std::fs::copy(src, &dest).is_err() {
-            result.errors += 1;
-            continue;
-        }
         in_library.insert(src);
         copied.push(CopiedItem { dest, meta: m });
     }

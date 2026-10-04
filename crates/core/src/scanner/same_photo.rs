@@ -347,6 +347,48 @@ pub fn unique_dest(path: &Path) -> Option<PathBuf> {
     (2..10_000).map(|n| numbered(path, n)).find(|c| !c.exists())
 }
 
+/// Create a new file at `wanted`, or at the next free ` (n)` name beside it, and fill it with
+/// `fill`; returns where it landed. An existing file is never replaced: the name is claimed
+/// by an exclusive create (`O_CREAT|O_EXCL`), so a file that appears there between finding
+/// the name free and claiming it — another import, another program — makes this one move on
+/// to the next free name instead of overwriting it. The contents are synced before the name
+/// is reported placed; a fill that fails removes the file it created (and only that one).
+pub fn create_new_file(
+    wanted: &Path,
+    fill: impl FnMut(&mut std::fs::File) -> std::io::Result<()>,
+) -> std::io::Result<PathBuf> {
+    create_new_with(wanted, unique_dest, fill)
+}
+
+/// [`create_new_file`], with the free-name search given — where a test makes a name be taken
+/// after it was found free.
+fn create_new_with(
+    wanted: &Path,
+    next_free: impl Fn(&Path) -> Option<PathBuf>,
+    mut fill: impl FnMut(&mut std::fs::File) -> std::io::Result<()>,
+) -> std::io::Result<PathBuf> {
+    use std::io::{Error, ErrorKind};
+    // Each lost race means another file now holds a name; a bound keeps a pathological
+    // directory from spinning here.
+    for _ in 0..100 {
+        let Some(candidate) = next_free(wanted) else { break };
+        let mut file = match std::fs::OpenOptions::new().write(true).create_new(true).open(&candidate) {
+            Ok(file) => file,
+            Err(e) if e.kind() == ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        };
+        return match fill(&mut file).and_then(|()| file.sync_all()) {
+            Ok(()) => Ok(candidate),
+            Err(e) => {
+                drop(file);
+                let _ = std::fs::remove_file(&candidate);
+                Err(e)
+            }
+        };
+    }
+    Err(Error::new(ErrorKind::AlreadyExists, format!("no free name beside {}", wanted.display())))
+}
+
 /// Test files carrying a capture stamp, shared by the card-ingest and bundle-import tests.
 #[cfg(test)]
 pub(crate) mod test_files {
@@ -481,6 +523,46 @@ mod tests {
         std::fs::write(dir.join("DSC1 (5).ARW"), b"dddd").unwrap(); // past the gap
         assert_eq!(same_size_candidates(&dest, 4), vec![dest.clone(), dir.join("DSC1 (3).ARW")]);
         assert_eq!(unique_dest(&dest), Some(dir.join("DSC1 (4).ARW")));
+    }
+
+    // --- placing a new file (L-4) ---------------------------------------------------------
+
+    /// A name found free but taken before it is claimed (another program wrote it in
+    /// between) keeps its file: the new one moves on to the next free name.
+    #[test]
+    fn a_name_taken_after_it_was_found_free_is_never_overwritten() {
+        let dir = temp("no-clobber");
+        let wanted = dir.join("DSC1.ARW");
+        std::fs::write(&wanted, b"library").unwrap();
+        let raced = dir.join("DSC1 (2).ARW");
+        std::fs::write(&raced, b"written meanwhile").unwrap();
+        let asked = std::cell::Cell::new(0);
+        // The first answer is the name as it was before the other writer took it.
+        let next_free = |p: &Path| {
+            asked.set(asked.get() + 1);
+            if asked.get() == 1 { Some(raced.clone()) } else { unique_dest(p) }
+        };
+        let placed = create_new_with(&wanted, next_free, |f| {
+            use std::io::Write;
+            f.write_all(b"arriving")
+        })
+        .unwrap();
+        assert_eq!(placed, dir.join("DSC1 (3).ARW"));
+        assert_eq!(std::fs::read(&raced).unwrap(), b"written meanwhile");
+        assert_eq!(std::fs::read(&wanted).unwrap(), b"library");
+        assert_eq!(std::fs::read(&placed).unwrap(), b"arriving");
+    }
+
+    /// A fill that fails removes the file it created, and only that one.
+    #[test]
+    fn a_failed_fill_removes_only_its_own_file() {
+        let dir = temp("fill-fails");
+        let wanted = dir.join("DSC1.ARW");
+        std::fs::write(&wanted, b"library").unwrap();
+        let err = create_new_file(&wanted, |_| Err(std::io::Error::other("card pulled"))).unwrap_err();
+        assert_eq!(err.to_string(), "card pulled");
+        assert!(!dir.join("DSC1 (2).ARW").exists());
+        assert_eq!(std::fs::read(&wanted).unwrap(), b"library");
     }
 
     /// The stamps exiftool reads: the capture time, its sub-second and the serial, for the

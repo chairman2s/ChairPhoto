@@ -254,15 +254,20 @@ pub fn extract_originals_abortable(
             continue;
         }
 
-        // Any other collision is a different photo → ` (n)`.
-        let Some(dest) = unique_free_name(bp, &dest, &mut result) else { continue };
-        if let Err(e) = std::fs::write(&dest, &orig_bytes) {
-            eprintln!(
-                "bundle import: write {} failed: {e}", dest.display()
-            );
-            result.errors += 1;
-            continue;
-        }
+        // Any other collision is a different photo → ` (n)`, claimed so that a file placed
+        // there meanwhile is never overwritten.
+        let placed = same_photo::create_new_file(&dest, |file| {
+            use std::io::Write;
+            file.write_all(&orig_bytes)
+        });
+        let dest = match placed {
+            Ok(dest) => dest,
+            Err(e) => {
+                eprintln!("bundle import: placing {} ({}) failed: {e}", bp.uuid, dest.display());
+                result.errors += 1;
+                continue;
+            }
+        };
         result.copied += 1;
         place_sidecar(archive, &arc_orig, &dest, bp);
         extracted.push(ExtractedItem {
@@ -273,25 +278,6 @@ pub fn extract_originals_abortable(
     }
 
     Ok((extracted, result, false))
-}
-
-/// `dest`, or the free ` (n)` name beside it when it is taken; `None` (counted as an error)
-/// when no free name is found — never an overwrite.
-fn unique_free_name(
-    bp: &crate::bundle::BundlePhoto,
-    dest: &Path,
-    result: &mut BundleImportResult,
-) -> Option<PathBuf> {
-    let free = crate::scanner::same_photo::unique_dest(dest);
-    if free.is_none() {
-        eprintln!(
-            "bundle import: couldn't find a free name for {} ({}) — skipped",
-            bp.uuid,
-            dest.display()
-        );
-        result.errors += 1;
-    }
-    free
 }
 
 /// A bundle original found already in the library at `existing`: put the bundle's identity

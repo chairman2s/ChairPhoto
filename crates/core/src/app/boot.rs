@@ -30,7 +30,9 @@ pub struct Boot<T> {
 ///    publishing feature).
 /// 3. **Omarchy theme watcher** — `appearance:theme_changed` through `state`'s sink.
 /// 4. **Decode analyzers** — sharpness and perceptual hash ride every preview decode.
-/// 5. **Image pool** — returned in [`Boot::pool`].
+/// 5. **Zoom cache cleanup** — a one-time, best-effort removal of the zoom tier's orphaned
+///    pre-no-upscale-fix cache directory, on its own thread (disk I/O; nothing waits on it).
+/// 6. **Image pool** — returned in [`Boot::pool`].
 ///
 /// Install the front end's event sink with [`AppState::set_events`] **first**: the watcher
 /// sends through `state`, and an event sent before the sink exists is dropped.
@@ -88,6 +90,11 @@ pub fn boot_with<T: Clone + Send + 'static>(state: &AppState, runner: image_pool
     // The registry is process-global, so a second boot must not add a second pair.
     static ANALYZERS: Once = Once::new();
     ANALYZERS.call_once(|| register_decode_analyzers(state));
+
+    // One-time, best-effort cleanup of the zoom tier's pre-no-upscale-fix cache directory
+    // (#168 review): disk I/O that nothing waits on, so it runs on its own thread rather
+    // than blocking boot.
+    std::thread::spawn(crate::thumbnails::cleanup_stale_zoom_cache);
 
     // The bounded LIFO image pool every media request goes through.
     let n_threads = image_pool::default_thread_count();

@@ -1,6 +1,6 @@
 //! Process-wide serialization of env-var mutations in tests; see the rules above
 //! `test_env_helpers` in `app/mod.rs`. One `ENV_LOCK` per test binary: the core's unit tests
-//! and the Tauri shell's each compile this file once (the shell via `#[path]`).
+//! compile this file once (the Tauri shell's did too, via `#[path]`, until #165).
 
 use std::sync::Mutex;
 

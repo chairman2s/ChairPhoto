@@ -10,8 +10,7 @@
 //! 1. an [`AppState`] with the [`events::GpuiSink`] installed — first, so nothing the core
 //!    starts can send into the void ([`start_core`]);
 //! 2. `app::boot_with` — crash markers, upload sweep, Omarchy watcher, decode analyzers, image
-//!    pool (the same startup the Tauri shell runs; this pool's runner decodes to BGRA
-//!    textures, [`image_store::runner`]);
+//!    pool (this pool's runner decodes to BGRA textures, [`image_store::runner`]);
 //! 3. the GPUI application ([`wire`]): embedded fonts, gpui-kit's init, the theme from the
 //!    current system theme (before the first window: `theme::init` switches to Light), the
 //!    keymap and the quit wiring;
@@ -24,7 +23,7 @@
 //!
 //! Quitting — Ctrl+Q, closing the main window, or `SIGTERM`/`SIGINT`/`SIGHUP` (dispatched as
 //! the same `Quit` action) — goes through [`quit_app`], and the quit runs
-//! `crash_marker::clean_exit()`, as the Tauri shell does at `RunEvent::Exit`: decodes a
+//! `crash_marker::clean_exit()`, as the Tauri shell did at `RunEvent::Exit`: decodes a
 //! deliberate quit cuts short are not crashes. `clean_exit` also disarms the markers, so a
 //! decode that starts between the quit and the process exit cannot leave one either.
 //!

@@ -1,9 +1,8 @@
 //! ChairPhoto's core: the catalog, import, XMP, decode, background jobs and the module
-//! backends — everything the app does, with no Tauri dependency.
+//! backends — everything the app does, with no UI toolkit.
 //!
-//! The Tauri shell (`src-tauri/`, package `chairphoto`) holds `run()`, the command surface,
-//! the native media protocols and the Tauri plugins, and re-exports this crate at its root.
-//! Anything a front end needs from here is `pub`; front ends reach it through [`app::AppState`]
+//! The front end is the GPUI app (`crates/app`), which links this crate directly. (Until #165
+//! a Tauri shell wrapped it too.) Anything a front end needs from here is `pub`; front ends reach it through [`app::AppState`]
 //! and the domain modules, and hear from it through [`app::events`].
 
 pub mod app;

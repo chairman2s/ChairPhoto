@@ -4442,13 +4442,12 @@ fn scan_folder_aborts_mid_run_and_stops_early() {
 // ---------------------------------------------------------------------------
 // I4 — Multi-catalog: create / reopen round-trip tests.
 //
-// The Tauri commands (switch_catalog / list_recent_catalogs) are private to the
-// commands crate and are unit-tested there.  Here we test the underlying
-// `Catalog` primitives they call: that a fresh catalog can be created,
+// The catalog switch itself (`app::catalogs::switch_catalog`) is unit-tested in
+// `app/catalogs.rs`.  Here we test the underlying `Catalog` primitives they call: that a fresh catalog can be created,
 // populated, closed, and reopened with its state intact; and that two
 // independent catalogs coexist without cross-contaminating each other's rows.
-// The recent-catalog registry helpers (record / load / save) are tested
-// separately in commands/catalog.rs where the private functions are accessible.
+// The recent-catalog registry helpers (record / load / save) are exercised
+// in `app/catalogs.rs` too.
 // ---------------------------------------------------------------------------
 
 /// Create a named catalog in a fresh temp dir and return (Catalog, db_path, root).

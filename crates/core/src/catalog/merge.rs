@@ -35,7 +35,11 @@
 //!   photo holds its `relative_path` (the importer found the same capture there under
 //!   another identity, #246/#185) — is kept apart: neither inserted (`photos.path` is
 //!   UNIQUE) nor merged onto the photo at that path, whose identity differs. Counted in
-//!   [`MergeSummary::photos_kept_apart`].
+//!   [`MergeSummary::photos_kept_apart`]. So is a photo with no row whose original the
+//!   importer found in the library at another name (a ` (n)` one) under another identity
+//!   ([`Catalog::merge_bundle_into`]'s `kept_apart`): its own path may be free, but the
+//!   photo is in the library already, as the other row's — a row inserted there would
+//!   describe a file that is not this photo's, or none.
 //!
 //! Consequences: **re-merging the same bundle is a no-op** (a version is added only for
 //! settings the photo does not already have), and merging a bundle whose photos/tags
@@ -103,14 +107,22 @@ impl Catalog {
     /// docs). Pure-DB: it never touches the filesystem — placing originals is the
     /// importer's job. The whole apply is one transaction.
     pub fn merge_bundle(&self, manifest: &BundleManifest) -> Result<MergeSummary> {
-        Ok(self.merge_bundle_into(manifest, &HashSet::new())?.summary)
+        Ok(self.merge_bundle_into(manifest, &HashSet::new(), &HashSet::new())?.summary)
     }
 
     /// [`Self::merge_bundle`], told which rows the caller created for this bundle's photos
     /// just before (`fresh`): those already carry the bundle's state, so an existing photo
-    /// in `fresh` is not filled again. Returns the IPTC fills left to the caller (see
-    /// [`MergeOutcome`]).
-    pub fn merge_bundle_into(&self, manifest: &BundleManifest, fresh: &HashSet<i64>) -> Result<MergeOutcome> {
+    /// in `fresh` is not filled again. `kept_apart` holds the identities (canonical, as
+    /// [`super::photo_identity_for`] gives them) of the bundle's photos the caller kept apart:
+    /// their original is in the library already under another identity, so one with no row is
+    /// kept apart here too ([`MergeSummary::photos_kept_apart`]) rather than inserted at its
+    /// path. Returns the IPTC fills left to the caller (see [`MergeOutcome`]).
+    pub fn merge_bundle_into(
+        &self,
+        manifest: &BundleManifest,
+        fresh: &HashSet<i64>,
+        kept_apart: &HashSet<String>,
+    ) -> Result<MergeOutcome> {
         let tx = self.conn.unchecked_transaction()?;
         let outcome = {
             let mut ctx = MergeCtx {
@@ -118,6 +130,7 @@ impl Catalog {
                 outcome: MergeOutcome::default(),
                 tag_id_by_uuid: HashMap::new(),
                 fresh,
+                kept_apart,
             };
             ctx.run(manifest)?;
             ctx.outcome
@@ -137,6 +150,8 @@ struct MergeCtx<'a> {
     tag_id_by_uuid: HashMap<String, i64>,
     /// Rows the importer created for this bundle's photos (see `merge_bundle_into`).
     fresh: &'a HashSet<i64>,
+    /// Identities the importer kept apart (see `merge_bundle_into`).
+    kept_apart: &'a HashSet<String>,
 }
 
 impl MergeCtx<'_> {
@@ -377,10 +392,11 @@ impl MergeCtx<'_> {
                 }
                 id
             }
-            None if self.path_taken(&photo.relative_path)? => {
-                // No row holds this identity, but another photo holds the path: the importer
-                // found the same capture there under another identity (#246). It is neither
-                // this photo's row nor a free path — keep the two apart.
+            None if self.kept_apart.contains(&uuid) || self.path_taken(&photo.relative_path)? => {
+                // No row holds this identity, but another photo holds the path, or the importer
+                // found this photo's original in the library under another identity (#246) —
+                // perhaps at a ` (n)` name, its own path free. It is neither this photo's row
+                // nor a free path — keep the two apart.
                 eprintln!(
                     "bundle merge: photo {uuid} kept apart: another photo, under another identity, \
                      is at {}",
@@ -800,7 +816,7 @@ mod tests {
             )
             .unwrap();
 
-        let out = cat.merge_bundle_into(&sample_manifest(), &HashSet::new()).unwrap();
+        let out = cat.merge_bundle_into(&sample_manifest(), &HashSet::new(), &HashSet::new()).unwrap();
         let s = &out.summary;
         assert_eq!(s.photos_added, 0);
         assert_eq!(s.photos_existing, 1);
@@ -847,7 +863,7 @@ mod tests {
         );
 
         // A second merge adds no version: the photo has those settings now.
-        let again = cat.merge_bundle_into(&sample_manifest(), &HashSet::new()).unwrap();
+        let again = cat.merge_bundle_into(&sample_manifest(), &HashSet::new(), &HashSet::new()).unwrap();
         assert_eq!((again.summary.versions_added, again.summary.photos_filled), (0, 0));
         assert_eq!(cat.list_versions(after.id).unwrap().len(), 3);
 
@@ -877,7 +893,7 @@ mod tests {
         let local = cat.get_photo_by_uuid("photo-a").unwrap();
         cat.set_edit_record(local.id, r#"{ "basic-editor": { "exposure": 0.3 } }"#).unwrap();
 
-        let out = cat.merge_bundle_into(&sample_manifest(), &HashSet::new()).unwrap();
+        let out = cat.merge_bundle_into(&sample_manifest(), &HashSet::new(), &HashSet::new()).unwrap();
         let after = cat.get_photo(local.id).unwrap();
         assert_eq!(after.rating, 2, "a rating it has wins");
         assert_eq!(after.label, "green", "a blank label is filled");
@@ -909,7 +925,7 @@ mod tests {
             let mut manifest = sample_manifest();
             manifest.photos[0].edit_record = Some(blank.into());
             manifest.photos[0].versions.clear();
-            let out = cat.merge_bundle_into(&manifest, &HashSet::new()).unwrap();
+            let out = cat.merge_bundle_into(&manifest, &HashSet::new(), &HashSet::new()).unwrap();
             assert_eq!(out.summary.versions_added, 0, "{blank:?}");
             assert!(cat.list_versions(id).unwrap().is_empty(), "{blank:?}");
         }
@@ -928,7 +944,7 @@ mod tests {
             )
             .unwrap();
         let id = cat.conn().last_insert_rowid();
-        let out = cat.merge_bundle_into(&sample_manifest(), &HashSet::from([id])).unwrap();
+        let out = cat.merge_bundle_into(&sample_manifest(), &HashSet::from([id]), &HashSet::new()).unwrap();
         assert_eq!((out.summary.photos_filled, out.summary.versions_added), (0, 0));
         assert!(out.iptc_fills.is_empty());
         assert_eq!(cat.get_photo(id).unwrap().rating, 0);
@@ -957,6 +973,19 @@ mod tests {
             .query_row("SELECT uuid, rating FROM photos", [], |r| Ok((r.get(0)?, r.get(1)?)))
             .unwrap();
         assert_eq!(only, ("11111111-2222-4333-8444-555555555555".to_string(), 0));
+    }
+
+    /// An identity the importer kept apart (its original found in the library at another
+    /// name, under another identity) is kept apart here too, with its own path free: no
+    /// metadata-only row is inserted for it.
+    #[test]
+    fn an_identity_the_importer_kept_apart_is_not_inserted_at_its_free_path() {
+        let (cat, _root) = temp_catalog("apart-free");
+        let kept = HashSet::from([crate::catalog::photo_identity_for("photo-a").unwrap()]);
+        let out = cat.merge_bundle_into(&sample_manifest(), &HashSet::new(), &kept).unwrap();
+        let s = out.summary;
+        assert_eq!((s.photos_added, s.photos_existing, s.photos_kept_apart), (0, 0, 1));
+        assert_eq!(cat.count_photos(&Default::default()).unwrap(), 0);
     }
 
     #[test]

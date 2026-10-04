@@ -459,6 +459,11 @@ pub(crate) fn index_bundle_with(
     // relative path: merge has no identity to match such a photo by, and the photo at its
     // path need not be it (#150), so it is told which row the index phase chose.
     let mut indexed_blank: std::collections::HashMap<&str, String> = std::collections::HashMap::new();
+    // The identities of the bundle's photos whose original is in the library already as
+    // another identity's photo: the merge keeps them apart too, even where their own path is
+    // free (the original found at a ` (n)` name), rather than inserting a row there that
+    // describes no file of theirs.
+    let mut kept_apart: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     let tx = catalog.begin().map_err(|e| e.to_string())?;
     for item in extracted {
@@ -471,8 +476,9 @@ pub(crate) fn index_bundle_with(
         // A file the library already had (#246) that a row of another identity holds is that
         // row's photo, not the bundle's: the same capture imported separately on each side.
         // It is kept apart — no upsert, no identity bound into the owner's sidecar (which may
-        // lack one, as identity debt) — and the merge counts the bundle's photo kept apart
-        // when no row holds its identity (`MergeSummary::photos_kept_apart`).
+        // lack one, as identity debt) — and the merge, told so, counts the bundle's photo kept
+        // apart when no row holds its identity (`MergeSummary::photos_kept_apart`), whether or
+        // not its own relative path is free.
         if item.already_in_library {
             if let Some(held_by) = held_by_another_identity(catalog, path, &item.photo_uuid)? {
                 eprintln!(
@@ -480,6 +486,9 @@ pub(crate) fn index_bundle_with(
                     path.display(),
                     item.photo_uuid
                 );
+                if let Some(identity) = crate::catalog::photo_identity_for(&item.photo_uuid) {
+                    kept_apart.insert(identity);
+                }
                 after_each(indexed);
                 continue;
             }
@@ -669,7 +678,7 @@ pub(crate) fn index_bundle_with(
     // so not `fresh`) has what it lacks filled in from the bundle: culling, new versions,
     // and — Step D — IPTC (#185).
     let merged = catalog
-        .merge_bundle_into(manifest, &fresh)
+        .merge_bundle_into(manifest, &fresh, &kept_apart)
         .map_err(|e| e.to_string())?;
     let merge_summary = merged.summary;
     versions_added_to.extend(merged.versions_added_to);
@@ -1618,6 +1627,37 @@ mod tests {
         assert_eq!((after.uuid.as_str(), after.rating, after.label.as_str()), (OURS, 0, ""));
         assert_eq!(catalog.get_iptc(row.id).unwrap(), Default::default());
         assert_eq!(crate::xmp::read_identifier(&original).as_deref(), Some(OURS));
+    }
+
+    /// L-a of the second #246/#185 review: the library's copy of the capture is at a ` (n)`
+    /// name, under a row of another identity, and the bundle's own path (the plain name) is
+    /// free. The bundle's photo is kept apart there too — never inserted as a metadata-only
+    /// row at the free path, describing a file that is not there (or, later, another photo's).
+    #[test]
+    fn a_photo_kept_apart_at_a_numbered_name_gets_no_row_at_its_free_path() {
+        const THEIRS: &str = "6f1c1f0e-2b7a-4c3d-9e8f-0a1b2c3d4e5f";
+        const OURS: &str = "7a2d2f1f-3c8b-4d4e-8f90-1b2c3d4e5f60";
+        let (catalog, root) = temp_catalog("185-apart-n");
+        let original = root.join("2026/06/28/DSC01234 (2).ARW");
+        std::fs::create_dir_all(original.parent().unwrap()).unwrap();
+        std::fs::write(&original, b"FAKE RAW BYTES").unwrap();
+        crate::xmp::write_identifier(&original, OURS).unwrap();
+        catalog.upsert_photo_with_identity(&original, None, 1, 14, Some(OURS)).unwrap();
+
+        let bundle_path = make_test_bundle("185-apart-n", THEIRS, "2026/06/28/DSC01234.ARW");
+        let (manifest, mut archive) = open_bundle(&bundle_path).unwrap();
+        let (extracted, partial) = extract_originals(&manifest, &mut archive, &root, |_, _| {}).unwrap();
+        assert_eq!(partial.skipped_duplicate, 1);
+        let result = index_bundle(&catalog, &manifest, &extracted, &root, partial).unwrap();
+        assert_eq!((result.merge.photos_kept_apart, result.merge.photos_added), (1, 0), "{:?}", result.merge);
+        assert!(catalog.get_photo_by_uuid(THEIRS).is_err(), "no row for the bundle's photo");
+        assert_eq!(photo_paths(&catalog), ["2026/06/28/DSC01234 (2).ARW"]);
+        assert!(!root.join("2026/06/28/DSC01234.ARW").exists());
+    }
+
+    fn photo_paths(catalog: &Catalog) -> Vec<String> {
+        let mut stmt = catalog.conn().prepare("SELECT path FROM photos ORDER BY path").unwrap();
+        stmt.query_map([], |r| r.get(0)).unwrap().collect::<Result<_, _>>().unwrap()
     }
 
     /// M-3 of the #246/#185 review: the library's photo has a row of its own identity but its

@@ -1,15 +1,13 @@
-//! Blocking render bodies behind the native media protocols: the bytes a `thumb://`,
-//! `preview://`, `zoom://` or (with the `edit` feature) `edit://` request serves.
-//! [`render_bytes`] is the [`ImagePool`](crate::image_pool::ImagePool) runner every front end
-//! installs (`app::boot`); [`render_edit_bytes`] renders from a photo's resolved preview/zoom
-//! tier or a resident RAW working image. Core code — the Tauri protocol handler
-//! (`protocol.rs`), the edit commands and the GPUI app call in here; nothing here depends on
-//! a command layer.
+//! Blocking render bodies behind the image pool: a photo's thumbnail, preview or zoom tier, an
+//! edit render (the `edit` feature) or a face avatar (the `faces` feature), for the job a
+//! [`JobKey`] names.
 //!
-//! [`render_image`] is the same render for a front end that draws pixels itself (the GPUI
-//! app, #101): the same key, the same resolution and disk caches, but it returns the decoded,
-//! rotated image instead of JPEG/PNG bytes, so nothing is re-encoded only to be decoded again.
-//! `render_edit_image` (the `edit` feature) is the Darkroom's frame without the encode.
+//! [`render_image`] is the runner the GPUI app's [`ImagePool`](crate::image_pool::ImagePool)
+//! calls (#101): it returns the decoded, rotated image through the on-disk tier caches, so
+//! nothing is encoded only to be decoded again. `render_edit_image` (the `edit` feature) is the
+//! Darkroom's frame, rendered from a photo's resolved preview/zoom tier or a resident RAW
+//! working image. (The Tauri shell's protocols served the same renders as encoded bytes until
+//! #165 removed them.)
 
 use crate::app::AppState;
 use crate::catalog::ResolveMode;
@@ -56,74 +54,6 @@ fn resolve(state: &AppState, id: i64, kind: ImageKind) -> Result<Resolved, Strin
     Ok(Resolved { absolute, rotation, cover, is_video })
 }
 
-/// Render one image and return its JPEG bytes, or an error string.
-///
-/// The runner [`app::boot`](crate::app::boot) injects into the
-/// [`ImagePool`](crate::image_pool::ImagePool); the Tauri protocol's no-pool fallback calls it
-/// directly.
-///
-/// It matches on [`JobKey`], whose `Edit` variant exists only with this crate's `edit` feature,
-/// so the match must live in this crate under that same gate. In a front end it would be gated
-/// by the front end's `edit` instead, and Cargo's feature unification can turn the core's on
-/// while the front end's is off (another workspace member asked for it) — a non-exhaustive
-/// match that fails to compile.
-pub fn render_bytes(state: &AppState, key: JobKey) -> Result<Vec<u8>, String> {
-    let (id, kind) = match key {
-        JobKey::Photo { id, kind } => (id, kind),
-        #[cfg(feature = "edit")]
-        JobKey::Edit(job) => return render_edit_bytes(state, &job),
-        // Never actually requested over `avatar://` (there is no such protocol — the GPUI
-        // app's `image_store::runner` is the only submitter, see `render_image` below), but
-        // the match must still cover it: `JobKey` carries it whenever `faces` is on, the same
-        // as `edit` above.
-        #[cfg(feature = "faces")]
-        JobKey::Avatar(job) => {
-            let image = crate::plugins::faces::avatar::render_avatar(state, &job)?;
-            let mut bytes = Vec::new();
-            image
-                .write_to(&mut std::io::Cursor::new(&mut bytes), image::ImageFormat::Png)
-                .map_err(|e| e.to_string())?;
-            return Ok(bytes);
-        }
-    };
-    let Resolved { absolute, rotation, cover, .. } = resolve(state, id, kind)?;
-    match absolute {
-        Some(absolute) => match kind {
-            ImageKind::Thumb => {
-                // A cover shows the version's look; if it cannot be rendered (no edit
-                // engine in this build, an engine-2 cover without the decoder, a failure)
-                // the plain thumbnail below is served instead.
-                if let Some(json) = &cover {
-                    #[cfg(feature = "edit")]
-                    match crate::plugins::edit::cover::cover_thumb(&absolute, id, json) {
-                        Ok(bytes) => return crate::thumbnails::rotate_jpeg(bytes, rotation),
-                        Err(e) => eprintln!("cover thumbnail for photo {id}: {e}"),
-                    }
-                    #[cfg(not(feature = "edit"))]
-                    let _ = json;
-                }
-                // Apply the user rotation on top of the file's baked EXIF orientation, then
-                // keep the rotated id-keyed copy so the photo stays browsable (correctly
-                // oriented) after it's offloaded and the NAS goes offline.
-                let bytes = crate::thumbnails::rotate_jpeg(thumbnail_bytes(&absolute)?, rotation)?;
-                crate::thumbnails::save_persistent_thumb(id, &bytes);
-                Ok(bytes)
-            }
-            ImageKind::Preview => crate::thumbnails::rotate_jpeg(preview_bytes(&absolute)?, rotation),
-            ImageKind::Zoom => crate::thumbnails::rotate_jpeg(zoom_bytes(&absolute)?, rotation),
-        },
-        // Original unreachable (e.g. offloaded + NAS unmounted): fall back to the kept
-        // thumbnail so the grid still shows the photo. Preview/zoom need the original.
-        None => {
-            let e = format!("no reachable copy of photo {id}");
-            match kind {
-                ImageKind::Thumb => crate::thumbnails::read_persistent_thumb(id).ok_or(e),
-                _ => Err(e),
-            }
-        }
-    }
-}
-
 /// A decoded image from [`render_image`]: display-ready (oriented, user rotation applied,
 /// sRGB) pixels, usually `Rgb8` straight from a cached JPEG.
 #[derive(Clone, Debug)]
@@ -144,16 +74,22 @@ impl DecodedImage {
     }
 }
 
-/// [`render_bytes`] for a front end that draws decoded pixels (the GPUI app's pool runner):
-/// the same key, resolution, disk caches, cover thumbnails, persistent-thumbnail fallback and
-/// rotation, returning the image instead of JPEG bytes.
+/// Render one job for a front end that draws decoded pixels (the GPUI app's pool runner):
+/// a photo tier through the disk caches, cover thumbnails, the persistent-thumbnail fallback
+/// and the user rotation, returning the image.
 ///
-/// The thumb/preview/zoom tiers still come from the on-disk JPEG caches — one decode and no
-/// re-encode: the user rotation is a pixel permutation here, where `render_bytes` re-encodes.
-/// The one encode left is the persistent thumbnail of a *rotated* photo, which must stay the
-/// file `render_bytes` would have written. An edit key renders through `render_edit_image`,
-/// with no JPEG/PNG. A video with no poster frame is [`video_tile`]
-/// ([`DecodedImage::video_tile`]) rather than an error: there is no inline playback (#97).
+/// The thumb/preview/zoom tiers come from the on-disk JPEG caches — one decode and no
+/// re-encode: the user rotation is a pixel permutation. The one encode left is the persistent
+/// thumbnail of a *rotated* photo (`thumbnails::encode_rotated_jpeg`). An edit key renders
+/// through `render_edit_image`, with no JPEG/PNG. A video with no poster frame is
+/// [`video_tile`] ([`DecodedImage::video_tile`]) rather than an error: there is no inline
+/// playback (#97).
+///
+/// It matches on [`JobKey`], whose `Edit` and `Avatar` variants exist only with this crate's
+/// `edit` and `faces` features, so the match must live in this crate under those same gates. In
+/// a front end it would be gated by the front end's features instead, and Cargo's feature
+/// unification can turn the core's on while the front end's is off (another workspace member
+/// asked for it) — a non-exhaustive match that fails to compile.
 pub fn render_image(state: &AppState, key: JobKey) -> Result<DecodedImage, String> {
     let (id, kind) = match key {
         JobKey::Photo { id, kind } => (id, kind),
@@ -203,8 +139,8 @@ fn decode_tier(id: i64, kind: ImageKind, resolved: Resolved) -> Result<(DynamicI
             }
             let bytes = thumbnail_bytes(&absolute)?;
             let img = rotate(decode(&bytes)?);
-            // The same persistent copy `render_bytes` keeps: the cached JPEG as-is, or, for a
-            // rotated photo, `rotate_jpeg`'s re-encode of these same pixels.
+            // The persistent copy: the cached JPEG as-is, or, for a rotated photo, a q90
+            // re-encode of these same pixels (the file the Tauri shell's byte path wrote too).
             if ((rotation % 360) + 360) % 360 == 0 {
                 crate::thumbnails::save_persistent_thumb(id, &bytes);
             } else if let Ok(rotated) = crate::thumbnails::encode_rotated_jpeg(&img) {
@@ -249,39 +185,10 @@ enum EditOut {
 }
 
 #[cfg(feature = "edit")]
-/// The blocking body of an edit render — the `edit://` protocol
-/// (`protocol::handle_edit_request`, the Darkroom stage) and the `render_edit` command
-/// share it. Resolves the photo's path, decodes the source tier, renders, and encodes:
-/// JPEG q90, or lossless PNG for a base-only frame (the GL drag tier's texture — a JPEG
-/// base would spend the preview↔export parity budget before the shader ran). Operates on
-/// the embedded preview or zoom tier, never the original file.
-pub fn render_edit_bytes(state: &AppState, job: &crate::image_pool::EditJob) -> Result<Vec<u8>, String> {
-    use crate::plugins::edit::{self, timing::Stages};
-    let mut t = Stages::start(format!(
-        "render_edit photo={} max_edge={} hi_res={} base_only={} source={}",
-        job.photo_id, job.max_edge, job.hi_res, job.base_only, job.source.to_query()
-    ));
-    let out = match render_edit(state, job, &mut t)? {
-        EditOut::ClipPng(bytes) => {
-            t.report(&format!("clip bytes={}", bytes.len()));
-            return Ok(bytes);
-        }
-        EditOut::Frame(out) => out,
-    };
-    let bytes = if job.base_only {
-        edit::encode_png_fast(&out)?
-    } else {
-        edit::encode_jpeg(&out, 90)?
-    };
-    t.mark(if job.base_only { "encode_png" } else { "encode_jpeg" });
-    t.report(&format!("bytes={}", bytes.len()));
-    Ok(bytes)
-}
-
-#[cfg(feature = "edit")]
-/// [`render_edit_bytes`] without the encode: the frame `render_proxy` (or the hi-res and
-/// engine-2 paths) produced, for a front end that uploads pixels (the GPUI Darkroom, #101).
-/// The same source selection, caches and errors; `base_only` still skips the look. The
+/// The blocking body of an edit render, for a front end that uploads pixels (the GPUI
+/// Darkroom, #101): the frame `render_proxy` (or the hi-res and engine-2 paths) produced.
+/// Resolves the photo's path and renders from the embedded preview or zoom tier or the
+/// resident RAW working image, never the original file; `base_only` skips the look. The
 /// clipping overlay (`clip`) arrives from the renderer as PNG and is decoded here.
 pub fn render_edit_image(state: &AppState, job: &crate::image_pool::EditJob) -> Result<DynamicImage, String> {
     use crate::plugins::edit::timing::Stages;
@@ -298,7 +205,7 @@ pub fn render_edit_image(state: &AppState, job: &crate::image_pool::EditJob) -> 
 }
 
 #[cfg(feature = "edit")]
-/// The shared body of [`render_edit_bytes`] and [`render_edit_image`], up to the encode.
+/// [`render_edit_image`]'s body: a frame, or the clipping overlay as the renderer encoded it.
 fn render_edit(
     state: &AppState,
     job: &crate::image_pool::EditJob,
@@ -397,8 +304,8 @@ pub fn working_image(token: &crate::plugins::edit::SourceToken) -> Result<std::s
 mod tests {
     use super::*;
 
-    /// A working-image token nothing resident answers to is an error — the `edit://`
-    /// responder turns it into a 404 — never a fall-through to the preview pixels.
+    /// A working-image token nothing resident answers to is an error, never a fall-through
+    /// to the preview pixels.
     #[test]
     fn a_stale_working_token_is_an_error_not_other_pixels() {
         let token = crate::plugins::edit::SourceToken::Working { photo_id: 999_999, generation: 1 };

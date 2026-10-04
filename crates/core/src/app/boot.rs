@@ -1,19 +1,18 @@
-//! Process startup shared by every front end: [`boot`].
+//! Process startup for the front end: [`boot_with`].
 //!
-//! Before this existed the Tauri shell's `setup` hook did all of it inline, so a second front
-//! end (the GPUI app, `crates/app`) would have had to copy it — and a copy that forgets the
-//! crash-marker init lets a file that crashed LibRaw twice crash it a third time. What stays in
-//! each shell is what only that shell has: the Tauri deep-link registration, the loopback video
-//! server and the WebKit environment workaround; a GPUI window.
+//! It began as the Tauri shell's `setup` hook, moved here so the GPUI app (`crates/app`) would
+//! not copy it — a copy that forgets the crash-marker init lets a file that crashed LibRaw
+//! twice crash it a third time. What stays in the front end is what only it has: a GPUI
+//! window.
 
 use super::{app_data_dir, AppState};
 use crate::image_pool::{self, ImagePool};
 use std::sync::{Arc, Once};
 
-/// What [`boot`] started, for the front end to hold and report.
-pub struct Boot<T = Vec<u8>> {
-    /// The bounded LIFO decode pool with the front end's runner — [`crate::media::render_bytes`]
-    /// for [`boot`]. Hold it for the app's lifetime: the `Arc` keeps its worker threads alive.
+/// What [`boot_with`] started, for the front end to hold and report.
+pub struct Boot<T> {
+    /// The bounded LIFO decode pool with the front end's runner. Hold it for the app's
+    /// lifetime: the `Arc` keeps its worker threads alive.
     pub pool: Arc<ImagePool<T>>,
     /// The previous run's crash strikes (already printed to stderr), for a front end that
     /// wants to show them.
@@ -39,15 +38,9 @@ pub struct Boot<T = Vec<u8>> {
 /// Call once per process. The crash-marker store, the watcher and the analyzer registry are
 /// process-global; a second call re-uses them (it starts no second watcher and registers no
 /// second pair of analyzers) but builds a second pool.
-pub fn boot(state: &AppState) -> Boot {
-    let pool_state = state.clone();
-    boot_with(state, Arc::new(move |key| crate::media::render_bytes(&pool_state, key)))
-}
-
-/// [`boot`] with the image pool's runner chosen by the front end: the Tauri shell's pool
-/// renders encoded bytes (`media::render_bytes`, through [`boot`]); the GPUI app's renders
-/// decoded pixels (`media::render_image`, converted to its texture format on the worker).
-/// Everything else is the same startup, in the same order.
+///
+/// The front end chooses the pool's runner: the GPUI app's renders decoded pixels
+/// (`media::render_image`, converted to its texture format on the worker).
 pub fn boot_with<T: Clone + Send + 'static>(state: &AppState, runner: image_pool::Runner<T>) -> Boot<T> {
     // Before anything can call into LibRaw (or, one day, a GPU driver): turn the previous
     // run's leftover crash markers into strikes (crash_marker.rs).

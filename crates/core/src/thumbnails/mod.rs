@@ -117,22 +117,9 @@ pub fn thumbnail_bytes(path: &Path) -> Result<Vec<u8>, String> {
     cached(path, THUMB)
 }
 
-/// Rotate already-encoded JPEG bytes clockwise by `degrees` (0/90/180/270) and
-/// re-encode. Used to apply a photo's non-destructive user-rotation override on top of
-/// the EXIF-oriented preview. Rotation by a multiple of 90° resamples nothing (pure
-/// pixel permutation); the re-encode keeps display quality. A no-op for 0.
-pub fn rotate_jpeg(bytes: Vec<u8>, degrees: i64) -> Result<Vec<u8>, String> {
-    let d = ((degrees % 360) + 360) % 360;
-    if d == 0 {
-        return Ok(bytes);
-    }
-    let img = image::load_from_memory(&bytes).map_err(|e| e.to_string())?;
-    encode_rotated_jpeg(&rotate_image(img, d))
-}
-
-/// [`rotate_jpeg`]'s rotation on decoded pixels: clockwise by `degrees`; anything but
-/// 90/180/270 (after normalising) leaves the image as it is. The GPUI app's decode path
-/// (`media::render_image`) rotates here instead of re-encoding.
+/// Apply a photo's non-destructive user rotation on top of the EXIF-oriented tier: clockwise
+/// by `degrees`; anything but 90/180/270 (after normalising) leaves the image as it is.
+/// Rotation by a multiple of 90° resamples nothing (a pure pixel permutation).
 pub fn rotate_image(img: DynamicImage, degrees: i64) -> DynamicImage {
     match ((degrees % 360) + 360) % 360 {
         90 => img.rotate90(),
@@ -142,8 +129,8 @@ pub fn rotate_image(img: DynamicImage, degrees: i64) -> DynamicImage {
     }
 }
 
-/// The JPEG [`rotate_jpeg`] writes for a rotated image (quality 90). Shared so the decode
-/// path keeps the same persistent thumbnail the byte path would have written.
+/// The persistent thumbnail of a rotated photo (`media::render_image`): JPEG quality 90, the
+/// same file the Tauri shell's byte path wrote before #165.
 pub(crate) fn encode_rotated_jpeg(img: &DynamicImage) -> Result<Vec<u8>, String> {
     let mut out = Cursor::new(Vec::new());
     img.write_with_encoder(JpegEncoder::new_with_quality(&mut out, 90))

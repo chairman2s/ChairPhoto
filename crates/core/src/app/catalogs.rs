@@ -1,9 +1,8 @@
 //! Which catalog is open: the default catalog's location, the recent-catalogs registry, and
 //! opening the default catalog at startup — shared by every front end.
 //!
-//! [`open_default_catalog`] is what the Tauri `init_catalog` command runs and what the GPUI
-//! app calls after [`boot`](super::boot). It is not a catalog *switch*: nothing can be open
-//! yet, so it publishes the handle directly and emits no `catalog:switched`; a front end
+//! [`open_default_catalog`] is what the GPUI app calls after [`boot_with`](super::boot_with).
+//! It is not a catalog *switch*: nothing can be open yet, so it publishes the handle directly and emits no `catalog:switched`; a front end
 //! reads the result. A switch is [`switch_catalog`], whose two ownership phases
 //! ([`detach_catalog_and_trip_jobs`], [`publish_catalog_and_reset_jobs`]) `set_library_root`
 //! runs too.

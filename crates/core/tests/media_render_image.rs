@@ -1,5 +1,6 @@
-//! `media::render_image` — the GPUI app's decode path (#101) — against `media::render_bytes`,
-//! the Tauri protocols' path, on real files through the real disk caches.
+//! `media::render_image` — the GPUI app's decode path (#101) — against the cached tiers'
+//! JPEGs, on real files through the real disk caches. (Until #165 these tests also held it to
+//! the Tauri protocols' byte path, `media::render_bytes`, which went with the shell.)
 //!
 //! Its own test binary on purpose: the thumbnail cache lives under `XDG_CACHE_HOME`, a
 //! process-wide variable that no other test binary's modules can move under these tests.
@@ -11,7 +12,7 @@ mod common;
 use chairphoto_core::app::AppState;
 use chairphoto_core::catalog::Catalog;
 use chairphoto_core::image_pool::{ImageKind, JobKey};
-use chairphoto_core::media::{render_bytes, render_image, video_tile};
+use chairphoto_core::media::{render_image, video_tile};
 use common::TestTmpDir;
 use image::codecs::jpeg::JpegEncoder;
 use image::{DynamicImage, RgbImage};
@@ -78,54 +79,62 @@ fn decode(bytes: &[u8]) -> image::RgbImage {
     image::load_from_memory(bytes).unwrap().to_rgb8()
 }
 
-/// Unrotated, every tier's pixels are exactly the decode of the bytes the Tauri protocol
-/// serves: `render_image` is `render_bytes` minus the encode, not a second renderer.
+/// The cached JPEG of one tier of the original at `abs`.
+fn cached_tier(abs: &Path, kind: ImageKind) -> Vec<u8> {
+    use chairphoto_core::thumbnails::{preview_bytes, thumbnail_bytes, zoom_bytes};
+    match kind {
+        ImageKind::Thumb => thumbnail_bytes(abs),
+        ImageKind::Preview => preview_bytes(abs),
+        ImageKind::Zoom => zoom_bytes(abs),
+    }
+    .unwrap()
+}
+
+/// Unrotated, every tier's pixels are exactly the decode of that tier's cached JPEG: no
+/// second renderer, no re-encode.
 #[test]
-fn unrotated_tiers_are_the_protocol_bytes_decoded() {
+fn unrotated_tiers_are_the_cached_jpegs_decoded() {
     let dir = Fixture::new("media-plain");
     let (state, ids) = catalog_with(&dir, &["a.jpg"], |root, n| {
         write_jpeg(root, n, 2600, 1700);
     });
+    let abs = dir.join("photos").join("a.jpg");
     for kind in [ImageKind::Thumb, ImageKind::Preview, ImageKind::Zoom] {
-        let key = JobKey::photo(ids[0], kind);
-        let bytes = render_bytes(&state, key.clone()).unwrap();
-        let decoded = render_image(&state, key).unwrap();
+        let decoded = render_image(&state, JobKey::photo(ids[0], kind)).unwrap();
         assert!(!decoded.video_tile);
-        assert_eq!(decoded.image.to_rgb8(), decode(&bytes), "{kind:?}");
+        assert_eq!(decoded.image.to_rgb8(), decode(&cached_tier(&abs, kind)), "{kind:?}");
     }
+    // An unrotated thumbnail keeps the cached JPEG itself as the persistent copy.
+    let kept = std::fs::read(chairphoto_core::thumbnails::persistent_thumb_path(ids[0])).unwrap();
+    assert_eq!(kept, cached_tier(&abs, ImageKind::Thumb));
 }
 
 /// A user rotation: `render_image` rotates the cached pixels (no re-encode), so it equals the
-/// rotated decode of the cached JPEG exactly, has the protocol's dimensions, and leaves the
-/// same persistent thumbnail file `render_bytes` writes.
+/// rotated decode of the cached JPEG exactly, and keeps a persistent thumbnail that is the
+/// rotated pixels as a quality-90 JPEG — the file the Tauri shell's byte path wrote before
+/// #165, so a thumbnail kept then and one kept now are the same file.
 #[test]
-fn a_rotated_photo_rotates_pixels_and_keeps_the_same_persistent_thumb() {
+fn a_rotated_photo_rotates_pixels_and_keeps_a_rotated_persistent_thumb() {
     let dir = Fixture::new("media-rot");
     let (state, ids) = catalog_with(&dir, &["r.jpg"], |root, n| {
         write_jpeg(root, n, 1200, 800);
     });
     let id = ids[0];
     state.catalog.lock().unwrap().as_ref().unwrap().set_photo_rotation(id, 90).unwrap();
-    let key = JobKey::photo(id, ImageKind::Thumb);
 
-    let bytes = render_bytes(&state, key.clone()).unwrap();
-    let from_bytes = std::fs::read(chairphoto_core::thumbnails::persistent_thumb_path(id)).unwrap();
-    std::fs::remove_file(chairphoto_core::thumbnails::persistent_thumb_path(id)).unwrap();
-
-    let decoded = render_image(&state, key).unwrap().image;
-    let from_image = std::fs::read(chairphoto_core::thumbnails::persistent_thumb_path(id)).unwrap();
-    assert_eq!(from_bytes, from_image, "the persistent thumbnail must not depend on the front end");
-    assert_eq!(from_bytes, bytes);
-
+    let decoded = render_image(&state, JobKey::photo(id, ImageKind::Thumb)).unwrap().image;
     let abs = dir.join("photos").join("r.jpg");
-    let cached = chairphoto_core::thumbnails::thumbnail_bytes(&abs).unwrap();
-    let expected = image::load_from_memory(&cached).unwrap().rotate90().to_rgb8();
-    assert_eq!(decoded.to_rgb8(), expected);
-    assert_eq!((decoded.width(), decoded.height()), image::load_from_memory(&bytes).unwrap().to_rgb8().dimensions());
+    let expected = image::load_from_memory(&cached_tier(&abs, ImageKind::Thumb)).unwrap().rotate90();
+    assert_eq!(decoded.to_rgb8(), expected.to_rgb8());
+
+    let kept = std::fs::read(chairphoto_core::thumbnails::persistent_thumb_path(id)).unwrap();
+    let mut q90 = std::io::Cursor::new(Vec::new());
+    expected.write_with_encoder(JpegEncoder::new_with_quality(&mut q90, 90)).unwrap();
+    assert_eq!(kept, q90.into_inner(), "the rotated pixels, re-encoded at quality 90");
 }
 
 /// Every rotation on the preview and zoom tiers: `render_image` is the cached tier's JPEG,
-/// decoded and rotated as pixels, with the protocol's dimensions.
+/// decoded and rotated as pixels.
 #[test]
 fn rotated_preview_and_zoom_rotate_the_cached_pixels() {
     let dir = Fixture::new("media-rot-tiers");
@@ -137,11 +146,7 @@ fn rotated_preview_and_zoom_rotate_the_cached_pixels() {
     for degrees in [90, 180, 270] {
         state.catalog.lock().unwrap().as_ref().unwrap().set_photo_rotation(id, degrees).unwrap();
         for kind in [ImageKind::Preview, ImageKind::Zoom] {
-            let cached = match kind {
-                ImageKind::Preview => chairphoto_core::thumbnails::preview_bytes(&abs).unwrap(),
-                _ => chairphoto_core::thumbnails::zoom_bytes(&abs).unwrap(),
-            };
-            let plain = image::load_from_memory(&cached).unwrap();
+            let plain = image::load_from_memory(&cached_tier(&abs, kind)).unwrap();
             let expected = match degrees {
                 90 => plain.rotate90(),
                 180 => plain.rotate180(),
@@ -150,14 +155,12 @@ fn rotated_preview_and_zoom_rotate_the_cached_pixels() {
             .to_rgb8();
             let decoded = render_image(&state, JobKey::photo(id, kind)).unwrap().image.to_rgb8();
             assert_eq!(decoded, expected, "{kind:?} at {degrees}°");
-            let served = decode(&render_bytes(&state, JobKey::photo(id, kind)).unwrap());
-            assert_eq!(decoded.dimensions(), served.dimensions(), "{kind:?} at {degrees}°");
         }
     }
 }
 
 /// A rotated photo with a cover version: the thumbnail is the cover render, rotated — not
-/// the plain thumbnail — with the protocol's dimensions.
+/// the plain thumbnail.
 #[cfg(feature = "edit")]
 #[test]
 fn a_rotated_cover_thumbnail_is_the_cover_render_rotated() {
@@ -187,12 +190,10 @@ fn a_rotated_cover_thumbnail_is_the_cover_render_rotated() {
         .rotate270()
         .to_rgb8();
     assert_ne!(decoded, plain, "the cover's look, not the plain thumbnail");
-    let served = decode(&render_bytes(&state, JobKey::photo(id, ImageKind::Thumb)).unwrap());
-    assert_eq!(decoded.dimensions(), served.dimensions());
 }
 
-/// Original gone: the thumbnail tier falls back to the persistent copy, as the protocol does;
-/// preview has no fallback and errors.
+/// Original gone: the thumbnail tier falls back to the persistent copy; preview has no
+/// fallback and errors.
 #[test]
 fn an_unreachable_original_falls_back_to_the_persistent_thumb() {
     let dir = Fixture::new("media-offline");
@@ -220,8 +221,6 @@ fn a_video_without_a_poster_is_the_generic_tile() {
         assert!(decoded.video_tile, "{kind:?}");
         assert_eq!(decoded.image.to_rgb8(), video_tile().to_rgb8());
     }
-    // The byte path is unchanged: it still reports the failure.
-    assert!(render_bytes(&state, JobKey::photo(ids[0], ImageKind::Thumb)).is_err());
 }
 
 /// A photo that is not a video and cannot be decoded is still an error.
@@ -234,19 +233,23 @@ fn an_undecodable_photo_is_an_error() {
     assert!(render_image(&state, JobKey::photo(ids[0], ImageKind::Thumb)).is_err());
 }
 
-/// The Darkroom frame without the encode: for a base-only render (lossless PNG on the byte
-/// path) the pixels are identical; for a full render the size matches and the JPEG is close.
+
+/// The Darkroom frame is the edit engine's render of the photo's cached preview tier, with no
+/// encode between them: a base-only frame and a full frame are each exactly what
+/// `render_proxy` makes of that JPEG, and the pool's key renders the same frame. (Until #165
+/// this compared against the Tauri `edit://` protocol's PNG/JPEG bytes.)
 #[cfg(feature = "edit")]
 #[test]
-fn an_edit_frame_is_the_protocol_render_without_the_encode() {
+fn an_edit_frame_is_the_engine_render_of_the_preview_tier() {
     use chairphoto_core::image_pool::EditJob;
-    use chairphoto_core::media::{render_edit_bytes, render_edit_image};
-    use chairphoto_core::plugins::edit::SourceToken;
+    use chairphoto_core::media::render_edit_image;
+    use chairphoto_core::plugins::edit::{render_proxy, RenderOpts, RenderSource, SourceToken};
 
     let dir = Fixture::new("media-edit");
     let (state, ids) = catalog_with(&dir, &["e.jpg"], |root, n| {
         write_jpeg(root, n, 2400, 1600);
     });
+    let abs = dir.join("photos").join("e.jpg");
     let record = r#"{"straighten": 4, "tone": {"ev": 0.4, "contrast": 0.2}, "vignette": -0.3}"#;
     let job = |max_edge, base_only| EditJob {
         photo_id: ids[0],
@@ -258,27 +261,22 @@ fn an_edit_frame_is_the_protocol_render_without_the_encode() {
         clip: false,
         catalog_epoch: 0,
     };
+    let engine = |max_edge, skip_look| {
+        let preview = cached_tier(&abs, ImageKind::Preview);
+        render_proxy(RenderSource::PreviewJpeg(&preview), record, max_edge, RenderOpts { skip_look })
+            .unwrap()
+            .to_rgb8()
+    };
 
     let base = job(720, true);
-    let png = render_edit_bytes(&state, &base).unwrap();
-    let frame = render_edit_image(&state, &base).unwrap();
-    assert_eq!(frame.to_rgb8(), decode(&png), "a base-only frame is the PNG's pixels");
+    let base_frame = render_edit_image(&state, &base).unwrap().to_rgb8();
+    assert_eq!(base_frame, engine(720, true), "a base-only frame is the engine's, unencoded");
 
-    let full = job(1400, false);
-    let jpeg = decode(&render_edit_bytes(&state, &full).unwrap());
-    let frame = render_edit_image(&state, &full).unwrap().to_rgb8();
-    assert_eq!(frame.dimensions(), jpeg.dimensions());
-    assert!(frame.width().max(frame.height()) <= 1400);
-    let mean_abs: f64 = frame
-        .as_raw()
-        .iter()
-        .zip(jpeg.as_raw())
-        .map(|(a, b)| (*a as f64 - *b as f64).abs())
-        .sum::<f64>()
-        / frame.as_raw().len() as f64;
-    assert!(mean_abs < 3.0, "JPEG q90 of the same frame drifted by {mean_abs:.2} on average");
+    let full = render_edit_image(&state, &job(1400, false)).unwrap().to_rgb8();
+    assert!(full.width().max(full.height()) <= 1400);
+    assert_eq!(full, engine(1400, false), "a full frame is the engine's, unencoded");
 
     // The same frame through the pool's key.
     let via_key = render_image(&state, JobKey::Edit(base)).unwrap();
-    assert_eq!(via_key.image.to_rgb8(), decode(&png));
+    assert_eq!(via_key.image.to_rgb8(), base_frame);
 }

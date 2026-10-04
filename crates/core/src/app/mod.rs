@@ -4,7 +4,7 @@
 //! state in [`jobs::JobRegistry`]) plus the helpers more than one domain needs. The Tauri
 //! command layer (`commands/`) re-exports all of it; a native frontend links it directly.
 //!
-//! Startup is [`boot`] (crash markers, upload sweep, theme watcher, decode analyzers, the
+//! Startup is [`boot_with`] (crash markers, upload sweep, theme watcher, decode analyzers, the
 //! image pool) and then [`open_default_catalog`]; every front end runs the same two.
 //!
 //! Blocking work goes through [`spawn_blocking`] on the runtime from [`runtime`], which the
@@ -52,7 +52,7 @@ pub mod storage;
 pub mod tags;
 pub mod uploads;
 
-pub use boot::{boot, boot_with, Boot};
+pub use boot::{boot_with, Boot};
 // `catalogs::switch_catalog` is deliberately not re-exported here: the Tauri shell re-exports
 // this module flat beside a command of the same name.
 pub use catalogs::{

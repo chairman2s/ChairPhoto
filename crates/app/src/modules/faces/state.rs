@@ -661,11 +661,20 @@ impl FacesState {
                 // A start of ours may have come in between: it is never replaced.
                 if !s.index.busy() {
                     if let Some(st) = index.filter(|st| !s.finished.contains(&st.job)) {
+                        // `begin_index_job`'s claim starts at `done: 0, total: 0,
+                        // stage: STAGE_INDEXING` before the job has reported anything — the
+                        // conversion pass (#135) may still run first, under a different
+                        // stage (#192). A re-attach landing on that untouched claim must not
+                        // show it as an active "Indexing: 0 / …": `progress: false` is
+                        // exactly what a fresh start already uses for this (below, and
+                        // `index_faces`), so the panel shows "Starting…" until the first
+                        // real progress event — whichever stage it turns out to be — arrives.
+                        let progress = st.done != 0 || st.total != 0;
                         s.index.phase = IndexPhase::Running {
                             job: st.job,
                             done: st.done,
                             total: st.total,
-                            progress: true,
+                            progress,
                             stage: st.stage,
                         };
                     }

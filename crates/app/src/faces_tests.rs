@@ -517,13 +517,15 @@ fn a_switch_drops_the_old_run_and_adopts_the_new_catalogs(cx: &mut TestAppContex
     work(&f.app, cx);
     assert_eq!(
         f.phase(cx),
-        IndexPhase::Running { job: theirs.job, done: 0, total: 0, progress: true, stage: core_faces::STAGE_INDEXING },
+        // `theirs` is a bare claim — no progress event has ever landed for it — so #192's
+        // fix reads it as "Starting…" (`progress: false`), not an active "Indexing: 0 / …".
+        IndexPhase::Running { job: theirs.job, done: 0, total: 0, progress: false, stage: core_faces::STAGE_INDEXING },
         "the new catalog's run is followed"
     );
     send_done(&f.app, old, 7, 7, cx);
     assert_eq!(
         f.phase(cx),
-        IndexPhase::Running { job: theirs.job, done: 0, total: 0, progress: true, stage: core_faces::STAGE_INDEXING },
+        IndexPhase::Running { job: theirs.job, done: 0, total: 0, progress: false, stage: core_faces::STAGE_INDEXING },
         "the old end is ignored"
     );
 }

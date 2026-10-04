@@ -691,7 +691,9 @@ Two modes over the same core location model:
   card again skips every file. Each date folder is listed once per import
   (`same_photo::FolderListings`), not once per file: card ingest plans every file before
   copying any, and a bundle's unpack records each name it places. One photo met twice in a run (the same file in two folders
-  of the card) is the same rule against the file already copied: it is copied once. The metadata comes from one exiftool pass per 150 colliding
+  of the card) is the same rule against the file already copied: it is copied once. Every
+  earlier match counts, so a third meeting is skipped against the second when the first
+  failed to copy. The metadata comes from one exiftool pass per 150 colliding
   files (`scanner::same_photo`), over both sides of each pair, so a re-import reads a few KB
   per file rather than hashing the card. The import dialog's "already imported" flag uses
   the same rule. Owner decisions: Year/Month/Day tree, keep filenames. UI: topbar "Import card" dialog with an

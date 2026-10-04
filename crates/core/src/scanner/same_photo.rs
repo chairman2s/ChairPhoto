@@ -221,10 +221,12 @@ pub struct Arrival {
     pub candidates: Vec<PathBuf>,
 }
 
-/// For each arrival, the candidate that is the same photo (#246's rule), or `None` when it
-/// is a different photo. Reads every file's stamp in one batched pass. `None` once `abort`
-/// is set.
-pub fn find_already_imported(arrivals: &[Arrival], abort: &AtomicBool) -> Option<Vec<Option<PathBuf>>> {
+/// For each arrival, every candidate that is the same photo (#246's rule), in candidate
+/// order — empty when it is a different photo. All of them, not the first: a caller whose
+/// candidates include files of its own run needs the one that made it into the library
+/// (L-e of the second #246 review). Reads every file's stamp in one batched pass. `None`
+/// once `abort` is set.
+pub fn find_already_imported(arrivals: &[Arrival], abort: &AtomicBool) -> Option<Vec<Vec<PathBuf>>> {
     let mut paths: Vec<PathBuf> = Vec::new();
     let mut seen = HashSet::new();
     for a in arrivals {
@@ -242,7 +244,7 @@ pub fn find_already_imported(arrivals: &[Arrival], abort: &AtomicBool) -> Option
         if abort.load(Ordering::Relaxed) {
             return None;
         }
-        out.push(a.candidates.iter().find(|c| is_same_photo(&a.file, stamp(&a.file), c, stamp(c))).cloned());
+        out.push(a.candidates.iter().filter(|c| is_same_photo(&a.file, stamp(&a.file), c, stamp(c))).cloned().collect());
     }
     Some(out)
 }
@@ -893,7 +895,7 @@ mod tests {
             Arrival { file: other.clone(), candidates: vec![lib.clone()] },
         ];
         let found = find_already_imported(&arrivals, &AtomicBool::new(false)).unwrap();
-        assert_eq!(found, vec![Some(lib.clone()), None]);
+        assert_eq!(found, vec![vec![lib.clone()], vec![]]);
         let never = AtomicBool::new(false);
         let from_stdin = |p: &Path| find_in_library(&std::fs::read(p).unwrap(), std::slice::from_ref(&lib), &never);
         assert_eq!(from_stdin(&same), Some(Some(lib.clone())), "from stdin too");
@@ -934,7 +936,7 @@ mod tests {
             Arrival { file: copy.clone(), candidates: vec![lib.clone()] },
         ];
         let found = find_already_imported(&arrivals, &AtomicBool::new(false)).unwrap();
-        assert_eq!(found, vec![None, Some(lib.clone())]);
+        assert_eq!(found, vec![vec![], vec![lib.clone()]]);
         let never = AtomicBool::new(false);
         assert_eq!(find_in_library(&std::fs::read(&other).unwrap(), std::slice::from_ref(&lib), &never), Some(None));
     }
@@ -950,7 +952,7 @@ mod tests {
         assert!(!stamp.has_capture_time(), "{stamp:?}");
     }
 
-    /// The first candidate that is the same photo answers; a different one is passed over.
+    /// The candidates that are the same photo answer; a different one is passed over.
     #[test]
     fn the_matching_candidate_answers() {
         let dir = temp("found");
@@ -962,11 +964,13 @@ mod tests {
         std::fs::write(&lib2, b"bytes two").unwrap();
         std::fs::write(&a, b"bytes two").unwrap();
         std::fs::write(&b, b"bytes six").unwrap();
+        let lib3 = dir.join("lib (3).png");
+        std::fs::write(&lib3, b"bytes two").unwrap();
         let arrivals = vec![
-            Arrival { file: a, candidates: vec![lib.clone(), lib2.clone()] },
+            Arrival { file: a, candidates: vec![lib.clone(), lib2.clone(), lib3.clone()] },
             Arrival { file: b, candidates: vec![lib, lib2.clone()] },
         ];
         let found = find_already_imported(&arrivals, &AtomicBool::new(false)).unwrap();
-        assert_eq!(found, vec![Some(lib2), None]);
+        assert_eq!(found, vec![vec![lib2, lib3], vec![]], "every match, in order");
     }
 }

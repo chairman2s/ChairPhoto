@@ -613,7 +613,7 @@ pub fn list_card_photos(source: &Path, dest_base: &Path) -> Result<Vec<CardPhoto
                 .unwrap_or_default(),
             size,
             capture_time: capture,
-            is_duplicate: duplicates.get(i).is_some_and(Option::is_some),
+            is_duplicate: duplicates.get(i).is_some_and(|found| !found.is_empty()),
         })
         .collect();
     out.sort_by(|a, b| a.name.cmp(&b.name));
@@ -708,8 +708,9 @@ pub fn copy_from_card_abortable(
         // Take ownership of this file's metadata so it travels to the index phase.
         let m = meta.remove(src);
         // The same photo as a library file, or as an earlier file of this run that made it
-        // into the library (one that failed to copy does not count).
-        let same_photo_imported = before.is_some_and(|p| !this_run.contains(&p) || in_library.contains(&p));
+        // into the library (one that failed to copy does not count): any of them, not only
+        // the first found — that one may be a file of the run that failed to copy.
+        let same_photo_imported = before.iter().any(|p| !this_run.contains(p) || in_library.contains(p));
         if same_photo_imported {
             result.skipped += 1; // this capture is already in the library
             in_library.insert(src);
@@ -961,15 +962,15 @@ fn mtime_secs(md: Option<&std::fs::Metadata>) -> i64 {
         .unwrap_or(0)
 }
 
-/// For each of `sources`, the library file among its `candidates` that is the same photo
-/// (#246, [`same_photo::find_already_imported`]); only sources with candidates are read.
-/// `None` once `abort` is set.
+/// For each of `sources`, every file among its `candidates` that is the same photo (#246,
+/// [`same_photo::find_already_imported`]); only sources with candidates are read. `None`
+/// once `abort` is set.
 fn already_imported<'a>(
     sources: &[PathBuf],
     candidates: impl Iterator<Item = &'a Vec<PathBuf>>,
     abort: &AtomicBool,
-) -> Option<Vec<Option<PathBuf>>> {
-    let mut out = vec![None; sources.len()];
+) -> Option<Vec<Vec<PathBuf>>> {
+    let mut out = vec![Vec::new(); sources.len()];
     let (index, arrivals): (Vec<usize>, Vec<same_photo::Arrival>) = sources
         .iter()
         .zip(candidates)
@@ -1226,6 +1227,49 @@ mod tests {
         assert!(rows[0].0.ends_with("/IMG (2).jpg"), "{rows:?}");
         assert_ne!(rows[0].1, ORPHAN_ID, "the orphan's identity is not adopted");
         assert_eq!(std::fs::read_to_string(&orphan).unwrap(), orphan_xml);
+    }
+
+    /// L-e of the second #246 review: one photo met three times in a run, the first copy
+    /// failing. The second is copied (the first is not in the library), and the third is
+    /// skipped against the second — not copied again because the first match it meets is the
+    /// failed one.
+    #[cfg(unix)]
+    #[test]
+    fn a_photo_met_again_after_a_failed_copy_is_skipped_against_the_copy_that_landed() {
+        use std::os::unix::fs::PermissionsExt;
+        let (_catalog, _dir, root, card) = ingest_rig("failed-first");
+        let mtime = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_782_648_000);
+        let files: Vec<PathBuf> = ["A", "B", "D"].iter().map(|f| card.join(f).join("IMG.jpg")).collect();
+        for f in &files {
+            std::fs::create_dir_all(f.parent().unwrap()).unwrap();
+            std::fs::write(f, b"\xff\xd8one").unwrap();
+            std::fs::File::options().write(true).open(f).unwrap().set_modified(mtime).unwrap();
+        }
+        let set_mode = |mode: u32| {
+            for f in &files {
+                std::fs::set_permissions(f, std::fs::Permissions::from_mode(mode)).unwrap();
+            }
+        };
+        // Whichever file the walk meets first cannot be read when it is copied (after the
+        // plan read them all); the others can.
+        let (result, copied, _) = copy_from_card_abortable(&card, &root, None, &AtomicBool::new(false), |done, _| {
+            match done {
+                1 => set_mode(0o000),
+                2 => set_mode(0o644),
+                _ => {}
+            }
+        })
+        .unwrap();
+        set_mode(0o644);
+        assert_eq!((result.scanned, result.errors, result.skipped, copied.len()), (3, 1, 1, 1), "{result:?}");
+        let copies: Vec<PathBuf> = WalkDir::new(&root)
+            .into_iter()
+            .filter_map(|e| e.ok())
+            .map(|e| e.into_path())
+            .filter(|p| p.is_file())
+            .collect();
+        assert_eq!(copies.len(), 1, "{copies:?}");
+        assert!(copies[0].ends_with("IMG.jpg"));
     }
 
     /// An abort while the collisions are being read copies nothing.

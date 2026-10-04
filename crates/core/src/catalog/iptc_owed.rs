@@ -675,6 +675,46 @@ mod tests {
         assert_eq!(c.settle_iptc_write(&again, &Ok(())).unwrap(), IptcSettled::Unchanged);
     }
 
+    /// Review of #148, L1 (its probe M4), pinned as its own test: `owed_iptc_write`'s SELECT
+    /// names its 11 output columns positionally, and nothing short of checking every field's
+    /// value against a distinct expectation catches two columns swapped there (`iptc_credit`
+    /// and `iptc_source`, say) — a Lightroom sidecar's foreign Credit would then be deleted
+    /// and the user's credit written nowhere, with every other test still green. Store 11
+    /// distinct values and check `owed_iptc_write().values` field by field.
+    #[test]
+    fn owed_iptc_write_maps_every_column_to_its_own_field() {
+        let (_dir, c, id, _) = photo("iptc-owed-column-mapping");
+        let f = IptcFields {
+            description: "d-value".into(),
+            headline: "h-value".into(),
+            title: "t-value".into(),
+            creator: "cr-value".into(),
+            copyright: "co-value".into(),
+            credit: "cd-value".into(),
+            source: "s-value".into(),
+            city: "ci-value".into(),
+            state: "st-value".into(),
+            country: "cn-value".into(),
+            country_code: "cc-value".into(),
+        };
+        let written = c.set_iptc(id, &f).unwrap();
+        assert_eq!(written.fields, IptcMask::EACH.into_iter().fold(IptcMask::NONE, |a, m| a | m));
+
+        let read = c.owed_iptc_write(id).unwrap().unwrap();
+        assert_eq!(read.values.description, "d-value");
+        assert_eq!(read.values.headline, "h-value");
+        assert_eq!(read.values.title, "t-value");
+        assert_eq!(read.values.creator, "cr-value");
+        assert_eq!(read.values.copyright, "co-value");
+        assert_eq!(read.values.credit, "cd-value");
+        assert_eq!(read.values.source, "s-value");
+        assert_eq!(read.values.city, "ci-value");
+        assert_eq!(read.values.state, "st-value");
+        assert_eq!(read.values.country, "cn-value");
+        assert_eq!(read.values.country_code, "cc-value");
+        assert_eq!(read.values, f, "every field read back matches what was stored, by name");
+    }
+
     /// A failed write leaves the fields owed, and the next store's write carries them.
     #[test]
     fn a_failed_write_stays_owed_and_the_next_store_carries_it() {

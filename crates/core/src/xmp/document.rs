@@ -383,6 +383,14 @@ impl Folder {
     /// names another folder (an unmount, a move) is reported missing, as the path check before
     /// the handle was; a removal after this check still cannot redirect the write, because
     /// the write goes through the handle.
+    ///
+    /// A folder we may traverse but not search (the `O_PATH` fallback in [`Self::open_dir`],
+    /// or — pre-existing — one we opened `O_RDONLY` with read but no execute bit) fails the
+    /// `statat` below with `EACCES`, not `ENOENT`: we cannot tell whether the original is there
+    /// or not, which is a different fact from it being offline or moved. Report that as a
+    /// permission error instead of folding it into "missing" (#221 L2): a permission error
+    /// tells the user to fix the folder's mode, while "missing" tells them to look for an
+    /// unplugged volume — the wrong advice here, and nothing is written either way.
     fn require_original(&self, original: &Path) -> Result<(), String> {
         let name = file_name(original)?;
         #[cfg(unix)]
@@ -390,8 +398,16 @@ impl Folder {
             let same = |a: &rustix::fs::Stat, b: &rustix::fs::Stat| a.st_dev == b.st_dev && a.st_ino == b.st_ino;
             let here = rustix::fs::fstat(&self.fd).map_err(|e| e.to_string())?;
             let in_place = rustix::fs::stat(&self.path).is_ok_and(|at_path| same(&at_path, &here));
-            let is_file = rustix::fs::statat(&self.fd, name, rustix::fs::AtFlags::empty())
-                .is_ok_and(|st| rustix::fs::FileType::from_raw_mode(st.st_mode) == rustix::fs::FileType::RegularFile);
+            let is_file = match rustix::fs::statat(&self.fd, name, rustix::fs::AtFlags::empty()) {
+                Ok(st) => rustix::fs::FileType::from_raw_mode(st.st_mode) == rustix::fs::FileType::RegularFile,
+                Err(rustix::io::Errno::ACCESS) => {
+                    return Err(format!(
+                        "cannot check {}: permission denied reading its folder",
+                        original.display()
+                    ));
+                }
+                Err(_) => false,
+            };
             (in_place, is_file)
         };
         #[cfg(not(unix))]
@@ -495,6 +511,17 @@ impl Folder {
         if self.listable {
             let _ = rustix::fs::fsync(&self.fd);
         }
+    }
+
+    /// This folder's filesystem device id, so the sidecar-temp sweeper can give each volume
+    /// its own thread and queue ([`sweeper_for`], #221 L3). `None` when the platform cannot
+    /// report one cheaply from the handle already open (non-Unix), which then shares the
+    /// fallback queue keyed by `None`.
+    fn device_id(&self) -> Option<u64> {
+        #[cfg(unix)]
+        return rustix::fs::fstat(&self.fd).ok().map(|st| st.st_dev as u64);
+        #[cfg(not(unix))]
+        return None;
     }
 }
 
@@ -651,15 +678,15 @@ const STALE_TEMP_AGE: std::time::Duration = std::time::Duration::from_secs(24 * 
 static SWEPT: std::sync::Mutex<std::collections::BTreeSet<PathBuf>> =
     std::sync::Mutex::new(std::collections::BTreeSet::new());
 
-/// How many folders may wait for the sweeper at once. Each holds its directory handle while
-/// it waits, so the queue is bounded; a folder that finds it full is not marked swept and is
-/// queued again by a later write.
+/// How many folders may wait for one device's sweeper at once. Each holds its directory
+/// handle while it waits, so each device's queue is bounded; a folder that finds its queue
+/// full is not marked swept and is queued again by a later write.
 const SWEEP_QUEUE: usize = 64;
 
-/// Queue `folder` for a sweep ([`Folder::sweep_stale_temps`]) on the sweeper thread, unless
-/// it was swept or queued before in this run. Never blocks and never lists: the sweep runs on
-/// a thread of its own, so it never holds a lock its caller holds — a face-region, GPS or
-/// identity-Overwrite write commits under the catalog lock, and listing a large folder on a
+/// Queue `folder` for a sweep ([`Folder::sweep_stale_temps`]) on its device's sweeper thread,
+/// unless it was swept or queued before in this run. Never blocks and never lists: the sweep
+/// runs on a thread of its own, so it never holds a lock its caller holds — a face-region, GPS
+/// or identity-Overwrite write commits under the catalog lock, and listing a large folder on a
 /// NAS there would stall every other catalog user (#155 review, L3).
 fn sweep_later(folder: Folder) {
     if !folder.listable {
@@ -669,30 +696,45 @@ fn sweep_later(folder: Folder) {
     if !SWEPT.lock().unwrap_or_else(|e| e.into_inner()).insert(path.clone()) {
         return;
     }
-    let queued = sweeper().is_some_and(|tx| tx.try_send(folder).is_ok());
+    let device = folder.device_id();
+    let queued = sweeper_for(device).is_some_and(|tx| tx.try_send(folder).is_ok());
     if !queued {
         SWEPT.lock().unwrap_or_else(|e| e.into_inner()).remove(&path);
     }
 }
 
-/// The sweeper thread's queue, started on first use; `None` if the thread cannot be started
-/// (the sweep is best effort).
-fn sweeper() -> Option<&'static std::sync::mpsc::SyncSender<Folder>> {
-    static SWEEPER: std::sync::OnceLock<Option<std::sync::mpsc::SyncSender<Folder>>> = std::sync::OnceLock::new();
-    SWEEPER
-        .get_or_init(|| {
-            let (tx, rx) = std::sync::mpsc::sync_channel::<Folder>(SWEEP_QUEUE);
-            std::thread::Builder::new()
-                .name("sidecar-temp-sweep".into())
-                .spawn(move || {
-                    for folder in rx {
-                        folder.sweep_stale_temps();
-                    }
-                })
-                .ok()
-                .map(|_| tx)
+/// One sweeper thread and queue per device (#221 L3), keyed by [`Folder::device_id`] (`None`
+/// on a platform that cannot report one, which then shares a single queue).
+///
+/// Before this, every folder shared one thread and one 64-entry queue. A listing stuck on a
+/// hung NFS/SMB mount — [`Folder::sweep_stale_temps`]'s `temp_names()`, a blocking syscall this
+/// code cannot safely time out or cancel from another thread — then stalled every later sweep
+/// on every volume, and the folders already queued behind it kept their directory handles
+/// open (up to 64 of them) for as long as the run lasted, which can hold an unrelated volume
+/// busy enough to refuse a clean unmount. A time or entry budget inside the listing was the
+/// other option, but there is no safe way to abort a blocking directory read mid-syscall
+/// without risking the fd; per-device isolation instead bounds the damage to the one volume
+/// that is actually hung — its own queue can still fill and its own unmount can still wait on
+/// it (a residual, not a regression: before 96d0d8f the same hang blocked the committing
+/// writer, which was worse), but every other volume's sweeps keep running.
+fn sweeper_for(device: Option<u64>) -> Option<std::sync::mpsc::SyncSender<Folder>> {
+    type Sweepers = std::collections::HashMap<Option<u64>, std::sync::mpsc::SyncSender<Folder>>;
+    static SWEEPERS: std::sync::OnceLock<std::sync::Mutex<Sweepers>> = std::sync::OnceLock::new();
+    let mut sweepers = SWEEPERS.get_or_init(|| std::sync::Mutex::new(Sweepers::new())).lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(tx) = sweepers.get(&device) {
+        return Some(tx.clone());
+    }
+    let (tx, rx) = std::sync::mpsc::sync_channel::<Folder>(SWEEP_QUEUE);
+    std::thread::Builder::new()
+        .name("sidecar-temp-sweep".into())
+        .spawn(move || {
+            for folder in rx {
+                folder.sweep_stale_temps();
+            }
         })
-        .as_ref()
+        .ok()?;
+    sweepers.insert(device, tx.clone());
+    Some(tx)
 }
 
 #[cfg(test)]
@@ -1390,6 +1432,33 @@ mod tests {
         }
     }
 
+    /// #221 L3: each device gets its own sweeper thread and queue, so a hang on one volume's
+    /// listing cannot stall another's. Two distinct device keys land their folders' sweeps on
+    /// two distinct threads; the same device key reuses the thread it already has. Goes
+    /// straight at `sweeper_for` (real multiple mounts are not available to a test), which is
+    /// the entire isolation decision — `sweep_later` only ever forwards `Folder::device_id()`
+    /// to it.
+    #[test]
+    fn each_device_gets_its_own_sweeper_thread() {
+        let dir = crate::test_support::TestTmpDir::new("doc-221-sweeper-devices");
+        let send_to = |device: Option<u64>, name: &str| {
+            let sub = dir.join(name);
+            std::fs::create_dir_all(&sub).unwrap();
+            let folder = Folder::open_dir(&sub).unwrap();
+            sweeper_for(device).unwrap().send(folder).unwrap();
+            sub
+        };
+
+        let a = send_to(Some(101), "a");
+        let b = send_to(Some(202), "b");
+        let thread_a = wait_swept(&a);
+        let thread_b = wait_swept(&b);
+        assert_ne!(thread_a, thread_b, "two different devices must not share a sweeper thread");
+
+        let a2 = send_to(Some(101), "a2");
+        assert_eq!(wait_swept(&a2), thread_a, "the same device reuses its sweeper thread");
+    }
+
     /// #155 review L3: a write that commits under the catalog lock (here a GPS write, as
     /// `map` makes it) returns without listing its folder; the sweep runs on another thread,
     /// which holds no lock of the caller's.
@@ -1443,6 +1512,33 @@ mod tests {
         let xml = std::fs::read_to_string(sidecar_path(&p)).unwrap();
         assert!(xml.contains("history_end") && xml.contains("<chairphoto:Foo>bar</chairphoto:Foo>"), "{xml}");
         assert_eq!(temps_beside(&sidecar_path(&p)), Vec::<String>::new());
+    }
+
+    /// #221 L2: a folder we may neither list nor search (0000) still opens via the `O_PATH`
+    /// fallback (#155 review L2), but `require_original`'s `statat` on the original's name
+    /// then fails `EACCES`, not `ENOENT`. That must read as a permission error, not folded
+    /// into "the original is missing (offline or moved)" — which tells the user to look for
+    /// an unplugged volume, the wrong advice for a folder that is right there but locked down.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn a_folder_with_no_access_reports_a_permission_error_not_missing() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = crate::test_support::TestTmpDir::new("doc-221-eacces");
+        let locked = dir.join("locked");
+        std::fs::create_dir_all(&locked).unwrap();
+        let p = locked.join("X.ARW");
+        std::fs::write(&p, b"raw").unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::read_dir(&locked).is_ok() {
+            std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+            println!("SKIPPED: a_folder_with_no_access_reports_a_permission_error_not_missing — running with privileges that ignore the mode (root?)");
+            return;
+        }
+        let err = SidecarDocument::open(&p).err();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let err = err.expect("open must refuse a folder we cannot search");
+        assert!(err.contains("permission denied"), "{err}");
+        assert!(!err.contains("offline or moved"), "{err}");
     }
 
     /// #155 review L1: a FIFO named like a day-old temp neither hangs the commit's sweep (an

@@ -212,26 +212,48 @@ impl SlideshowJob {
     }
 }
 
-/// A render's frame directory: a fresh `<random>` directory under the app's cache dir
-/// (`crate::thumbnails::cache_dir()/chairphoto/slideshow`, not `std::env::temp_dir()` — on
-/// some machines `/tmp` is a quota-limited tmpfs, and up to 4096px frames for a long
-/// slideshow could fill it, #211), created exclusively with mode 0700 (the frames are
-/// full-size renders of the user's photos; the random name cannot be predicted or
-/// pre-created by another user). Dropping it removes the directory, so it goes on every
-/// exit — success, error, cancel, or a panic in a frame writer.
+/// How long a frame directory can sit unremoved before the next render's sweep treats it as
+/// abandoned (a crash or `SIGKILL` skipped `Drop`) rather than a slow sibling still running.
+const FRAME_DIR_STALE_AFTER: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
+
+/// Every frame directory's name carries this prefix, whichever root it lives under — what the
+/// sweep recognizes as "ours" (#211 L4).
+const FRAME_DIR_PREFIX: &str = "chairphoto-slideshow-";
+
+/// A render's frame directory: a fresh `<prefix><random>` directory, created exclusively with
+/// mode 0700 (the frames are full-size renders of the user's photos; the random name cannot be
+/// predicted or pre-created by another user). Dropping it removes the directory, so it goes on
+/// every exit — success, error, cancel, or a panic in a frame writer.
 struct FrameDir(PathBuf);
 
 impl FrameDir {
     fn create() -> Result<Self, String> {
-        let base = crate::thumbnails::cache_dir().join("chairphoto").join("slideshow");
-        std::fs::create_dir_all(&base).map_err(|e| format!("{}: {e}", base.display()))?;
-        let path = base.join(uuid::Uuid::new_v4().simple().to_string());
+        let (root, check_uid) = frame_dir_root();
+        std::fs::create_dir_all(&root).map_err(|e| format!("{}: {e}", root.display()))?;
+        let path = root.join(format!("{FRAME_DIR_PREFIX}{}", uuid::Uuid::new_v4().simple()));
         let mut builder = std::fs::DirBuilder::new();
         #[cfg(unix)]
         std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
         // `create`, not `create_dir_all`: an existing directory of that name is an error,
         // never adopted.
         builder.create(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+        // Best-effort: a crash or SIGKILL since a previous render skips `Drop`, leaving a full
+        // frame directory behind forever. Sweep now that we know a render is actually
+        // happening (and, in the shared-temp-root case, now that we have a directory of our
+        // own whose owner tells us who "ours" means).
+        #[cfg(unix)]
+        let owner = if check_uid {
+            use std::os::unix::fs::MetadataExt;
+            std::fs::metadata(&path).ok().map(|m| m.uid())
+        } else {
+            None
+        };
+        #[cfg(not(unix))]
+        let owner = {
+            let _ = check_uid;
+            None
+        };
+        sweep_stale_frame_dirs(&root, owner, std::time::SystemTime::now());
         Ok(FrameDir(path))
     }
 }
@@ -239,6 +261,64 @@ impl FrameDir {
 impl Drop for FrameDir {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// Where frame directories live, and whether the sweep must additionally check ownership
+/// before touching an entry (#211 L4): the app's cache dir
+/// (`crate::thumbnails::cache_dir()/chairphoto/slideshow`), unless `cache_dir()` itself fell
+/// back to the shared system temp dir (no `XDG_CACHE_HOME`, no `HOME`) — in which case frames
+/// go directly under the shared temp root instead of a predictable shared
+/// `<tmp>/chairphoto/slideshow` that every user, and every crashed run, would use identically.
+/// Each render's own leaf directory is still `create()`d (never adopted) with mode 0700
+/// either way; what changes is only where the sweep looks and whether it must also check who
+/// owns what it finds there.
+fn frame_dir_root() -> (PathBuf, bool) {
+    frame_dir_root_in(crate::thumbnails::cache_dir(), &std::env::temp_dir())
+}
+
+/// [`frame_dir_root`], parametrized so a test can exercise the shared-temp-root fallback
+/// without mutating the process's real `HOME`/`XDG_CACHE_HOME` (racy under parallel tests) —
+/// mirrors `slideshow::which`'s split from `which_in` (#211 L3).
+fn frame_dir_root_in(cache_dir: PathBuf, shared_tmp: &Path) -> (PathBuf, bool) {
+    if cache_dir != shared_tmp {
+        (cache_dir.join("chairphoto").join("slideshow"), false)
+    } else {
+        (shared_tmp.to_path_buf(), true)
+    }
+}
+
+/// Remove our own frame directories under `root` that are older than
+/// [`FRAME_DIR_STALE_AFTER`] — left behind by a crash, never by `Drop`, which always removes
+/// its own directory before this could ever see it. `owner`, when given, skips any entry not
+/// owned by that uid: the only case that matters in practice is `root` being the shared temp
+/// dir (#211 L4), where another user's identically-prefixed directory must never be touched.
+/// Best-effort throughout: a sweep that can't read a directory, or can't remove one entry,
+/// leaves it for the next sweep rather than failing the render that triggered it.
+fn sweep_stale_frame_dirs(root: &Path, owner: Option<u32>, now: std::time::SystemTime) {
+    #[cfg(not(unix))]
+    let _ = owner; // no uid concept off Unix; the age/prefix checks still apply
+    let Ok(entries) = std::fs::read_dir(root) else { return };
+    for entry in entries.flatten() {
+        if !entry.file_name().to_string_lossy().starts_with(FRAME_DIR_PREFIX) {
+            continue;
+        }
+        let Ok(meta) = entry.metadata() else { continue };
+        if !meta.is_dir() {
+            continue;
+        }
+        #[cfg(unix)]
+        if let Some(owner) = owner {
+            use std::os::unix::fs::MetadataExt;
+            if meta.uid() != owner {
+                continue;
+            }
+        }
+        let Ok(modified) = meta.modified() else { continue };
+        let Ok(age) = now.duration_since(modified) else { continue };
+        if age > FRAME_DIR_STALE_AFTER {
+            let _ = std::fs::remove_dir_all(entry.path());
+        }
     }
 }
 
@@ -468,6 +548,65 @@ mod tests {
             let frames = used.lock().unwrap().clone().expect("the writer ran");
             assert!(!frames.exists(), "{how}: the frame dir is removed: {frames:?}");
         }
+    }
+
+    /// #211 L4: with a real per-user cache dir (`XDG_CACHE_HOME`/`HOME` set — the normal
+    /// case), frames go under it and no ownership check is needed; only when `cache_dir()`
+    /// itself degenerates all the way to the shared system temp dir does the root become that
+    /// shared dir directly, with ownership checking turned on. Pure and env-independent: it
+    /// calls the parametrized `frame_dir_root_in`, never the real `frame_dir_root`, so it
+    /// cannot pass by accident of whatever this test runner's actual `HOME` happens to be.
+    /// (Mutation-checked: comparing `cache_dir != shared_tmp` the other way around — or always
+    /// returning `check_uid: false` — fails one of the two cases.)
+    #[test]
+    fn frame_dir_root_only_falls_back_to_the_shared_temp_root_when_the_cache_dir_did_too() {
+        let cache = PathBuf::from("/home/someone/.cache");
+        let tmp = PathBuf::from("/tmp");
+        assert_eq!(frame_dir_root_in(cache.clone(), &tmp), (cache.join("chairphoto").join("slideshow"), false));
+        assert_eq!(frame_dir_root_in(tmp.clone(), &tmp), (tmp.clone(), true));
+    }
+
+    /// #211 L4: the sweep removes only entries that carry [`FRAME_DIR_PREFIX`], are older
+    /// than [`FRAME_DIR_STALE_AFTER`], and — when an owner is given — belong to that owner.
+    /// Pure: ages directories with `set_modified` and calls `sweep_stale_frame_dirs` directly
+    /// against a fixed `now`, so it needs no real crash and no real day of wall-clock time.
+    /// (Mutation-checked: dropping the age comparison — sweeping every matching entry — fails
+    /// `fresh_survives`; dropping the prefix check fails `unrelated_survives`; dropping the
+    /// owner check, with a deliberately-wrong `owner`, fails `wrong_owner_survives`.)
+    #[test]
+    #[cfg(unix)]
+    fn sweep_stale_frame_dirs_only_removes_old_prefixed_owned_entries() {
+        let dir = TestTmpDir::new("slideshow-sweep");
+        let now = std::time::SystemTime::now();
+        let old = now - FRAME_DIR_STALE_AFTER - std::time::Duration::from_secs(60);
+
+        let age = |p: &std::path::Path, t: std::time::SystemTime| {
+            std::fs::File::open(p).unwrap().set_modified(t).unwrap();
+        };
+        let stale = dir.join(format!("{FRAME_DIR_PREFIX}stale"));
+        std::fs::create_dir(&stale).unwrap();
+        age(&stale, old);
+        let fresh = dir.join(format!("{FRAME_DIR_PREFIX}fresh"));
+        std::fs::create_dir(&fresh).unwrap();
+        let unrelated = dir.join("not-ours-stale");
+        std::fs::create_dir(&unrelated).unwrap();
+        age(&unrelated, old);
+
+        // No owner filter (the normal, per-user cache dir case): the old prefixed one goes,
+        // the fresh one and the unrelated one stay.
+        sweep_stale_frame_dirs(&dir, None, now);
+        assert!(!stale.exists(), "stale and prefixed: swept");
+        assert!(fresh.exists(), "fresh_survives: not old enough");
+        assert!(unrelated.exists(), "unrelated_survives: no prefix");
+
+        // An owner filter that does not match ours (the shared-temp-root case, guarding
+        // against another user's identically-prefixed directory) leaves everything alone,
+        // even the equally-old, equally-prefixed one recreated here.
+        let stale2 = dir.join(format!("{FRAME_DIR_PREFIX}stale2"));
+        std::fs::create_dir(&stale2).unwrap();
+        age(&stale2, old);
+        sweep_stale_frame_dirs(&dir, Some(u32::MAX), now);
+        assert!(stale2.exists(), "wrong_owner_survives: filter didn't match, so nothing was touched");
     }
 
     #[test]

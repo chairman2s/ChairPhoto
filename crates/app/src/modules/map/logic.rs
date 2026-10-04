@@ -16,9 +16,15 @@ use std::collections::{BTreeMap, BTreeSet};
 pub const MACHINE_TILE_HOSTS: &str = "map.tileHosts";
 /// The module setting where the answers used to live, per catalog (`map.tileHosts`, the
 /// first GPUI port). Merged into [`MACHINE_TILE_HOSTS`] ([`HostConsent::merge_legacy`]) on a
-/// catalog's read, and emptied once the machine's copy is saved; until then every read
-/// merges it again, which is why "Ask again" is stored as [`ASK`], not deleted.
+/// catalog's read, and emptied once the machine's copy is saved. The machine records the
+/// catalog as merged in the same write ([`MERGED_CATALOGS`]), so a copy whose emptying
+/// failed is never merged again (#229).
 pub const TILE_HOSTS_KEY: &str = "tileHosts";
+/// The entry of [`MACHINE_TILE_HOSTS`] listing the catalogs (by `settings.catalog_uuid`)
+/// whose old per-catalog answers are already merged into this machine's: a JSON array of
+/// UUIDs. It lives in the answers' own value so it reaches the disk in the very write that
+/// carries the merged answers, never apart from them. Not a host: a host name never holds `#`.
+pub const MERGED_CATALOGS: &str = "#mergedCatalogs";
 /// The module setting holding the tile URL template (`map.tileUrl`, React's key).
 pub const TILE_URL_KEY: &str = "tileUrl";
 
@@ -44,6 +50,8 @@ pub struct HostConsent {
     answers: BTreeMap<String, bool>,
     /// Hosts reset with "Ask again": `Unknown`, and closed to old per-catalog answers.
     ask: BTreeSet<String>,
+    /// The catalogs whose old answers are merged in ([`MERGED_CATALOGS`]).
+    merged: BTreeSet<String>,
 }
 
 impl HostConsent {
@@ -56,6 +64,9 @@ impl HostConsent {
         let mut consent = HostConsent::default();
         for (host, value) in map {
             match value {
+                serde_json::Value::Array(ids) if host == MERGED_CATALOGS => {
+                    consent.merged.extend(ids.into_iter().filter_map(|id| id.as_str().map(str::to_string)));
+                }
                 serde_json::Value::Bool(a) => {
                     consent.answers.insert(host, a);
                 }
@@ -107,11 +118,27 @@ impl HostConsent {
         changed
     }
 
+    /// Whether the catalog `catalog_uuid`'s old answers are already merged in: a later read of
+    /// that catalog, whose copy survived because emptying it failed, must not merge it again —
+    /// that would undo, "denied wins", an Allow the user gave since (#229).
+    pub fn merged_from(&self, catalog_uuid: &str) -> bool {
+        self.merged.contains(catalog_uuid)
+    }
+
+    /// Record that the catalog `catalog_uuid`'s old answers are merged in.
+    pub fn record_merged(&mut self, catalog_uuid: &str) {
+        self.merged.insert(catalog_uuid.to_string());
+    }
+
     pub fn to_json(&self) -> String {
         let mut map: BTreeMap<&str, serde_json::Value> =
             self.answers.iter().map(|(h, &a)| (h.as_str(), serde_json::Value::Bool(a))).collect();
         for host in &self.ask {
             map.insert(host, serde_json::Value::String(ASK.into()));
+        }
+        if !self.merged.is_empty() {
+            let ids = self.merged.iter().map(|id| serde_json::Value::String(id.clone())).collect();
+            map.insert(MERGED_CATALOGS, serde_json::Value::Array(ids));
         }
         serde_json::to_string(&map).unwrap_or_else(|_| "{}".into())
     }
@@ -330,6 +357,24 @@ mod tests {
         assert!(machine.merge_legacy_except(&legacy, |h| h == "b.example"));
         assert_eq!(machine.get("b.example"), Consent::Allowed, "the user's Allow stands");
         assert_eq!(machine.get("c.example"), Consent::Allowed, "the rest merges");
+    }
+
+    /// #229: the record of merged catalogs survives a save and a re-read, and the user's own
+    /// answers (which re-serialize the value) keep it; it is neither a host nor an answer.
+    #[test]
+    fn the_merged_catalogs_record_round_trips_and_survives_the_users_answers() {
+        let mut machine = HostConsent::parse(Some(r#"{"b.example":true}"#));
+        assert!(!machine.merged_from("cat-a"));
+        machine.record_merged("cat-a");
+        assert_eq!(machine.to_json(), r##"{"#mergedCatalogs":["cat-a"],"b.example":true}"##);
+        let mut machine = HostConsent::parse(Some(&machine.to_json()));
+        assert!(machine.merged_from("cat-a") && !machine.merged_from("cat-b"));
+        machine.set("c.example", false);
+        machine.forget("b.example");
+        let back = HostConsent::parse(Some(&machine.to_json()));
+        assert!(back.merged_from("cat-a"), "the user's answers keep the record");
+        assert_eq!(back.hosts().collect::<Vec<_>>(), vec![("c.example", false)], "the record is not a host");
+        assert_eq!(back.get(MERGED_CATALOGS), Consent::Unknown);
     }
 
     #[test]

@@ -34,10 +34,12 @@
 //!   the key's current value, not a value. It runs only inside a write, under the disk lock:
 //!   it is applied to the key's newest intended value, the whole map with its result is
 //!   written, and only once that file is on disk does the result enter the intended map —
-//!   provided the key still holds the value the function saw. If an immediate change to the
-//!   key landed while the file was being written, the function is applied again to that
-//!   newer value and written again. A store that cannot write (memory only, a failing disk)
-//!   never applies it at all.
+//!   provided no change to the key landed since the function read it. That is judged by the
+//!   key's own generation, never by comparing values: two changes that return the key to the
+//!   value the function saw (Block, then Allow again) are still changes, and the function may
+//!   have read more than the value (#229). If an immediate change to the key landed while the
+//!   file was being written, the function is applied again to that newer value and written
+//!   again. A store that cannot write (memory only, a failing disk) never applies it at all.
 //! - **A callback** (`then`) is told `Ok` only when the file holds the change: for an
 //!   immediate change, this value or a newer value of the key; for a durable change, its
 //!   result, applied to the newest value, and visible.
@@ -57,11 +59,19 @@
 //!
 //! An immediate change is **optimistic**: if its write fails, the value stays in memory (a
 //! theme, a panel layout, or the user's own tile answer should not flicker back) and the
-//! next write that succeeds — of any key — carries it. The one exception to "newest on disk"
-//! is a disk that starts failing mid-change: if an immediate change to a key lands while a
-//! durable change's write of it is under way, and the re-applied write then fails, the file
-//! keeps the durable result (never made visible) until a write succeeds. The immediate
-//! change's own write fails too, and its caller is told `Err`.
+//! next write that succeeds — of any key — carries it.
+//!
+//! **A durable change that fails after one of its rounds was written puts the file back**
+//! (#229). A round whose file landed but whose result was overtaken (an immediate change to
+//! the key landed during that write) leaves the file holding a result memory never took. If
+//! the durable change then ends in `Err` — a later round's write fails, or the key keeps
+//! changing — it writes the intended map as it is now (the newer value, without the durable
+//! result) before it returns, under the same disk lock, so the overtaken result does not
+//! outlive the call. The one exception to "newest on disk" is that write-back failing too —
+//! a disk failing for two writes in a row: the file then keeps the overtaken result (never
+//! visible) until a write succeeds. The immediate change's own queued write retries it (its
+//! caller is told `Err` if that fails as well), and so does every later write of any key;
+//! only a restart before any of them succeeds reads the overtaken result.
 //!
 //! **Lock order:** the disk lock (held across each write, on a worker only), then the state
 //! lock (held only to read or change the intended map, never across I/O — the UI thread
@@ -101,6 +111,9 @@ struct Shared {
     /// Held across each write: the generation of the intended map the file holds — every
     /// change at or below it is in the file, or replaced there by a newer value of its key.
     disk: Mutex<u64>,
+    /// Tests: fail this many of the next file writes.
+    #[cfg(test)]
+    fail_writes: std::sync::atomic::AtomicUsize,
 }
 
 #[derive(Default)]
@@ -108,6 +121,17 @@ struct State {
     values: BTreeMap<String, String>,
     /// Bumped on every change to `values`.
     generation: u64,
+    /// Each changed key's last change, as the `generation` it made. A durable change compares
+    /// this, not the key's value, to tell whether the key changed under its write (#229).
+    changed: BTreeMap<String, u64>,
+}
+
+impl State {
+    fn change(&mut self, key: &str, value: String) {
+        self.values.insert(key.to_string(), value);
+        self.generation += 1;
+        self.changed.insert(key.to_string(), self.generation);
+    }
 }
 
 impl Global for MachinePrefs {}
@@ -136,7 +160,7 @@ impl MachinePrefs {
                 BTreeMap::new()
             }
         };
-        let shared = Shared { state: Mutex::new(State { values, generation: 0 }), disk: Mutex::new(0) };
+        let shared = Shared { state: Mutex::new(State { values, ..State::default() }), ..Shared::default() };
         MachinePrefs { path: Some(path), shared: Arc::new(shared) }
     }
 
@@ -200,8 +224,7 @@ impl MachinePrefs {
         let (value, generation) = {
             let mut state = lock(&prefs.shared.state);
             let value = change(state.values.get(key).map(String::as_str));
-            state.values.insert(key.to_string(), value.clone());
-            state.generation += 1;
+            state.change(key, value.clone());
             (value, state.generation)
         };
         let Some(path) = prefs.path.clone() else {
@@ -263,43 +286,83 @@ impl Shared {
         if *on_disk >= generation {
             return Ok(()); // a write that ran after this change carried it, or a newer value
         }
+        self.write_intended(path, &mut on_disk)
+    }
+
+    /// Write the intended map as it is now. The caller holds the disk lock (`on_disk`).
+    fn write_intended(&self, path: &Path, on_disk: &mut u64) -> Result<(), String> {
         let (values, now) = {
             let state = lock(&self.state);
             (state.values.clone(), state.generation)
         };
-        write_atomically(path, &values).map_err(|e| failed(path, e))?;
+        self.write_file(path, &values).map_err(|e| failed(path, e))?;
         *on_disk = (*on_disk).max(now);
         Ok(())
     }
 
     /// Apply `change` to `key`'s newest value, write the whole map with its result, and only
-    /// then make the result visible — if the key still holds what `change` saw; otherwise do
-    /// it again from the newer value.
+    /// then make the result visible — if the key did not change meanwhile; otherwise do it
+    /// again from the newer value. Ending in `Err` after a round's file landed with a result
+    /// that was overtaken, it writes the intended map back over it (see the module docs).
     fn write_durably(&self, path: &Path, key: &str, change: &dyn Fn(Option<&str>) -> String) -> Result<(), String> {
         let mut on_disk = lock(&self.disk);
+        let mut overtaken = false;
+        let saved = self.durable_rounds(path, key, change, &mut on_disk, &mut overtaken);
+        if saved.is_err() && overtaken {
+            // The file holds a result the intended map never took: put the intended map back.
+            if let Err(e) = self.write_intended(path, &mut on_disk) {
+                eprintln!("machine prefs: {key}: the file keeps a change that was overtaken until a write succeeds ({e})");
+            }
+        }
+        saved
+    }
+
+    /// [`write_durably`](Self::write_durably)'s rounds. Sets `overtaken` once a round's file
+    /// landed whose result the intended map did not take.
+    fn durable_rounds(
+        &self,
+        path: &Path,
+        key: &str,
+        change: &dyn Fn(Option<&str>) -> String,
+        on_disk: &mut u64,
+        overtaken: &mut bool,
+    ) -> Result<(), String> {
         for _ in 0..DURABLE_ROUNDS {
-            let (mut values, seen) = {
+            let (mut values, seen, seen_key) = {
                 let state = lock(&self.state);
-                (state.values.clone(), state.generation)
+                (state.values.clone(), state.generation, state.changed.get(key).copied())
             };
             let base = values.get(key).cloned();
             let result = change(base.as_deref()); // state lock released: may take its own
             values.insert(key.to_string(), result.clone());
-            write_atomically(path, &values).map_err(|e| failed(path, e))?;
+            self.write_file(path, &values).map_err(|e| failed(path, e))?;
             let mut state = lock(&self.state);
-            if state.values.get(key) != base.as_ref() {
-                continue; // an immediate change to the key landed during the write: newer intent
+            if state.changed.get(key).copied() != seen_key {
+                // A change to the key landed during the write — even one that put back the
+                // value `change` saw: newer intent, and the file holds a stale result.
+                *overtaken = true;
+                continue;
             }
             // The file holds the map as of `seen` with the result in place of `base`.
             let exact = state.generation == seen;
             if base.as_ref() != Some(&result) {
-                state.values.insert(key.to_string(), result);
-                state.generation += 1;
+                state.change(key, result);
             }
             *on_disk = (*on_disk).max(if exact { state.generation } else { seen });
             return Ok(());
         }
         Err(format!("{key} kept changing while it was being saved"))
+    }
+
+    fn write_file(&self, path: &Path, values: &BTreeMap<String, String>) -> std::io::Result<()> {
+        #[cfg(test)]
+        {
+            use std::sync::atomic::Ordering::SeqCst;
+            if self.fail_writes.fetch_update(SeqCst, SeqCst, |n| n.checked_sub(1)).is_ok() {
+                return Err(std::io::Error::other("injected write failure (test)"));
+            }
+        }
+        write_atomically(path, values)
     }
 }
 
@@ -327,9 +390,12 @@ impl MachinePrefs {
     /// Tests: what an immediate change does to the intended map, without its write — for a
     /// durable change's function to simulate one landing in the middle of its write.
     fn change_now(&self, key: &str, value: &str) {
-        let mut state = lock(&self.shared.state);
-        state.values.insert(key.to_string(), value.to_string());
-        state.generation += 1;
+        lock(&self.shared.state).change(key, value.to_string());
+    }
+
+    /// Tests: fail the next `n` file writes (a disk that fails mid-change).
+    fn fail_next_writes(&self, n: usize) {
+        self.shared.fail_writes.store(n, std::sync::atomic::Ordering::SeqCst);
     }
 }
 
@@ -728,6 +794,141 @@ mod tests {
         assert_eq!(read(cx, "k").as_deref(), Some("x,y"));
         assert_eq!(disk(&path, "k").as_deref(), Some("x,y"));
         assert_eq!((told.get("x"), told.get("y")), (Some(Ok(())), Some(Ok(()))));
+    }
+
+    // --- #229: changes that land during a durable write, and a disk failing mid-change ----
+
+    /// R3, property 1 under ABA: two immediate changes land during the durable write and put
+    /// the key back to the value the function saw (Block, then Allow again). They are still
+    /// newer intent: the function's stale result — which, like the legacy merge, may depend on
+    /// more than the value — is not applied; it is applied again to the newest value.
+    #[gpui_kit::test]
+    fn changes_restoring_the_value_during_a_durable_write_still_make_it_reapply(cx: &mut TestAppContext) {
+        let dir = TempDir::new("aba");
+        let path = dir.0.join(FILE_NAME);
+        let prefs = MachinePrefs::load(path.clone());
+        install(cx, prefs.clone());
+        cx.update(|cx| MachinePrefs::set(cx, "k", r#"{"b":true}"#));
+        run(cx);
+        let calls = Arc::new(Mutex::new(0usize));
+        let told = Told::default();
+        {
+            let calls = calls.clone();
+            cx.update(|cx| {
+                MachinePrefs::modify_durably(
+                    cx,
+                    "k",
+                    move |current| {
+                        let mut calls = calls.lock().unwrap();
+                        *calls += 1;
+                        if *calls == 1 {
+                            prefs.change_now("k", r#"{"b":false}"#); // the user Blocks b...
+                            prefs.change_now("k", r#"{"b":true}"#); // ...and Allows it again
+                            return r#"{"b":false}"#.to_string(); // computed before those answers
+                        }
+                        current.unwrap_or_default().to_string()
+                    },
+                    told.cb("merge"),
+                )
+            });
+        }
+        run(cx);
+        assert_eq!(*calls.lock().unwrap(), 2, "re-applied after the key changed, though its value came back");
+        assert_eq!(read(cx, "k").as_deref(), Some(r#"{"b":true}"#), "the user's latest Allow stands");
+        assert_eq!(disk(&path, "k").as_deref(), Some(r#"{"b":true}"#), "on disk too");
+        assert_eq!(told.get("merge"), Some(Ok(())));
+    }
+
+    /// The legacy-merge shape of R1: the first round writes its result (a legacy Allow), the
+    /// user's Block lands during that write, and the round re-applied to the Block fails to
+    /// write. Returns the store, its path, the `then` results and the dir (keep it alive).
+    fn overtaken_then_failing(failures: usize, cx: &mut TestAppContext) -> (MachinePrefs, PathBuf, Told, TempDir) {
+        let dir = TempDir::new("overtaken");
+        let path = dir.0.join(FILE_NAME);
+        let prefs = MachinePrefs::load(path.clone());
+        install(cx, prefs.clone());
+        let calls = Arc::new(Mutex::new(0usize));
+        let told = Told::default();
+        {
+            let prefs = prefs.clone();
+            cx.update(|cx| {
+                MachinePrefs::modify_durably(
+                    cx,
+                    "k",
+                    move |current| {
+                        let mut calls = calls.lock().unwrap();
+                        *calls += 1;
+                        match *calls {
+                            1 => prefs.change_now("k", "user-block"), // lands during round 1's write
+                            2 => prefs.fail_next_writes(failures),    // round 2's write fails
+                            _ => {}
+                        }
+                        format!("{}+legacy-allow", current.unwrap_or("none"))
+                    },
+                    told.cb("merge"),
+                )
+            });
+        }
+        run(cx);
+        (prefs, path, told, dir)
+    }
+
+    /// R1: a durable change that fails after one of its rounds was written and overtaken does
+    /// not leave that round's result (a legacy Allow the user overrode) on disk: it writes the
+    /// intended map back — the user's newest value — and says `Err`.
+    #[gpui_kit::test]
+    fn a_durable_change_failing_after_an_overtaken_round_writes_the_newest_value_back(cx: &mut TestAppContext) {
+        let (prefs, path, told, _dir) = overtaken_then_failing(1, cx);
+        assert!(matches!(told.get("merge"), Some(Err(_))), "the failure is surfaced");
+        assert_eq!(prefs.get("k").as_deref(), Some("user-block"), "never applied");
+        assert_eq!(disk(&path, "k").as_deref(), Some("user-block"), "a restart reads the user's answer, not the overtaken merge");
+    }
+
+    /// R1, the remaining limit (module docs): the write-back fails too. The file keeps the
+    /// overtaken result, and the next write that succeeds — here the user's own queued write,
+    /// which must not be skipped as already on disk — replaces it with the newest value.
+    #[gpui_kit::test]
+    fn when_the_write_back_fails_too_the_next_successful_write_replaces_the_overtaken_result(cx: &mut TestAppContext) {
+        let (prefs, path, told, _dir) = overtaken_then_failing(2, cx);
+        assert!(matches!(told.get("merge"), Some(Err(_))));
+        assert_eq!(disk(&path, "k").as_deref(), Some("none+legacy-allow"), "the documented limit");
+        prefs.fail_next_writes(0); // the disk recovers
+        let generation = lock(&prefs.shared.state).generation;
+        assert_eq!(prefs.shared.write_covering(&path, generation), Ok(()));
+        assert_eq!(disk(&path, "k").as_deref(), Some("user-block"));
+    }
+
+    /// R1, the other `Err`: the key keeps changing for every round. The last round's file was
+    /// overtaken like the others, and is written back over too.
+    #[gpui_kit::test]
+    fn a_durable_change_giving_up_on_a_changing_key_writes_the_newest_value_back(cx: &mut TestAppContext) {
+        let dir = TempDir::new("keeps-changing");
+        let path = dir.0.join(FILE_NAME);
+        let prefs = MachinePrefs::load(path.clone());
+        install(cx, prefs.clone());
+        let calls = Arc::new(Mutex::new(0usize));
+        let told = Told::default();
+        {
+            let prefs = prefs.clone();
+            cx.update(|cx| {
+                MachinePrefs::modify_durably(
+                    cx,
+                    "k",
+                    move |_| {
+                        let mut calls = calls.lock().unwrap();
+                        *calls += 1;
+                        prefs.change_now("k", &format!("user-{calls}"));
+                        "legacy-allow".to_string()
+                    },
+                    told.cb("merge"),
+                )
+            });
+        }
+        run(cx);
+        assert!(matches!(told.get("merge"), Some(Err(_))));
+        let newest = format!("user-{DURABLE_ROUNDS}");
+        assert_eq!(prefs.get("k"), Some(newest.clone()));
+        assert_eq!(disk(&path, "k"), Some(newest), "not the last round's overtaken result");
     }
 
     /// A restart: a new store over the same file reads every value the last writes left —

@@ -452,9 +452,11 @@ impl MergeCtx<'_> {
                 has.extend(parse(&json?));
             }
         }
+        // A blank edit record is no edit (as `insert_photo` treats it), so no version.
         let offered = photo
             .edit_record
             .iter()
+            .filter(|e| !e.trim().is_empty())
             .map(|e| (IMPORTED_EDIT_VERSION, e.as_str()))
             .chain(photo.versions.iter().map(|v| (v.name.as_str(), v.edit_json.as_str())));
         let mut added = 0;
@@ -887,6 +889,30 @@ mod tests {
             out.iptc_fills,
             vec![(local.id, IptcFields { headline: "Sunset".into(), city: "Bergen".into(), ..Default::default() })]
         );
+    }
+
+    /// L-2 of the #246/#185 review: a blank edit record (empty or whitespace) is no edit — an
+    /// existing photo gains no "Imported edit" version from it, as a new photo gains no edit
+    /// record. Its versions still arrive.
+    #[test]
+    fn a_blank_edit_record_adds_no_version() {
+        let (cat, _root) = temp_catalog("blank-edit");
+        cat.conn()
+            .execute(
+                "INSERT INTO photos(uuid, path, mtime_ns, size, extension, created_at, updated_at)
+                 VALUES(?1, 'existing/local.ARW', 1, 1, 'arw', 1, 1)",
+                params![crate::catalog::photo_identity_for("photo-a").unwrap()],
+            )
+            .unwrap();
+        let id = cat.conn().last_insert_rowid();
+        for blank in ["", "   "] {
+            let mut manifest = sample_manifest();
+            manifest.photos[0].edit_record = Some(blank.into());
+            manifest.photos[0].versions.clear();
+            let out = cat.merge_bundle_into(&manifest, &HashSet::new()).unwrap();
+            assert_eq!(out.summary.versions_added, 0, "{blank:?}");
+            assert!(cat.list_versions(id).unwrap().is_empty(), "{blank:?}");
+        }
     }
 
     /// A row the importer created for this bundle (`fresh`) already has the bundle's state:

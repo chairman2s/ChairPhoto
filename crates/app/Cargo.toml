@@ -97,3 +97,9 @@ tiny-skia = { version = "0.11.4", optional = true }
 [dev-dependencies]
 # The headless test platform: `#[gpui_kit::test]`, `TestAppContext`, `VisualTestContext`.
 gpui-kit = { version = "=0.7.0", features = ["test-support"] }
+# Turns on the core's `test-hooks` feature (its slideshow frame-root override, #228) for this
+# crate's own test binary only. Cargo unifies a path dependency's features across
+# `[dependencies]` and `[dev-dependencies]` for a compilation that pulls in both — a test
+# target does, the `chairphoto-gpui` binary does not — so the feature never reaches the
+# shipped binary even though it is declared here unconditionally.
+chairphoto-core = { path = "../core", default-features = false, features = ["test-hooks"] }

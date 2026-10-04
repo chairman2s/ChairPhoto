@@ -9,6 +9,7 @@ use crate::modules::dialog::DialogHost;
 use crate::modules::ModuleRegistry;
 use crate::storage::Runner;
 use crate::tests::{colliding_catalog, core_switch, deliver_switch, start, App, TempDir};
+use chairphoto_core::app::slideshow::test_hooks::set_test_frame_root;
 use chairphoto_core::app::slideshow::{FrameWriter, FFMPEG_MISSING, SLIDESHOW_CANCELLED};
 use chairphoto_core::app::{CoreEvent, EventSink as _, SlideshowProgress, CATALOG_CHANGED};
 use chairphoto_core::catalog::Catalog;
@@ -21,6 +22,14 @@ use std::sync::Arc;
 /// Open a catalog in `dir` with `n` photos whose files exist, select them all, and read the
 /// Library's rows; returns their ids.
 fn catalog_with_files(app: &App, dir: &TempDir, n: usize, cx: &mut TestAppContext) -> Vec<i64> {
+    // Every render a test makes through `claim_slideshow(..).run_with(..)` (via the manual
+    // `Runner`, which runs synchronously on this test thread — see its module doc) writes its
+    // frames, and runs the stale-dir sweep, under this scratch cache, never the real
+    // `~/.cache` (#228). The `test-hooks` feature is what makes `set_test_frame_root` reach
+    // this crate at all: without it `FrameDir::create()` always calls the real
+    // `crate::thumbnails::cache_dir()`, since core's own `cfg(test)` override does not exist
+    // when core is an ordinary (non-`cfg(test)`) dependency.
+    set_test_frame_root(&dir.0.join("cache"));
     let db = dir.0.join("photos.chairphoto");
     let root = dir.0.join("photos");
     std::fs::create_dir_all(root.join("2026")).unwrap();

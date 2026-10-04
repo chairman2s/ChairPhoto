@@ -25,6 +25,8 @@ pub mod stacks;
 mod tests;
 #[cfg(test)]
 mod fit_tests;
+#[cfg(test)]
+mod perf_tests;
 
 use crate::keymap::contexts;
 use gpui_kit::{actions, KeyBinding};

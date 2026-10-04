@@ -8,11 +8,17 @@
 //! # the agent library (the default catalog under XDG_DATA_HOME)
 //! XDG_DATA_HOME=~/.local/share/chairphoto-agent/xdg-data \
 //! XDG_CACHE_HOME=~/.local/share/chairphoto-agent/xdg-cache \
-//!   cargo run --release -p chairphoto-app --example loupe_bench -- [--dwell-ms 150] [--steps 200]
+//!   cargo run --release -p chairphoto-app --example loupe_bench -- [--dwell-ms 150] [--steps 200] [--stride 1]
 //!
 //! # a synthetic catalog of N generated JPEG originals in DIR (deleted afterwards); point
-//! # XDG_CACHE_HOME at an empty scratch directory so the first visits are truly cold
-//!   … --example loupe_bench -- --synthetic 60 --dir DIR
+//! # XDG_CACHE_HOME at an empty scratch directory so the first visits are truly cold.
+//! # `--size WxH` sets the originals' pixel size (default 3000x2000; a 24 MP camera JPEG is
+//! # 6000x4000, and a JPEG original's cold preview decodes all of it)
+//!   … --example loupe_bench -- --synthetic 60 --dir DIR [--size 6000x4000]
+//!
+//! # the files already in ORIG (say, copies of a few RAWs), catalogued in DIR (DIR deleted
+//! # afterwards, ORIG left alone)
+//!   … --example loupe_bench -- --originals ORIG --dir DIR
 //! ```
 //!
 //! Refuses to run without `XDG_DATA_HOME` and `XDG_CACHE_HOME`, so it never touches the user's
@@ -26,12 +32,16 @@
 //! shows it — at most one frame (16.7 ms at 60 Hz; 33.4 ms on the 29.9 Hz EIZO), which the
 //! preloaded budget has to absorb. A visual check in the running app is the end-to-end proof.
 
+#[path = "support/bench_catalog.rs"]
+mod bench_catalog;
+
+use bench_catalog::arg;
 use chairphoto_app::image_store::{neighbour_window, ImageKey, ImageLru, Loaded};
 use chairphoto_core::app::{runtime, with_catalog, AppState};
-use chairphoto_core::catalog::{Catalog, PhotoQuery};
+use chairphoto_core::catalog::PhotoQuery;
 use chairphoto_core::image_pool::{self, ImageKind, ImagePool, JobKey};
 use std::collections::HashSet;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::mpsc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -60,28 +70,6 @@ fn summary(label: &str, target_ms: f64, mut v: Vec<Duration>) {
     );
 }
 
-fn arg(name: &str) -> Option<String> {
-    let args: Vec<String> = std::env::args().collect();
-    args.iter().position(|a| a == name).and_then(|i| args.get(i + 1).cloned())
-}
-
-/// `n` 3000×2000 JPEG originals with a different gradient each, in a catalog rooted in `dir`.
-fn synthetic_catalog(state: &AppState, dir: &Path, n: usize) -> PathBuf {
-    let root = dir.join("photos");
-    std::fs::create_dir_all(root.join("bench")).expect("bench dir");
-    let catalog = Catalog::open(&dir.join("bench.chairphoto"), &root).expect("open the bench catalog");
-    for i in 0..n {
-        let path = root.join(format!("bench/b{i:05}.jpg"));
-        let img = image::RgbImage::from_fn(3000, 2000, |x, y| {
-            image::Rgb([(x / 12) as u8, (y / 8) as u8, ((x + y + i as u32 * 37) / 20) as u8])
-        });
-        img.save(&path).expect("write a bench JPEG");
-        catalog.upsert_photo(&path, None, 0, 1).expect("add a bench photo");
-    }
-    *state.catalog.lock().unwrap() = Some(catalog);
-    root
-}
-
 fn main() {
     if std::env::var_os("XDG_DATA_HOME").is_none() || std::env::var_os("XDG_CACHE_HOME").is_none() {
         eprintln!("loupe_bench: set XDG_DATA_HOME and XDG_CACHE_HOME to isolated dirs (see the module docs)");
@@ -89,14 +77,20 @@ fn main() {
     }
     let dwell = Duration::from_millis(arg("--dwell-ms").map_or(150, |v| v.parse().expect("--dwell-ms N")));
     let steps: usize = arg("--steps").map_or(200, |v| v.parse().expect("--steps N"));
+    // `--stride K` moves K photos per step: past the preload window (K > 5), every step lands
+    // cold — a jump (Home/End, a filmstrip click) rather than an arrow press.
+    let stride: usize = arg("--stride").map_or(1, |v| v.parse().expect("--stride K"));
     let state = AppState::default();
     let synthetic = arg("--synthetic").map(|n| n.parse::<usize>().expect("--synthetic N"));
     let dir = arg("--dir").map(PathBuf::from);
-    match (synthetic, &dir) {
-        (Some(n), Some(dir)) => {
-            synthetic_catalog(&state, dir, n);
+    let originals = arg("--originals").map(PathBuf::from);
+    match (synthetic, &originals, &dir) {
+        (Some(n), None, Some(dir)) => {
+            bench_catalog::synthetic(&state, dir, n, bench_catalog::size_arg());
         }
-        (Some(_), None) => panic!("--synthetic needs --dir"),
+        (None, Some(originals), Some(dir)) => bench_catalog::originals(&state, dir, originals),
+        (Some(_), Some(_), _) => panic!("--synthetic or --originals, not both"),
+        (Some(_), None, None) | (None, Some(_), None) => panic!("--synthetic and --originals need --dir"),
         _ => {
             runtime().block_on(chairphoto_core::app::open_default_catalog(&state)).expect("open the default catalog");
         }
@@ -134,7 +128,11 @@ fn main() {
         }
     };
 
-    for i in 0..steps.min(ids.len()) {
+    for step in 0..steps {
+        let i = step * stride % ids.len();
+        if step > 0 && i == 0 {
+            break;
+        }
         std::thread::sleep(dwell);
         while let Ok(done) = rx.try_recv() {
             land(&mut lru, &mut in_flight, done);
@@ -190,7 +188,7 @@ fn main() {
     summary("preload in flight (target < 500 ms)", 500., flying);
     summary("cold (target < 500 ms)", 500., cold);
 
-    if let (Some(_), Some(dir)) = (synthetic, dir) {
+    if let (true, Some(dir)) = (synthetic.is_some() || originals.is_some(), dir) {
         drop(pool);
         let _ = std::fs::remove_dir_all(dir);
     }

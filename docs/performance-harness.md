@@ -163,3 +163,54 @@ CHAIRPHOTO_TAG_BENCH_DB=~/.local/share/chairphoto/default.chairphoto \
 
 On a 144k-photo / 1.6k-tag catalog (2026-09-19): closure 240 ms → two queries + walk 106 ms
 in release; 1028 → 630 ms in the debug profile a plain `cargo run` uses.
+
+## GPUI benches (#168)
+
+The GPUI app's measurement paths, all on scratch data: never point them at a real
+catalog or cache. Build them `--release`; the debug numbers are not the app's.
+
+### Grid frame bench (headless)
+
+`crates/app/src/library/perf_tests.rs` (ignored) opens a synthetic catalog of
+`CHAIRPHOTO_GRID_BENCH_ROWS` rows (default 30 000) in the real wired window on GPUI's headless
+test platform, and times `render_frame` while scrolling, a row read landing (with the
+`photo_page` SQL apart), one window's storage-badge read, and the rows-landed cover-look scan
+(rv151 L5). Window size `CHAIRPHOTO_GRID_BENCH_W`/`_H` (default 2560×1440); frames per pass
+`CHAIRPHOTO_GRID_BENCH_FRAMES` (default 300). Its module docs say what the `effects` line
+does and does not mean.
+
+```bash
+TMPDIR=~/.local/share/chairphoto-agent/tmp/grid CHAIRPHOTO_GRID_BENCH_ROWS=30000 \
+  cargo test --release -p chairphoto-app --lib library::perf_tests -- --ignored --nocapture
+```
+
+`crates/app/examples/grid_bench.rs` is the same scroll in a real window on the display
+(frame-interval percentiles, compositor pacing included); it needs the display.
+
+### Loupe and Darkroom benches
+
+`loupe_bench` (stepping latency through the real decode pool) and `darkroom_bench` (drag-frame
+timing) open the default catalog under `XDG_DATA_HOME`, or a scratch one they build and delete:
+`--synthetic N [--size WxH] --dir DIR` (generated JPEG originals; a 24 MP camera JPEG is
+`6000x4000`) or `--originals ORIG --dir DIR` (the files in ORIG, left alone).
+`loupe_bench --stride K` moves K photos per step; past the preload window (K > 5) every step
+lands cold. Point `XDG_CACHE_HOME` at an empty directory for cold numbers.
+
+```bash
+XDG_DATA_HOME=$S/data XDG_CACHE_HOME=$S/empty-cache \
+  cargo run --release -p chairphoto-app --example loupe_bench -- \
+  --synthetic 160 --size 6000x4000 --dir $S/loupe --steps 20 --stride 8
+```
+
+### Cold preview stages
+
+`thumbnails::bench::cold_preview_stage_timings` (core, ignored) times what a cold loupe
+preview pays in `preview_bytes`: the read (or a RAW's embedded-preview extraction through
+exiv2), the decode, the colour-space probe (an `exiftool` run), the downscale (`image`'s and
+`thumbnails::downscale`'s) and encode, the thumbnail derived on the way, and the app's decode
+of the cached preview. `CHAIRPHOTO_PREVIEW_BENCH_FILE` names the original (default a generated
+6000×4000 JPEG).
+
+```bash
+cargo test --release -p chairphoto-core --lib thumbnails::bench -- --ignored --nocapture
+```

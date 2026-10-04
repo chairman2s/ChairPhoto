@@ -9,6 +9,15 @@
 //! Refuses to run without `XDG_DATA_HOME`, so it never opens the user's own catalog. Nothing
 //! is written to the catalog: it only renders.
 //!
+//! Or on a scratch catalog in DIR (deleted afterwards), as `loupe_bench` builds them: N
+//! generated JPEG originals (`--synthetic N [--size WxH]`), or the files in ORIG
+//! (`--originals ORIG`, left alone):
+//!
+//! ```sh
+//!   … --example darkroom_bench -- --synthetic 3 --size 6000x4000 --dir DIR
+//!   DARKROOM_BENCH_RAW=1 … --example darkroom_bench -- --originals ORIG --dir DIR
+//! ```
+//!
 //! For each of the first `DARKROOM_BENCH_PHOTOS` photos (default 3) it plays a 2 s Exposure
 //! drag at 60 pointer events per second through the real image pool and the app's runner
 //! (`media::render_edit_image` → BGRA).
@@ -35,6 +44,9 @@
 //! measure: GPU upload and paint (the in-app `editor.renderTiming` log covers request → frame
 //! taken in the running app; see docs/plans/gpui/parity.md, renderTiming row).
 
+#[path = "support/bench_catalog.rs"]
+mod bench_catalog;
+
 use chairphoto_app::darkroom::{failed_frames, fast_wait, frame_outcome, FrameOutcome, FrameTier, SETTLE};
 use chairphoto_app::image_store::Loaded;
 use chairphoto_core::app::{catalog_identity, editing, runtime, with_catalog, AppState};
@@ -43,6 +55,7 @@ use chairphoto_core::develop_source::DevelopSource;
 use chairphoto_core::image_pool::{self, EditJob, ImagePool, JobKey, Respond};
 use chairphoto_core::plugins::edit::SourceToken;
 use chairphoto_model::darkroom::render_timing::{summarize, FrameSample, Tier};
+use std::path::PathBuf;
 use std::sync::mpsc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -214,9 +227,23 @@ fn main() {
         std::process::exit(2);
     }
     let state = AppState::default();
-    let path = runtime()
-        .block_on(chairphoto_core::app::open_default_catalog(&state))
-        .expect("open the default catalog");
+    let dir = bench_catalog::arg("--dir").map(PathBuf::from);
+    let synthetic = bench_catalog::arg("--synthetic").map(|n| n.parse::<usize>().expect("--synthetic N"));
+    let originals = bench_catalog::arg("--originals").map(PathBuf::from);
+    let path = match (synthetic, &originals, &dir) {
+        (Some(n), None, Some(dir)) => {
+            bench_catalog::synthetic(&state, dir, n, bench_catalog::size_arg());
+            dir.join("bench.chairphoto")
+        }
+        (None, Some(originals), Some(dir)) => {
+            bench_catalog::originals(&state, dir, originals);
+            dir.join("bench.chairphoto")
+        }
+        (None, None, _) => runtime()
+            .block_on(chairphoto_core::app::open_default_catalog(&state))
+            .expect("open the default catalog"),
+        _ => panic!("--synthetic N or --originals ORIG, each with --dir DIR"),
+    };
     let n: usize = std::env::var("DARKROOM_BENCH_PHOTOS").ok().and_then(|v| v.parse().ok()).unwrap_or(3);
     let ids: Vec<i64> = with_catalog(&state, |c| c.list_photos(&PhotoQuery::default()))
         .expect("list photos")
@@ -256,6 +283,10 @@ fn main() {
         }
     }
     let _ = editing::develop_close(&state, editing::develop_ticket(&state));
+    if let (true, Some(dir)) = (synthetic.is_some() || originals.is_some(), &dir) {
+        drop(pool);
+        let _ = std::fs::remove_dir_all(dir);
+    }
     if failed_total > 0 {
         println!("{failed_total} frames failed: the numbers above leave them out");
     }

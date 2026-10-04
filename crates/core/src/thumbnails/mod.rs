@@ -248,7 +248,11 @@ fn cached(path: &Path, size: Size) -> Result<Vec<u8>, String> {
     // every smaller tier, so derive and cache those too — a lone thumb request stays a
     // thumb decode (no over-decode), but a preview/zoom decode also fills the smaller
     // tiers so the next grid request is a free cache hit.
+    let probe = probe_colour_space_beside(path);
     let img = extract_and_decode(path, size.max)?;
+    if let Some(probe) = probe {
+        let _ = probe.join();
+    }
     run_analyzers(&img, path, size.max);
     let bytes = generate_from_decode(path, &img, size)?;
     for smaller in smaller_sizes(size.max) {
@@ -291,7 +295,11 @@ pub fn warm_all_sizes(path: &Path) -> Result<(), String> {
     }
     // Decode once at the largest needed size; the smaller tiers downscale from it.
     let largest = missing.iter().map(|s| s.max).max().unwrap();
+    let probe = probe_colour_space_beside(path);
     let img = extract_and_decode(path, largest)?;
+    if let Some(probe) = probe {
+        let _ = probe.join();
+    }
     run_analyzers(&img, path, largest);
     for s in missing {
         generate_from_decode(path, &img, s)?;
@@ -353,8 +361,13 @@ fn generate_from_decode(path: &Path, img: &DynamicImage, size: Size) -> Result<V
 /// Downscale a decoded image to `size` and JPEG-encode it (with Adobe-RGB→sRGB when the
 /// source file is Adobe RGB). Pure — no disk writes.
 fn encode_size(path: &Path, img: &DynamicImage, size: Size) -> Result<Vec<u8>, String> {
-    // thumbnail() only downscales, so a max larger than the image leaves it native.
-    let resized = img.thumbnail(size.max, size.max);
+    // A tier only ever shrinks: an image that already fits is encoded at its own size. (image's
+    // `thumbnail` fits the image to the box both ways, so the 10 000 px zoom tier used to
+    // blow a 6000 px decode up to 10 000 px — a 67 MP JPEG that took seconds to encode and a
+    // 267 MB texture, for no more detail, #168.) `downscale::thumbnail` is image's
+    // `thumbnail`, byte for byte, without its per-pixel overhead.
+    let fits = img.width() <= size.max && img.height() <= size.max;
+    let resized = if fits { std::borrow::Cow::Borrowed(img) } else { std::borrow::Cow::Owned(downscale::thumbnail(img, size.max)) };
     let mut out = Cursor::new(Vec::new());
     // The webview shows untagged JPEGs as sRGB. Sony shoots Adobe RGB (wider gamut), so
     // an Adobe RGB preview displayed as-is looks dull/desaturated. Convert it to sRGB for
@@ -394,6 +407,21 @@ fn decode_oriented(
     let mut img = DynamicImage::from_decoder(decoder).map_err(|e| e.to_string())?;
     img.apply_orientation(orientation);
     Ok(img)
+}
+
+/// Start [`is_adobe_rgb`] for `path` on its own thread, for a caller about to decode: the
+/// probe is an `exiftool` run (~75 ms, a quarter of a cold 24 MP preview) that the encode
+/// after the decode needs, and the two need not wait for each other. Join it before encoding;
+/// its answer is in `is_adobe_rgb`'s memo by then (#168). A probe that cannot start leaves
+/// the encode to run it, as before.
+fn probe_colour_space_beside(path: &Path) -> Option<std::thread::JoinHandle<()>> {
+    let path = path.to_path_buf();
+    std::thread::Builder::new()
+        .name("colour-space-probe".into())
+        .spawn(move || {
+            is_adobe_rgb(&path);
+        })
+        .ok()
 }
 
 /// Whether a file's color space is Adobe RGB (Sony tags this as ColorSpace=Uncalibrated
@@ -711,6 +739,11 @@ fn fnv1a(s: &str) -> u64 {
     hash
 }
 
+mod downscale;
+
+#[cfg(test)]
+mod bench;
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
@@ -734,6 +767,26 @@ pub(crate) mod tests {
         adobe_rgb_to_srgb(&mut img);
         let p = img.get_pixel(0, 0).0;
         assert!(p[0] > 200, "red channel should increase, got {}", p[0]);
+    }
+
+    // --- tiers never upscale (#168) ------------------------------------------
+
+    /// An image smaller than a tier is encoded at its own size — the zoom tier is the
+    /// decode's native resolution — while a larger one still shrinks to fit.
+    #[test]
+    fn a_tier_never_upscales() {
+        let path = Path::new("/nonexistent/upscale-check.jpg");
+        let dims = |img: &DynamicImage, size: Size| {
+            let bytes = encode_size(path, img, size).unwrap();
+            let decoded = image::load_from_memory(&bytes).unwrap();
+            (decoded.width(), decoded.height())
+        };
+        let small = DynamicImage::ImageRgb8(RgbImage::from_pixel(600, 400, image::Rgb([90, 120, 150])));
+        assert_eq!(dims(&small, ZOOM), (600, 400), "zoom: native");
+        assert_eq!(dims(&small, PREVIEW), (600, 400), "preview of a small image: native");
+        assert_eq!(dims(&small, THUMB), (512, 341), "thumb: shrunk to fit");
+        let tall = DynamicImage::ImageRgb8(RgbImage::from_pixel(300, 3000, image::Rgb([9, 9, 9])));
+        assert_eq!(dims(&tall, PREVIEW), (205, 2048), "a long edge over the box still shrinks");
     }
 
     // --- decode-once chain + analyzer hook -----------------------------------

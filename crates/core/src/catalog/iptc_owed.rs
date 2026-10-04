@@ -91,6 +91,33 @@ impl IptcMask {
         }
     }
 
+    /// The one field this mask names, to set it. `None` for any mask that is not one of
+    /// [`Self::EACH`].
+    pub fn value_mut(self, f: &mut IptcFields) -> Option<&mut String> {
+        Some(match self {
+            Self::DESCRIPTION => &mut f.description,
+            Self::HEADLINE => &mut f.headline,
+            Self::TITLE => &mut f.title,
+            Self::CREATOR => &mut f.creator,
+            Self::COPYRIGHT => &mut f.copyright,
+            Self::CREDIT => &mut f.credit,
+            Self::SOURCE => &mut f.source,
+            Self::CITY => &mut f.city,
+            Self::STATE => &mut f.state,
+            Self::COUNTRY => &mut f.country,
+            Self::COUNTRY_CODE => &mut f.country_code,
+            _ => return None,
+        })
+    }
+
+    /// The fields of `f` that hold a value (not empty or whitespace).
+    pub fn present_in(f: &IptcFields) -> Self {
+        Self::EACH
+            .into_iter()
+            .filter(|m| !m.value(f).trim().is_empty())
+            .fold(Self::NONE, |a, m| a | m)
+    }
+
     /// The name a front end shows for the one field this mask names. Only meaningful for a
     /// single-field mask (one of [`Self::EACH`]); any other mask answers the empty string.
     pub fn label(self) -> &'static str {

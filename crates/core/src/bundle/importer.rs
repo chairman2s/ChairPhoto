@@ -443,19 +443,29 @@ fn place_sidecar(
 /// **Step A — Upsert** (fast DB writes): for each extracted file, call
 /// `upsert_photo_with_identity` with the UUID from the sidecar written by
 /// `extract_originals`. A brand-new photo is created with the bundle's UUID; an
-/// already-present photo (same UUID) is merely updated in place. For newly-created
-/// photos the bundle's rating/label/pick/IPTC/edit-record/versions are applied now
-/// (the same pattern as E5's `index_ingested` + `set_photo_metadata`).
+/// already-present photo (same UUID) is merely updated in place. For a row created for
+/// the bundle's own photo the bundle's rating/label/pick/IPTC/edit-record/versions are
+/// applied now (the same pattern as E5's `index_ingested` + `set_photo_metadata`). A row
+/// created under another identity — a copy kept apart from the row holding the bundle's
+/// identity (#150) — gets none of it (#185).
 ///
-/// **Step B — F1c merge**: run `merge_bundle` for the taxonomy, import batch, and
-/// tag assignments. Since the upsert already placed photos that were freshly extracted,
-/// the merge sees them as "existing" (never overwrites) and only unions assignments —
-/// the correct additive behaviour. Photos that had no originals in the bundle (metadata-
-/// only / offline originals) are inserted by the merge if not already present.
+/// **Step B — F1c merge**: run `merge_bundle_into` for the taxonomy, import batch, and
+/// tag assignments, told which rows Step A created (`fresh`). A photo already in the
+/// catalog — the file skipped as already imported (#246), or matched by identity — has
+/// what it lacks filled in: blank culling, the bundle's edits as new versions (#185).
+/// Photos that had no originals in the bundle (metadata-only / offline originals) are
+/// inserted by the merge if not already present, or filled in like any existing photo.
 ///
 /// **Step C — Post-index** (file I/O): write the batch UUID sidecar (K3) per file,
-/// apply auto-tags, pair RAW+JPEG stacks, and run `reconcile_missing` (O(n) stat
-/// checks). These happen on the secondary connection so the main mutex stays free.
+/// write a new photo's owed IPTC, apply auto-tags, pair RAW+JPEG stacks, and run
+/// `reconcile_missing` (O(n) stat checks). These happen on the secondary connection so the
+/// main mutex stays free.
+///
+/// **Step D — an existing photo's blank IPTC** (#185, between C.1 and the auto-tags): the
+/// fields the merge found blank on the row are filled where the photo's sidecar has no
+/// value either, through `set_iptc` under the sidecar's write turn ([`fill_blank_iptc`]).
+/// An existing photo is neither queued for backup nor put in the bundle's batch: this
+/// import did not add it, and its batch is the immutable one it arrived with.
 ///
 /// `dest_base` must be a path under the catalog root (same as E5's requirement).
 pub fn index_bundle(
@@ -473,10 +483,11 @@ pub fn index_bundle(
 /// import, a catalog switch). A stop leaves a consistent catalog, as if the bundle had held
 /// only the originals indexed so far: Step A is committed for each (its row with the
 /// bundle's identity, its identity sidecar or queued repair, the bundle's culling, IPTC,
-/// edit and versions for a new photo, its queued backup), and Steps B and C run over the
-/// manifest narrowed to those photos — the batch and their tags merged, the batch assigned
-/// and written into their sidecars, auto-tags, stacks, reconcile. The narrowing matters: the
-/// full merge would insert the originals not yet indexed as metadata-only rows. Importing
+/// edit and versions for a new photo, its queued backup), and Steps B to D run over the
+/// manifest narrowed to those photos — the batch and their tags merged, an existing
+/// photo's blanks filled, the batch assigned and written into their sidecars, auto-tags,
+/// stacks, reconcile. The narrowing matters: the full merge would insert the originals not
+/// yet indexed as metadata-only rows. Importing
 /// the bundle again finishes it; the upsert is UUID-aware, so the photos indexed here are
 /// matched, not duplicated. [`Indexed`] says how many originals were indexed.
 pub fn index_bundle_abortable(
@@ -517,6 +528,9 @@ pub(crate) fn index_bundle_with(
         .collect();
 
     let mut newly_created: Vec<i64> = Vec::new();
+    // The rows created for the bundle's own photos, which Step A gives the bundle's state.
+    let mut fresh: std::collections::HashSet<i64> = std::collections::HashSet::new();
+    let mut versions_added_to: Vec<i64> = Vec::new();
     let mut upserted_copies: Vec<(i64, PathBuf)> = Vec::new();
     // The identity of the row each blank-uuid original was indexed into, by the manifest's
     // relative path: merge has no identity to match such a photo by, and the photo at its
@@ -591,13 +605,22 @@ pub(crate) fn index_bundle_with(
             indexed_blank.insert(item.relative_path.as_str(), upsert.uuid.clone());
         }
 
+        // A row created here is the bundle photo's own unless it took another identity: a copy
+        // kept apart from the row holding the bundle's identity, whose original is still in
+        // place (#150). That row, which merge matches by identity, gets the bundle's state
+        // (filled in where it lacks it, Step B); the copy gets none of it (#185).
+        let bundles_own = crate::catalog::photo_identity_for(&item.photo_uuid)
+            .is_none_or(|identity| identity == upsert.uuid);
         if upsert.created {
             newly_created.push(upsert.id);
+        }
+        if upsert.created && bundles_own {
+            fresh.insert(upsert.id);
 
             // Apply the bundle's non-destructive state for this brand-new photo.
             // The F1c merge won't do this because the upsert already made the photo
-            // "existing" (merge is additive; it never overwrites an existing row).
-            // This mirrors E5's set_photo_metadata call after upsert.
+            // "existing" (it fills in only what an existing row lacks, and is told this
+            // row is fresh). This mirrors E5's set_photo_metadata call after upsert.
             if let Some(bp) = bp_by_key.get(&(item.photo_uuid.as_str(), item.relative_path.as_str())) {
                 // Rating / label / pick (non-zero or non-default only — zero/empty are
                 // already the column defaults from the INSERT in upsert_photo_with_identity).
@@ -643,6 +666,9 @@ pub(crate) fn index_bundle_with(
                 }
 
                 // Named versions, in bundle order.
+                if !bp.versions.is_empty() {
+                    versions_added_to.push(upsert.id);
+                }
                 for v in &bp.versions {
                     if let Ok(vid) = catalog.create_version(upsert.id, &v.name) {
                         let edit_json = {
@@ -697,11 +723,15 @@ pub(crate) fn index_bundle_with(
 
     // Step B — F1c merge: apply taxonomy, import batch, tag assignments — additive.
     // Photos with originals in the bundle are already "existing" after the upsert above;
-    // the merge only inserts metadata-only photos (no original in bundle) if not present,
-    // and unions tag assignments for all.
-    let merge_summary = catalog
-        .merge_bundle(manifest)
+    // the merge inserts metadata-only photos (no original in bundle) if not present, and
+    // unions tag assignments for all. An existing photo (one this import did not create,
+    // so not `fresh`) has what it lacks filled in from the bundle: culling, new versions,
+    // and — Step D — IPTC (#185).
+    let merged = catalog
+        .merge_bundle_into(manifest, &fresh)
         .map_err(|e| e.to_string())?;
+    let merge_summary = merged.summary;
+    versions_added_to.extend(merged.versions_added_to);
 
     // Step B.1 — Batch assignment for newly-upserted photos.
     //
@@ -744,6 +774,27 @@ pub(crate) fn index_bundle_with(
         }
     }
 
+    // Step D — #185: an existing photo's blank IPTC fields take the bundle's values, through
+    // the sidecar-safe store (`fill_blank_iptc`).
+    for (photo_id, offered) in &merged.iptc_fills {
+        fill_blank_iptc(catalog, *photo_id, offered);
+    }
+
+    // A version added to a photo is a version write, and owes the monochrome refresh every
+    // such write owes (docs/editing.md): a B&W version marks the photo monochrome. Adding
+    // versions never removes one, so the flag is only ever set here, never cleared.
+    #[cfg(feature = "edit")]
+    for &photo_id in &versions_added_to {
+        let any_bw = catalog
+            .list_versions(photo_id)
+            .is_ok_and(|vs| vs.iter().any(|v| crate::plugins::edit::is_bw(&v.edit_json)));
+        if any_bw {
+            let _ = catalog.set_grayscale(photo_id, true);
+        }
+    }
+    #[cfg(not(feature = "edit"))]
+    let _ = versions_added_to;
+
     // Apply auto-tags (monochrome, long-exposure, etc.) and pair RAW+JPEG stacks.
     let _ = catalog.apply_auto_tags();
     let _ = catalog.pair_raw_jpeg_stacks();
@@ -762,6 +813,92 @@ pub(crate) fn index_bundle_with(
     merge_summary.photos_existing = merge_summary.photos_existing.saturating_sub(newly_created.len());
     partial_result.merge = merge_summary;
     Ok(Indexed { result: partial_result, indexed, total })
+}
+
+/// Fill an existing photo's blank IPTC fields with the bundle's `offered` values (#185):
+/// only a field that neither the row nor the sidecar beside its original has a value for —
+/// a value either already holds is the photo's own and wins. An existing row's IPTC changes
+/// only through [`Catalog::set_iptc`] (AGENTS.md, "XMP safety"): the original's path is
+/// resolved first, so an unreachable original changes nothing; the store happens under the
+/// sidecar's write turn ([`WriteOrder`](crate::xmp::lock::WriteOrder)), held through the
+/// write and the compare-and-set settle; a write that fails stays owed for the repair pass.
+/// Not `set_iptc_carried`: that one is for values arriving beside a sidecar of their own,
+/// and the sidecar here is the existing photo's, not the bundle's.
+///
+/// A sidecar that does not parse says nothing about what it holds, so nothing is filled:
+/// the owed write would later land on whatever it carries (when uncertain, preserve).
+///
+/// Blocking (sidecar IO and the turn); runs with no transaction open on `catalog`, so a
+/// store waiting on another writer's turn never holds the catalog's write lock.
+fn fill_blank_iptc(catalog: &Catalog, photo_id: i64, offered: &crate::catalog::IptcFields) {
+    use crate::catalog::IptcMask;
+    use crate::xmp::lock::WriteOrder;
+
+    let resolve = || catalog.resolve_photo_path(photo_id).ok().flatten();
+    let Some(first) = resolve() else {
+        eprintln!("bundle import: photo {photo_id}'s original is unreachable; its blank IPTC is not filled");
+        return;
+    };
+    let mut turn = WriteOrder::reserve(&first).wait();
+    // The original may resolve to another copy once the turn is ours (another location came
+    // back): follow it, as the IPTC save does (`app::iptc::run_in_turn`).
+    let mut original = None;
+    for _ in 0..=3 {
+        let Some(now) = resolve() else {
+            eprintln!("bundle import: photo {photo_id}'s original went away; its blank IPTC is not filled");
+            return;
+        };
+        match turn.moved_to(&now) {
+            None => {
+                original = Some(now);
+                break;
+            }
+            Some(next) => {
+                drop(turn);
+                turn = next.wait();
+            }
+        }
+    }
+    let Some(original) = original else {
+        eprintln!("bundle import: photo {photo_id}'s original kept moving; its blank IPTC is not filled");
+        return;
+    };
+    let in_sidecar = match crate::xmp::read_iptc_present(&original) {
+        Ok(present) => present,
+        Err(e) => {
+            eprintln!("bundle import: photo {photo_id}'s sidecar does not parse ({e}); its blank IPTC is not filled");
+            return;
+        }
+    };
+    let Ok(current) = catalog.get_iptc(photo_id) else { return };
+    let fill = IptcMask::present_in(offered)
+        .without(IptcMask::present_in(&current))
+        .without(in_sidecar);
+    if fill.is_empty() {
+        return;
+    }
+    let mut next = current;
+    for m in IptcMask::EACH.into_iter().filter(|m| fill.contains(*m)) {
+        if let Some(slot) = m.value_mut(&mut next) {
+            *slot = m.value(offered).to_string();
+        }
+    }
+    let write = match catalog.set_iptc(photo_id, &next) {
+        Ok(w) => w,
+        Err(e) => {
+            eprintln!("bundle import: couldn't fill photo {photo_id}'s blank IPTC: {e}");
+            return;
+        }
+    };
+    let outcome = write.run(&original);
+    match catalog.settle_iptc_write(&write, &outcome) {
+        Ok(crate::catalog::IptcSettled::Failed(e)) => {
+            eprintln!("bundle import: IPTC sidecar write for photo {photo_id} owed for repair: {e}")
+        }
+        Ok(_) => {}
+        Err(e) => eprintln!("bundle import: couldn't record the IPTC sidecar write for photo {photo_id}: {e}"),
+    }
+    drop(turn);
 }
 
 // ---------------------------------------------------------------------------
@@ -1268,6 +1405,140 @@ mod tests {
             )
             .unwrap();
         assert!(queued.contains(KNOWN), "its sidecar's identity is reported: {queued}");
+
+        // #185: the bundle's state goes onto the row merge matches by identity — filling in
+        // only what it lacks — and none of it onto the copy's row.
+        assert_eq!((kept.label.as_str(), kept.pick_state), ("green", crate::catalog::PickState::Pick));
+        assert_eq!(catalog.get_iptc(row.id).unwrap().headline, "Test sunset");
+        let copy_row = catalog.get_photo(copy.0).unwrap();
+        assert_eq!((copy_row.rating, copy_row.label.as_str()), (0, ""), "the copy gets no culling");
+        assert_eq!(catalog.get_iptc(copy.0).unwrap(), Default::default(), "nor IPTC");
+    }
+
+    // --- a bundle photo the library already has (#185) ------------------------------------
+
+    /// The bundle brings a photo the library already has, edited, at the same path: the file
+    /// is skipped (#246) and the bundle's data lands on the existing row — its edit record
+    /// and version as new versions after the row's own, its label and pick where the row had
+    /// none, its IPTC only where neither the row nor the row's sidecar has a value (written
+    /// to that sidecar, nothing left owed). The row's own values win; no second row, no
+    /// backup queued and no batch membership for a photo this import did not add.
+    #[test]
+    fn a_bundle_of_an_existing_edited_photo_adds_versions_and_fills_only_blanks() {
+        use crate::bundle::BundleVersion;
+        use crate::catalog::{IptcFields, IptcMask, PickState};
+        const KNOWN: &str = "6f1c1f0e-2b7a-4c3d-9e8f-0a1b2c3d4e5f";
+        let (catalog, root) = temp_catalog("185");
+        let original = root.join("2026/06/28/DSC01234.ARW");
+        std::fs::create_dir_all(original.parent().unwrap()).unwrap();
+        std::fs::write(&original, b"FAKE RAW BYTES").unwrap();
+        // The row's sidecar holds a Country the catalog never imported: the photo's own value.
+        std::fs::write(
+            crate::xmp::sidecar_path(&original),
+            format!(
+                r#"<x:xmpmeta xmlns:x="adobe:ns:meta/"><rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"><rdf:Description rdf:about="" xmlns:xmp="http://ns.adobe.com/xap/1.0/" xmlns:photoshop="http://ns.adobe.com/photoshop/1.0/" photoshop:Country="Norway"><xmp:Identifier><rdf:Bag><rdf:li>{KNOWN}</rdf:li></rdf:Bag></xmp:Identifier></rdf:Description></rdf:RDF></x:xmpmeta>"#
+            ),
+        )
+        .unwrap();
+        let row = catalog.upsert_photo_with_identity(&original, None, 1, 14, Some(KNOWN)).unwrap();
+        catalog.set_culling(row.id, Some(4), None, None).unwrap();
+        catalog.set_iptc(row.id, &IptcFields { headline: "Mine".into(), ..Default::default() }).unwrap();
+        catalog.write_owed_iptc(row.id).unwrap();
+        let mine = catalog.create_version(row.id, "Mine").unwrap();
+        catalog.set_version_edit(mine, r#"{"local":1}"#).unwrap();
+
+        let src = temp_dir("185-src");
+        let file = src.join("DSC01234.ARW");
+        std::fs::write(&file, b"FAKE RAW BYTES").unwrap();
+        let mut bp = plain_photo(KNOWN, "2026/06/28/DSC01234.ARW");
+        bp.rating = 3;
+        bp.label = "green".into();
+        bp.pick_state = PickState::Pick;
+        bp.iptc = IptcFields {
+            headline: "Theirs".into(),
+            city: "Oslo".into(),
+            country: "Sweden".into(),
+            ..Default::default()
+        };
+        bp.edit_record = Some(r#"{"bw":{"enabled":true}}"#.into());
+        bp.versions = vec![BundleVersion { name: "Square".into(), edit_json: r#"{"crop":"1:1"}"#.into(), position: 0 }];
+        let bundle_path = bundle_of("185", vec![(bp, Some(file))]);
+
+        let (manifest, mut archive) = open_bundle(&bundle_path).unwrap();
+        let (extracted, partial) = extract_originals(&manifest, &mut archive, &root, |_, _| {}).unwrap();
+        assert_eq!((partial.skipped_duplicate, partial.copied), (1, 0), "the file is already here");
+        let result = index_bundle(&catalog, &manifest, &extracted, &root, partial).unwrap();
+        let m = &result.merge;
+        assert_eq!((m.photos_added, m.photos_existing, m.photos_filled, m.versions_added), (0, 1, 1, 2), "{m:?}");
+        assert_eq!(catalog.count_photos(&Default::default()).unwrap(), 1, "no second row");
+
+        let after = catalog.get_photo(row.id).unwrap();
+        assert_eq!((after.rating, after.label.as_str(), after.pick_state), (4, "green", PickState::Pick));
+        let iptc = catalog.get_iptc(row.id).unwrap();
+        assert_eq!(
+            (iptc.headline.as_str(), iptc.city.as_str(), iptc.country.as_str()),
+            ("Mine", "Oslo", ""),
+            "the row's headline and its sidecar's country win; the blank city is filled"
+        );
+        let xml = std::fs::read_to_string(crate::xmp::sidecar_path(&original)).unwrap();
+        use crate::xmp::test_fixtures::property_values;
+        let photoshop = "http://ns.adobe.com/photoshop/1.0/";
+        assert_eq!(property_values(&xml, photoshop, "City"), vec!["Oslo"], "{xml}");
+        assert_eq!(property_values(&xml, photoshop, "Headline"), vec!["Mine"], "{xml}");
+        assert_eq!(property_values(&xml, photoshop, "Country"), vec!["Norway"], "{xml}");
+        assert_eq!(catalog.owed_iptc(row.id).unwrap(), IptcMask::NONE);
+
+        let versions: Vec<(String, String)> =
+            catalog.list_versions(row.id).unwrap().into_iter().map(|v| (v.name, v.edit_json)).collect();
+        assert_eq!(
+            versions,
+            [
+                ("Mine".to_string(), r#"{"local":1}"#.to_string()),
+                (crate::catalog::IMPORTED_EDIT_VERSION.to_string(), r#"{"bw":{"enabled":true}}"#.to_string()),
+                ("Square".to_string(), r#"{"crop":"1:1"}"#.to_string()),
+            ]
+        );
+        assert_eq!(catalog.get_edit_record(row.id).unwrap(), None, "its edit record is not changed");
+        // The B&W version it gained owes the monochrome refresh a version write owes.
+        #[cfg(feature = "edit")]
+        assert!(catalog.is_grayscale(row.id).unwrap(), "a B&W version marks it monochrome");
+        assert!(catalog.list_pending_operations().unwrap().is_empty(), "no backup queued for it");
+        assert_eq!(catalog.import_batch_uuid_for_photo(row.id).unwrap(), None, "not in the bundle's batch");
+
+        // Importing the bundle again changes nothing more.
+        let (manifest, mut archive) = open_bundle(&bundle_path).unwrap();
+        let (extracted, partial) = extract_originals(&manifest, &mut archive, &root, |_, _| {}).unwrap();
+        let again = index_bundle(&catalog, &manifest, &extracted, &root, partial).unwrap();
+        assert_eq!((again.merge.photos_filled, again.merge.versions_added), (0, 0));
+        assert_eq!(catalog.list_versions(row.id).unwrap().len(), 3);
+    }
+
+    /// The file is the same capture as the library's, but the library's row has another
+    /// identity (both sides imported the card on their own): the bundle's photo is kept apart
+    /// — counted, its data on no row — and the library's row and sidecar are untouched.
+    #[test]
+    fn the_same_file_under_another_identity_is_kept_apart() {
+        const THEIRS: &str = "6f1c1f0e-2b7a-4c3d-9e8f-0a1b2c3d4e5f";
+        const OURS: &str = "7a2d2f1f-3c8b-4d4e-8f90-1b2c3d4e5f60";
+        let (catalog, root) = temp_catalog("185-apart");
+        let original = root.join("2026/06/28/DSC01234.ARW");
+        std::fs::create_dir_all(original.parent().unwrap()).unwrap();
+        std::fs::write(&original, b"FAKE RAW BYTES").unwrap();
+        crate::xmp::write_identifier(&original, OURS).unwrap();
+        let row = catalog.upsert_photo_with_identity(&original, None, 1, 14, Some(OURS)).unwrap();
+
+        let bundle_path = make_test_bundle("185-apart", THEIRS, "2026/06/28/DSC01234.ARW");
+        let (manifest, mut archive) = open_bundle(&bundle_path).unwrap();
+        let (extracted, partial) = extract_originals(&manifest, &mut archive, &root, |_, _| {}).unwrap();
+        assert_eq!(partial.skipped_duplicate, 1);
+        let result = index_bundle(&catalog, &manifest, &extracted, &root, partial).expect("not a UNIQUE failure");
+        assert_eq!((result.merge.photos_kept_apart, result.merge.photos_added), (1, 0), "{:?}", result.merge);
+
+        assert_eq!(catalog.count_photos(&Default::default()).unwrap(), 1);
+        let after = catalog.get_photo(row.id).unwrap();
+        assert_eq!((after.uuid.as_str(), after.rating, after.label.as_str()), (OURS, 0, ""));
+        assert_eq!(catalog.get_iptc(row.id).unwrap(), Default::default());
+        assert_eq!(crate::xmp::read_identifier(&original).as_deref(), Some(OURS));
     }
 
     #[test]

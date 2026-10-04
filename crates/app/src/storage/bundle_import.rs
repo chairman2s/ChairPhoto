@@ -217,7 +217,7 @@ impl Render for BundleImport {
             }
             body = body.child(ui::sub(format!("Batch: {label}"), colors)).child(div().id("bundle-counts").child(ui::sub(counts, colors)).test_support());
             if p.new_count == 0 && p.existing > 0 {
-                body = body.child(ui::sub("All photos are already present — re-importing will be a no-op (safe to run).", colors));
+                body = body.child(ui::sub("All photos are already present — importing only fills in what they lack (safe to run).", colors));
             }
         }
         let can_run = !self.importing && has_path && self.preview.is_some();

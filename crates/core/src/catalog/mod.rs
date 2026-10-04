@@ -51,7 +51,7 @@ pub use lifecycle::{
     carry_companions, copy_and_verify, copy_with_companions, sha256_file, verify_and_delete_locals, BackupPlan,
     CarriedCompanion, CompanionCarry, CopyOutcome, OffloadPlan, RestorePlan,
 };
-pub use merge::MergeSummary;
+pub use merge::{MergeOutcome, MergeSummary, IMPORTED_EDIT_VERSION};
 pub use models::{
     Album, BurstInput, ExportKeywords, HistoryStep, ImportBatch, IptcFields, LocationRole, MetadataEntry,
     PendingOperation, Photo, PhotoLocation, PhotoVersion, PickState, PromotedMetadata,

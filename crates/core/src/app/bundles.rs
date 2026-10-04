@@ -26,7 +26,8 @@ pub struct BundlePreview {
     pub total: usize,
     /// Photos not yet in the catalog (will be added on import).
     pub new_count: usize,
-    /// Photos already present in the catalog (merge is a no-op for them).
+    /// Photos already present in the catalog (the merge keeps their values and fills only
+    /// their blanks, #185).
     pub existing: usize,
 }
 
@@ -226,6 +227,81 @@ mod tests {
                 assert_eq!(a.count_photos(&Default::default()).unwrap(), 0, "nothing merged into the left catalog");
             }
         }
+    }
+
+    /// **Forced interleaving** (#185, catalog identity). The bundle's photo is already in
+    /// catalog A, which the import started against; a switch to catalog B — whose photo has
+    /// the very same row id — lands once the photo is indexed. The bundle's data is filled
+    /// in on A's row (and A's photo's sidecar) only, through the import's own connection to
+    /// A's file: B's colliding row, and its file's sidecar, are untouched. (No front end is
+    /// attached, so no `catalog:switched` is delivered; this path never reads it.)
+    #[test]
+    fn a_switch_during_indexing_fills_the_existing_row_of_the_catalog_the_import_started_against() {
+        const UUID: &str = "00000000-0000-4000-8000-000000000000";
+        let dir = crate::test_support::TestTmpDir::new("bundle-185-switch");
+        let orig = dir.join("orig/IMG_0.jpg");
+        std::fs::create_dir_all(orig.parent().unwrap()).unwrap();
+        std::fs::write(&orig, "original 0").unwrap();
+        let mut manifest = BundleManifest::new(
+            BundleBatch { uuid: "batch-185".into(), source_label: "Trip".into(), note: String::new(), created_at: 1 },
+            2,
+        );
+        manifest.photos.push(BundlePhoto {
+            uuid: UUID.into(),
+            relative_path: "2026/01/02/IMG_0.jpg".into(),
+            rating: 3,
+            label: "green".into(),
+            pick_state: crate::catalog::PickState::Pick,
+            iptc: crate::catalog::IptcFields { city: "Oslo".into(), ..Default::default() },
+            edit_record: None,
+            versions: vec![crate::bundle::BundleVersion { name: "Square".into(), edit_json: "{\"crop\":1}".into(), position: 0 }],
+            tag_uuids: Vec::new(),
+        });
+        let path = dir.join("trip.chairphoto");
+        let originals = std::collections::HashMap::from([(UUID.to_string(), Some(orig.clone()))]);
+        write_bundle(&GatheredBundle { manifest, originals }, &path, |_, _| {}).unwrap();
+
+        // A holds the photo (the same file at the bundle's path), B a photo with the same row id.
+        let seed = |db: &Path, root: &Path, uuid: &str| -> (i64, std::path::PathBuf) {
+            let file = root.join("2026/01/02/IMG_0.jpg");
+            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+            std::fs::write(&file, "original 0").unwrap();
+            let c = Catalog::open(db, root).unwrap();
+            let id = c.upsert_photo_with_identity(&file, None, 1, 10, Some(uuid)).unwrap().id;
+            (id, file)
+        };
+        let (root_a, root_b) = (dir.join("library"), dir.join("b"));
+        let (a_id, a_file) = seed(&dir.join("a.chairphoto"), &root_a, UUID);
+        let (b_id, b_file) = seed(&dir.join("b.chairphoto"), &root_b, "11111111-2222-4333-8444-555555555555");
+        assert_eq!(a_id, b_id, "colliding row ids");
+
+        let state = AppState::default();
+        *state.catalog.lock().unwrap() = Some(Catalog::open(&dir.join("a.chairphoto"), &root_a).unwrap());
+        let claim = super::super::scans::claim_import(&state).unwrap();
+        let switch = |n: usize| {
+            if n == 1 {
+                crate::app::catalogs::detach_catalog_and_trip_jobs(&state).unwrap();
+                let b = Catalog::open(&dir.join("b.chairphoto"), &root_b).unwrap();
+                crate::app::catalogs::publish_catalog_and_reset_jobs(&state, b).unwrap();
+            }
+        };
+        let result = import_bundle_claimed_with(&state, &claim, &path, &switch).unwrap();
+        assert_eq!((result.skipped_duplicate, result.merge.photos_filled), (1, 1), "{result:?}");
+
+        let a = Catalog::open_secondary(&dir.join("a.chairphoto"), &root_a).unwrap();
+        let filled = a.get_photo(a_id).unwrap();
+        assert_eq!((filled.rating, filled.label.as_str()), (3, "green"), "A's blank row is filled");
+        assert_eq!(a.get_iptc(a_id).unwrap().city, "Oslo");
+        assert_eq!(a.list_versions(a_id).unwrap().len(), 1);
+        assert!(std::fs::read_to_string(crate::xmp::sidecar_path(&a_file)).unwrap().contains("Oslo"));
+
+        let b = crate::app::with_catalog(&state, |c| {
+            Ok((c.get_photo(b_id)?, c.get_iptc(b_id)?, c.list_versions(b_id)?.len()))
+        })
+        .unwrap();
+        assert_eq!((b.0.rating, b.0.label.as_str(), b.1.city.as_str(), b.2), (0, "", "", 0), "B untouched");
+        let b_sidecar = std::fs::read_to_string(crate::xmp::sidecar_path(&b_file)).unwrap_or_default();
+        assert!(!b_sidecar.contains("Oslo"), "B's photo's sidecar untouched");
     }
 
     /// **Forced interleaving** (#114 Codex, finding D). Cancel, a newer import and a catalog

@@ -695,6 +695,20 @@ pub fn bundle_import_line(r: &BundleImportResult) -> String {
     if r.skipped_duplicate > 0 {
         line += &format!(" {} already present (skipped).", r.skipped_duplicate);
     }
+    if r.merge.photos_filled > 0 {
+        line += &format!(
+            " {} already in the catalog filled in ({} new {}).",
+            r.merge.photos_filled,
+            r.merge.versions_added,
+            plural(r.merge.versions_added, "version", "versions")
+        );
+    }
+    if r.merge.photos_kept_apart > 0 {
+        line += &format!(
+            " {} kept apart (the same file is here under another identity).",
+            r.merge.photos_kept_apart
+        );
+    }
     if r.merge.tags_created > 0 {
         line += &format!(" {} {} created.", r.merge.tags_created, plural(r.merge.tags_created, "tag", "tags"));
     }
@@ -715,5 +729,28 @@ mod tests {
         assert_eq!(rescan_line(&r), "Scanned 5, imported 4 (3 new), 1 errors");
         let clean = ScanResult { scanned: 2, imported: 2, created: 2, errors: 0, skipped: 0 };
         assert_eq!(card_import_line(&clean), "Imported 2 new of 2 on card");
+    }
+
+    /// #185: the bundle line says what an import filled in on photos already in the catalog,
+    /// and what it kept apart.
+    #[test]
+    fn the_bundle_line_reports_filled_and_kept_apart_photos() {
+        let r = BundleImportResult {
+            copied: 0,
+            skipped_duplicate: 2,
+            errors: 0,
+            merge: chairphoto_core::catalog::MergeSummary {
+                photos_existing: 2,
+                photos_filled: 1,
+                versions_added: 2,
+                photos_kept_apart: 1,
+                ..Default::default()
+            },
+        };
+        assert_eq!(
+            bundle_import_line(&r),
+            "Import complete. No new photos. 2 already present (skipped). 1 already in the catalog filled in \
+             (2 new versions). 1 kept apart (the same file is here under another identity)."
+        );
     }
 }

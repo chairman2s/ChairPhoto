@@ -349,8 +349,10 @@ person (Overwrite or Dismiss). Re-homing it would leave the original with no row
 scan would catalogue it afresh without its ratings, tags and faces, or the two files would
 take turns owning the row. A row whose primary copies are all on other volumes still gains a
 file found on a volume indexed in place as another location; that moves nothing. A bundle
-whose photo lands as such a separate copy still merges its tags onto the existing row, which
-merge matches by identity.
+whose photo lands as such a separate copy puts none of its data on the copy's row (#185): its
+culling, IPTC, edits, versions and tags go onto the existing row, which merge matches by
+identity, the way a bundle photo already in the library does (see "Photo (existing)" below).
+The copy's row is a file of this import (its batch, its queued backup) and nothing more.
 
 "Still in place" is a question about the file, not the name (#184). On a case-insensitive
 filesystem (APFS and HFS+ by default, exFAT and vfat drives, a casefold directory) the old
@@ -757,7 +759,8 @@ A **merge** is two independent halves:
 
 The laptop only **adds new import batches**; it does not check out existing library
 photos. Therefore merge is **additive** — the desktop gains photos it has never seen,
-and **no edit conflicts are possible**. The one shared structure is the **tag
+and a photo it already has keeps every value it holds (a bundle fills only its blanks and
+adds its edits as new versions, #185), so **no edit conflicts are possible**. The one shared structure is the **tag
 taxonomy**, resolved by matching tags on normalized full path (assignments union);
 albums merge by name. All non-destructive.
 
@@ -787,7 +790,8 @@ The merge engine (`catalog/merge.rs`) is **pure-DB, no file I/O**:
 | Tag taxonomy | Resolve by tag uuid first, then normalized full_path; create missing ancestors; never overwrite existing uuid / exportable flag |
 | Tag terms | `INSERT … ON CONFLICT DO NOTHING` — adds missing terms, never modifies existing |
 | Photo (new) | Insert with full state (rating, label, pick, IPTC, edit record, versions) |
-| Photo (existing) | **Never touched** — existing rating/label/pick/IPTC/edits/versions are preserved |
+| Photo (existing) | **Its own values win; blanks are filled** (owner decision on #185, 2026-10-04). Rating 0, an empty label and a pick of "none" take the bundle's. The bundle's edit record (as a version named "Imported edit") and its versions are added as **new versions** after the photo's own, unless the photo already has those settings (its edit record or a version with an equal JSON value), so a re-merge adds none; the photo's edit record and versions are not changed. Blank IPTC fields are filled by the importer, not the pure-DB merge (below). A row the importer created for this bundle moments before is not filled again. |
+| Photo (new identity, path taken) | **Kept apart** — no row holds its identity but another photo, under another identity, holds its path (the same capture imported separately on each side, #246): neither inserted (`photos.path` is UNIQUE; before #185 the whole merge failed here) nor merged onto that photo. Counted in `MergeSummary::photos_kept_apart`. |
 | Tag assignments | `INSERT OR IGNORE` union — new assignments added, none removed |
 
 The importer (`bundle/importer.rs`) runs in three phases:
@@ -800,8 +804,27 @@ The importer (`bundle/importer.rs`) runs in three phases:
    time or serial); one that a stop leaves undecided is removed.
    Writes a UUID sidecar beside each original so the index phase can match by identity.
 3. **Index** (secondary connection, off the main lock) — `upsert_photo_with_identity` for
-   each extracted file; run `merge_bundle`; assign newly-created photos to the batch;
-   write the batch UUID sidecar; apply auto-tags; reconcile missing.
+   each extracted file, giving a row created for the bundle's own photo the bundle's full
+   state; run `merge_bundle_into`, which fills in what an existing photo lacks; assign
+   newly-created photos to the batch; write the batch UUID sidecar; fill an existing
+   photo's blank IPTC; apply auto-tags; reconcile missing.
+
+   **A bundle photo the library already has** (#185) — its file skipped as the same
+   capture (#246), or its identity held by a row whose own file is still in place (its
+   copy then gets a row of its own, as above) — has its data put on the row merge matches
+   by identity, never on a second row, as the table above says. Its IPTC goes through the rules for an existing row's IPTC (AGENTS.md, "XMP
+   safety"): the original's path is resolved first (an unreachable original is not
+   filled), the store is `Catalog::set_iptc` under the sidecar's write turn
+   (`xmp::lock::WriteOrder`), held through the sidecar write and the compare-and-set
+   settle, and a failed write stays owed. A field is filled only when neither the row nor
+   the sidecar beside its original has a value — a value in the sidecar the catalog never
+   imported is the photo's own too — and not at all when that sidecar does not parse. (Not
+   `set_iptc_carried`: that is for values arriving beside a sidecar of their own, and this
+   sidecar is the existing photo's.) Such a photo is **not** queued for backup and **not**
+   put in the bundle's batch: it was not added by this import, and batch membership is
+   immutable ("All photos from that ingest belong to it forever" — it belongs to the batch
+   it arrived with). A version it gains owes the monochrome refresh any version write owes
+   (docs/editing.md): a B&W version sets the flag.
 
 **Batch UUID in XMP sidecar** (`chairphoto:ImportBatch`): every imported photo's
 XMP sidecar carries the batch UUID alongside the photo UUID. This makes the batch

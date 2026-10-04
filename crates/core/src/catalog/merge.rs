@@ -9,10 +9,19 @@
 //! The merge **never deletes or overwrites** anything the catalog already has. It
 //! only *adds*:
 //!
-//! - **Photos** are matched by `photos.uuid`. An existing photo row is left
-//!   completely untouched (rating, label, pick, IPTC, edits, versions all preserved);
-//!   only its tag assignments are *unioned* (new tags added, none removed). A photo
-//!   the catalog has never seen is inserted with the bundle's uuid and its full state.
+//! - **Photos** are matched by `photos.uuid`. A photo the catalog has never seen is
+//!   inserted with the bundle's uuid and its full state. An existing photo keeps
+//!   everything it has (owner decision on #185, 2026-10-04): the bundle only fills
+//!   what it lacks — a rating of 0, an empty label, a pick of "none" — and its develop
+//!   edit record and versions are added as **new versions** whose settings the photo
+//!   does not already have; the photo's own edit record and versions are not changed.
+//!   Its blank IPTC fields are filled too, but not here: a store to an existing row's
+//!   IPTC owes its sidecar the change, so the fields the bundle offers are returned
+//!   ([`MergeOutcome::iptc_fills`]) for the importer to store and write under the
+//!   sidecar's write turn (`bundle::importer`). Tag assignments are *unioned* (new tags
+//!   added, none removed). A row the importer created for this bundle a moment before
+//!   ([`Catalog::merge_bundle_into`]'s `fresh`) already holds the bundle's state and is
+//!   not filled again.
 //! - **The tag taxonomy** is unioned: each bundle tag is resolved by `tags.uuid`
 //!   first, then by normalized `full_path`; a missing tag (and any missing ancestors)
 //!   is created, adopting the bundle's uuid. Terms are added if absent, never removed
@@ -22,12 +31,15 @@
 //! - **Tag assignments** union additively (a raw `INSERT OR IGNORE` — deliberately
 //!   *not* [`Catalog::assign_tag`], which prunes redundant ancestors and would delete
 //!   rows, breaking the additive invariant).
-//! - **Versions / IPTC / rating / label / pick / edit record** travel only for
-//!   **new** photos (the additive-only decision means no edit conflicts are possible:
-//!   the laptop only adds new import batches, never checks out existing photos).
+//! - **A photo with no row and no free path** — its identity is new here, but another
+//!   photo holds its `relative_path` (the importer found the same capture there under
+//!   another identity, #246/#185) — is kept apart: neither inserted (`photos.path` is
+//!   UNIQUE) nor merged onto the photo at that path, whose identity differs. Counted in
+//!   [`MergeSummary::photos_kept_apart`].
 //!
-//! Consequences: **re-merging the same bundle is a no-op**, and merging a bundle
-//! whose photos/tags partly pre-exist adds only the genuinely new rows.
+//! Consequences: **re-merging the same bundle is a no-op** (a version is added only for
+//! settings the photo does not already have), and merging a bundle whose photos/tags
+//! partly pre-exist adds only what is genuinely new.
 //!
 //! The whole apply runs in a single transaction so a failure rolls back cleanly.
 
@@ -35,7 +47,7 @@ use super::tag_path::{normalize_lookup, normalize_tag_path};
 use super::{Catalog, CatalogError, Result};
 use crate::bundle::{BundleManifest, BundlePhoto, BundleTag};
 use rusqlite::{params, OptionalExtension, Transaction};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// What a merge did, for the importer to report. All counts are of rows the merge
@@ -45,7 +57,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 pub struct MergeSummary {
     /// Photos inserted (the catalog had never seen these UUIDs).
     pub photos_added: usize,
-    /// Photos matched to an existing row by UUID (left untouched; assignments unioned).
+    /// Photos matched to an existing row by UUID (its values kept, its blanks filled,
+    /// assignments unioned).
     pub photos_existing: usize,
     /// Tags created (leaf or ancestor) because neither the uuid nor the path existed.
     pub tags_created: usize,
@@ -58,6 +71,31 @@ pub struct MergeSummary {
     /// Photos with no identity (a blank uuid from a pre-#146 bundle) and no original in the
     /// bundle, whose path another photo already holds: neither matched nor inserted (#150).
     pub photos_skipped: usize,
+    /// Existing photos the bundle filled something in on: a blank rating, label or pick, or
+    /// a new version (#185). Their blank IPTC is filled by the importer, not counted here.
+    pub photos_filled: usize,
+    /// Versions added to existing photos from the bundle's edit records and versions.
+    pub versions_added: usize,
+    /// Photos whose identity no row holds while another photo, under another identity,
+    /// holds their path — the same capture imported separately on each side (#246): kept
+    /// apart, neither inserted nor merged.
+    pub photos_kept_apart: usize,
+}
+
+/// The name of the version an existing photo gains from a bundle's photo-level edit record.
+pub const IMPORTED_EDIT_VERSION: &str = "Imported edit";
+
+/// What [`Catalog::merge_bundle_into`] did, and what it leaves the caller to do.
+#[derive(Debug, Clone, Default)]
+pub struct MergeOutcome {
+    pub summary: MergeSummary,
+    /// For each existing photo (not `fresh`), the bundle's IPTC fields that the row has no
+    /// value for. Not stored: the caller stores what the photo's sidecar has no value for
+    /// either, through `Catalog::set_iptc`, under the sidecar's write turn.
+    pub iptc_fills: Vec<(i64, super::IptcFields)>,
+    /// The photos versions were added to, existing or new — each owes the monochrome
+    /// refresh a version write owes.
+    pub versions_added_to: Vec<i64>,
 }
 
 impl Catalog {
@@ -65,18 +103,27 @@ impl Catalog {
     /// docs). Pure-DB: it never touches the filesystem — placing originals is the
     /// importer's job. The whole apply is one transaction.
     pub fn merge_bundle(&self, manifest: &BundleManifest) -> Result<MergeSummary> {
+        Ok(self.merge_bundle_into(manifest, &HashSet::new())?.summary)
+    }
+
+    /// [`Self::merge_bundle`], told which rows the caller created for this bundle's photos
+    /// just before (`fresh`): those already carry the bundle's state, so an existing photo
+    /// in `fresh` is not filled again. Returns the IPTC fills left to the caller (see
+    /// [`MergeOutcome`]).
+    pub fn merge_bundle_into(&self, manifest: &BundleManifest, fresh: &HashSet<i64>) -> Result<MergeOutcome> {
         let tx = self.conn.unchecked_transaction()?;
-        let summary = {
+        let outcome = {
             let mut ctx = MergeCtx {
                 tx: &tx,
-                summary: MergeSummary::default(),
+                outcome: MergeOutcome::default(),
                 tag_id_by_uuid: HashMap::new(),
+                fresh,
             };
             ctx.run(manifest)?;
-            ctx.summary
+            ctx.outcome
         };
         tx.commit()?;
-        Ok(summary)
+        Ok(outcome)
     }
 }
 
@@ -85,9 +132,11 @@ impl Catalog {
 /// consumed while unioning assignments).
 struct MergeCtx<'a> {
     tx: &'a Transaction<'a>,
-    summary: MergeSummary,
+    outcome: MergeOutcome,
     /// Maps each bundle tag uuid to the catalog tag id it resolved/created to.
     tag_id_by_uuid: HashMap<String, i64>,
+    /// Rows the importer created for this bundle's photos (see `merge_bundle_into`).
+    fresh: &'a HashSet<i64>,
 }
 
 impl MergeCtx<'_> {
@@ -132,7 +181,7 @@ impl MergeCtx<'_> {
              VALUES(?1, ?2, ?3, ?4)",
             params![batch.uuid, batch.source_label, batch.note, batch.created_at],
         )?;
-        self.summary.batch_added = true;
+        self.outcome.summary.batch_added = true;
         Ok(self.tx.last_insert_rowid())
     }
 
@@ -227,7 +276,7 @@ impl MergeCtx<'_> {
                             ts
                         ],
                     )?;
-                    self.summary.tags_created += 1;
+                    self.outcome.summary.tags_created += 1;
                     self.tx.last_insert_rowid()
                 }
             };
@@ -267,15 +316,15 @@ impl MergeCtx<'_> {
                     now()
                 ],
             )?;
-            self.summary.terms_added += changed;
+            self.outcome.summary.terms_added += changed;
         }
         Ok(())
     }
 
     // --- photos -------------------------------------------------------------
 
-    /// Merge one photo: insert it with full state if the uuid is new, else leave the
-    /// existing row untouched. Either way, union its tag assignments.
+    /// Merge one photo: insert it with full state if the uuid is new, else fill in what the
+    /// existing row lacks ([`Self::fill_existing`]). Either way, union its tag assignments.
     ///
     /// A UUID is matched in its canonical lowercase spelling (#146), so a bundle that carries
     /// it in another case still finds the photo. A bundle written before #146 can carry a
@@ -306,22 +355,13 @@ impl MergeCtx<'_> {
                 (uuid, existing)
             }
             None => {
-                let taken = self
-                    .tx
-                    .query_row(
-                        "SELECT 1 FROM photos WHERE path = ?1",
-                        params![photo.relative_path],
-                        |_| Ok(()),
-                    )
-                    .optional()?
-                    .is_some();
-                if taken {
+                if self.path_taken(&photo.relative_path)? {
                     eprintln!(
                         "bundle merge: a photo with no identity at {} was skipped: another \
                          photo is at that path",
                         photo.relative_path
                     );
-                    self.summary.photos_skipped += 1;
+                    self.outcome.summary.photos_skipped += 1;
                     return Ok(());
                 }
                 (uuid::Uuid::new_v4().to_string(), None)
@@ -330,13 +370,28 @@ impl MergeCtx<'_> {
 
         let photo_id = match existing {
             Some(id) => {
-                // Existing photo: never overwritten. Only assignments union below.
-                self.summary.photos_existing += 1;
+                // Existing photo: never overwritten; only what it lacks is filled in.
+                self.outcome.summary.photos_existing += 1;
+                if !self.fresh.contains(&id) {
+                    self.fill_existing(id, photo)?;
+                }
                 id
+            }
+            None if self.path_taken(&photo.relative_path)? => {
+                // No row holds this identity, but another photo holds the path: the importer
+                // found the same capture there under another identity (#246). It is neither
+                // this photo's row nor a free path — keep the two apart.
+                eprintln!(
+                    "bundle merge: photo {uuid} kept apart: another photo, under another identity, \
+                     is at {}",
+                    photo.relative_path
+                );
+                self.outcome.summary.photos_kept_apart += 1;
+                return Ok(());
             }
             None => {
                 let id = self.insert_photo(photo, &uuid, batch_id)?;
-                self.summary.photos_added += 1;
+                self.outcome.summary.photos_added += 1;
                 id
             }
         };
@@ -349,6 +404,119 @@ impl MergeCtx<'_> {
         }
 
         self.union_assignments(photo_id, photo)?;
+        Ok(())
+    }
+
+    /// Whether a photo already holds `relative_path` (`photos.path` is UNIQUE).
+    fn path_taken(&self, relative_path: &str) -> Result<bool> {
+        Ok(self
+            .tx
+            .query_row("SELECT 1 FROM photos WHERE path = ?1", params![relative_path], |_| Ok(()))
+            .optional()?
+            .is_some())
+    }
+
+    /// Fill in what an existing photo lacks from the bundle's photo (#185, owner decision
+    /// 2026-10-04). The photo's own values always win:
+    /// - **Culling:** a rating of 0, an empty label and a pick of "none" take the bundle's.
+    /// - **Edits:** the bundle's photo-level edit record and each of its versions are added as
+    ///   new versions, after the photo's own, unless the photo already has those settings (its
+    ///   edit record or a version with an equal JSON value) — so a re-merge adds nothing. The
+    ///   photo's edit record and versions are not changed. The edit record's version is named
+    ///   [`IMPORTED_EDIT_VERSION`]; a version keeps its name.
+    /// - **IPTC:** the bundle's fields the row has no value for are returned in
+    ///   [`MergeOutcome::iptc_fills`], not stored (see there).
+    fn fill_existing(&mut self, photo_id: i64, photo: &BundlePhoto) -> Result<()> {
+        let culled = self.tx.execute(
+            "UPDATE photos SET
+                rating = CASE WHEN rating = 0 THEN ?2 ELSE rating END,
+                color_label = CASE WHEN color_label = '' THEN ?3 ELSE color_label END,
+                pick_state = CASE WHEN pick_state = 'none' THEN ?4 ELSE pick_state END,
+                updated_at = ?5
+             WHERE id = ?1
+               AND ((rating = 0 AND ?2 <> 0) OR (color_label = '' AND ?3 <> '')
+                    OR (pick_state = 'none' AND ?4 <> 'none'))",
+            params![photo_id, photo.rating, photo.label, photo.pick_state.as_db_str(), now()],
+        )? > 0;
+
+        // Settings the photo already has, as JSON values (so formatting is no difference).
+        let parse = |json: &str| serde_json::from_str::<serde_json::Value>(json.trim()).ok();
+        let mut has: Vec<serde_json::Value> = Vec::new();
+        {
+            let mut stmt = self.tx.prepare(
+                "SELECT edit_json FROM photo_edits WHERE photo_id = ?1
+                 UNION ALL SELECT edit_json FROM photo_versions WHERE photo_id = ?1",
+            )?;
+            let rows = stmt.query_map(params![photo_id], |r| r.get::<_, String>(0))?;
+            for json in rows {
+                has.extend(parse(&json?));
+            }
+        }
+        let offered = photo
+            .edit_record
+            .iter()
+            .map(|e| (IMPORTED_EDIT_VERSION, e.as_str()))
+            .chain(photo.versions.iter().map(|v| (v.name.as_str(), v.edit_json.as_str())));
+        let mut added = 0;
+        for (name, edit_json) in offered {
+            let trimmed = edit_json.trim();
+            let value = if trimmed.is_empty() { "{}" } else { trimmed };
+            // Not JSON: the bundle is malformed there; a version must hold valid JSON.
+            let Some(parsed) = parse(value) else { continue };
+            if has.contains(&parsed) {
+                continue;
+            }
+            let name = if name.trim().is_empty() { IMPORTED_EDIT_VERSION } else { name };
+            let ts = now();
+            self.tx.execute(
+                "INSERT INTO photo_versions(photo_id, name, edit_json, position, created_at, updated_at)
+                 VALUES(?1, ?2, ?3,
+                        (SELECT COALESCE(MAX(position), -1) + 1 FROM photo_versions WHERE photo_id = ?1),
+                        ?4, ?4)",
+                params![photo_id, name, value, ts],
+            )?;
+            has.push(parsed);
+            added += 1;
+        }
+        if added > 0 {
+            self.outcome.summary.versions_added += added;
+            self.outcome.versions_added_to.push(photo_id);
+        }
+        if culled || added > 0 {
+            self.outcome.summary.photos_filled += 1;
+        }
+
+        let current: super::IptcFields = self.tx.query_row(
+            "SELECT iptc_description, iptc_headline, iptc_title, iptc_creator, iptc_copyright,
+                iptc_credit, iptc_source, iptc_city, iptc_state, iptc_country, iptc_country_code
+             FROM photos WHERE id = ?1",
+            params![photo_id],
+            |r| {
+                Ok(super::IptcFields {
+                    description: r.get(0)?,
+                    headline: r.get(1)?,
+                    title: r.get(2)?,
+                    creator: r.get(3)?,
+                    copyright: r.get(4)?,
+                    credit: r.get(5)?,
+                    source: r.get(6)?,
+                    city: r.get(7)?,
+                    state: r.get(8)?,
+                    country: r.get(9)?,
+                    country_code: r.get(10)?,
+                })
+            },
+        )?;
+        let blank_here = super::IptcMask::present_in(&photo.iptc).without(super::IptcMask::present_in(&current));
+        if !blank_here.is_empty() {
+            let mut fill = super::IptcFields::default();
+            for m in super::IptcMask::EACH.into_iter().filter(|m| blank_here.contains(*m)) {
+                if let Some(slot) = m.value_mut(&mut fill) {
+                    *slot = m.value(&photo.iptc).to_string();
+                }
+            }
+            self.outcome.iptc_fills.push((photo_id, fill));
+        }
         Ok(())
     }
 
@@ -445,7 +613,7 @@ impl MergeCtx<'_> {
                  VALUES(?1, ?2, ?3)",
                 params![photo_id, tag_id, ts],
             )?;
-            self.summary.assignments_added += changed;
+            self.outcome.summary.assignments_added += changed;
         }
         Ok(())
     }
@@ -597,8 +765,13 @@ mod tests {
         assert_eq!(count("SELECT COUNT(*) FROM photo_versions"), 1);
     }
 
+    // --- an existing photo (#185) -------------------------------------------------------
+
+    /// An existing photo keeps every value it has — culling, IPTC, its edit record and its
+    /// version — and gains the bundle's edit record and version as new versions after its
+    /// own; its tags union. Merging again adds nothing more.
     #[test]
-    fn existing_photo_is_never_overwritten_only_assignments_union() {
+    fn existing_photo_keeps_its_values_and_gains_the_bundles_edits_as_new_versions() {
         let (cat, _root) = temp_catalog("preserve");
         // Seed a photo the "desktop" already has, matching photo-a's identity but with
         // DIFFERENT local state (higher rating, a manual tag, its own version). The fixture's
@@ -625,11 +798,21 @@ mod tests {
             )
             .unwrap();
 
-        let s = cat.merge_bundle(&sample_manifest()).unwrap();
+        let out = cat.merge_bundle_into(&sample_manifest(), &HashSet::new()).unwrap();
+        let s = &out.summary;
         assert_eq!(s.photos_added, 0);
         assert_eq!(s.photos_existing, 1);
         // The bundle's tag assignment (Birds/Owls) unions in.
         assert_eq!(s.assignments_added, 1);
+        assert_eq!((s.photos_filled, s.versions_added), (1, 2));
+        assert_eq!(out.versions_added_to, vec![local.id]);
+        // IPTC is not stored by the merge: only the field the row has no value for (City;
+        // the Headline is the row's own) is handed back for the sidecar-safe fill.
+        assert_eq!(
+            out.iptc_fills,
+            vec![(local.id, IptcFields { city: "Bergen".into(), ..Default::default() })]
+        );
+        assert_eq!(cat.get_iptc(local.id).unwrap().city, "", "not stored by the merge");
 
         // The existing photo row is byte-for-byte preserved.
         let after = cat.get_photo_by_uuid("photo-a").unwrap();
@@ -648,10 +831,23 @@ mod tests {
             Some(r#"{"local":true}"#),
             "edit record not overwritten"
         );
-        // The local version is preserved; the bundle's version did NOT graft on.
-        let versions = cat.list_versions(after.id).unwrap();
-        assert_eq!(versions.len(), 1, "bundle version must not be added to existing photo");
-        assert_eq!(versions[0].name, "Local version");
+        // The local version is preserved, first; the bundle's edit record and version follow
+        // as new versions.
+        let versions: Vec<(String, String)> =
+            cat.list_versions(after.id).unwrap().into_iter().map(|v| (v.name, v.edit_json)).collect();
+        assert_eq!(
+            versions,
+            [
+                ("Local version".to_string(), r#"{"local":1}"#.to_string()),
+                (IMPORTED_EDIT_VERSION.to_string(), r#"{"basic-editor":{"exposure":0.3}}"#.to_string()),
+                ("Insta".to_string(), r#"{"crop":"1:1"}"#.to_string()),
+            ]
+        );
+
+        // A second merge adds no version: the photo has those settings now.
+        let again = cat.merge_bundle_into(&sample_manifest(), &HashSet::new()).unwrap();
+        assert_eq!((again.summary.versions_added, again.summary.photos_filled), (0, 0));
+        assert_eq!(cat.list_versions(after.id).unwrap().len(), 3);
 
         // Assignments: the manual tag is kept AND the bundle's tag is added (union).
         let paths: Vec<String> = cat
@@ -662,6 +858,79 @@ mod tests {
             .collect();
         assert!(paths.contains(&"Manual/Keep".to_string()), "manual tag preserved");
         assert!(paths.contains(&"Birds/Owls".to_string()), "bundle tag unioned in");
+    }
+
+    /// A blank rating, label and pick take the bundle's; a version whose settings the photo
+    /// already has (its edit record, in another JSON spelling) is not added again.
+    #[test]
+    fn an_existing_photos_blank_culling_is_filled_and_known_settings_are_not_versioned_again() {
+        let (cat, _root) = temp_catalog("fill");
+        cat.conn()
+            .execute(
+                "INSERT INTO photos(uuid, path, mtime_ns, size, extension, rating, created_at, updated_at)
+                 VALUES(?1, 'existing/local.ARW', 1, 1, 'arw', 2, 1, 1)",
+                params![crate::catalog::photo_identity_for("photo-a").unwrap()],
+            )
+            .unwrap();
+        let local = cat.get_photo_by_uuid("photo-a").unwrap();
+        cat.set_edit_record(local.id, r#"{ "basic-editor": { "exposure": 0.3 } }"#).unwrap();
+
+        let out = cat.merge_bundle_into(&sample_manifest(), &HashSet::new()).unwrap();
+        let after = cat.get_photo(local.id).unwrap();
+        assert_eq!(after.rating, 2, "a rating it has wins");
+        assert_eq!(after.label, "green", "a blank label is filled");
+        assert_eq!(after.pick_state, PickState::Pick, "a blank pick is filled");
+        let names: Vec<String> = cat.list_versions(local.id).unwrap().into_iter().map(|v| v.name).collect();
+        assert_eq!(names, ["Insta"], "the edit record it already has is not added again");
+        assert_eq!(out.summary.versions_added, 1);
+        assert_eq!(
+            out.iptc_fills,
+            vec![(local.id, IptcFields { headline: "Sunset".into(), city: "Bergen".into(), ..Default::default() })]
+        );
+    }
+
+    /// A row the importer created for this bundle (`fresh`) already has the bundle's state:
+    /// nothing is filled in on it again.
+    #[test]
+    fn a_fresh_row_is_not_filled_again() {
+        let (cat, _root) = temp_catalog("fresh");
+        cat.conn()
+            .execute(
+                "INSERT INTO photos(uuid, path, mtime_ns, size, extension, created_at, updated_at)
+                 VALUES(?1, 'existing/local.ARW', 1, 1, 'arw', 1, 1)",
+                params![crate::catalog::photo_identity_for("photo-a").unwrap()],
+            )
+            .unwrap();
+        let id = cat.conn().last_insert_rowid();
+        let out = cat.merge_bundle_into(&sample_manifest(), &HashSet::from([id])).unwrap();
+        assert_eq!((out.summary.photos_filled, out.summary.versions_added), (0, 0));
+        assert!(out.iptc_fills.is_empty());
+        assert_eq!(cat.get_photo(id).unwrap().rating, 0);
+        assert!(cat.list_versions(id).unwrap().is_empty());
+        assert_eq!(out.summary.assignments_added, 1, "its tags still union");
+    }
+
+    /// A bundle photo whose identity no row holds, at a path another photo (another identity)
+    /// holds, is kept apart and counted — neither inserted (the path is UNIQUE; before, the
+    /// whole merge failed on it) nor merged onto the photo there.
+    #[test]
+    fn a_new_identity_at_a_path_another_photo_holds_is_kept_apart() {
+        let (cat, _root) = temp_catalog("apart");
+        cat.conn()
+            .execute(
+                "INSERT INTO photos(uuid, path, mtime_ns, size, extension, created_at, updated_at)
+                 VALUES('11111111-2222-4333-8444-555555555555', '2026/06/28/DSC01234.ARW', 1, 1, 'arw', 1, 1)",
+                [],
+            )
+            .unwrap();
+        let s = cat.merge_bundle(&sample_manifest()).unwrap();
+        assert_eq!((s.photos_added, s.photos_existing, s.photos_kept_apart), (0, 0, 1));
+        assert_eq!(s.assignments_added, 0, "its tags do not land on the other photo");
+        let only: (String, i64) = cat
+            .conn()
+            .query_row("SELECT uuid, rating FROM photos", [], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap();
+        assert_eq!(only, ("11111111-2222-4333-8444-555555555555".to_string(), 0));
     }
 
     #[test]

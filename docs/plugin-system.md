@@ -99,10 +99,13 @@ a fresh view each time their dialog opens).
 Each backend-bearing module's Rust lives in its own module under
 `crates/core/src/plugins/<name>/`, behind a Cargo feature (e.g. `faces`). A build can omit the
 feature to compile the backend out entirely; [`modules::compiled_features()`] lists what this
-build has, and a module whose declared `backend_feature` is absent registers metadata-only —
-the Modules panel shows "backend not included in this build" and refuses to enable it. Default
-feature set decides what ships. Runtime toggle is independent: even compiled in, a module does
-nothing until enabled.
+build has. Most modules are themselves gated behind the matching app feature
+(`crates/app/src/modules/mod.rs::bundled()`), so omitting it drops the module from the registry
+entirely — it never registers, metadata or otherwise. Instagram, Flickr and SmugMug are the
+exception: they always register (their publishing feature is opt-in upstream), and when their
+`backend_feature` is absent they register metadata-only — the Modules panel shows "backend not
+included in this build" and refuses to enable it. Default feature set decides what ships.
+Runtime toggle is independent: even compiled in, a module does nothing until enabled.
 
 ## A module's settings
 
@@ -146,8 +149,8 @@ before a catalog has finished restoring is queued rather than applied.
 
 ## How AI tagging maps on
 
-AI tagging is a module: `id: "ai-tagging"`, `backend_feature: "ai"`.
-- `load`: registers an inspector panel ("Suggest tags") and a settings panel
+AI tagging is a module: `id: "ai"`, `backend_feature: "ai"`.
+- `load`: registers an inspector panel ("AI tags") and a settings panel
   (provider/model/key), reading config via the namespaced settings handle.
 - Backend: `crates/core/src/plugins/ai/` behind the `ai` Cargo feature.
 - Fully optional: omit the `ai` feature to compile it out; or leave it off in Modules.

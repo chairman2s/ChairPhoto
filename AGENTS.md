@@ -158,7 +158,8 @@ The GPUI app is the only front end; all UI work goes here.
 
 The Rust side is a Cargo workspace rooted at the repository root, of the three crates above.
 The core crate has no UI dependency, GPUI included; `crates/app` links the core directly and
-forwards each of its features to the core's feature of the same name.
+forwards each of its features to the core's feature of the same name — except `tag-graph` and
+`dev-module` (`crates/app/Cargo.toml`), which are app-only and have no matching core feature.
 
 The core owns file access, catalog queries, image decoding, XMP, and external processes.
 The GPUI app calls the core directly (`crates/core/src/app/` services, through `AppState`)

@@ -274,16 +274,55 @@ impl Drop for FrameDir {
 /// either way; what changes is only where the sweep looks and whether it must also check who
 /// owns what it finds there.
 fn frame_dir_root() -> (PathBuf, bool) {
-    // A test's own scratch root (#211 nit), never the real cache dir: cargo test gives each
-    // test function its own thread, so `tests::set_test_frame_root`'s thread-local is already
-    // exactly test-scoped, the same reasoning `BEFORE_SETTLE`/`ON_RETRY` rely on elsewhere.
-    #[cfg(all(test, unix))]
-    if let Some(root) = tests::TEST_FRAME_ROOT.with(|c| c.borrow().clone()) {
+    // A test's own scratch root (#211 nit, #228), never the real cache dir: cargo test gives
+    // each test function its own thread (and a GPUI headless test's manual `Runner` runs a
+    // claimed render synchronously on that same thread), so `test_hooks`' thread-local is
+    // already exactly test-scoped, the same reasoning `BEFORE_SETTLE`/`ON_RETRY` rely on
+    // elsewhere.
+    #[cfg(all(any(test, feature = "test-hooks"), unix))]
+    if let Some(root) = test_hooks::get() {
         // Standing in for `cache_dir()`, not for the final root: the same
         // `chairphoto/slideshow` nesting (and the shared-temp-root comparison) applies.
         return frame_dir_root_in(root, &std::env::temp_dir());
     }
     frame_dir_root_in(crate::thumbnails::cache_dir(), &std::env::temp_dir())
+}
+
+/// Lets a test point [`FrameDir::create`] at a scratch directory instead of the real cache
+/// dir (#228), without threading an override through every call site.
+///
+/// `#[cfg(test)]` alone only compiles this for *this* crate's own test binary. A consumer
+/// crate's tests — `chairphoto-app`, which links `chairphoto-core` as an ordinary
+/// (non-`cfg(test)`) dependency — cannot reach a `cfg(test)`-only item here at all, which is
+/// why every app-crate slideshow test used to write its frames (and run the stale-dir sweep)
+/// under the real `~/.cache`. The `test-hooks` feature is this module's escape hatch: a pure
+/// compile gate, enabled only from `chairphoto-app`'s `[dev-dependencies]`, so it reaches that
+/// crate's test binary and nothing it ships.
+#[cfg(all(any(test, feature = "test-hooks"), unix))]
+pub mod test_hooks {
+    use std::cell::RefCell;
+    use std::path::{Path, PathBuf};
+
+    thread_local! {
+        /// Where this thread's [`super::frame_dir_root`] looks instead of the real cache dir.
+        /// Thread-local, not a `Mutex`: cargo test gives each test function its own thread, so
+        /// one call in a test's setup is already exactly test-scoped. A test that spawns its
+        /// own thread to run a render concurrently must call [`set_test_frame_root`] again
+        /// there, since a thread-local starts empty on a new thread.
+        static TEST_FRAME_ROOT: RefCell<Option<PathBuf>> = RefCell::new(None);
+    }
+
+    /// Point this thread's [`super::FrameDir::create`] calls at `root` (a scratch directory,
+    /// never the real cache dir) until the thread exits or calls this again.
+    pub fn set_test_frame_root(root: &Path) {
+        TEST_FRAME_ROOT.with(|c| *c.borrow_mut() = Some(root.to_path_buf()));
+    }
+
+    /// This thread's override, if one is set. `pub(super)`: only [`super::frame_dir_root`]
+    /// reads it.
+    pub(super) fn get() -> Option<PathBuf> {
+        TEST_FRAME_ROOT.with(|c| c.borrow().clone())
+    }
 }
 
 /// [`frame_dir_root`], parametrized so a test can exercise the shared-temp-root fallback
@@ -339,29 +378,11 @@ pub fn cancel_slideshow(state: &AppState) -> Result<(), String> {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+    use super::test_hooks::set_test_frame_root;
     use crate::catalog::Catalog;
     use crate::test_support::TestTmpDir;
-    use std::cell::RefCell;
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
     use std::sync::Mutex;
-
-    thread_local! {
-        /// Where this thread's [`super::frame_dir_root`] looks instead of the real cache dir
-        /// (#211 nit): before this, every test that reached `FrameDir::create()` through
-        /// `claim_slideshow(..).run_with(..)` wrote its frames — and ran the stale-dir sweep —
-        /// under the real `~/.cache`, since `frame_dir_root()` always called the production
-        /// `crate::thumbnails::cache_dir()`. Thread-local, not a `Mutex`: cargo test gives each
-        /// test function its own thread, so [`setup`] setting this once is already exactly
-        /// test-scoped; a test that spawns its own thread (the forced-interleaving case below)
-        /// sets it again there, since a thread-local starts empty on a new thread.
-        pub(super) static TEST_FRAME_ROOT: RefCell<Option<PathBuf>> = RefCell::new(None);
-    }
-
-    /// Point this thread's `FrameDir::create()` calls at `root` (a scratch directory under a
-    /// test's own [`TestTmpDir`]) instead of the real cache dir.
-    fn set_test_frame_root(root: &Path) {
-        TEST_FRAME_ROOT.with(|c| *c.borrow_mut() = Some(root.to_path_buf()));
-    }
 
     #[derive(Default)]
     struct Progress(Mutex<Vec<(u32, u32, u64)>>);
@@ -470,6 +491,26 @@ mod tests {
         let cache_root = dir.join("cache").join("chairphoto").join("slideshow");
         assert!(frame_dir.starts_with(&cache_root), "{frame_dir:?} is under the cache dir {cache_root:?}");
         assert!(!frame_dir.starts_with(crate::thumbnails::cache_dir()), "{frame_dir:?} must not be under the real cache dir");
+    }
+
+    /// #228 (r7 review): the test override above makes every other test in this module write
+    /// under a scratch cache, which is the point of #211's follow-up — but it means no test
+    /// here any longer calls the *production* `frame_dir_root()` with the override unset, so
+    /// mutating its fallback branch to `std::env::temp_dir()` (the original #211 bug) passed
+    /// every test in this file. Call it directly, on a thread that never sets the override, to
+    /// pin that branch again. Pure: `frame_dir_root`/`frame_dir_root_in` do no I/O (the `Path`
+    /// comparison alone decides the tuple), so this never creates anything under the real
+    /// cache dir — verified separately by stat'ing it unchanged across a full workspace run.
+    #[test]
+    fn frame_dir_root_itself_resolves_under_the_real_cache_dir_with_no_override_set() {
+        assert!(test_hooks::get().is_none(), "this test's own thread must carry no override");
+        let (root, shared) = frame_dir_root();
+        let cache_dir = crate::thumbnails::cache_dir();
+        let tmp_dir = std::env::temp_dir();
+        if cache_dir != tmp_dir {
+            assert!(!shared, "a real, distinct cache dir must not be treated as the shared-temp fallback");
+            assert_eq!(root, cache_dir.join("chairphoto").join("slideshow"));
+        }
     }
 
     /// #212 Nit-1: a slideshow frame is an engine-2 render too (`export::write_item_jpeg` →

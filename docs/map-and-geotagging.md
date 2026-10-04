@@ -173,16 +173,17 @@ catalog is filled, and its sidecar property is then replaced, so a city another
 tool wrote (and the catalog never imported) gives way to the geocoded one.
 
 Both fills are bound to the catalog they read the photo from (`CatalogIdentity`): the cache,
-the row, the sidecar path and the IPTC written into it all come from that catalog, and a catalog switch during the Nominatim call makes the next
-step fail closed with `CATALOG_CHANGED` instead of writing the new catalog's row (whose ids
-collide) or the old catalog's sidecar. The GPUI module binds its fence writes the same way,
-to the catalog the fences were read from. In the GPUI module, Geocode all is an owned job
+the row, the sidecar path and the IPTC written into it all come from that catalog, and a
+catalog switch during the Nominatim call makes the next step fail closed with
+`CATALOG_CHANGED` instead of writing the new catalog's row (whose ids collide) or the old
+catalog's sidecar. The GPUI module binds its fence writes the same way, to the catalog the
+fences were read from. In the GPUI module, Geocode all is an owned job
 (`geocode_all_to_iptc_with`): at most one run; Cancel, a catalog switch or disabling the
 module sets its abort flag and aborts its task (dropping a pending Nominatim request), and
-its progress and result land only while it is still the current run. The single-photo path uses a TOCTOU-safe three-step
-pattern (read GPS and check cache, async HTTP, store result) so it never blocks the UI
-thread. The inspector exposes "Geocode location" for one photo and "Geocode all with GPS"
-for the batch, with a progress bar and a summary.
+its progress and result land only while it is still the current run. The single-photo path
+uses a TOCTOU-safe three-step pattern (read GPS and check cache, async HTTP, store result)
+so it never blocks the UI thread. The inspector exposes "Geocode location" for one photo and
+"Geocode all with GPS" for the batch, with a progress bar and a summary.
 
 ### Nominatim usage policy
 

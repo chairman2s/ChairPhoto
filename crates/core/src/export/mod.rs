@@ -1397,18 +1397,27 @@ mod overlap_tests {
     /// and the chmod can't redirect it. That race itself is impractical to force
     /// deterministically in a test; this only checks the end state the handle-based path
     /// produces.
+    ///
+    /// #212 nit: also covers an original with setuid/setgid bits set (0o7750) — the copy must
+    /// mask those out (`& 0o777`), never carrying setuid/setgid over to a file this process
+    /// now owns in the export destination.
+    /// (Mutation-checked: dropping the `& 0o777` mask in `export_handoff` makes the plain
+    /// 0o640 case still pass but this setuid/setgid case fail — `left: 0o7750, right: 0o750` —
+    /// confirming the mask is what this case exercises.)
     #[test]
     fn hand_off_carries_over_the_originals_permission_bits() {
         use std::os::unix::fs::PermissionsExt;
         let dir = TestTmpDir::new("export-handoff-perms");
-        let original = dir.join("IMG.CR3");
-        std::fs::write(&original, "raw bytes").unwrap();
-        std::fs::set_permissions(&original, std::fs::Permissions::from_mode(0o640)).unwrap();
-        let dest = dir.join("out");
-        std::fs::create_dir_all(&dest).unwrap();
-        export_handoff(&item(original.clone()), &dest, &|_| {}).unwrap();
-        let mode = std::fs::metadata(dest.join("IMG.CR3")).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode, 0o640, "the copy keeps the original's permission bits");
+        for (name, source_mode, want) in [("IMG.CR3", 0o640, 0o640), ("IMG2.CR3", 0o7750, 0o750)] {
+            let original = dir.join(name);
+            std::fs::write(&original, "raw bytes").unwrap();
+            std::fs::set_permissions(&original, std::fs::Permissions::from_mode(source_mode)).unwrap();
+            let dest = dir.join(format!("out-{name}"));
+            std::fs::create_dir_all(&dest).unwrap();
+            export_handoff(&item(original.clone()), &dest, &|_| {}).unwrap();
+            let mode = std::fs::metadata(dest.join(name)).unwrap().permissions().mode() & 0o7777;
+            assert_eq!(mode, want, "{name}: source mode {source_mode:o}");
+        }
     }
 
     /// #212: a failure after the RAW copy lands — here, the sidecar copy, because the

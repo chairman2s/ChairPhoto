@@ -358,13 +358,13 @@ fn machine_hosts(cx: &mut TestAppContext) -> Option<String> {
 
 /// Gate #119, and #214's fail-closed fix. Here every write fails (the store's directory is
 /// a file): the catalog keeps its copy (gate #119, unchanged), and — unlike before #214 —
-/// the merge is not applied to this machine's answers either, in memory or on disk: the map
-/// still asks about the legacy hosts, and the failure is surfaced
-/// (`MapState::consent_write_error`). `MachinePrefs`'s own cache (`machine_hosts`) shows the
-/// attempted value regardless (`set_then` fills it in before it knows whether the write will
-/// land), which is why this test checks the file on disk and the module's own state, not it.
-/// Once the store can be written, the next read of the catalog merges, saves and only then
-/// empties the copy.
+/// the merge is not applied to this machine's answers either, in memory, in `MachinePrefs`'s
+/// own cache, or on disk: the map still asks about the legacy hosts, and the failure is
+/// surfaced (`MapState::consent_write_error`). `set_then`'s candidate used to fill
+/// `MachinePrefs`'s cache before it knew whether the write would land (#214 M1); it no
+/// longer does, so `machine_hosts` reads `None` here too, not just the file on disk. Once the
+/// store can be written, the next read of the catalog merges, saves and only then empties
+/// the copy.
 #[gpui_kit::test]
 fn a_failed_machine_prefs_write_keeps_the_catalogs_old_answers(cx: &mut TestAppContext) {
     let dir = TempDir::new("map-migrate-fail");
@@ -392,6 +392,7 @@ fn a_failed_machine_prefs_write_keeps_the_catalogs_old_answers(cx: &mut TestAppC
         map_state_entity.read_with(cx, |s, _| s.consent_write_error().is_some()),
         "the failed write is surfaced"
     );
+    assert_eq!(machine_hosts(cx), None, "#214 M1: the failed candidate never reached MachinePrefs's cache either");
 
     std::fs::remove_file(&blocker).unwrap();
     open_catalog_with_photos(&app, &dir, 1, cx); // the same catalog, read again
@@ -399,6 +400,75 @@ fn a_failed_machine_prefs_write_keeps_the_catalogs_old_answers(cx: &mut TestAppC
     assert_eq!(MachinePrefs::load(prefs).get(MACHINE_TILE_HOSTS), Some(legacy), "saved now");
     assert_eq!(setting(&app).as_deref(), Some("{}"), "and only then emptied");
     assert_eq!(machine_hosts(cx).as_deref(), Some(legacy), "the machine's copy matches what was saved");
+}
+
+// --- r5 review probes (#214 M1) ------------------------------------------------------------
+//
+// `MachinePrefs::persist` used to insert a `set_then` candidate into its in-memory `values`
+// before the write even started, and left it there on a failed write: `MapState::new` reads
+// `MachinePrefs` directly, so a module disable/enable after an unconfirmed (or failed)
+// migration could adopt a legacy Allow that was never actually durable (P214a), and a later
+// successful write of an unrelated key (here, Preferences' own "appearance.mode") would
+// persist that unconfirmed merge to disk regardless (P214b).
+
+/// P214a: after a migration that never confirmed (the store is in memory only, so
+/// `set_then` always fails), disabling and re-enabling the Map module — a fresh
+/// `MapState::new` — must still not allow the legacy host. Before the fix, the failed
+/// candidate was already sitting in `MachinePrefs`'s cache, so the fresh state adopted it.
+#[gpui_kit::test]
+fn probe_r5_module_reload_after_failed_migration_does_not_allow_legacy_host(cx: &mut TestAppContext) {
+    let dir = TempDir::new("r5-map-reload");
+    let fake = Arc::new(FakeTiles::default());
+    cx.update(|cx| cx.set_global(MapTiles(fake.clone())));
+    let app = start(cx);
+    open_catalog_with_photos(&app, &dir, 1, cx);
+    seed_b(&app);
+    work(&app, cx);
+    cx.update(|cx| ModuleRegistry::enable(&app.wired.modules, MAP_MODULE_ID, cx));
+    work(&app, cx);
+    let state = map_state_via_settings(&app, cx);
+    assert!(state.read_with(cx, |s, _| s.host_consent().is_empty()), "precondition: not merged");
+    assert_eq!(machine_hosts(cx), None, "precondition: nothing in MachinePrefs's cache either");
+
+    cx.update(|cx| ModuleRegistry::disable(&app.wired.modules, MAP_MODULE_ID, cx));
+    work(&app, cx);
+    cx.update(|cx| ModuleRegistry::enable(&app.wired.modules, MAP_MODULE_ID, cx));
+    work(&app, cx);
+    let state = map_state_via_settings(&app, cx);
+    let b = state.read_with(cx, |s, _| s.host_consent().get("b.example"));
+    assert_ne!(b, Consent::Allowed, "the unconfirmed legacy Allow must not reach a fresh MapState");
+}
+
+/// P214b: a transient write failure, then an unrelated `MachinePrefs::set` (Preferences'
+/// "appearance.mode") that succeeds, must not persist the unconfirmed merge to disk — its
+/// candidate was never in `values` to ride along on that later, unrelated write.
+#[gpui_kit::test]
+fn probe_r5_unrelated_pref_write_does_not_persist_an_unconfirmed_merge(cx: &mut TestAppContext) {
+    let dir = TempDir::new("r5-map-flaky");
+    cx.update(|cx| cx.set_global(MapTiles(Arc::new(FakeTiles::default()))));
+    let app = start(cx);
+    let blocker = dir.0.join("blocker");
+    std::fs::write(&blocker, "x").unwrap();
+    let prefs = blocker.join(MACHINE_PREFS_FILE);
+    cx.update(|cx| cx.set_global(MachinePrefs::load(prefs.clone())));
+    open_catalog_with_photos(&app, &dir, 1, cx);
+    seed_b(&app);
+    work(&app, cx);
+    cx.update(|cx| ModuleRegistry::enable(&app.wired.modules, MAP_MODULE_ID, cx));
+    work(&app, cx);
+    let state = map_state_via_settings(&app, cx);
+    assert!(state.read_with(cx, |s, _| s.host_consent().is_empty()), "precondition: not merged");
+
+    std::fs::remove_file(&blocker).unwrap();
+    cx.update(|cx| MachinePrefs::set(cx, "appearance.mode", "standard"));
+    work(&app, cx);
+    let on_disk = MachinePrefs::load(prefs).get(MACHINE_TILE_HOSTS).map(str::to_string);
+    assert!(on_disk.is_none_or(|j| !j.contains("b.example")), "the unconfirmed merge must not be persisted by an unrelated write");
+    assert_eq!(
+        state.read_with(cx, |s, _| s.host_consent().get("b.example")),
+        Consent::Unknown,
+        "and still not adopted in memory"
+    );
 }
 
 /// Answers stored per catalog by the first port move to this machine on each catalog's
@@ -544,10 +614,11 @@ fn an_undurable_store_never_merges_the_catalogs_legacy_allow(prefs: Prefs, cx: &
     assert!(state.read_with(cx, |s, _| s.consent_write_error().is_some()), "the failed write is surfaced");
     assert_eq!(m.setting(LEGACY_HOSTS).as_deref(), Some(B_LEGACY), "the catalog kept its old answer");
     if let Some(path) = &prefs_path {
-        // The actual file on disk — not `MachinePrefs`'s own in-memory cache, which `set_then`
-        // fills in with the attempted value before it knows whether the write will land — never
-        // got the merge either.
+        // The actual file on disk never got the merge either — and, since #214 M1, nor does
+        // `MachinePrefs`'s own in-memory cache, which an unconfirmed `set_then` candidate
+        // used to fill in before it knew whether the write would land.
         assert!(!path.exists(), "the write failed: no file, let alone one with the merge");
+        assert_eq!(machine_hosts(cx), None, "nor MachinePrefs's cache");
     }
 
     // A "restart": the same catalog read again, the store still just as broken. Still asks,
@@ -573,8 +644,9 @@ fn an_undurable_store_never_merges_the_catalogs_legacy_allow_when_writes_fail(cx
 
 /// **#214**: unlike the legacy migration, the user's own Allow/Block/Ask again
 /// ([`MapState::set_consent`]) is not held back — it is not an invisible background merge —
-/// but a write that cannot be saved is still surfaced, so the user knows that answer will be
-/// asked again after a restart.
+/// but a write that cannot be saved is still surfaced, so the user knows that answer may not
+/// survive a restart (Preferences' wording no longer claims every answer shown will be
+/// re-asked: an earlier durable one is unaffected by this failure).
 #[gpui_kit::test]
 fn a_failed_set_consent_write_still_applies_but_is_surfaced(cx: &mut TestAppContext) {
     let dir = TempDir::new("map-set-consent-fail");
@@ -701,7 +773,10 @@ fn ask_again_survives_a_reread_after_a_switch_interrupted_the_clear(cx: &mut Tes
     // The reads run and land; the merge queues the machine's write (and, after it, the clear).
     cx.update(|cx| Runner::get(cx).run_pending());
     cx.run_until_parked();
-    assert_eq!(machine_hosts(cx).as_deref(), Some(B_LEGACY), "merged");
+    // #214 M1: computed and queued, but not yet confirmed durable — so not yet in
+    // `MachinePrefs`'s own cache either (`migrate_consent` uses `set_confirmed_then`
+    // precisely so this moment cannot be mistaken for "merged").
+    assert_eq!(machine_hosts(cx), None, "not yet confirmed");
     assert!(cx.update(|cx| Runner::get(cx).pending()) > 0, "the write and the clear are still queued");
     // The core switches before they run (`catalog:switched` not delivered yet).
     let (other, _) = colliding_catalog(&dir, "other", 1);

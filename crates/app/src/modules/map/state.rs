@@ -420,17 +420,22 @@ impl MapState {
     /// later change in Preferences is not undone by the next read.
     ///
     /// The merge is applied to this machine's answers, and the catalog's copy emptied, only
-    /// **after** the machine's copy is confirmed on disk ([`MachinePrefs::set_then`], off the
-    /// UI thread) — never optimistically (#214): a store that cannot durably remember the
-    /// merge (in memory only, or a write that fails) must not apply it in memory either, or
-    /// a restart — which finds the store empty again — replays the merge forever, silently
-    /// re-allowing a host the user reset in a session just as undurable. On failure the
-    /// catalog keeps its answers (gate #119) and the next read tries again, unmerged in the
-    /// meantime: the affected hosts simply keep asking, and [`Self::consent_write_error`]
-    /// says why. The copy also survives when a switch lands before the clear, which
-    /// `with_catalog_as(from)` then refuses. A successful re-merge must not undo the user's
-    /// "Ask again" meanwhile: that is stored as an explicit "ask" entry
-    /// ([`HostConsent::forget`]), which the merge leaves alone (#198).
+    /// **after** the machine's copy is confirmed on disk
+    /// ([`MachinePrefs::set_confirmed_then`], off the UI thread) — never optimistically
+    /// (#214): a store that cannot durably remember the merge (in memory only, or a write
+    /// that fails) must not apply it in memory either, or a restart — which finds the store
+    /// empty again — replays the merge forever, silently re-allowing a host the user reset
+    /// in a session just as undurable. `set_confirmed_then`, not plain `set_then`, matters
+    /// here specifically (#214 M1): unlike `set_consent`'s own answers, which the user sees
+    /// applied at once, this merge must not even reach `MachinePrefs`'s own cache — readable
+    /// by a fresh [`Self::new`] after a module reload, or ridden along on a later write of
+    /// an unrelated key — before its own write actually lands. On failure the catalog keeps
+    /// its answers (gate #119) and the next read tries again, unmerged in the meantime: the
+    /// affected hosts simply keep asking, and [`Self::consent_write_error`] says why. The
+    /// copy also survives when a switch lands before the clear, which `with_catalog_as(from)`
+    /// then refuses. A successful re-merge must not undo the user's "Ask again" meanwhile:
+    /// that is stored as an explicit "ask" entry ([`HostConsent::forget`]), which the merge
+    /// leaves alone (#198).
     fn migrate_consent(&mut self, from: CatalogIdentity, legacy: Option<&str>, cx: &mut Context<Self>) {
         let legacy = HostConsent::parse(legacy);
         if legacy.is_empty() {
@@ -446,7 +451,7 @@ impl MapState {
         let json = merged.to_json();
         let (app, key) = (self.app.clone(), self.settings.key(TILE_HOSTS_KEY));
         let (tx, rx) = futures::channel::oneshot::channel();
-        MachinePrefs::set_then(cx, MACHINE_TILE_HOSTS, &json, move |saved| {
+        MachinePrefs::set_confirmed_then(cx, MACHINE_TILE_HOSTS, &json, move |saved| {
             // Still off the UI thread, same as before #214: the clear is catalog I/O, and
             // only happens once the write is confirmed. `tx` just reports the outcome back so
             // the in-memory answers change only once the merge is durable too.

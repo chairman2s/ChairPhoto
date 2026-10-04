@@ -142,7 +142,8 @@ pub struct BundleBatch {
 }
 
 /// One photo in the bundle, keyed by its `photos.uuid`. Carries the non-destructive
-/// state that merges additively (matched by UUID; existing rows are never touched).
+/// state that merges additively (matched by UUID; an existing row keeps its values and has
+/// only its blanks filled, #185).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BundlePhoto {
@@ -160,7 +161,8 @@ pub struct BundlePhoto {
     /// Culling pick state.
     #[serde(default = "default_pick_state")]
     pub pick_state: PickState,
-    /// User-authored IPTC Core fields (only applied to brand-new photos on merge).
+    /// User-authored IPTC Core fields: all of them for a photo new to the catalog, only the
+    /// ones it (and its sidecar) has no value for on an existing photo (#185).
     #[serde(default)]
     pub iptc: IptcFields,
     /// The photo-level opaque edit record (`photo_edits.edit_json`), if any. Opaque to
@@ -168,7 +170,8 @@ pub struct BundlePhoto {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub edit_record: Option<String>,
     /// Named non-destructive versions (`photo_versions`), each with its opaque
-    /// `edit_json`. Ordered by `position`.
+    /// `edit_json`. Ordered by `position`. An existing photo gains them (and the edit record)
+    /// as new versions after its own, unless it already has those settings (#185).
     #[serde(default)]
     pub versions: Vec<BundleVersion>,
     /// Tag assignments **by tag UUID** (references entries in [`BundleManifest::taxonomy`]).

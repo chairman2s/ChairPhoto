@@ -127,7 +127,8 @@ fn scan_nas_folder_in(
 }
 
 /// The photos on a card/source folder, each flagged as a duplicate when the library already
-/// holds a same-size file at its date-tree destination. Filesystem and metadata only.
+/// holds it at its date-tree destination (the same name, size and capture, #246). Filesystem
+/// and metadata only.
 pub fn list_card_photos(state: &AppState, source: &Path) -> Result<Vec<crate::scanner::CardPhoto>, String> {
     let dest = library_root(state)?;
     crate::scanner::list_card_photos(source, &dest)

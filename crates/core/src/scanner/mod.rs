@@ -6,10 +6,12 @@
 
 use crate::catalog::Catalog;
 use crate::metadata::extract_batch;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use walkdir::WalkDir;
 
+pub mod same_photo;
 pub mod sidecars;
 
 /// Commit a scan's writes every this many files rather than in one giant transaction, so
@@ -45,7 +47,8 @@ pub struct ScanResult {
     pub imported: usize,
     pub created: usize,
     pub errors: usize,
-    /// Ingest only: source files already present at the destination (same size), skipped.
+    /// Ingest only: source files the library already holds at their destination (the same
+    /// name, size and capture, #246), skipped.
     pub skipped: usize,
 }
 
@@ -533,8 +536,8 @@ pub struct CopiedItem {
 /// `dest_base` under a `YYYY/MM/DD` tree (by capture date, falling back to file mtime),
 /// keeping camera filenames, then index the copies, batch them, and auto-enqueue backup.
 /// Unlike scan-in-place, this COPIES files. `dest_base` must be under the catalog root.
-/// See docs/storage-and-import.md (Import). A destination collision with the same byte
-/// size is treated as already-imported (skipped); a different size gets a " (n)" name.
+/// See docs/storage-and-import.md (Import). A destination collision that is the same capture
+/// (#246, [`same_photo`]) is already imported and skipped; any other gets a " (n)" name.
 ///
 /// This is a convenience wrapper over the two phases [`copy_from_card`] (heavy, no
 /// catalog) and [`index_ingested`] (brief catalog work). `app::scans::ingest_from_card_claimed`
@@ -557,13 +560,15 @@ pub struct CardPhoto {
     pub name: String,
     pub size: i64,
     pub capture_time: Option<String>,
-    /// A same-size file already exists at this photo's computed destination.
+    /// The library already holds this photo at its computed destination: a file of the same
+    /// name and size there is the same capture (#246, [`same_photo`]).
     pub is_duplicate: bool,
 }
 
-/// List the importable photos on a card/source folder, flagging each as a duplicate when a
-/// same-size file already exists at its computed date-tree destination under `dest_base`.
-/// Filesystem + metadata only — no catalog access; call off the UI thread.
+/// List the importable photos on a card/source folder, flagging each as a duplicate when the
+/// library already holds it at its computed date-tree destination under `dest_base`, by the
+/// same rule the copy uses (#246, [`same_photo`]). Filesystem + metadata only — no catalog
+/// access; call off the UI thread.
 pub fn list_card_photos(source: &Path, dest_base: &Path) -> Result<Vec<CardPhoto>, String> {
     if !source.is_dir() {
         return Err(format!("Not a directory: {}", source.display()));
@@ -576,36 +581,24 @@ pub fn list_card_photos(source: &Path, dest_base: &Path) -> Result<Vec<CardPhoto
         .filter(|p| p.is_file() && is_supported_image(p))
         .collect();
     let meta = extract_batch(&sources);
+    // The copy's own plan, earlier files of the listing included: a file the copy would skip
+    // as the same photo as one it copies first is flagged too (#246 review, N-a).
+    let planned = plan_card(&sources, &meta, dest_base);
+    let duplicates = already_imported(&sources, planned.iter().map(|p| &p.candidates), &AtomicBool::new(false))
+        .unwrap_or_default();
     let mut out: Vec<CardPhoto> = sources
         .iter()
-        .map(|src| {
-            let capture = meta.get(src).and_then(|m| m.promoted.capture_time.clone());
-            let md = std::fs::metadata(src).ok();
-            let size = md.as_ref().map(|m| m.len() as i64).unwrap_or(0);
-            let mtime_secs = md
-                .and_then(|m| m.modified().ok())
-                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                .map(|d| d.as_secs() as i64)
-                .unwrap_or(0);
-            let is_duplicate = src
+        .zip(planned)
+        .enumerate()
+        .map(|(i, (src, CardPlan { capture, size, .. }))| CardPhoto {
+            path: src.to_string_lossy().into_owned(),
+            name: src
                 .file_name()
-                .map(|f| {
-                    dest_base
-                        .join(date_subdir(capture.as_deref(), mtime_secs))
-                        .join(f)
-                })
-                .map(|d| d.exists() && same_len(src, &d))
-                .unwrap_or(false);
-            CardPhoto {
-                path: src.to_string_lossy().into_owned(),
-                name: src
-                    .file_name()
-                    .map(|f| f.to_string_lossy().into_owned())
-                    .unwrap_or_default(),
-                size,
-                capture_time: capture,
-                is_duplicate,
-            }
+                .map(|f| f.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+            size: size as i64,
+            capture_time: capture,
+            is_duplicate: duplicates.get(i).is_some_and(|found| !found.is_empty()),
         })
         .collect();
     out.sort_by(|a, b| a.name.cmp(&b.name));
@@ -659,9 +652,19 @@ pub fn copy_from_card_abortable(
     // One metadata pass on the source files — reused for the capture date AND indexing.
     let mut meta = extract_batch(&sources);
 
+    // Which collisions are the same photo is read in one batched pass before anything is
+    // copied.
+    let planned = plan_card(&sources, &meta, dest_base);
+    let Some(imported_before) = already_imported(&sources, planned.iter().map(|p| &p.candidates), abort) else {
+        return Ok((ScanResult::default(), Vec::new(), true));
+    };
+
     let mut result = ScanResult::default();
     let mut copied: Vec<CopiedItem> = Vec::new();
-    for src in &sources {
+    // The files of this run that are in the library now: copied, or found there already.
+    let mut in_library: HashSet<&PathBuf> = HashSet::new();
+    let this_run: HashSet<&PathBuf> = sources.iter().collect();
+    for ((src, CardPlan { dir, .. }), before) in sources.iter().zip(planned).zip(imported_before) {
         if abort.load(Ordering::Relaxed) {
             return Ok((result, copied, true));
         }
@@ -669,14 +672,15 @@ pub fn copy_from_card_abortable(
         progress(result.scanned, total);
         // Take ownership of this file's metadata so it travels to the index phase.
         let m = meta.remove(src);
-        let capture = m.as_ref().and_then(|m| m.promoted.capture_time.clone());
-        let mtime_secs = std::fs::metadata(src)
-            .ok()
-            .and_then(|md| md.modified().ok())
-            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-            .map(|d| d.as_secs() as i64)
-            .unwrap_or(0);
-        let dir = dest_base.join(date_subdir(capture.as_deref(), mtime_secs));
+        // The same photo as a library file, or as an earlier file of this run that made it
+        // into the library (one that failed to copy does not count): any of them, not only
+        // the first found — that one may be a file of the run that failed to copy.
+        let same_photo_imported = before.iter().any(|p| !this_run.contains(p) || in_library.contains(p));
+        if same_photo_imported {
+            result.skipped += 1; // this capture is already in the library
+            in_library.insert(src);
+            continue;
+        }
         if std::fs::create_dir_all(&dir).is_err() {
             result.errors += 1;
             continue;
@@ -685,29 +689,65 @@ pub fn copy_from_card_abortable(
             result.errors += 1;
             continue;
         };
-        let mut dest = dir.join(filename);
-        if dest.exists() {
-            if same_len(src, &dest) {
-                result.skipped += 1; // identical-size copy already present
-                continue;
-            }
-            // Different content under the same name → keep both, or error if we somehow
-            // can't find a free name (never overwrite).
-            match unique_dest(&dest) {
-                Some(p) => dest = p,
-                None => {
-                    result.errors += 1;
-                    continue;
-                }
-            }
-        }
-        if std::fs::copy(src, &dest).is_err() {
+        // A different photo under a name already used is kept beside it as ` (n)`, or an
+        // error if no free name is found — never an overwrite, even of a file placed there
+        // after the name was found free. The copy keeps the source's permissions, as
+        // `fs::copy` did.
+        let placed = same_photo::create_new_file(&dir.join(filename), |out| {
+            let mut input = std::fs::File::open(src)?;
+            std::io::copy(&mut input, out)?;
+            out.set_permissions(input.metadata()?.permissions())
+        });
+        let Ok(dest) = placed else {
             result.errors += 1;
             continue;
-        }
+        };
+        in_library.insert(src);
         copied.push(CopiedItem { dest, meta: m });
     }
     Ok((result, copied, false))
+}
+
+/// Where a card's file goes, and the files it may already be (#246).
+struct CardPlan {
+    /// The date folder under the destination.
+    dir: PathBuf,
+    capture: Option<String>,
+    size: u64,
+    /// The same-size library files of its name there, then the earlier files of this run
+    /// bound for the same name at that size — one photo met twice on the card (two folders
+    /// holding the same file) is copied once.
+    candidates: Vec<PathBuf>,
+}
+
+/// [`CardPlan`] for each of `sources`, in order: the one plan both the copy
+/// ([`copy_from_card_abortable`]) and the import dialog's listing ([`list_card_photos`])
+/// decide by, so the dialog's "already imported" agrees with what the copy skips. Nothing is
+/// copied while planning, so each folder is listed once for the whole plan.
+fn plan_card(
+    sources: &[PathBuf],
+    meta: &HashMap<PathBuf, crate::metadata::PhotoMetadata>,
+    dest_base: &Path,
+) -> Vec<CardPlan> {
+    let mut listings = same_photo::FolderListings::default();
+    let mut bound_for: HashMap<(PathBuf, u64), Vec<PathBuf>> = HashMap::new();
+    sources
+        .iter()
+        .map(|src| {
+            let capture = meta.get(src).and_then(|m| m.promoted.capture_time.clone());
+            let md = std::fs::metadata(src).ok();
+            let dir = dest_base.join(date_subdir(capture.as_deref(), mtime_secs(md.as_ref())));
+            let size = md.map(|m| m.len()).unwrap_or(0);
+            let Some(dest) = src.file_name().map(|f| dir.join(f)) else {
+                return CardPlan { dir, capture, size, candidates: Vec::new() };
+            };
+            let mut candidates = listings.same_size_candidates(&dest, size);
+            let earlier = bound_for.entry((dest, size)).or_default();
+            candidates.extend(earlier.iter().cloned());
+            earlier.push(src.clone());
+            CardPlan { dir, capture, size, candidates }
+        })
+        .collect()
 }
 
 /// What an abortable indexing pass ([`index_ingested_abortable`],
@@ -921,34 +961,37 @@ fn date_subdir(capture: Option<&str>, mtime_secs: i64) -> String {
         .unwrap_or_else(|| "unknown-date".into())
 }
 
-fn same_len(a: &Path, b: &Path) -> bool {
-    match (std::fs::metadata(a), std::fs::metadata(b)) {
-        (Ok(a), Ok(b)) => a.len() == b.len(),
-        _ => false,
-    }
+/// A file's mtime in seconds since the epoch, 0 when unknown.
+fn mtime_secs(md: Option<&std::fs::Metadata>) -> i64 {
+    md.and_then(|m| m.modified().ok())
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
 }
 
-/// A destination path that doesn't exist yet (`name (2).ext`, …), or `None` if no free
-/// name was found — the caller must then NOT copy (never overwrite an existing file).
-fn unique_dest(path: &Path) -> Option<PathBuf> {
-    if !path.exists() {
-        return Some(path.to_path_buf());
+/// For each of `sources`, every file among its `candidates` that is the same photo (#246,
+/// [`same_photo::find_already_imported`]); only sources with candidates are read. `None`
+/// once `abort` is set.
+fn already_imported<'a>(
+    sources: &[PathBuf],
+    candidates: impl Iterator<Item = &'a Vec<PathBuf>>,
+    abort: &AtomicBool,
+) -> Option<Vec<Vec<PathBuf>>> {
+    let mut out = vec![Vec::new(); sources.len()];
+    let (index, arrivals): (Vec<usize>, Vec<same_photo::Arrival>) = sources
+        .iter()
+        .zip(candidates)
+        .enumerate()
+        .filter(|(_, (_, c))| !c.is_empty())
+        .map(|(i, (src, c))| (i, same_photo::Arrival { file: src.clone(), candidates: c.clone() }))
+        .unzip();
+    if arrivals.is_empty() {
+        return Some(out);
     }
-    let dir = path.parent().unwrap_or_else(|| Path::new("."));
-    let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("file");
-    let ext = path.extension().and_then(|s| s.to_str());
-    for n in 2..10_000 {
-        let mut name = format!("{stem} ({n})");
-        if let Some(ext) = ext {
-            name.push('.');
-            name.push_str(ext);
-        }
-        let candidate = dir.join(name);
-        if !candidate.exists() {
-            return Some(candidate);
-        }
+    for (i, found) in index.into_iter().zip(same_photo::find_already_imported(&arrivals, abort)?) {
+        out[i] = found;
     }
-    None
+    Some(out)
 }
 
 /// Upsert one photo, returning (photo_id, created, unchanged). `unchanged` is true when
@@ -1042,5 +1085,225 @@ mod tests {
         assert!(!is_supported_image(Path::new("DSC1.rrdata")));
         // Sanity: the RAW it sits next to *is* supported.
         assert!(is_supported_image(Path::new("DSC1.ARW")));
+    }
+
+    // --- card ingest: same name, same size (#246) ------------------------------------------
+
+    use same_photo::test_files::{exiftool_available, stamped_jpeg};
+
+    fn ingest_rig(tag: &str) -> (Catalog, crate::test_support::TestTmpDir, PathBuf, PathBuf) {
+        let dir = crate::test_support::TestTmpDir::new(&format!("ingest-246-{tag}"));
+        let root = dir.join("photos");
+        std::fs::create_dir_all(&root).unwrap();
+        let catalog = Catalog::open(&dir.join("test.chairphoto"), &root).unwrap();
+        let card = dir.join("card");
+        (catalog, dir, root, card)
+    }
+
+    fn photos(catalog: &Catalog) -> Vec<(String, String)> {
+        let mut stmt = catalog.conn().prepare("SELECT path, uuid FROM photos ORDER BY path").unwrap();
+        stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?))).unwrap().collect::<Result<_, _>>().unwrap()
+    }
+
+    /// Two bodies wrote `DSC1.jpg` in the same second, at the same byte size: one card holds
+    /// the first (already imported), a second card the other two — one differing in the
+    /// sub-second, one in the serial. Both are different photos: each is kept under a ` (n)`
+    /// name with its own row and UUID, and nothing is overwritten. Importing the cards again
+    /// skips every file, the ` (n)` ones included.
+    #[test]
+    fn a_different_capture_under_a_used_name_is_kept_and_a_second_import_skips_all() {
+        if !exiftool_available("a_different_capture_under_a_used_name_is_kept_and_a_second_import_skips_all") {
+            return;
+        }
+        let (catalog, _dir, root, card) = ingest_rig("kept");
+        let first = card.join("A/DSC1.jpg");
+        let subsec = card.join("B/DSC1.jpg");
+        let serial = card.join("C/DSC1.jpg");
+        stamped_jpeg(&first, "2026:06:28 12:00:00", "123", "4711");
+        stamped_jpeg(&subsec, "2026:06:28 12:00:00", "456", "4711");
+        stamped_jpeg(&serial, "2026:06:28 12:00:00", "123", "4712");
+        let size = |p: &Path| std::fs::metadata(p).unwrap().len();
+        assert!(size(&first) == size(&subsec) && size(&first) == size(&serial), "same size");
+
+        // The first body's photo is in the library already.
+        let only_first: std::collections::HashSet<String> =
+            [first.to_string_lossy().into_owned()].into_iter().collect();
+        let (r, copied) = copy_from_card(&card, &root, Some(&only_first), |_, _| {}).unwrap();
+        index_ingested(&catalog, &root, &card, copied, None, r).unwrap();
+        let library = root.join("2026/06/28/DSC1.jpg");
+        let before = std::fs::read(&library).unwrap();
+
+        let result = ingest_from_card(&catalog, &card, &root, None).unwrap();
+        assert_eq!((result.scanned, result.skipped, result.created), (3, 1, 2), "{result:?}");
+        assert_eq!(std::fs::read(&library).unwrap(), before, "never overwritten");
+        let rows = photos(&catalog);
+        let paths: Vec<&str> = rows.iter().map(|(p, _)| p.as_str()).collect();
+        assert_eq!(paths, ["2026/06/28/DSC1 (2).jpg", "2026/06/28/DSC1 (3).jpg", "2026/06/28/DSC1.jpg"]);
+        let uuids: std::collections::HashSet<&str> = rows.iter().map(|(_, u)| u.as_str()).collect();
+        assert_eq!(uuids.len(), 3, "each photo its own UUID: {rows:?}");
+
+        let again = ingest_from_card(&catalog, &card, &root, None).unwrap();
+        assert_eq!((again.skipped, again.created), (3, 0), "a second import skips all: {again:?}");
+        assert_eq!(photos(&catalog), rows);
+        assert!(!root.join("2026/06/28/DSC1 (4).jpg").exists());
+
+        // The card listing says the same.
+        let listed = list_card_photos(&card, &root).unwrap();
+        assert!(listed.iter().all(|p| p.is_duplicate), "all listed as imported");
+    }
+
+    /// A file with no capture time (here: bytes exiftool cannot read) is decided by its
+    /// contents: the same bytes are skipped, other bytes of the same size kept as ` (2)`.
+    #[test]
+    fn without_a_capture_time_the_contents_decide_a_collision() {
+        let (catalog, _dir, root, card) = ingest_rig("hash");
+        std::fs::create_dir_all(&card).unwrap();
+        std::fs::write(card.join("IMG.jpg"), b"\xff\xd8one").unwrap();
+        let first = ingest_from_card(&catalog, &card, &root, None).unwrap();
+        assert_eq!(first.created, 1);
+        let again = ingest_from_card(&catalog, &card, &root, None).unwrap();
+        assert_eq!((again.skipped, again.created), (1, 0), "identical bytes: skipped");
+
+        std::fs::write(card.join("IMG.jpg"), b"\xff\xd8two").unwrap();
+        let other = ingest_from_card(&catalog, &card, &root, None).unwrap();
+        assert_eq!((other.skipped, other.created), (0, 1), "other bytes: kept");
+        let copies: Vec<PathBuf> = WalkDir::new(&root)
+            .into_iter()
+            .filter_map(|e| e.ok())
+            .map(|e| e.into_path())
+            .filter(|p| p.extension().is_some_and(|e| e == "jpg"))
+            .collect();
+        assert_eq!(copies.len(), 2, "{copies:?}");
+        assert!(copies.iter().any(|p| p.ends_with("IMG (2).jpg")));
+    }
+
+    /// L-1 of the #246 review: one photo met twice in a run — the same file in two folders of
+    /// the card — is copied once and the second skipped, as before #246; a different photo
+    /// of that name and size in the same run is still kept as ` (2)`.
+    #[test]
+    fn the_same_photo_twice_on_one_card_is_copied_once() {
+        let (catalog, _dir, root, card) = ingest_rig("twice");
+        for (folder, bytes) in [("A", b"\xff\xd8one"), ("B", b"\xff\xd8one"), ("C", b"\xff\xd8two")] {
+            std::fs::create_dir_all(card.join(folder)).unwrap();
+            std::fs::write(card.join(folder).join("IMG.jpg"), bytes).unwrap();
+        }
+        let result = ingest_from_card(&catalog, &card, &root, None).unwrap();
+        assert_eq!((result.scanned, result.skipped, result.created), (3, 1, 2), "{result:?}");
+        // The walk's order decides which of the two photos keeps the plain name.
+        let (mut names, mut contents): (Vec<String>, Vec<Vec<u8>>) = WalkDir::new(&root)
+            .into_iter()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().extension().is_some_and(|x| x == "jpg"))
+            .map(|e| (e.file_name().to_string_lossy().into_owned(), std::fs::read(e.path()).unwrap()))
+            .unzip();
+        names.sort();
+        contents.sort();
+        assert_eq!(names, ["IMG (2).jpg", "IMG.jpg"]);
+        assert_eq!(contents, [b"\xff\xd8one".to_vec(), b"\xff\xd8two".to_vec()]);
+        let again = ingest_from_card(&catalog, &card, &root, None).unwrap();
+        assert_eq!((again.skipped, again.created), (3, 0), "{again:?}");
+    }
+
+    /// M-a of the second #246 review: an orphan sidecar (another tool's, with an identifier;
+    /// its original gone) at the name a card's file would take is not adopted: the file goes
+    /// to the next name whose sidecar's name is free too, gets a fresh identity of its own,
+    /// and the orphan is untouched.
+    #[test]
+    fn a_card_file_never_lands_beside_an_orphan_sidecar() {
+        const ORPHAN_ID: &str = "11111111-1111-4111-8111-111111111111";
+        let (catalog, _dir, root, card) = ingest_rig("orphan");
+        std::fs::create_dir_all(&card).unwrap();
+        let src = card.join("IMG.jpg");
+        std::fs::write(&src, b"\xff\xd8one").unwrap();
+        // A fixed mtime, so the date folder is known.
+        let mtime = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_782_648_000);
+        std::fs::File::options().write(true).open(&src).unwrap().set_modified(mtime).unwrap();
+        let dir = root.join(date_subdir(None, mtime_secs(std::fs::metadata(&src).ok().as_ref())));
+        std::fs::create_dir_all(&dir).unwrap();
+        let orphan = dir.join("IMG.jpg.xmp");
+        let orphan_xml = format!(
+            r#"<x:xmpmeta xmlns:x="adobe:ns:meta/"><rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"><rdf:Description rdf:about="" xmlns:xmp="http://ns.adobe.com/xap/1.0/" xmp:Rating="5" xmp:Identifier="{ORPHAN_ID}"/></rdf:RDF></x:xmpmeta>"#
+        );
+        std::fs::write(&orphan, &orphan_xml).unwrap();
+
+        let result = ingest_from_card(&catalog, &card, &root, None).unwrap();
+        assert_eq!(result.created, 1, "{result:?}");
+        assert!(!dir.join("IMG.jpg").exists(), "nothing placed beside the orphan");
+        let rows = photos(&catalog);
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].0.ends_with("/IMG (2).jpg"), "{rows:?}");
+        assert_ne!(rows[0].1, ORPHAN_ID, "the orphan's identity is not adopted");
+        assert_eq!(std::fs::read_to_string(&orphan).unwrap(), orphan_xml);
+    }
+
+    /// L-e of the second #246 review: one photo met three times in a run, the first copy
+    /// failing. The second is copied (the first is not in the library), and the third is
+    /// skipped against the second — not copied again because the first match it meets is the
+    /// failed one.
+    #[cfg(unix)]
+    #[test]
+    fn a_photo_met_again_after_a_failed_copy_is_skipped_against_the_copy_that_landed() {
+        use std::os::unix::fs::PermissionsExt;
+        let (_catalog, _dir, root, card) = ingest_rig("failed-first");
+        let mtime = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_782_648_000);
+        let files: Vec<PathBuf> = ["A", "B", "D"].iter().map(|f| card.join(f).join("IMG.jpg")).collect();
+        for f in &files {
+            std::fs::create_dir_all(f.parent().unwrap()).unwrap();
+            std::fs::write(f, b"\xff\xd8one").unwrap();
+            std::fs::File::options().write(true).open(f).unwrap().set_modified(mtime).unwrap();
+        }
+        let set_mode = |mode: u32| {
+            for f in &files {
+                std::fs::set_permissions(f, std::fs::Permissions::from_mode(mode)).unwrap();
+            }
+        };
+        // Whichever file the walk meets first cannot be read when it is copied (after the
+        // plan read them all); the others can.
+        let (result, copied, _) = copy_from_card_abortable(&card, &root, None, &AtomicBool::new(false), |done, _| {
+            match done {
+                1 => set_mode(0o000),
+                2 => set_mode(0o644),
+                _ => {}
+            }
+        })
+        .unwrap();
+        set_mode(0o644);
+        assert_eq!((result.scanned, result.errors, result.skipped, copied.len()), (3, 1, 1, 1), "{result:?}");
+        let copies: Vec<PathBuf> = WalkDir::new(&root)
+            .into_iter()
+            .filter_map(|e| e.ok())
+            .map(|e| e.into_path())
+            .filter(|p| p.is_file())
+            .collect();
+        assert_eq!(copies.len(), 1, "{copies:?}");
+        assert!(copies[0].ends_with("IMG.jpg"));
+    }
+
+    /// N-a of the second #246 review: the import dialog's listing flags the second meeting of
+    /// one photo in a card as already imported, as the copy skips it (both decide by one plan,
+    /// `plan_card`).
+    #[test]
+    fn the_listing_flags_what_the_copy_skips() {
+        let (_catalog, _dir, root, card) = ingest_rig("listing");
+        for folder in ["A", "B"] {
+            std::fs::create_dir_all(card.join(folder)).unwrap();
+            std::fs::write(card.join(folder).join("IMG.jpg"), b"\xff\xd8one").unwrap();
+        }
+        let flagged: Vec<String> =
+            list_card_photos(&card, &root).unwrap().into_iter().filter(|p| p.is_duplicate).map(|p| p.path).collect();
+        assert_eq!(flagged.len(), 1, "{flagged:?}");
+        let (result, copied) = copy_from_card(&card, &root, None, |_, _| {}).unwrap();
+        assert_eq!((result.skipped, copied.len()), (1, 1));
+    }
+
+    /// An abort while the collisions are being read copies nothing.
+    #[test]
+    fn an_abort_before_the_copy_copies_nothing() {
+        let (_catalog, _dir, root, card) = ingest_rig("abort");
+        std::fs::create_dir_all(&card).unwrap();
+        std::fs::write(card.join("IMG.jpg"), b"\xff\xd8one").unwrap();
+        let (_, copied, aborted) =
+            copy_from_card_abortable(&card, &root, None, &AtomicBool::new(true), |_, _| {}).unwrap();
+        assert!(aborted && copied.is_empty());
     }
 }

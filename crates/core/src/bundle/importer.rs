@@ -6,9 +6,13 @@
 //!
 //! 1. **Parse** — open the zip, read `manifest.json`, validate `format_version`.
 //! 2. **Copy** (off the catalog lock, slow) — extract each `originals/<relative_path>`
-//!    into `<root>/YYYY/MM/DD/<filename>`, using E5's collision rules:
-//!    - Same-size file at the destination → already imported, skip.
-//!    - Different-size collision → rename with ` (n)` suffix (never overwrite).
+//!    into `<root>/YYYY/MM/DD/<filename>`, using card ingest's collision rules (#246):
+//!    - A same-name, same-size file there that is the same capture (EXIF capture time,
+//!      sub-second, camera serial; the contents when neither has a capture time) →
+//!      already imported, skip.
+//!    - Any other collision → rename with ` (n)` suffix (never overwrite).
+//!    A collision is decided against the original's bytes in memory, never by unpacking
+//!    them beside the library file first.
 //!    Sidecars (`<entry>.xmp`) are extracted beside their original.
 //!    Progress events (`import:progress {done, total}`) stream the copy phase.
 //! 3. **Index** (on a secondary connection, off the main catalog lock) — call
@@ -41,7 +45,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 pub struct BundleImportResult {
     /// Photos copied from the bundle originals (new to the filesystem).
     pub copied: usize,
-    /// Originals skipped because a same-size file already existed at the destination.
+    /// Originals skipped because the library already held them at their destination (the
+    /// same name, size and capture, #246).
     pub skipped_duplicate: usize,
     /// Originals that encountered a non-fatal error during extraction (metadata-only).
     pub errors: usize,
@@ -99,15 +104,22 @@ pub struct ExtractedItem {
     pub photo_uuid: String,
     /// The catalog-root-relative logical path from the manifest (for the date tree).
     pub relative_path: String,
+    /// `dest` was in the library before this import: the same capture, found there and not
+    /// copied (#246). Its sidecar is the owner's, so the index phase binds an identity to it
+    /// only when no row of another identity holds the file ([`index_bundle`]).
+    pub already_in_library: bool,
 }
 
 /// Extract originals from `archive` into `dest_base` under a `YYYY/MM/DD` tree,
 /// mirroring the `ORIGINALS_DIR/<relative_path>` archive entries. Sidecars
 /// (`<entry>.xmp`) are extracted beside their original.
 ///
-/// Collision rules (E5 parity):
-/// - Same-size file already at the destination → `skipped_duplicate` (no write).
-/// - Different-size collision → ` (n)` suffix (never overwrite).
+/// Collision rules (card ingest's, #246 — `scanner::same_photo`):
+/// - A file of the same name and size at the destination (or at one of the ` (n)` names an
+///   earlier import gave a different photo of that name) that is the same capture — EXIF
+///   capture time, sub-second and camera serial agree, or, with no capture time on either
+///   side, the contents — is this photo, already imported → `skipped_duplicate` (no write).
+/// - Any other collision → ` (n)` suffix (never overwrite).
 ///
 /// `on_progress(done, total)` is called once per original (including skipped/error)
 /// so the caller can stream `import:progress` events.
@@ -127,11 +139,17 @@ pub fn extract_originals(
 ///
 /// A stop never leaves a half-written file: `abort` is read between originals, and each
 /// original is written whole. What was unpacked before the stop **stays** in the library
-/// folder, each copy with its identity sidecar, and nothing is deleted. A same-size
-/// "already here" entry may be the user's own pre-existing original, and this function will
-/// not decide which files it may remove. Importing the bundle again finishes the job: the
-/// copies are then same-size skips, bound by UUID and indexed. A rescan also picks them up
-/// under the bundle's identity.
+/// folder, each copy with its identity sidecar, and nothing is deleted. An "already here"
+/// entry may be the user's own pre-existing original, and this function will not decide
+/// which files it may remove. Importing the bundle again finishes the job: the copies are
+/// then the same captures at their names, skipped, bound by UUID and indexed. A rescan also
+/// picks them up under the bundle's identity.
+///
+/// A collision is decided as each original comes out of the bundle, against its bytes in
+/// memory ([`same_photo::find_in_library`](crate::scanner::same_photo::find_in_library)):
+/// the manifest carries no capture time or serial, and the bytes are never written anywhere
+/// to be compared, so re-importing a bundle the library already holds writes nothing to the
+/// library's disk.
 pub fn extract_originals_abortable(
     manifest: &BundleManifest,
     archive: &mut ZipArchive<std::fs::File>,
@@ -139,6 +157,8 @@ pub fn extract_originals_abortable(
     abort: &std::sync::atomic::AtomicBool,
     on_progress: impl Fn(usize, usize),
 ) -> Result<(Vec<ExtractedItem>, BundleImportResult, bool), String> {
+    use crate::scanner::same_photo;
+
     let total = manifest.photos.len();
     let mut result = BundleImportResult {
         copied: 0,
@@ -147,6 +167,8 @@ pub fn extract_originals_abortable(
         merge: MergeSummary::default(),
     };
     let mut extracted: Vec<ExtractedItem> = Vec::new();
+    // Each date folder is listed once for the unpack, and told of every name placed in it.
+    let mut listings = same_photo::FolderListings::default();
 
     for (i, bp) in manifest.photos.iter().enumerate() {
         if abort.load(std::sync::atomic::Ordering::Relaxed) {
@@ -217,122 +239,117 @@ pub fn extract_originals_abortable(
             continue;
         }
 
-        let mut dest = dir.join(filename);
+        let dest = dir.join(filename);
 
-        // Collision rules (E5 parity): same-size → skip; different-size → rename.
-        if dest.exists() {
-            let dest_size = std::fs::metadata(&dest).map(|m| m.len()).unwrap_or(u64::MAX);
-            if dest_size == orig_bytes.len() as u64 {
-                // Same-size → already imported, skip the copy.
-                result.skipped_duplicate += 1;
-                // Put the UUID in the sidecar so the upsert can match by it. The file was
-                // here before this import, so it may already carry a *different*
-                // identity — `bind_sidecar_identity` leaves that one alone rather than
-                // overwriting another photo's identity on the strength of a same-size
-                // filename collision. This phase holds no catalog connection, so an
-                // unbound identity is only reported here; index_bundle records it durably.
-                // A blank manifest uuid is no identity (#146 N4): the indexer mints one.
-                if let Some(identity) = crate::catalog::photo_identity_for(&bp.uuid) {
-                    let found = crate::xmp::read_identifier(&dest);
-                    let outcome =
-                        crate::catalog::bind_sidecar_identity(&dest, &identity, found.as_deref());
-                    if outcome != crate::catalog::SidecarIdentity::Bound {
-                        eprintln!(
-                            "bundle import: identity not bound for {} ({outcome:?}) — queued for repair",
-                            dest.display()
-                        );
-                    }
-                }
-                // Still record as extracted so the indexer can upsert its location.
-                extracted.push(ExtractedItem {
-                    dest,
-                    photo_uuid: bp.uuid.clone(),
-                    relative_path: bp.relative_path.clone(),
-                });
-                continue;
-            }
-            // Different-size collision — rename.
-            match unique_dest(&dest) {
-                Some(p) => dest = p,
-                None => {
-                    eprintln!(
-                        "bundle import: couldn't find a free name for {} ({}) — skipped",
-                        bp.uuid, dest.display()
-                    );
-                    result.errors += 1;
-                    continue;
-                }
-            }
-        }
-
-        if let Err(e) = std::fs::write(&dest, &orig_bytes) {
-            eprintln!(
-                "bundle import: write {} failed: {e}", dest.display()
-            );
-            result.errors += 1;
+        // A same-name, same-size file may be this photo, already imported (#246): decided
+        // now, against the bytes in memory.
+        let candidates = listings.same_size_candidates(&dest, orig_bytes.len() as u64);
+        let Some(already) = same_photo::find_in_library(&orig_bytes, &candidates, abort) else {
+            return Ok((extracted, result, true));
+        };
+        if let Some(existing) = already {
+            // The same capture is already in the library: skip the copy. Nothing is written
+            // beside it here — not even the bundle's identity into its sidecar: the index
+            // phase decides that, knowing which row holds the file.
+            result.skipped_duplicate += 1;
+            extracted.push(ExtractedItem {
+                dest: existing,
+                photo_uuid: bp.uuid.clone(),
+                relative_path: bp.relative_path.clone(),
+                already_in_library: true,
+            });
             continue;
         }
+
+        // Any other collision is a different photo → ` (n)`, claimed so that a file placed
+        // there meanwhile is never overwritten.
+        let placed = same_photo::create_new_file(&dest, |file| {
+            use std::io::Write;
+            file.write_all(&orig_bytes)
+        });
+        let dest = match placed {
+            Ok(dest) => dest,
+            Err(e) => {
+                eprintln!("bundle import: placing {} ({}) failed: {e}", bp.uuid, dest.display());
+                result.errors += 1;
+                continue;
+            }
+        };
+        listings.placed(&dest);
         result.copied += 1;
-
-        // Sidecar handling — the UUID must land in the sidecar beside the original so
-        // that index_bundle's `upsert_photo_with_identity` (and future re-scans) can
-        // match this photo by UUID instead of minting a duplicate.
-        //
-        // Strategy:
-        // 1. If the bundle carries a sidecar for this original, extract it as-is (it
-        //    already contains `xmp:Identifier`).
-        // 2. Otherwise, write a fresh merge-safe UUID sidecar from the bundle UUID now,
-        //    before the index phase runs — this is the binding invariant (AGENTS.md).
-        let sidecar_dest = {
-            let mut s = dest.as_os_str().to_os_string();
-            s.push(".xmp");
-            PathBuf::from(s)
-        };
-        let arc_sidecar = format!("{}.xmp", arc_orig);
-        let bundle_sidecar_extracted = if let Ok(mut entry) = archive.by_name(&arc_sidecar) {
-            let mut sidecar_bytes = Vec::new();
-            if entry.read_to_end(&mut sidecar_bytes).is_ok() {
-                if let Err(e) = std::fs::write(&sidecar_dest, &sidecar_bytes) {
-                    eprintln!(
-                        "bundle import: sidecar write {} failed (non-fatal): {e}",
-                        sidecar_dest.display()
-                    );
-                    false
-                } else {
-                    true
-                }
-            } else {
-                false
-            }
-        } else {
-            false
-        };
-        // If no bundle sidecar landed, write a bare UUID sidecar so the identity is
-        // in place for the index phase. This satisfies the AGENTS.md invariant: every
-        // catalogued photo's XMP sidecar carries its UUID. A failure here is not the
-        // end of it — the photo has no catalog row yet, so index_bundle is the one that
-        // records the repair once the row exists.
-        // A blank manifest uuid is no identity (#146 N4); the indexer mints one and binds it.
-        let identity = crate::catalog::photo_identity_for(&bp.uuid);
-        if let (false, false, Some(identity)) =
-            (bundle_sidecar_extracted, sidecar_dest.exists(), identity)
-        {
-            if let Err(e) = crate::xmp::write_identifier(&dest, &identity) {
-                eprintln!(
-                    "bundle import: couldn't write UUID sidecar for {} — queued for repair: {e}",
-                    dest.display()
-                );
-            }
-        }
-
+        place_sidecar(archive, &arc_orig, &dest, bp);
         extracted.push(ExtractedItem {
             dest,
             photo_uuid: bp.uuid.clone(),
             relative_path: bp.relative_path.clone(),
+            already_in_library: false,
         });
     }
 
     Ok((extracted, result, false))
+}
+
+/// The sidecar of an original just placed at `dest` — the UUID must land in it so that
+/// index_bundle's `upsert_photo_with_identity` (and future re-scans) can match this photo by
+/// UUID instead of minting a duplicate.
+///
+/// 1. If the bundle carries a sidecar for this original, extract it as-is (it already
+///    contains `xmp:Identifier`) — as a new file only: an existing file at the sidecar's name
+///    is never replaced (`dest` was chosen with that name free, so one there now is another
+///    program's, and is left as it is).
+/// 2. Otherwise, write a fresh merge-safe UUID sidecar from the bundle UUID now, before the
+///    index phase runs — this is the binding invariant (AGENTS.md). A failure here is not
+///    the end of it — the photo has no catalog row yet, so index_bundle is the one that
+///    records the repair once the row exists. A blank manifest uuid is no identity (#146
+///    N4); the indexer mints one and binds it.
+fn place_sidecar(
+    archive: &mut ZipArchive<std::fs::File>,
+    arc_orig: &str,
+    dest: &Path,
+    bp: &crate::bundle::BundlePhoto,
+) {
+    let sidecar_dest = {
+        let mut s = dest.as_os_str().to_os_string();
+        s.push(".xmp");
+        PathBuf::from(s)
+    };
+    let arc_sidecar = format!("{}.xmp", arc_orig);
+    // Never over an existing file: `dest` was chosen with its sidecar's name free
+    // (`same_photo::unique_dest`), so one there now appeared meanwhile and is someone else's.
+    let write_new = |bytes: &[u8]| -> std::io::Result<()> {
+        use std::io::Write;
+        let mut file = std::fs::OpenOptions::new().write(true).create_new(true).open(&sidecar_dest)?;
+        file.write_all(bytes).and_then(|()| file.sync_all()).inspect_err(|_| {
+            let _ = std::fs::remove_file(&sidecar_dest);
+        })
+    };
+    let bundle_sidecar_extracted = if let Ok(mut entry) = archive.by_name(&arc_sidecar) {
+        let mut sidecar_bytes = Vec::new();
+        if entry.read_to_end(&mut sidecar_bytes).is_ok() {
+            if let Err(e) = write_new(&sidecar_bytes) {
+                eprintln!(
+                    "bundle import: sidecar write {} failed (non-fatal): {e}",
+                    sidecar_dest.display()
+                );
+                false
+            } else {
+                true
+            }
+        } else {
+            false
+        }
+    } else {
+        false
+    };
+    let identity = crate::catalog::photo_identity_for(&bp.uuid);
+    if let (false, false, Some(identity)) = (bundle_sidecar_extracted, sidecar_dest.exists(), identity) {
+        if let Err(e) = crate::xmp::write_identifier(dest, &identity) {
+            eprintln!(
+                "bundle import: couldn't write UUID sidecar for {} — queued for repair: {e}",
+                dest.display()
+            );
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -352,19 +369,29 @@ pub fn extract_originals_abortable(
 /// **Step A — Upsert** (fast DB writes): for each extracted file, call
 /// `upsert_photo_with_identity` with the UUID from the sidecar written by
 /// `extract_originals`. A brand-new photo is created with the bundle's UUID; an
-/// already-present photo (same UUID) is merely updated in place. For newly-created
-/// photos the bundle's rating/label/pick/IPTC/edit-record/versions are applied now
-/// (the same pattern as E5's `index_ingested` + `set_photo_metadata`).
+/// already-present photo (same UUID) is merely updated in place. For a row created for
+/// the bundle's own photo the bundle's rating/label/pick/IPTC/edit-record/versions are
+/// applied now (the same pattern as E5's `index_ingested` + `set_photo_metadata`). A row
+/// created under another identity — a copy kept apart from the row holding the bundle's
+/// identity (#150) — gets none of it (#185).
 ///
-/// **Step B — F1c merge**: run `merge_bundle` for the taxonomy, import batch, and
-/// tag assignments. Since the upsert already placed photos that were freshly extracted,
-/// the merge sees them as "existing" (never overwrites) and only unions assignments —
-/// the correct additive behaviour. Photos that had no originals in the bundle (metadata-
-/// only / offline originals) are inserted by the merge if not already present.
+/// **Step B — F1c merge**: run `merge_bundle_into` for the taxonomy, import batch, and
+/// tag assignments, told which rows Step A created (`fresh`). A photo already in the
+/// catalog — the file skipped as already imported (#246), or matched by identity — has
+/// what it lacks filled in: blank culling, the bundle's edits as new versions (#185).
+/// Photos that had no originals in the bundle (metadata-only / offline originals) are
+/// inserted by the merge if not already present, or filled in like any existing photo.
 ///
 /// **Step C — Post-index** (file I/O): write the batch UUID sidecar (K3) per file,
-/// apply auto-tags, pair RAW+JPEG stacks, and run `reconcile_missing` (O(n) stat
-/// checks). These happen on the secondary connection so the main mutex stays free.
+/// write a new photo's owed IPTC, apply auto-tags, pair RAW+JPEG stacks, and run
+/// `reconcile_missing` (O(n) stat checks). These happen on the secondary connection so the
+/// main mutex stays free.
+///
+/// **Step D — an existing photo's blank IPTC** (#185, between C.1 and the auto-tags): the
+/// fields the merge found blank on the row are filled where the photo's sidecar has no
+/// value either, through `set_iptc` under the sidecar's write turn ([`fill_blank_iptc`]).
+/// An existing photo is neither queued for backup nor put in the bundle's batch: this
+/// import did not add it, and its batch is the immutable one it arrived with.
 ///
 /// `dest_base` must be a path under the catalog root (same as E5's requirement).
 pub fn index_bundle(
@@ -382,10 +409,11 @@ pub fn index_bundle(
 /// import, a catalog switch). A stop leaves a consistent catalog, as if the bundle had held
 /// only the originals indexed so far: Step A is committed for each (its row with the
 /// bundle's identity, its identity sidecar or queued repair, the bundle's culling, IPTC,
-/// edit and versions for a new photo, its queued backup), and Steps B and C run over the
-/// manifest narrowed to those photos — the batch and their tags merged, the batch assigned
-/// and written into their sidecars, auto-tags, stacks, reconcile. The narrowing matters: the
-/// full merge would insert the originals not yet indexed as metadata-only rows. Importing
+/// edit and versions for a new photo, its queued backup), and Steps B to D run over the
+/// manifest narrowed to those photos — the batch and their tags merged, an existing
+/// photo's blanks filled, the batch assigned and written into their sidecars, auto-tags,
+/// stacks, reconcile. The narrowing matters: the full merge would insert the originals not
+/// yet indexed as metadata-only rows. Importing
 /// the bundle again finishes it; the upsert is UUID-aware, so the photos indexed here are
 /// matched, not duplicated. [`Indexed`] says how many originals were indexed.
 pub fn index_bundle_abortable(
@@ -426,11 +454,19 @@ pub(crate) fn index_bundle_with(
         .collect();
 
     let mut newly_created: Vec<i64> = Vec::new();
+    // The rows created for the bundle's own photos, which Step A gives the bundle's state.
+    let mut fresh: std::collections::HashSet<i64> = std::collections::HashSet::new();
+    let mut versions_added_to: Vec<i64> = Vec::new();
     let mut upserted_copies: Vec<(i64, PathBuf)> = Vec::new();
     // The identity of the row each blank-uuid original was indexed into, by the manifest's
     // relative path: merge has no identity to match such a photo by, and the photo at its
     // path need not be it (#150), so it is told which row the index phase chose.
     let mut indexed_blank: std::collections::HashMap<&str, String> = std::collections::HashMap::new();
+    // The identities of the bundle's photos whose original is in the library already as
+    // another identity's photo: the merge keeps them apart too, even where their own path is
+    // free (the original found at a ` (n)` name), rather than inserting a row there that
+    // describes no file of theirs.
+    let mut kept_apart: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     let tx = catalog.begin().map_err(|e| e.to_string())?;
     for item in extracted {
@@ -439,6 +475,28 @@ pub(crate) fn index_bundle_with(
         }
         indexed += 1;
         let path = &item.dest;
+
+        // A file the library already had (#246) that a row of another identity holds is that
+        // row's photo, not the bundle's: the same capture imported separately on each side.
+        // It is kept apart — no upsert, no identity bound into the owner's sidecar (which may
+        // lack one, as identity debt) — and the merge, told so, counts the bundle's photo kept
+        // apart when no row holds its identity (`MergeSummary::photos_kept_apart`), whether or
+        // not its own relative path is free.
+        if item.already_in_library {
+            if let Some(held_by) = held_by_another_identity(catalog, path, &item.photo_uuid)? {
+                eprintln!(
+                    "bundle import: {} is already photo {held_by}'s; bundle photo {} kept apart",
+                    path.display(),
+                    item.photo_uuid
+                );
+                if let Some(identity) = crate::catalog::photo_identity_for(&item.photo_uuid) {
+                    kept_apart.insert(identity);
+                }
+                after_each(indexed);
+                continue;
+            }
+        }
+
         let meta = std::fs::metadata(path).map_err(|e| e.to_string())?;
         let mtime_ns = meta
             .modified()
@@ -454,7 +512,7 @@ pub(crate) fn index_bundle_with(
         let sidecar_uuid = crate::xmp::read_identifier(path);
 
         // The sidecar wins when it has an identity — it describes the file that is
-        // actually on disk, which for a same-size collision need not be the bundle's
+        // actually on disk, which for a name collision (#246) need not be the bundle's
         // photo. When it has none (the copy phase's write failed, or the existing
         // sidecar doesn't parse), fall back to the manifest: this photo's identity is
         // known, so minting a fresh UUID here would be inventing a second one for it
@@ -500,13 +558,22 @@ pub(crate) fn index_bundle_with(
             indexed_blank.insert(item.relative_path.as_str(), upsert.uuid.clone());
         }
 
+        // A row created here is the bundle photo's own unless it took another identity: a copy
+        // kept apart from the row holding the bundle's identity, whose original is still in
+        // place (#150). That row, which merge matches by identity, gets the bundle's state
+        // (filled in where it lacks it, Step B); the copy gets none of it (#185).
+        let bundles_own = crate::catalog::photo_identity_for(&item.photo_uuid)
+            .is_none_or(|identity| identity == upsert.uuid);
         if upsert.created {
             newly_created.push(upsert.id);
+        }
+        if upsert.created && bundles_own {
+            fresh.insert(upsert.id);
 
             // Apply the bundle's non-destructive state for this brand-new photo.
             // The F1c merge won't do this because the upsert already made the photo
-            // "existing" (merge is additive; it never overwrites an existing row).
-            // This mirrors E5's set_photo_metadata call after upsert.
+            // "existing" (it fills in only what an existing row lacks, and is told this
+            // row is fresh). This mirrors E5's set_photo_metadata call after upsert.
             if let Some(bp) = bp_by_key.get(&(item.photo_uuid.as_str(), item.relative_path.as_str())) {
                 // Rating / label / pick (non-zero or non-default only — zero/empty are
                 // already the column defaults from the INSERT in upsert_photo_with_identity).
@@ -552,6 +619,9 @@ pub(crate) fn index_bundle_with(
                 }
 
                 // Named versions, in bundle order.
+                if !bp.versions.is_empty() {
+                    versions_added_to.push(upsert.id);
+                }
                 for v in &bp.versions {
                     if let Ok(vid) = catalog.create_version(upsert.id, &v.name) {
                         let edit_json = {
@@ -606,11 +676,15 @@ pub(crate) fn index_bundle_with(
 
     // Step B — F1c merge: apply taxonomy, import batch, tag assignments — additive.
     // Photos with originals in the bundle are already "existing" after the upsert above;
-    // the merge only inserts metadata-only photos (no original in bundle) if not present,
-    // and unions tag assignments for all.
-    let merge_summary = catalog
-        .merge_bundle(manifest)
+    // the merge inserts metadata-only photos (no original in bundle) if not present, and
+    // unions tag assignments for all. An existing photo (one this import did not create,
+    // so not `fresh`) has what it lacks filled in from the bundle: culling, new versions,
+    // and — Step D — IPTC (#185).
+    let merged = catalog
+        .merge_bundle_into(manifest, &fresh, &kept_apart)
         .map_err(|e| e.to_string())?;
+    let merge_summary = merged.summary;
+    versions_added_to.extend(merged.versions_added_to);
 
     // Step B.1 — Batch assignment for newly-upserted photos.
     //
@@ -653,6 +727,27 @@ pub(crate) fn index_bundle_with(
         }
     }
 
+    // Step D — #185: an existing photo's blank IPTC fields take the bundle's values, through
+    // the sidecar-safe store (`fill_blank_iptc`).
+    for (photo_id, offered) in &merged.iptc_fills {
+        fill_blank_iptc(catalog, *photo_id, offered);
+    }
+
+    // A version added to a photo is a version write, and owes the monochrome refresh every
+    // such write owes (docs/editing.md): a B&W version marks the photo monochrome. Adding
+    // versions never removes one, so the flag is only ever set here, never cleared.
+    #[cfg(feature = "edit")]
+    for &photo_id in &versions_added_to {
+        let any_bw = catalog
+            .list_versions(photo_id)
+            .is_ok_and(|vs| vs.iter().any(|v| crate::plugins::edit::is_bw(&v.edit_json)));
+        if any_bw {
+            let _ = catalog.set_grayscale(photo_id, true);
+        }
+    }
+    #[cfg(not(feature = "edit"))]
+    let _ = versions_added_to;
+
     // Apply auto-tags (monochrome, long-exposure, etc.) and pair RAW+JPEG stacks.
     let _ = catalog.apply_auto_tags();
     let _ = catalog.pair_raw_jpeg_stacks();
@@ -673,32 +768,113 @@ pub(crate) fn index_bundle_with(
     Ok(Indexed { result: partial_result, indexed, total })
 }
 
+/// The identity of the row at `path` when it is not the bundle photo's (`bundle_uuid`, as
+/// [`crate::catalog::photo_identity_for`] reads it), else `None` — also when no row is
+/// there, or the bundle photo has no identity (a pre-#146 blank uuid, which the importer
+/// resolves to the row at its path, #150).
+fn held_by_another_identity(catalog: &Catalog, path: &Path, bundle_uuid: &str) -> Result<Option<String>, String> {
+    use rusqlite::OptionalExtension;
+    let Some(identity) = crate::catalog::photo_identity_for(bundle_uuid) else { return Ok(None) };
+    // Outside the root: the upsert reports that, per photo.
+    let Ok(relative) = catalog.to_relative(path) else { return Ok(None) };
+    let held: Option<String> = catalog
+        .conn()
+        .query_row("SELECT uuid FROM photos WHERE path = ?1", [&relative], |r| r.get(0))
+        .optional()
+        .map_err(|e| e.to_string())?;
+    Ok(held.filter(|uuid| *uuid != identity))
+}
+
+/// Fill an existing photo's blank IPTC fields with the bundle's `offered` values (#185):
+/// only a field that neither the row nor the sidecar beside its original has a value for —
+/// a value either already holds is the photo's own and wins. An existing row's IPTC changes
+/// only through [`Catalog::set_iptc`] (AGENTS.md, "XMP safety"): the original's path is
+/// resolved first, so an unreachable original changes nothing; the store happens under the
+/// sidecar's write turn ([`WriteOrder`](crate::xmp::lock::WriteOrder)), held through the
+/// write and the compare-and-set settle; a write that fails stays owed for the repair pass.
+/// Not `set_iptc_carried`: that one is for values arriving beside a sidecar of their own,
+/// and the sidecar here is the existing photo's, not the bundle's.
+///
+/// A sidecar that does not parse says nothing about what it holds, so nothing is filled:
+/// the owed write would later land on whatever it carries (when uncertain, preserve).
+///
+/// Blocking (sidecar IO and the turn); runs with no transaction open on `catalog`, so a
+/// store waiting on another writer's turn never holds the catalog's write lock.
+fn fill_blank_iptc(catalog: &Catalog, photo_id: i64, offered: &crate::catalog::IptcFields) {
+    use crate::catalog::IptcMask;
+    use crate::xmp::lock::WriteOrder;
+
+    let resolve = || catalog.resolve_photo_path(photo_id).ok().flatten();
+    let Some(first) = resolve() else {
+        eprintln!("bundle import: photo {photo_id}'s original is unreachable; its blank IPTC is not filled");
+        return;
+    };
+    let mut turn = WriteOrder::reserve(&first).wait();
+    // The original may resolve to another copy once the turn is ours (another location came
+    // back): follow it, as the IPTC save does (`app::iptc::run_in_turn`).
+    let mut original = None;
+    for _ in 0..=3 {
+        let Some(now) = resolve() else {
+            eprintln!("bundle import: photo {photo_id}'s original went away; its blank IPTC is not filled");
+            return;
+        };
+        match turn.moved_to(&now) {
+            None => {
+                original = Some(now);
+                break;
+            }
+            Some(next) => {
+                drop(turn);
+                turn = next.wait();
+            }
+        }
+    }
+    let Some(original) = original else {
+        eprintln!("bundle import: photo {photo_id}'s original kept moving; its blank IPTC is not filled");
+        return;
+    };
+    let in_sidecar = match crate::xmp::read_iptc_present(&original) {
+        Ok(present) => present,
+        Err(e) => {
+            eprintln!("bundle import: photo {photo_id}'s sidecar does not parse ({e}); its blank IPTC is not filled");
+            return;
+        }
+    };
+    let Ok(current) = catalog.get_iptc(photo_id) else { return };
+    let fill = IptcMask::present_in(offered)
+        .without(IptcMask::present_in(&current))
+        .without(in_sidecar);
+    if fill.is_empty() {
+        return;
+    }
+    let mut next = current;
+    for m in IptcMask::EACH.into_iter().filter(|m| fill.contains(*m)) {
+        if let Some(slot) = m.value_mut(&mut next) {
+            *slot = m.value(offered).to_string();
+        }
+    }
+    let write = match catalog.set_iptc(photo_id, &next) {
+        Ok(w) => w,
+        Err(e) => {
+            eprintln!("bundle import: couldn't fill photo {photo_id}'s blank IPTC: {e}");
+            return;
+        }
+    };
+    let outcome = write.run(&original);
+    match catalog.settle_iptc_write(&write, &outcome) {
+        Ok(crate::catalog::IptcSettled::Failed(e)) => {
+            eprintln!("bundle import: IPTC sidecar write for photo {photo_id} owed for repair: {e}")
+        }
+        Ok(_) => {}
+        Err(e) => eprintln!("bundle import: couldn't record the IPTC sidecar write for photo {photo_id}: {e}"),
+    }
+    drop(turn);
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// A destination path that doesn't exist yet (`name (2).ext`, …), or `None` if no
-/// free name was found. Never overwrites — the caller must not copy on `None`.
-fn unique_dest(path: &Path) -> Option<PathBuf> {
-    if !path.exists() {
-        return Some(path.to_path_buf());
-    }
-    let dir = path.parent().unwrap_or_else(|| Path::new("."));
-    let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("file");
-    let ext = path.extension().and_then(|s| s.to_str());
-    for n in 2..10_000 {
-        let mut name = format!("{stem} ({n})");
-        if let Some(ext) = ext {
-            name.push('.');
-            name.push_str(ext);
-        }
-        let candidate = dir.join(name);
-        if !candidate.exists() {
-            return Some(candidate);
-        }
-    }
-    None
-}
 
 // ---------------------------------------------------------------------------
 // Tests
@@ -786,6 +962,304 @@ mod tests {
         let dest = dir.join("test.chairphoto");
         write_bundle(&bundle, &dest, |_, _| {}).expect("write_bundle");
         dir.into_subpath("test.chairphoto")
+    }
+
+    /// A bundle of `photos`, each with its original copied from the given file (none: a
+    /// metadata-only entry).
+    fn bundle_of(
+        tag: &str,
+        photos: Vec<(crate::bundle::BundlePhoto, Option<PathBuf>)>,
+    ) -> crate::test_support::TestSubPath {
+        let dir = temp_dir(&format!("{tag}-bundle"));
+        let mut manifest = BundleManifest::new(
+            BundleBatch {
+                uuid: format!("batch-{tag}"),
+                source_label: "Test batch".into(),
+                note: String::new(),
+                created_at: 1_700_000_000,
+            },
+            1_700_100_000,
+        );
+        let mut originals = HashMap::new();
+        for (bp, original) in photos {
+            originals.insert(bp.uuid.clone(), original);
+            manifest.photos.push(bp);
+        }
+        let dest = dir.join("test.chairphoto");
+        write_bundle(&GatheredBundle { manifest, originals }, &dest, |_, _| {}).expect("write_bundle");
+        dir.into_subpath("test.chairphoto")
+    }
+
+    /// A bundle photo with no culling, IPTC, edits or tags of its own.
+    fn plain_photo(uuid: &str, relative_path: &str) -> crate::bundle::BundlePhoto {
+        crate::bundle::BundlePhoto {
+            uuid: uuid.into(),
+            relative_path: relative_path.into(),
+            rating: 0,
+            label: String::new(),
+            pick_state: crate::catalog::PickState::None,
+            iptc: Default::default(),
+            edit_record: None,
+            versions: Vec::new(),
+            tag_uuids: Vec::new(),
+        }
+    }
+
+    // --- same name, same size (#246) ----------------------------------------------------
+
+    /// The library holds `DSC1.jpg`; the bundle brings two photos of that name and size taken
+    /// in the same second — one the same capture (skipped), one another body's (kept as
+    /// ` (2)`, its own row and the bundle's UUID). The library file is never overwritten, and
+    /// importing the bundle again skips both.
+    #[test]
+    fn a_bundle_original_is_skipped_only_when_it_is_the_same_capture() {
+        use crate::scanner::same_photo::test_files::{exiftool_available, stamped_jpeg};
+        if !exiftool_available("a_bundle_original_is_skipped_only_when_it_is_the_same_capture") {
+            return;
+        }
+        const SAME: &str = "0b7f3b1e-1111-4c3d-9e8f-0a1b2c3d4e5f";
+        const OTHER: &str = "0b7f3b1e-2222-4c3d-9e8f-0a1b2c3d4e5f";
+        let src = temp_dir("246-src");
+        let same = src.join("same/DSC1.jpg");
+        let other = src.join("other/DSC1.jpg");
+        stamped_jpeg(&same, "2026:06:28 12:00:00", "123", "4711");
+        stamped_jpeg(&other, "2026:06:28 12:00:00", "123", "9999");
+        let bundle_path = bundle_of(
+            "246",
+            vec![
+                (plain_photo(SAME, "2026/06/28/DSC1.jpg"), Some(same.clone())),
+                (plain_photo(OTHER, "2026/06/29/DSC1.jpg"), Some(other.clone())),
+            ],
+        );
+
+        let (catalog, root) = temp_catalog("246");
+        // The library has the first photo on both days (the second day's under the same
+        // name, the same capture as `same`: so `other` collides with a different photo).
+        for day in ["28", "29"] {
+            let lib = root.join(format!("2026/06/{day}/DSC1.jpg"));
+            std::fs::create_dir_all(lib.parent().unwrap()).unwrap();
+            std::fs::copy(&same, &lib).unwrap();
+        }
+        assert_eq!(std::fs::metadata(&same).unwrap().len(), std::fs::metadata(&other).unwrap().len());
+
+        let (manifest, mut archive) = open_bundle(&bundle_path).unwrap();
+        let (extracted, partial) = extract_originals(&manifest, &mut archive, &root, |_, _| {}).unwrap();
+        assert_eq!((partial.skipped_duplicate, partial.copied, partial.errors), (1, 1, 0));
+        let kept = root.join("2026/06/29/DSC1 (2).jpg");
+        assert_eq!(std::fs::read(&kept).unwrap(), std::fs::read(&other).unwrap());
+        assert_eq!(std::fs::read(root.join("2026/06/29/DSC1.jpg")).unwrap(), std::fs::read(&same).unwrap());
+        let hidden: Vec<_> = std::fs::read_dir(root.join("2026/06/29"))
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().starts_with(".chairphoto-import-"))
+            .collect();
+        assert!(hidden.is_empty(), "no staged file left behind");
+        index_bundle(&catalog, &manifest, &extracted, &root, partial).unwrap();
+        let other_row = catalog.get_photo_by_uuid(OTHER).unwrap();
+        assert_eq!(other_row.path, "2026/06/29/DSC1 (2).jpg");
+
+        let (manifest, mut archive) = open_bundle(&bundle_path).unwrap();
+        let (_, again) = extract_originals(&manifest, &mut archive, &root, |_, _| {}).unwrap();
+        assert_eq!((again.skipped_duplicate, again.copied), (2, 0), "a second import skips both");
+        assert!(!root.join("2026/06/29/DSC1 (3).jpg").exists());
+    }
+
+    /// M-a of the second #246 review: an orphan sidecar — another tool's (digiKam's rating,
+    /// keywords and identifier), its original gone — sits at the ` (2)` name a different
+    /// photo would take. The bundle's original goes to ` (3)` instead, whether or not the
+    /// bundle carries a sidecar: the orphan is neither overwritten by the bundle's sidecar nor
+    /// adopted (its identity on the new photo), and the bundle's photo gets one row, at its
+    /// copy, under its own identity.
+    #[test]
+    fn an_orphan_sidecar_at_a_free_name_is_neither_overwritten_nor_adopted() {
+        const THEIRS: &str = "6f1c1f0e-2b7a-4c3d-9e8f-0a1b2c3d4e5f";
+        const ORPHAN_ID: &str = "11111111-1111-4111-8111-111111111111";
+        let orphan_xml = format!(
+            r#"<x:xmpmeta xmlns:x="adobe:ns:meta/"><rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"><rdf:Description rdf:about="" xmlns:xmp="http://ns.adobe.com/xap/1.0/" xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:digiKam="http://www.digikam.org/ns/1.0/" xmp:Rating="5" xmp:Identifier="{ORPHAN_ID}"><dc:subject><rdf:Bag><rdf:li>ForeignKeyword</rdf:li></rdf:Bag></dc:subject><digiKam:TagsList><rdf:Seq><rdf:li>Foreign/Keyword</rdf:li></rdf:Seq></digiKam:TagsList></rdf:Description></rdf:RDF></x:xmpmeta>"#
+        );
+        let bundle_xml = format!(
+            r#"<x:xmpmeta xmlns:x="adobe:ns:meta/"><rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"><rdf:Description rdf:about="" xmlns:xmp="http://ns.adobe.com/xap/1.0/" xmp:Identifier="{THEIRS}"/></rdf:RDF></x:xmpmeta>"#
+        );
+        for (tag, sidecar) in [("ma-with", Some(bundle_xml.as_str())), ("ma-without", None)] {
+            let (catalog, root) = temp_catalog(tag);
+            let dir = root.join("2026/06/28");
+            std::fs::create_dir_all(&dir).unwrap();
+            // Another photo of that name and size (no row), and the orphan at ` (2)`.
+            std::fs::write(dir.join("DSC01234.ARW"), b"OTHER RAWBYTES").unwrap();
+            let orphan = dir.join("DSC01234 (2).ARW.xmp");
+            std::fs::write(&orphan, &orphan_xml).unwrap();
+
+            let bundle_path = make_test_bundle_with(
+                tag,
+                THEIRS,
+                "2026/06/28/DSC01234.ARW",
+                Default::default(),
+                sidecar,
+            );
+            let (manifest, mut archive) = open_bundle(&bundle_path).unwrap();
+            let (extracted, partial) = extract_originals(&manifest, &mut archive, &root, |_, _| {}).unwrap();
+            assert_eq!((partial.copied, partial.skipped_duplicate, partial.errors), (1, 0, 0), "{tag}");
+            let placed = dir.join("DSC01234 (3).ARW");
+            assert_eq!(std::fs::read(&placed).unwrap(), b"FAKE RAW BYTES", "{tag}");
+            assert!(!dir.join("DSC01234 (2).ARW").exists(), "{tag}: nothing placed beside the orphan");
+            assert_eq!(std::fs::read_to_string(&orphan).unwrap(), orphan_xml, "{tag}: the orphan is untouched");
+
+            index_bundle(&catalog, &manifest, &extracted, &root, partial).unwrap();
+            assert_eq!(std::fs::read_to_string(&orphan).unwrap(), orphan_xml, "{tag}: still untouched");
+            assert_eq!(crate::xmp::read_identifier(&placed).as_deref(), Some(THEIRS), "{tag}");
+            assert_eq!(catalog.get_photo_by_uuid(THEIRS).unwrap().path, "2026/06/28/DSC01234 (3).ARW", "{tag}");
+            assert!(catalog.get_photo_by_uuid(ORPHAN_ID).is_err(), "{tag}: the orphan's identity is no row's");
+            assert_eq!(catalog.count_photos(&Default::default()).unwrap(), 1, "{tag}: no phantom row");
+        }
+    }
+
+    /// L-c of the second #246 review: the unpack lists each folder once and records each name
+    /// it places. The library holds a `DSC1.ARW`; the bundle's first photo is its own
+    /// `DSC1 (2).ARW`, placed at that free name after the folder was listed, and its second
+    /// photo, `DSC1.ARW`, is the same file: it collides with the library's (other bytes, same
+    /// size) and is found at the ` (2)` this unpack placed — skipped, not copied a third time.
+    #[test]
+    fn a_name_placed_earlier_in_the_unpack_is_a_candidate() {
+        let src = temp_dir("lc-src");
+        let (first, second) = (src.join("a/DSC1 (2).ARW"), src.join("b/DSC1.ARW"));
+        for p in [&first, &second] {
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, b"FAKE RAW TWO").unwrap();
+        }
+        let bundle_path = bundle_of(
+            "lc",
+            vec![
+                (plain_photo("uuid-lc-1", "2026/06/28/DSC1 (2).ARW"), Some(first)),
+                (plain_photo("uuid-lc-2", "2026/06/28/DSC1.ARW"), Some(second)),
+            ],
+        );
+        let dest_base = temp_dir("lc-dest");
+        let day = dest_base.join("2026/06/28");
+        std::fs::create_dir_all(&day).unwrap();
+        std::fs::write(day.join("DSC1.ARW"), b"FAKE RAW ONE").unwrap();
+        let (manifest, mut archive) = open_bundle(&bundle_path).unwrap();
+        let (_, partial) = extract_originals(&manifest, &mut archive, &dest_base, |_, _| {}).unwrap();
+        assert_eq!((partial.copied, partial.skipped_duplicate), (1, 1), "{partial:?}");
+        assert_eq!(std::fs::read(day.join("DSC1 (2).ARW")).unwrap(), b"FAKE RAW TWO");
+        assert_eq!(std::fs::read(day.join("DSC1.ARW")).unwrap(), b"FAKE RAW ONE");
+        assert!(!day.join("DSC1 (3).ARW").exists());
+    }
+
+    /// A sidecar that appears at the name after the original's place was chosen (another
+    /// program wrote it meanwhile) is never replaced by the bundle's: it is left as it is.
+    #[test]
+    fn the_bundles_sidecar_never_replaces_a_file() {
+        const THEIRS: &str = "6f1c1f0e-2b7a-4c3d-9e8f-0a1b2c3d4e5f";
+        let bundle_xml = format!(
+            r#"<x:xmpmeta xmlns:x="adobe:ns:meta/"><rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"><rdf:Description rdf:about="" xmlns:xmp="http://ns.adobe.com/xap/1.0/" xmp:Identifier="{THEIRS}"/></rdf:RDF></x:xmpmeta>"#
+        );
+        let bundle_path = make_test_bundle_with(
+            "ma-race",
+            THEIRS,
+            "2026/06/28/DSC01234.ARW",
+            Default::default(),
+            Some(&bundle_xml),
+        );
+        let (manifest, mut archive) = open_bundle(&bundle_path).unwrap();
+        let dir = temp_dir("ma-race-dest");
+        let dest = dir.join("DSC01234.ARW");
+        std::fs::write(&dest, b"FAKE RAW BYTES").unwrap();
+        std::fs::write(crate::xmp::sidecar_path(&dest), b"written meanwhile").unwrap();
+        let arc_orig = format!("{ORIGINALS_DIR}/2026/06/28/DSC01234.ARW");
+        place_sidecar(&mut archive, &arc_orig, &dest, &manifest.photos[0]);
+        assert_eq!(std::fs::read(crate::xmp::sidecar_path(&dest)).unwrap(), b"written meanwhile");
+    }
+
+    /// An abort while a collision is being decided copies nothing of it and leaves nothing
+    /// beside the library's files; an original decided before the stop stays placed.
+    #[test]
+    fn an_abort_during_a_collision_copies_nothing_of_it() {
+        let src = temp_dir("246-abort-src");
+        let (a, b) = (src.join("a/DSC1.ARW"), src.join("b/DSC2.ARW"));
+        for p in [&a, &b] {
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, b"FAKE RAW BYTES").unwrap();
+        }
+        let bundle_path = bundle_of(
+            "246-abort",
+            vec![
+                (plain_photo("uuid-246-a", "2026/06/28/DSC1.ARW"), Some(a)),
+                (plain_photo("uuid-246-b", "2026/06/28/DSC2.ARW"), Some(b)),
+            ],
+        );
+        // Abort as the first original's collision is decided, and as the second's.
+        for (stop_after, placed) in [(1, &[][..]), (2, &["DSC1 (2).ARW", "DSC1 (2).ARW.xmp"][..])] {
+            let (manifest, mut archive) = open_bundle(&bundle_path).unwrap();
+            let dest_base = temp_dir("246-abort-dest");
+            let date_dir = dest_base.join("2026/06/28");
+            std::fs::create_dir_all(&date_dir).unwrap();
+            // Same size as the bundle's "FAKE RAW BYTES", other bytes: both collide.
+            for name in ["DSC1.ARW", "DSC2.ARW"] {
+                std::fs::write(date_dir.join(name), b"OTHER RAWBYTES").unwrap();
+            }
+            let abort = AtomicBool::new(false);
+            let (_, partial, aborted) =
+                extract_originals_abortable(&manifest, &mut archive, &dest_base, &abort, |done, _| {
+                    if done == stop_after {
+                        abort.store(true, Ordering::Relaxed)
+                    }
+                })
+                .unwrap();
+            assert!(aborted && partial.copied == stop_after - 1, "stop after {stop_after}: {partial:?}");
+            let mut names: Vec<String> = std::fs::read_dir(&date_dir)
+                .unwrap()
+                .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+                .collect();
+            names.sort();
+            let mut expected: Vec<&str> = ["DSC1.ARW", "DSC2.ARW"].into_iter().chain(placed.iter().copied()).collect();
+            expected.sort();
+            assert_eq!(names, expected, "stop after {stop_after}");
+        }
+    }
+
+    /// Every file and directory under `root`, with its size and modification time: a
+    /// directory's mtime moves when an entry is created or removed in it, so a file written
+    /// and removed again between two snapshots still shows.
+    fn tree_snapshot(root: &Path) -> Vec<(PathBuf, u64, std::time::SystemTime)> {
+        let mut out: Vec<_> = walkdir::WalkDir::new(root)
+            .into_iter()
+            .map(|e| e.unwrap())
+            .map(|e| {
+                let md = e.metadata().unwrap();
+                (e.path().to_path_buf(), md.len(), md.modified().unwrap())
+            })
+            .collect();
+        out.sort();
+        out
+    }
+
+    /// M-1 of the #246 review: re-importing a bundle the library already holds writes nothing
+    /// to the library's disk — no copy of an original is unpacked there to be compared, at
+    /// any point of the unpack — and skips every original.
+    #[test]
+    fn re_importing_a_bundle_writes_nothing_to_the_library() {
+        let src = temp_dir("246-again-src");
+        let mut photos = Vec::new();
+        for (i, name) in ["DSC1.ARW", "DSC2.ARW", "DSC3.ARW"].into_iter().enumerate() {
+            let p = src.join(name);
+            std::fs::write(&p, format!("FAKE RAW BYTES {i}")).unwrap();
+            photos.push((plain_photo(&format!("uuid-246-again-{i}"), &format!("2026/06/28/{name}")), Some(p)));
+        }
+        let bundle_path = bundle_of("246-again", photos);
+        let (catalog, root) = temp_catalog("246-again");
+        let (manifest, mut archive) = open_bundle(&bundle_path).unwrap();
+        let (extracted, partial) = extract_originals(&manifest, &mut archive, &root, |_, _| {}).unwrap();
+        assert_eq!(partial.copied, 3);
+        index_bundle(&catalog, &manifest, &extracted, &root, partial).unwrap();
+
+        let before = tree_snapshot(&root);
+        let (manifest, mut archive) = open_bundle(&bundle_path).unwrap();
+        let (_, again) = extract_originals(&manifest, &mut archive, &root, |_, _| {
+            assert_eq!(tree_snapshot(&root), before, "the library is unchanged during the unpack");
+        })
+        .unwrap();
+        assert_eq!((again.skipped_duplicate, again.copied, again.errors), (3, 0, 0));
+        assert_eq!(tree_snapshot(&root), before, "the library is unchanged after the unpack");
     }
 
     #[test]
@@ -1054,6 +1528,232 @@ mod tests {
             )
             .unwrap();
         assert!(queued.contains(KNOWN), "its sidecar's identity is reported: {queued}");
+
+        // #185: the bundle's state goes onto the row merge matches by identity — filling in
+        // only what it lacks — and none of it onto the copy's row.
+        assert_eq!((kept.label.as_str(), kept.pick_state), ("green", crate::catalog::PickState::Pick));
+        assert_eq!(catalog.get_iptc(row.id).unwrap().headline, "Test sunset");
+        let copy_row = catalog.get_photo(copy.0).unwrap();
+        assert_eq!((copy_row.rating, copy_row.label.as_str()), (0, ""), "the copy gets no culling");
+        assert_eq!(catalog.get_iptc(copy.0).unwrap(), Default::default(), "nor IPTC");
+    }
+
+    // --- a bundle photo the library already has (#185) ------------------------------------
+
+    /// The bundle brings a photo the library already has, edited, at the same path: the file
+    /// is skipped (#246) and the bundle's data lands on the existing row — its edit record
+    /// and version as new versions after the row's own, its label and pick where the row had
+    /// none, its IPTC only where neither the row nor the row's sidecar has a value (written
+    /// to that sidecar, nothing left owed). The row's own values win; no second row, no
+    /// backup queued and no batch membership for a photo this import did not add.
+    #[test]
+    fn a_bundle_of_an_existing_edited_photo_adds_versions_and_fills_only_blanks() {
+        use crate::bundle::BundleVersion;
+        use crate::catalog::{IptcFields, IptcMask, PickState};
+        const KNOWN: &str = "6f1c1f0e-2b7a-4c3d-9e8f-0a1b2c3d4e5f";
+        let (catalog, root) = temp_catalog("185");
+        let original = root.join("2026/06/28/DSC01234.ARW");
+        std::fs::create_dir_all(original.parent().unwrap()).unwrap();
+        std::fs::write(&original, b"FAKE RAW BYTES").unwrap();
+        // The row's sidecar holds a Country the catalog never imported: the photo's own value.
+        std::fs::write(
+            crate::xmp::sidecar_path(&original),
+            format!(
+                r#"<x:xmpmeta xmlns:x="adobe:ns:meta/"><rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"><rdf:Description rdf:about="" xmlns:xmp="http://ns.adobe.com/xap/1.0/" xmlns:photoshop="http://ns.adobe.com/photoshop/1.0/" photoshop:Country="Norway"><xmp:Identifier><rdf:Bag><rdf:li>{KNOWN}</rdf:li></rdf:Bag></xmp:Identifier></rdf:Description></rdf:RDF></x:xmpmeta>"#
+            ),
+        )
+        .unwrap();
+        let row = catalog.upsert_photo_with_identity(&original, None, 1, 14, Some(KNOWN)).unwrap();
+        catalog.set_culling(row.id, Some(4), None, None).unwrap();
+        catalog.set_iptc(row.id, &IptcFields { headline: "Mine".into(), ..Default::default() }).unwrap();
+        catalog.write_owed_iptc(row.id).unwrap();
+        let mine = catalog.create_version(row.id, "Mine").unwrap();
+        catalog.set_version_edit(mine, r#"{"local":1}"#).unwrap();
+
+        let src = temp_dir("185-src");
+        let file = src.join("DSC01234.ARW");
+        std::fs::write(&file, b"FAKE RAW BYTES").unwrap();
+        let mut bp = plain_photo(KNOWN, "2026/06/28/DSC01234.ARW");
+        bp.rating = 3;
+        bp.label = "green".into();
+        bp.pick_state = PickState::Pick;
+        bp.iptc = IptcFields {
+            headline: "Theirs".into(),
+            city: "Oslo".into(),
+            country: "Sweden".into(),
+            ..Default::default()
+        };
+        bp.edit_record = Some(r#"{"bw":{"enabled":true}}"#.into());
+        bp.versions = vec![BundleVersion { name: "Square".into(), edit_json: r#"{"crop":"1:1"}"#.into(), position: 0 }];
+        let bundle_path = bundle_of("185", vec![(bp, Some(file))]);
+
+        let (manifest, mut archive) = open_bundle(&bundle_path).unwrap();
+        let (extracted, partial) = extract_originals(&manifest, &mut archive, &root, |_, _| {}).unwrap();
+        assert_eq!((partial.skipped_duplicate, partial.copied), (1, 0), "the file is already here");
+        let result = index_bundle(&catalog, &manifest, &extracted, &root, partial).unwrap();
+        let m = &result.merge;
+        assert_eq!((m.photos_added, m.photos_existing, m.photos_filled, m.versions_added), (0, 1, 1, 2), "{m:?}");
+        assert_eq!(catalog.count_photos(&Default::default()).unwrap(), 1, "no second row");
+
+        let after = catalog.get_photo(row.id).unwrap();
+        assert_eq!((after.rating, after.label.as_str(), after.pick_state), (4, "green", PickState::Pick));
+        let iptc = catalog.get_iptc(row.id).unwrap();
+        assert_eq!(
+            (iptc.headline.as_str(), iptc.city.as_str(), iptc.country.as_str()),
+            ("Mine", "Oslo", ""),
+            "the row's headline and its sidecar's country win; the blank city is filled"
+        );
+        let xml = std::fs::read_to_string(crate::xmp::sidecar_path(&original)).unwrap();
+        use crate::xmp::test_fixtures::property_values;
+        let photoshop = "http://ns.adobe.com/photoshop/1.0/";
+        assert_eq!(property_values(&xml, photoshop, "City"), vec!["Oslo"], "{xml}");
+        assert_eq!(property_values(&xml, photoshop, "Headline"), vec!["Mine"], "{xml}");
+        assert_eq!(property_values(&xml, photoshop, "Country"), vec!["Norway"], "{xml}");
+        assert_eq!(catalog.owed_iptc(row.id).unwrap(), IptcMask::NONE);
+
+        let versions: Vec<(String, String)> =
+            catalog.list_versions(row.id).unwrap().into_iter().map(|v| (v.name, v.edit_json)).collect();
+        assert_eq!(
+            versions,
+            [
+                ("Mine".to_string(), r#"{"local":1}"#.to_string()),
+                (crate::catalog::IMPORTED_EDIT_VERSION.to_string(), r#"{"bw":{"enabled":true}}"#.to_string()),
+                ("Square".to_string(), r#"{"crop":"1:1"}"#.to_string()),
+            ]
+        );
+        assert_eq!(catalog.get_edit_record(row.id).unwrap(), None, "its edit record is not changed");
+        // The B&W version it gained owes the monochrome refresh a version write owes.
+        #[cfg(feature = "edit")]
+        assert!(catalog.is_grayscale(row.id).unwrap(), "a B&W version marks it monochrome");
+        assert!(catalog.list_pending_operations().unwrap().is_empty(), "no backup queued for it");
+        assert_eq!(catalog.import_batch_uuid_for_photo(row.id).unwrap(), None, "not in the bundle's batch");
+
+        // Importing the bundle again changes nothing more.
+        let (manifest, mut archive) = open_bundle(&bundle_path).unwrap();
+        let (extracted, partial) = extract_originals(&manifest, &mut archive, &root, |_, _| {}).unwrap();
+        let again = index_bundle(&catalog, &manifest, &extracted, &root, partial).unwrap();
+        assert_eq!((again.merge.photos_filled, again.merge.versions_added), (0, 0));
+        assert_eq!(catalog.list_versions(row.id).unwrap().len(), 3);
+    }
+
+    /// The file is the same capture as the library's, but the library's row has another
+    /// identity (both sides imported the card on their own): the bundle's photo is kept apart
+    /// — counted, its data on no row — and the library's row and sidecar are untouched.
+    #[test]
+    fn the_same_file_under_another_identity_is_kept_apart() {
+        const THEIRS: &str = "6f1c1f0e-2b7a-4c3d-9e8f-0a1b2c3d4e5f";
+        const OURS: &str = "7a2d2f1f-3c8b-4d4e-8f90-1b2c3d4e5f60";
+        let (catalog, root) = temp_catalog("185-apart");
+        let original = root.join("2026/06/28/DSC01234.ARW");
+        std::fs::create_dir_all(original.parent().unwrap()).unwrap();
+        std::fs::write(&original, b"FAKE RAW BYTES").unwrap();
+        crate::xmp::write_identifier(&original, OURS).unwrap();
+        let row = catalog.upsert_photo_with_identity(&original, None, 1, 14, Some(OURS)).unwrap();
+
+        let bundle_path = make_test_bundle("185-apart", THEIRS, "2026/06/28/DSC01234.ARW");
+        let (manifest, mut archive) = open_bundle(&bundle_path).unwrap();
+        let (extracted, partial) = extract_originals(&manifest, &mut archive, &root, |_, _| {}).unwrap();
+        assert_eq!(partial.skipped_duplicate, 1);
+        let result = index_bundle(&catalog, &manifest, &extracted, &root, partial).expect("not a UNIQUE failure");
+        assert_eq!((result.merge.photos_kept_apart, result.merge.photos_added), (1, 0), "{:?}", result.merge);
+
+        assert_eq!(catalog.count_photos(&Default::default()).unwrap(), 1);
+        let after = catalog.get_photo(row.id).unwrap();
+        assert_eq!((after.uuid.as_str(), after.rating, after.label.as_str()), (OURS, 0, ""));
+        assert_eq!(catalog.get_iptc(row.id).unwrap(), Default::default());
+        assert_eq!(crate::xmp::read_identifier(&original).as_deref(), Some(OURS));
+    }
+
+    /// L-a of the second #246/#185 review: the library's copy of the capture is at a ` (n)`
+    /// name, under a row of another identity, and the bundle's own path (the plain name) is
+    /// free. The bundle's photo is kept apart there too — never inserted as a metadata-only
+    /// row at the free path, describing a file that is not there (or, later, another photo's).
+    #[test]
+    fn a_photo_kept_apart_at_a_numbered_name_gets_no_row_at_its_free_path() {
+        const THEIRS: &str = "6f1c1f0e-2b7a-4c3d-9e8f-0a1b2c3d4e5f";
+        const OURS: &str = "7a2d2f1f-3c8b-4d4e-8f90-1b2c3d4e5f60";
+        let (catalog, root) = temp_catalog("185-apart-n");
+        let original = root.join("2026/06/28/DSC01234 (2).ARW");
+        std::fs::create_dir_all(original.parent().unwrap()).unwrap();
+        std::fs::write(&original, b"FAKE RAW BYTES").unwrap();
+        crate::xmp::write_identifier(&original, OURS).unwrap();
+        catalog.upsert_photo_with_identity(&original, None, 1, 14, Some(OURS)).unwrap();
+
+        let bundle_path = make_test_bundle("185-apart-n", THEIRS, "2026/06/28/DSC01234.ARW");
+        let (manifest, mut archive) = open_bundle(&bundle_path).unwrap();
+        let (extracted, partial) = extract_originals(&manifest, &mut archive, &root, |_, _| {}).unwrap();
+        assert_eq!(partial.skipped_duplicate, 1);
+        let result = index_bundle(&catalog, &manifest, &extracted, &root, partial).unwrap();
+        assert_eq!((result.merge.photos_kept_apart, result.merge.photos_added), (1, 0), "{:?}", result.merge);
+        assert!(catalog.get_photo_by_uuid(THEIRS).is_err(), "no row for the bundle's photo");
+        assert_eq!(photo_paths(&catalog), ["2026/06/28/DSC01234 (2).ARW"]);
+        assert!(!root.join("2026/06/28/DSC01234.ARW").exists());
+    }
+
+    fn photo_paths(catalog: &Catalog) -> Vec<String> {
+        let mut stmt = catalog.conn().prepare("SELECT path FROM photos ORDER BY path").unwrap();
+        stmt.query_map([], |r| r.get(0)).unwrap().collect::<Result<_, _>>().unwrap()
+    }
+
+    /// M-3 of the #246/#185 review: the library's photo has a row of its own identity but its
+    /// sidecar is gone (identity debt), and the bundle brings the same bytes under another
+    /// identity. The owner's sidecar never receives the bundle's identity — not while
+    /// unpacking, not while indexing — the bundle's photo is kept apart and counted once, and
+    /// the row is untouched.
+    #[test]
+    fn a_foreign_identity_never_lands_in_the_owners_sidecar() {
+        const THEIRS: &str = "6f1c1f0e-2b7a-4c3d-9e8f-0a1b2c3d4e5f";
+        const OURS: &str = "7a2d2f1f-3c8b-4d4e-8f90-1b2c3d4e5f60";
+        let (catalog, root) = temp_catalog("185-foreign");
+        let original = root.join("2026/06/28/DSC01234.ARW");
+        std::fs::create_dir_all(original.parent().unwrap()).unwrap();
+        std::fs::write(&original, b"FAKE RAW BYTES").unwrap();
+        let row = catalog.upsert_photo_with_identity(&original, None, 1, 14, Some(OURS)).unwrap();
+        catalog.set_culling(row.id, Some(5), None, None).unwrap();
+        let sidecar = root.join("2026/06/28/DSC01234.ARW.xmp");
+        assert!(!sidecar.exists(), "the owner's sidecar is missing");
+
+        let bundle_path = make_test_bundle("185-foreign", THEIRS, "2026/06/28/DSC01234.ARW");
+        let (manifest, mut archive) = open_bundle(&bundle_path).unwrap();
+        let (extracted, partial) = extract_originals(&manifest, &mut archive, &root, |_, _| {}).unwrap();
+        assert_eq!(partial.skipped_duplicate, 1);
+        assert!(!sidecar.exists(), "unpacking writes no sidecar for the owner's file");
+        let result = index_bundle(&catalog, &manifest, &extracted, &root, partial).unwrap();
+        assert_eq!((result.merge.photos_kept_apart, result.merge.photos_added), (1, 0), "{:?}", result.merge);
+
+        assert_ne!(crate::xmp::read_identifier(&original).as_deref(), Some(THEIRS));
+        assert!(!sidecar.exists(), "indexing writes no sidecar for the owner's file either");
+        assert_eq!(catalog.count_photos(&Default::default()).unwrap(), 1);
+        let after = catalog.get_photo(row.id).unwrap();
+        assert_eq!((after.uuid.as_str(), after.rating), (OURS, 5));
+        assert_eq!(catalog.get_iptc(row.id).unwrap(), Default::default());
+        let conflicts: Vec<_> = catalog
+            .list_pending_identity()
+            .unwrap()
+            .into_iter()
+            .filter(|r| r.error.contains(THEIRS))
+            .collect();
+        assert!(conflicts.is_empty(), "no conflict naming the bundle's identity: {conflicts:?}");
+    }
+
+    /// The library file the bundle's photo is found at, with no row at all, takes the bundle's
+    /// identity in its sidecar during indexing — the binding the unpack no longer does.
+    #[test]
+    fn a_found_file_with_no_row_is_bound_to_the_bundles_identity_when_indexed() {
+        const THEIRS: &str = "6f1c1f0e-2b7a-4c3d-9e8f-0a1b2c3d4e5f";
+        let (catalog, root) = temp_catalog("185-unrowed");
+        let original = root.join("2026/06/28/DSC01234.ARW");
+        std::fs::create_dir_all(original.parent().unwrap()).unwrap();
+        std::fs::write(&original, b"FAKE RAW BYTES").unwrap();
+
+        let bundle_path = make_test_bundle("185-unrowed", THEIRS, "2026/06/28/DSC01234.ARW");
+        let (manifest, mut archive) = open_bundle(&bundle_path).unwrap();
+        let (extracted, partial) = extract_originals(&manifest, &mut archive, &root, |_, _| {}).unwrap();
+        assert_eq!(partial.skipped_duplicate, 1);
+        assert_eq!(crate::xmp::read_identifier(&original), None, "not bound while unpacking");
+        index_bundle(&catalog, &manifest, &extracted, &root, partial).unwrap();
+        assert_eq!(crate::xmp::read_identifier(&original).as_deref(), Some(THEIRS));
+        assert_eq!(catalog.get_photo_by_uuid(THEIRS).unwrap().path, "2026/06/28/DSC01234.ARW");
     }
 
     #[test]

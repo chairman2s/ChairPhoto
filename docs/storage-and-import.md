@@ -349,8 +349,10 @@ person (Overwrite or Dismiss). Re-homing it would leave the original with no row
 scan would catalogue it afresh without its ratings, tags and faces, or the two files would
 take turns owning the row. A row whose primary copies are all on other volumes still gains a
 file found on a volume indexed in place as another location; that moves nothing. A bundle
-whose photo lands as such a separate copy still merges its tags onto the existing row, which
-merge matches by identity.
+whose photo lands as such a separate copy puts none of its data on the copy's row (#185): its
+culling, IPTC, edits, versions and tags go onto the existing row, which merge matches by
+identity, the way a bundle photo already in the library does (see "Photo (existing)" below).
+The copy's row is a file of this import (its batch, its queued backup) and nothing more.
 
 "Still in place" is a question about the file, not the name (#184). On a case-insensitive
 filesystem (APFS and HFS+ by default, exFAT and vfat drives, a casefold directory) the old
@@ -666,9 +668,42 @@ Two modes over the same core location model:
   each supported image from the card into `<dest>/YYYY/MM/DD/` (date from EXIF capture
   time, falling back to file mtime), **keeping camera filenames**, then indexes the
   copies, groups them in one import batch, and auto-enqueues NAS backup. Destination
-  default `~/Pictures/Raw` (must be under the catalog root). Collisions: same byte-size →
-  skipped as already-imported; different size → ` (n)` rename (never overwrites). Owner
-  decisions: Year/Month/Day tree, keep filenames. UI: topbar "Import card" dialog with an
+  default `~/Pictures/Raw` (must be under the catalog root). Collisions (#246, owner
+  decision 2026-10-04): a file of the same name and size already there is the same photo,
+  already imported and skipped, only when its EXIF capture time (`DateTimeOriginal` with
+  `SubSecTimeOriginal`) and camera serial (`SerialNumber`, `InternalSerialNumber`, each
+  compared when both files carry it) agree. A file with no `DateTimeOriginal` (a camera's
+  video) has its QuickTime `CreateDate` as its capture time (read as
+  `-QuickTime:CreateDate`), compared only with the other file's; an all-zero date is no
+  capture time. A still's EXIF or XMP `CreateDate` is not read: a still with no
+  `DateTimeOriginal` has no capture time. When neither file has a
+  capture time (a PNG, a stripped JPEG) their contents are compared by streamed SHA-256
+  instead. Anything else —
+  another size, another sub-second, another body — is a different photo, copied as ` (n)`
+  with its own row and UUID; nothing is ever overwritten (`same_photo::create_new_file`):
+  the copy is written to a hidden temporary file in the same folder
+  (`.<name>.chairphoto-part-…`, never indexed), synced, and then given its name without
+  replacing anything — `renameat2(RENAME_NOREPLACE)` on Linux, else a hard link — so a file
+  that appears there after the name was found free sends the copy on to the next free name,
+  and a crash mid-copy leaves at most the hidden temporary file, never a short original at
+  a library name. On a filesystem with neither (exFAT, FAT) the name is claimed by an
+  exclusive create and the temporary file copied in: still no overwrite, but without that
+  crash guarantee. A name is free only when
+  nothing is at it and nothing at its sidecar's name (`<name>.xmp`) either: a sidecar with
+  no original beside it (another tool's, or one whose original was removed) belongs to some
+  other photo, and a new file placed beside it would adopt its identity and metadata. File mtime is never evidence (a
+  copy changes it). The ` (n)` names an earlier import gave are checked too (every one in
+  the folder, past a gap in the numbers or with the plain name gone), so importing a
+  card again skips every file. Each date folder is listed once per import
+  (`same_photo::FolderListings`), not once per file: card ingest plans every file before
+  copying any, and a bundle's unpack records each name it places. One photo met twice in a run (the same file in two folders
+  of the card) is the same rule against the file already copied: it is copied once. Every
+  earlier match counts, so a third meeting is skipped against the second when the first
+  failed to copy. The metadata comes from one exiftool pass per 150 colliding
+  files (`scanner::same_photo`), over both sides of each pair, so a re-import reads a few KB
+  per file rather than hashing the card. The import dialog's "already imported" flag uses
+  the same rule and the same plan, so a second meeting of one photo on the card is flagged
+  as the copy will skip it. Owner decisions: Year/Month/Day tree, keep filenames. UI: topbar "Import card" dialog with an
   optional **Import name** that labels the batch (defaults to the source folder); the batch
   keeps its stable UUID underneath. (Cross-volume "import once" by UUID is handled by bundle merge.)
 
@@ -747,7 +782,8 @@ A **merge** is two independent halves:
 
 The laptop only **adds new import batches**; it does not check out existing library
 photos. Therefore merge is **additive** — the desktop gains photos it has never seen,
-and **no edit conflicts are possible**. The one shared structure is the **tag
+and a photo it already has keeps every value it holds (a bundle fills only its blanks and
+adds its edits as new versions, #185), so **no edit conflicts are possible**. The one shared structure is the **tag
 taxonomy**, resolved by matching tags on normalized full path (assignments union);
 albums merge by name. All non-destructive.
 
@@ -777,17 +813,56 @@ The merge engine (`catalog/merge.rs`) is **pure-DB, no file I/O**:
 | Tag taxonomy | Resolve by tag uuid first, then normalized full_path; create missing ancestors; never overwrite existing uuid / exportable flag |
 | Tag terms | `INSERT … ON CONFLICT DO NOTHING` — adds missing terms, never modifies existing |
 | Photo (new) | Insert with full state (rating, label, pick, IPTC, edit record, versions) |
-| Photo (existing) | **Never touched** — existing rating/label/pick/IPTC/edits/versions are preserved |
+| Photo (existing) | **Its own values win; blanks are filled** (owner decision on #185, 2026-10-04). Rating 0, an empty label and a pick of "none" take the bundle's. The bundle's edit record (as a version named "Imported edit"; a blank one is no edit and adds none) and its versions are added as **new versions** after the photo's own, unless the photo already has those settings (its edit record or a version with an equal JSON value), so a re-merge adds none; the photo's edit record and versions are not changed. Blank IPTC fields are filled by the importer, not the pure-DB merge (below). A row the importer created for this bundle moments before is not filled again. |
+| Photo (new identity, path taken) | **Kept apart** — no row holds its identity but another photo, under another identity, holds its path (the same capture imported separately on each side, #246): neither inserted (`photos.path` is UNIQUE; before #185 the whole merge failed here) nor merged onto that photo. Counted in `MergeSummary::photos_kept_apart`. The same holds when the importer found the photo's original in the library at another name (a ` (n)` one) under another identity and its own path is free: the importer passes those identities to `merge_bundle_into`, so no metadata-only row is inserted at a path where no file of the photo is. |
 | Tag assignments | `INSERT OR IGNORE` union — new assignments added, none removed |
 
 The importer (`bundle/importer.rs`) runs in three phases:
 1. **Parse** — open the zip, validate `format_version`.
 2. **Copy** (off the catalog lock) — extract `originals/` into `<root>/YYYY/MM/DD/`;
-   same-size collision → skip; different-size → rename with ` (n)` suffix; never overwrite.
-   Writes a UUID sidecar beside each original so the index phase can match by identity.
+   a collision is decided by card ingest's rule (#246): the same name, size and capture →
+   already imported, skip; anything else → rename with ` (n)` suffix; never overwrite. The
+   bundle's side is read from the original's bytes in memory (the manifest carries no
+   capture time or serial), never written anywhere to be compared: one exiftool process
+   reads the bytes from stdin and the library files from their paths, with one set of
+   arguments, and the stamps decide first, as for a card (`same_photo::find_in_library`).
+   Only where they do not say "the same capture" are the contents compared, streamed and
+   stopping at the first differing byte — byte-identical is always the same photo — so a
+   re-import of RAWs that carry a capture time reads their headers, not every library
+   copy whole. Re-importing a bundle the library already holds writes nothing to the
+   library's disk.
+   A file found already there is not touched by this phase, its sidecar included: the
+   index phase binds an identity to it — the row's, through `ensure_sidecar_identity` —
+   and only when no row of **another** identity holds the file. One that does is the
+   owner's photo (the same capture imported separately on each side): it is neither
+   upserted nor bound, its sidecar never receives the bundle's identity (even when it
+   lacks one, as identity debt), and the bundle's photo is kept apart (below).
+   Writes a UUID sidecar beside each original so the index phase can match by identity:
+   the bundle's own sidecar, or a fresh identity sidecar, each only as a new file — a file
+   already at the sidecar's name (the original's name was chosen with it free, so one there
+   now appeared meanwhile) is left as it is, never replaced.
 3. **Index** (secondary connection, off the main lock) — `upsert_photo_with_identity` for
-   each extracted file; run `merge_bundle`; assign newly-created photos to the batch;
-   write the batch UUID sidecar; apply auto-tags; reconcile missing.
+   each extracted file, giving a row created for the bundle's own photo the bundle's full
+   state; run `merge_bundle_into`, which fills in what an existing photo lacks; assign
+   newly-created photos to the batch; write the batch UUID sidecar; fill an existing
+   photo's blank IPTC; apply auto-tags; reconcile missing.
+
+   **A bundle photo the library already has** (#185) — its file skipped as the same
+   capture (#246), or its identity held by a row whose own file is still in place (its
+   copy then gets a row of its own, as above) — has its data put on the row merge matches
+   by identity, never on a second row, as the table above says. Its IPTC goes through the rules for an existing row's IPTC (AGENTS.md, "XMP
+   safety"): the original's path is resolved first (an unreachable original is not
+   filled), the store is `Catalog::set_iptc` under the sidecar's write turn
+   (`xmp::lock::WriteOrder`), held through the sidecar write and the compare-and-set
+   settle, and a failed write stays owed. A field is filled only when neither the row nor
+   the sidecar beside its original has a value — a value in the sidecar the catalog never
+   imported is the photo's own too — and not at all when that sidecar does not parse. (Not
+   `set_iptc_carried`: that is for values arriving beside a sidecar of their own, and this
+   sidecar is the existing photo's.) Such a photo is **not** queued for backup and **not**
+   put in the bundle's batch: it was not added by this import, and batch membership is
+   immutable ("All photos from that ingest belong to it forever" — it belongs to the batch
+   it arrived with). A version it gains owes the monochrome refresh any version write owes
+   (docs/editing.md): a B&W version sets the flag.
 
 **Batch UUID in XMP sidecar** (`chairphoto:ImportBatch`): every imported photo's
 XMP sidecar carries the batch UUID alongside the photo UUID. This makes the batch

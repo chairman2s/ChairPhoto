@@ -20,7 +20,7 @@ resolver = "2"
 # match it. Bump it here for the next release, calendar-versioned (`YEAR.MONTH.RELEASE`, never
 # a zero-padded month).
 [workspace.package]
-version = "2026.8.0"
+version = "2026.10.0"
 
 # Optimize image-decoding crates even in dev builds. Our own code stays in debug
 # (fast incremental builds), but decoding a 66 MP embedded RAW preview is ~20x

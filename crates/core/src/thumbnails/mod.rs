@@ -366,10 +366,13 @@ fn generate_from_decode(path: &Path, img: &DynamicImage, size: Size) -> Result<V
 /// Downscale a decoded image to `size` and JPEG-encode it (with Adobe-RGB→sRGB when the
 /// source file is Adobe RGB). Pure — no disk writes.
 fn encode_size(path: &Path, img: &DynamicImage, size: Size) -> Result<Vec<u8>, String> {
-    // thumbnail() only downscales, so a max larger than the image leaves it native.
-    // `downscale::thumbnail` is `image`'s `thumbnail`, byte for byte, without its per-pixel
-    // overhead (#168).
-    let resized = downscale::thumbnail(img, size.max);
+    // A tier only ever shrinks: an image that already fits is encoded at its own size. (image's
+    // `thumbnail` fits the image to the box both ways, so the 10 000 px zoom tier used to
+    // blow a 6000 px decode up to 10 000 px — a 67 MP JPEG that took seconds to encode and a
+    // 267 MB texture, for no more detail, #168.) `downscale::thumbnail` is image's
+    // `thumbnail`, byte for byte, without its per-pixel overhead.
+    let fits = img.width() <= size.max && img.height() <= size.max;
+    let resized = if fits { std::borrow::Cow::Borrowed(img) } else { std::borrow::Cow::Owned(downscale::thumbnail(img, size.max)) };
     let mut out = Cursor::new(Vec::new());
     // The webview shows untagged JPEGs as sRGB. Sony shoots Adobe RGB (wider gamut), so
     // an Adobe RGB preview displayed as-is looks dull/desaturated. Convert it to sRGB for
@@ -754,6 +757,26 @@ pub(crate) mod tests {
         adobe_rgb_to_srgb(&mut img);
         let p = img.get_pixel(0, 0).0;
         assert!(p[0] > 200, "red channel should increase, got {}", p[0]);
+    }
+
+    // --- tiers never upscale (#168) ------------------------------------------
+
+    /// An image smaller than a tier is encoded at its own size — the zoom tier is the
+    /// decode's native resolution — while a larger one still shrinks to fit.
+    #[test]
+    fn a_tier_never_upscales() {
+        let path = Path::new("/nonexistent/upscale-check.jpg");
+        let dims = |img: &DynamicImage, size: Size| {
+            let bytes = encode_size(path, img, size).unwrap();
+            let decoded = image::load_from_memory(&bytes).unwrap();
+            (decoded.width(), decoded.height())
+        };
+        let small = DynamicImage::ImageRgb8(RgbImage::from_pixel(600, 400, image::Rgb([90, 120, 150])));
+        assert_eq!(dims(&small, ZOOM), (600, 400), "zoom: native");
+        assert_eq!(dims(&small, PREVIEW), (600, 400), "preview of a small image: native");
+        assert_eq!(dims(&small, THUMB), (512, 341), "thumb: shrunk to fit");
+        let tall = DynamicImage::ImageRgb8(RgbImage::from_pixel(300, 3000, image::Rgb([9, 9, 9])));
+        assert_eq!(dims(&tall, PREVIEW), (205, 2048), "a long edge over the box still shrinks");
     }
 
     // --- decode-once chain + analyzer hook -----------------------------------

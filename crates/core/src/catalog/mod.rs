@@ -48,7 +48,7 @@ pub use identity::{
 pub use iptc_owed::{IptcMask, IptcSettled, IptcSidecarState, IptcSidecarWrite, OwedDismissal, OwedIptc};
 pub use locations::{PathCandidate, ResolveMode};
 pub use lifecycle::{
-    carry_companions, copy_and_verify, copy_with_companions, verify_and_delete_locals, BackupPlan,
+    carry_companions, copy_and_verify, copy_with_companions, sha256_file, verify_and_delete_locals, BackupPlan,
     CarriedCompanion, CompanionCarry, CopyOutcome, OffloadPlan, RestorePlan,
 };
 pub use merge::MergeSummary;
@@ -2498,7 +2498,7 @@ impl<'a> IdentitySource<'a> {
     ///
     /// A trusted value is not recorded on a row that `matched_by_path` (#150, a nit of the
     /// #146 re-review): the value names the bundle's photo, and the row at that path is the
-    /// file already there — a same-size collision the importer skipped onto may be the
+    /// file already there — a name collision the importer skipped onto may be the
     /// user's own, different photo. A sidecar's value describes the file at that path, so
     /// it is recorded either way.
     fn legacy_value(&self, matched_by_path: bool) -> Option<&'a str> {

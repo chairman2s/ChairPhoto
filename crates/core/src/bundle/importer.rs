@@ -6,9 +6,11 @@
 //!
 //! 1. **Parse** — open the zip, read `manifest.json`, validate `format_version`.
 //! 2. **Copy** (off the catalog lock, slow) — extract each `originals/<relative_path>`
-//!    into `<root>/YYYY/MM/DD/<filename>`, using E5's collision rules:
-//!    - Same-size file at the destination → already imported, skip.
-//!    - Different-size collision → rename with ` (n)` suffix (never overwrite).
+//!    into `<root>/YYYY/MM/DD/<filename>`, using card ingest's collision rules (#246):
+//!    - A same-name, same-size file there that is the same capture (EXIF capture time,
+//!      sub-second, camera serial; the contents when neither has a capture time) →
+//!      already imported, skip.
+//!    - Any other collision → rename with ` (n)` suffix (never overwrite).
 //!    Sidecars (`<entry>.xmp`) are extracted beside their original.
 //!    Progress events (`import:progress {done, total}`) stream the copy phase.
 //! 3. **Index** (on a secondary connection, off the main catalog lock) — call
@@ -41,7 +43,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 pub struct BundleImportResult {
     /// Photos copied from the bundle originals (new to the filesystem).
     pub copied: usize,
-    /// Originals skipped because a same-size file already existed at the destination.
+    /// Originals skipped because the library already held them at their destination (the
+    /// same name, size and capture, #246).
     pub skipped_duplicate: usize,
     /// Originals that encountered a non-fatal error during extraction (metadata-only).
     pub errors: usize,
@@ -105,9 +108,12 @@ pub struct ExtractedItem {
 /// mirroring the `ORIGINALS_DIR/<relative_path>` archive entries. Sidecars
 /// (`<entry>.xmp`) are extracted beside their original.
 ///
-/// Collision rules (E5 parity):
-/// - Same-size file already at the destination → `skipped_duplicate` (no write).
-/// - Different-size collision → ` (n)` suffix (never overwrite).
+/// Collision rules (card ingest's, #246 — `scanner::same_photo`):
+/// - A file of the same name and size at the destination (or at one of the ` (n)` names an
+///   earlier import gave a different photo of that name) that is the same capture — EXIF
+///   capture time, sub-second and camera serial agree, or, with no capture time on either
+///   side, the contents — is this photo, already imported → `skipped_duplicate` (no write).
+/// - Any other collision → ` (n)` suffix (never overwrite).
 ///
 /// `on_progress(done, total)` is called once per original (including skipped/error)
 /// so the caller can stream `import:progress` events.
@@ -122,16 +128,36 @@ pub fn extract_originals(
         .map(|(extracted, result, _)| (extracted, result))
 }
 
+/// An original that arrived at a name the library already uses at its size, unpacked beside
+/// it under a hidden name until #246's rule says whether it is that photo.
+struct Staged<'m> {
+    bp: &'m crate::bundle::BundlePhoto,
+    arc_orig: String,
+    /// The unpacked bytes, `<dir>/.chairphoto-import-<filename>`: hidden from a scan, and
+    /// keeping the extension so exiftool reads it as it reads the library file.
+    staged: PathBuf,
+    /// Where it lands if it is a different photo (its ` (n)` name is found then).
+    dest: PathBuf,
+    candidates: Vec<PathBuf>,
+}
+
 /// [`extract_originals`], stopping before the next original once `abort` is set (a Cancel,
 /// a newer import or a catalog switch). The third value is whether it stopped early.
 ///
 /// A stop never leaves a half-written file: `abort` is read between originals, and each
 /// original is written whole. What was unpacked before the stop **stays** in the library
-/// folder, each copy with its identity sidecar, and nothing is deleted. A same-size
-/// "already here" entry may be the user's own pre-existing original, and this function will
-/// not decide which files it may remove. Importing the bundle again finishes the job: the
-/// copies are then same-size skips, bound by UUID and indexed. A rescan also picks them up
-/// under the bundle's identity.
+/// folder, each copy with its identity sidecar, and nothing is deleted. An "already here"
+/// entry may be the user's own pre-existing original, and this function will not decide
+/// which files it may remove. Importing the bundle again finishes the job: the copies are
+/// then the same captures at their names, skipped, bound by UUID and indexed. A rescan also
+/// picks them up under the bundle's identity.
+///
+/// The bundle's side of a collision is read from the original itself, unpacked beside the
+/// library file under a hidden name: the manifest carries no capture time or serial, and
+/// reading both files with the same exiftool pass means one file's bytes always give one
+/// answer. The collisions are decided together, in one batched read, once every original has
+/// been through the loop; an unpacked original the stop leaves undecided is removed (it was
+/// never placed in the library).
 pub fn extract_originals_abortable(
     manifest: &BundleManifest,
     archive: &mut ZipArchive<std::fs::File>,
@@ -139,6 +165,8 @@ pub fn extract_originals_abortable(
     abort: &std::sync::atomic::AtomicBool,
     on_progress: impl Fn(usize, usize),
 ) -> Result<(Vec<ExtractedItem>, BundleImportResult, bool), String> {
+    use crate::scanner::same_photo;
+
     let total = manifest.photos.len();
     let mut result = BundleImportResult {
         copied: 0,
@@ -147,9 +175,16 @@ pub fn extract_originals_abortable(
         merge: MergeSummary::default(),
     };
     let mut extracted: Vec<ExtractedItem> = Vec::new();
+    let mut staged: Vec<Staged> = Vec::new();
+    let drop_staged = |staged: &[Staged]| {
+        for s in staged {
+            let _ = std::fs::remove_file(&s.staged);
+        }
+    };
 
     for (i, bp) in manifest.photos.iter().enumerate() {
         if abort.load(std::sync::atomic::Ordering::Relaxed) {
+            drop_staged(&staged);
             return Ok((extracted, result, true));
         }
         on_progress(i + 1, total);
@@ -217,54 +252,27 @@ pub fn extract_originals_abortable(
             continue;
         }
 
-        let mut dest = dir.join(filename);
+        let dest = dir.join(filename);
 
-        // Collision rules (E5 parity): same-size → skip; different-size → rename.
-        if dest.exists() {
-            let dest_size = std::fs::metadata(&dest).map(|m| m.len()).unwrap_or(u64::MAX);
-            if dest_size == orig_bytes.len() as u64 {
-                // Same-size → already imported, skip the copy.
-                result.skipped_duplicate += 1;
-                // Put the UUID in the sidecar so the upsert can match by it. The file was
-                // here before this import, so it may already carry a *different*
-                // identity — `bind_sidecar_identity` leaves that one alone rather than
-                // overwriting another photo's identity on the strength of a same-size
-                // filename collision. This phase holds no catalog connection, so an
-                // unbound identity is only reported here; index_bundle records it durably.
-                // A blank manifest uuid is no identity (#146 N4): the indexer mints one.
-                if let Some(identity) = crate::catalog::photo_identity_for(&bp.uuid) {
-                    let found = crate::xmp::read_identifier(&dest);
-                    let outcome =
-                        crate::catalog::bind_sidecar_identity(&dest, &identity, found.as_deref());
-                    if outcome != crate::catalog::SidecarIdentity::Bound {
-                        eprintln!(
-                            "bundle import: identity not bound for {} ({outcome:?}) — queued for repair",
-                            dest.display()
-                        );
-                    }
-                }
-                // Still record as extracted so the indexer can upsert its location.
-                extracted.push(ExtractedItem {
-                    dest,
-                    photo_uuid: bp.uuid.clone(),
-                    relative_path: bp.relative_path.clone(),
-                });
+        // A same-name, same-size file may be this photo, already imported (#246): unpack it
+        // beside the library file, to be decided with the others after the loop.
+        let candidates = same_photo::same_size_candidates(&dest, orig_bytes.len() as u64);
+        if !candidates.is_empty() {
+            let mut hidden = std::ffi::OsString::from(".chairphoto-import-");
+            hidden.push(filename);
+            let staged_path = dir.join(hidden);
+            if let Err(e) = std::fs::write(&staged_path, &orig_bytes) {
+                eprintln!("bundle import: write {} failed: {e}", staged_path.display());
+                let _ = std::fs::remove_file(&staged_path);
+                result.errors += 1;
                 continue;
             }
-            // Different-size collision — rename.
-            match unique_dest(&dest) {
-                Some(p) => dest = p,
-                None => {
-                    eprintln!(
-                        "bundle import: couldn't find a free name for {} ({}) — skipped",
-                        bp.uuid, dest.display()
-                    );
-                    result.errors += 1;
-                    continue;
-                }
-            }
+            staged.push(Staged { bp, arc_orig, staged: staged_path, dest, candidates });
+            continue;
         }
 
+        // Any other collision (another size) is a different photo → ` (n)`.
+        let Some(dest) = unique_free_name(bp, &dest, &mut result) else { continue };
         if let Err(e) = std::fs::write(&dest, &orig_bytes) {
             eprintln!(
                 "bundle import: write {} failed: {e}", dest.display()
@@ -273,58 +281,7 @@ pub fn extract_originals_abortable(
             continue;
         }
         result.copied += 1;
-
-        // Sidecar handling — the UUID must land in the sidecar beside the original so
-        // that index_bundle's `upsert_photo_with_identity` (and future re-scans) can
-        // match this photo by UUID instead of minting a duplicate.
-        //
-        // Strategy:
-        // 1. If the bundle carries a sidecar for this original, extract it as-is (it
-        //    already contains `xmp:Identifier`).
-        // 2. Otherwise, write a fresh merge-safe UUID sidecar from the bundle UUID now,
-        //    before the index phase runs — this is the binding invariant (AGENTS.md).
-        let sidecar_dest = {
-            let mut s = dest.as_os_str().to_os_string();
-            s.push(".xmp");
-            PathBuf::from(s)
-        };
-        let arc_sidecar = format!("{}.xmp", arc_orig);
-        let bundle_sidecar_extracted = if let Ok(mut entry) = archive.by_name(&arc_sidecar) {
-            let mut sidecar_bytes = Vec::new();
-            if entry.read_to_end(&mut sidecar_bytes).is_ok() {
-                if let Err(e) = std::fs::write(&sidecar_dest, &sidecar_bytes) {
-                    eprintln!(
-                        "bundle import: sidecar write {} failed (non-fatal): {e}",
-                        sidecar_dest.display()
-                    );
-                    false
-                } else {
-                    true
-                }
-            } else {
-                false
-            }
-        } else {
-            false
-        };
-        // If no bundle sidecar landed, write a bare UUID sidecar so the identity is
-        // in place for the index phase. This satisfies the AGENTS.md invariant: every
-        // catalogued photo's XMP sidecar carries its UUID. A failure here is not the
-        // end of it — the photo has no catalog row yet, so index_bundle is the one that
-        // records the repair once the row exists.
-        // A blank manifest uuid is no identity (#146 N4); the indexer mints one and binds it.
-        let identity = crate::catalog::photo_identity_for(&bp.uuid);
-        if let (false, false, Some(identity)) =
-            (bundle_sidecar_extracted, sidecar_dest.exists(), identity)
-        {
-            if let Err(e) = crate::xmp::write_identifier(&dest, &identity) {
-                eprintln!(
-                    "bundle import: couldn't write UUID sidecar for {} — queued for repair: {e}",
-                    dest.display()
-                );
-            }
-        }
-
+        place_sidecar(archive, &arc_orig, &dest, bp);
         extracted.push(ExtractedItem {
             dest,
             photo_uuid: bp.uuid.clone(),
@@ -332,7 +289,141 @@ pub fn extract_originals_abortable(
         });
     }
 
+    // Decide the collisions together: one batched metadata read over them all.
+    let arrivals: Vec<same_photo::Arrival> = staged
+        .iter()
+        .map(|s| same_photo::Arrival { file: s.staged.clone(), candidates: s.candidates.clone() })
+        .collect();
+    let Some(decided) = same_photo::find_already_imported(&arrivals, abort) else {
+        drop_staged(&staged);
+        return Ok((extracted, result, true));
+    };
+    for (s, already) in staged.iter().zip(decided) {
+        if let Some(existing) = already {
+            // The same capture is already in the library: skip the copy.
+            let _ = std::fs::remove_file(&s.staged);
+            result.skipped_duplicate += 1;
+            bind_existing(&existing, s.bp);
+            // Still record as extracted so the indexer can upsert its location.
+            extracted.push(ExtractedItem {
+                dest: existing,
+                photo_uuid: s.bp.uuid.clone(),
+                relative_path: s.bp.relative_path.clone(),
+            });
+            continue;
+        }
+        // A different photo under a name already used: kept beside it as ` (n)`.
+        let Some(dest) = unique_free_name(s.bp, &s.dest, &mut result) else {
+            let _ = std::fs::remove_file(&s.staged);
+            continue;
+        };
+        if let Err(e) = std::fs::rename(&s.staged, &dest) {
+            eprintln!("bundle import: placing {} failed: {e}", dest.display());
+            let _ = std::fs::remove_file(&s.staged);
+            result.errors += 1;
+            continue;
+        }
+        result.copied += 1;
+        place_sidecar(archive, &s.arc_orig, &dest, s.bp);
+        extracted.push(ExtractedItem {
+            dest,
+            photo_uuid: s.bp.uuid.clone(),
+            relative_path: s.bp.relative_path.clone(),
+        });
+    }
+
     Ok((extracted, result, false))
+}
+
+/// `dest`, or the free ` (n)` name beside it when it is taken; `None` (counted as an error)
+/// when no free name is found — never an overwrite.
+fn unique_free_name(
+    bp: &crate::bundle::BundlePhoto,
+    dest: &Path,
+    result: &mut BundleImportResult,
+) -> Option<PathBuf> {
+    let free = crate::scanner::same_photo::unique_dest(dest);
+    if free.is_none() {
+        eprintln!(
+            "bundle import: couldn't find a free name for {} ({}) — skipped",
+            bp.uuid,
+            dest.display()
+        );
+        result.errors += 1;
+    }
+    free
+}
+
+/// A bundle original found already in the library at `existing`: put the bundle's identity
+/// in its sidecar so the upsert can match by it. The file was here before this import, so it
+/// may already carry a *different* identity — `bind_sidecar_identity` leaves that one alone
+/// rather than overwriting another photo's identity on the strength of a filename collision.
+/// The copy phase holds no catalog connection, so an unbound identity is only reported here;
+/// index_bundle records it durably. A blank manifest uuid is no identity (#146 N4): the
+/// indexer mints one.
+fn bind_existing(existing: &Path, bp: &crate::bundle::BundlePhoto) {
+    if let Some(identity) = crate::catalog::photo_identity_for(&bp.uuid) {
+        let found = crate::xmp::read_identifier(existing);
+        let outcome = crate::catalog::bind_sidecar_identity(existing, &identity, found.as_deref());
+        if outcome != crate::catalog::SidecarIdentity::Bound {
+            eprintln!(
+                "bundle import: identity not bound for {} ({outcome:?}) — queued for repair",
+                existing.display()
+            );
+        }
+    }
+}
+
+/// The sidecar of an original just placed at `dest` — the UUID must land in it so that
+/// index_bundle's `upsert_photo_with_identity` (and future re-scans) can match this photo by
+/// UUID instead of minting a duplicate.
+///
+/// 1. If the bundle carries a sidecar for this original, extract it as-is (it already
+///    contains `xmp:Identifier`).
+/// 2. Otherwise, write a fresh merge-safe UUID sidecar from the bundle UUID now, before the
+///    index phase runs — this is the binding invariant (AGENTS.md). A failure here is not
+///    the end of it — the photo has no catalog row yet, so index_bundle is the one that
+///    records the repair once the row exists. A blank manifest uuid is no identity (#146
+///    N4); the indexer mints one and binds it.
+fn place_sidecar(
+    archive: &mut ZipArchive<std::fs::File>,
+    arc_orig: &str,
+    dest: &Path,
+    bp: &crate::bundle::BundlePhoto,
+) {
+    let sidecar_dest = {
+        let mut s = dest.as_os_str().to_os_string();
+        s.push(".xmp");
+        PathBuf::from(s)
+    };
+    let arc_sidecar = format!("{}.xmp", arc_orig);
+    let bundle_sidecar_extracted = if let Ok(mut entry) = archive.by_name(&arc_sidecar) {
+        let mut sidecar_bytes = Vec::new();
+        if entry.read_to_end(&mut sidecar_bytes).is_ok() {
+            if let Err(e) = std::fs::write(&sidecar_dest, &sidecar_bytes) {
+                eprintln!(
+                    "bundle import: sidecar write {} failed (non-fatal): {e}",
+                    sidecar_dest.display()
+                );
+                false
+            } else {
+                true
+            }
+        } else {
+            false
+        }
+    } else {
+        false
+    };
+    let identity = crate::catalog::photo_identity_for(&bp.uuid);
+    if let (false, false, Some(identity)) = (bundle_sidecar_extracted, sidecar_dest.exists(), identity) {
+        if let Err(e) = crate::xmp::write_identifier(dest, &identity) {
+            eprintln!(
+                "bundle import: couldn't write UUID sidecar for {} — queued for repair: {e}",
+                dest.display()
+            );
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -454,7 +545,7 @@ pub(crate) fn index_bundle_with(
         let sidecar_uuid = crate::xmp::read_identifier(path);
 
         // The sidecar wins when it has an identity — it describes the file that is
-        // actually on disk, which for a same-size collision need not be the bundle's
+        // actually on disk, which for a name collision (#246) need not be the bundle's
         // photo. When it has none (the copy phase's write failed, or the existing
         // sidecar doesn't parse), fall back to the manifest: this photo's identity is
         // known, so minting a fresh UUID here would be inventing a second one for it
@@ -677,28 +768,6 @@ pub(crate) fn index_bundle_with(
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// A destination path that doesn't exist yet (`name (2).ext`, …), or `None` if no
-/// free name was found. Never overwrites — the caller must not copy on `None`.
-fn unique_dest(path: &Path) -> Option<PathBuf> {
-    if !path.exists() {
-        return Some(path.to_path_buf());
-    }
-    let dir = path.parent().unwrap_or_else(|| Path::new("."));
-    let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("file");
-    let ext = path.extension().and_then(|s| s.to_str());
-    for n in 2..10_000 {
-        let mut name = format!("{stem} ({n})");
-        if let Some(ext) = ext {
-            name.push('.');
-            name.push_str(ext);
-        }
-        let candidate = dir.join(name);
-        if !candidate.exists() {
-            return Some(candidate);
-        }
-    }
-    None
-}
 
 // ---------------------------------------------------------------------------
 // Tests
@@ -786,6 +855,151 @@ mod tests {
         let dest = dir.join("test.chairphoto");
         write_bundle(&bundle, &dest, |_, _| {}).expect("write_bundle");
         dir.into_subpath("test.chairphoto")
+    }
+
+    /// A bundle of `photos`, each with its original copied from the given file (none: a
+    /// metadata-only entry).
+    fn bundle_of(
+        tag: &str,
+        photos: Vec<(crate::bundle::BundlePhoto, Option<PathBuf>)>,
+    ) -> crate::test_support::TestSubPath {
+        let dir = temp_dir(&format!("{tag}-bundle"));
+        let mut manifest = BundleManifest::new(
+            BundleBatch {
+                uuid: format!("batch-{tag}"),
+                source_label: "Test batch".into(),
+                note: String::new(),
+                created_at: 1_700_000_000,
+            },
+            1_700_100_000,
+        );
+        let mut originals = HashMap::new();
+        for (bp, original) in photos {
+            originals.insert(bp.uuid.clone(), original);
+            manifest.photos.push(bp);
+        }
+        let dest = dir.join("test.chairphoto");
+        write_bundle(&GatheredBundle { manifest, originals }, &dest, |_, _| {}).expect("write_bundle");
+        dir.into_subpath("test.chairphoto")
+    }
+
+    /// A bundle photo with no culling, IPTC, edits or tags of its own.
+    fn plain_photo(uuid: &str, relative_path: &str) -> crate::bundle::BundlePhoto {
+        crate::bundle::BundlePhoto {
+            uuid: uuid.into(),
+            relative_path: relative_path.into(),
+            rating: 0,
+            label: String::new(),
+            pick_state: crate::catalog::PickState::None,
+            iptc: Default::default(),
+            edit_record: None,
+            versions: Vec::new(),
+            tag_uuids: Vec::new(),
+        }
+    }
+
+    // --- same name, same size (#246) ----------------------------------------------------
+
+    /// The library holds `DSC1.jpg`; the bundle brings two photos of that name and size taken
+    /// in the same second — one the same capture (skipped), one another body's (kept as
+    /// ` (2)`, its own row and the bundle's UUID). The library file is never overwritten, and
+    /// importing the bundle again skips both.
+    #[test]
+    fn a_bundle_original_is_skipped_only_when_it_is_the_same_capture() {
+        use crate::scanner::same_photo::test_files::{exiftool_available, stamped_jpeg};
+        if !exiftool_available("a_bundle_original_is_skipped_only_when_it_is_the_same_capture") {
+            return;
+        }
+        const SAME: &str = "0b7f3b1e-1111-4c3d-9e8f-0a1b2c3d4e5f";
+        const OTHER: &str = "0b7f3b1e-2222-4c3d-9e8f-0a1b2c3d4e5f";
+        let src = temp_dir("246-src");
+        let same = src.join("same/DSC1.jpg");
+        let other = src.join("other/DSC1.jpg");
+        stamped_jpeg(&same, "2026:06:28 12:00:00", "123", "4711");
+        stamped_jpeg(&other, "2026:06:28 12:00:00", "123", "9999");
+        let bundle_path = bundle_of(
+            "246",
+            vec![
+                (plain_photo(SAME, "2026/06/28/DSC1.jpg"), Some(same.clone())),
+                (plain_photo(OTHER, "2026/06/29/DSC1.jpg"), Some(other.clone())),
+            ],
+        );
+
+        let (catalog, root) = temp_catalog("246");
+        // The library has the first photo on both days (the second day's under the same
+        // name, the same capture as `same`: so `other` collides with a different photo).
+        for day in ["28", "29"] {
+            let lib = root.join(format!("2026/06/{day}/DSC1.jpg"));
+            std::fs::create_dir_all(lib.parent().unwrap()).unwrap();
+            std::fs::copy(&same, &lib).unwrap();
+        }
+        assert_eq!(std::fs::metadata(&same).unwrap().len(), std::fs::metadata(&other).unwrap().len());
+
+        let (manifest, mut archive) = open_bundle(&bundle_path).unwrap();
+        let (extracted, partial) = extract_originals(&manifest, &mut archive, &root, |_, _| {}).unwrap();
+        assert_eq!((partial.skipped_duplicate, partial.copied, partial.errors), (1, 1, 0));
+        let kept = root.join("2026/06/29/DSC1 (2).jpg");
+        assert_eq!(std::fs::read(&kept).unwrap(), std::fs::read(&other).unwrap());
+        assert_eq!(std::fs::read(root.join("2026/06/29/DSC1.jpg")).unwrap(), std::fs::read(&same).unwrap());
+        let hidden: Vec<_> = std::fs::read_dir(root.join("2026/06/29"))
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().starts_with(".chairphoto-import-"))
+            .collect();
+        assert!(hidden.is_empty(), "no staged file left behind");
+        index_bundle(&catalog, &manifest, &extracted, &root, partial).unwrap();
+        let other_row = catalog.get_photo_by_uuid(OTHER).unwrap();
+        assert_eq!(other_row.path, "2026/06/29/DSC1 (2).jpg");
+
+        let (manifest, mut archive) = open_bundle(&bundle_path).unwrap();
+        let (_, again) = extract_originals(&manifest, &mut archive, &root, |_, _| {}).unwrap();
+        assert_eq!((again.skipped_duplicate, again.copied), (2, 0), "a second import skips both");
+        assert!(!root.join("2026/06/29/DSC1 (3).jpg").exists());
+    }
+
+    /// An abort before the collisions are decided — between originals, or during the
+    /// decision — leaves no staged file and copies nothing of them.
+    #[test]
+    fn an_abort_removes_the_staged_originals() {
+        let src = temp_dir("246-abort-src");
+        let (a, b) = (src.join("a/DSC1.ARW"), src.join("b/DSC2.ARW"));
+        for p in [&a, &b] {
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, b"FAKE RAW BYTES").unwrap();
+        }
+        let bundle_path = bundle_of(
+            "246-abort",
+            vec![
+                (plain_photo("uuid-246-a", "2026/06/28/DSC1.ARW"), Some(a)),
+                (plain_photo("uuid-246-b", "2026/06/28/DSC2.ARW"), Some(b)),
+            ],
+        );
+        // Abort after the first original (in the loop), and after the last (at the decision).
+        for stop_after in [1, 2] {
+            let (manifest, mut archive) = open_bundle(&bundle_path).unwrap();
+            let dest_base = temp_dir("246-abort-dest");
+            let date_dir = dest_base.join("2026/06/28");
+            std::fs::create_dir_all(&date_dir).unwrap();
+            // Same size as the bundle's "FAKE RAW BYTES", other bytes: both are staged.
+            for name in ["DSC1.ARW", "DSC2.ARW"] {
+                std::fs::write(date_dir.join(name), b"OTHER RAWBYTES").unwrap();
+            }
+            let abort = AtomicBool::new(false);
+            let (_, partial, aborted) =
+                extract_originals_abortable(&manifest, &mut archive, &dest_base, &abort, |done, _| {
+                    if done == stop_after {
+                        abort.store(true, Ordering::Relaxed)
+                    }
+                })
+                .unwrap();
+            assert!(aborted && partial.copied == 0, "stop after {stop_after}");
+            let mut names: Vec<String> = std::fs::read_dir(&date_dir)
+                .unwrap()
+                .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+                .collect();
+            names.sort();
+            assert_eq!(names, ["DSC1.ARW", "DSC2.ARW"], "only the library's own files (stop after {stop_after})");
+        }
     }
 
     #[test]

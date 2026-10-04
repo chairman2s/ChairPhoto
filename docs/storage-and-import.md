@@ -666,9 +666,19 @@ Two modes over the same core location model:
   each supported image from the card into `<dest>/YYYY/MM/DD/` (date from EXIF capture
   time, falling back to file mtime), **keeping camera filenames**, then indexes the
   copies, groups them in one import batch, and auto-enqueues NAS backup. Destination
-  default `~/Pictures/Raw` (must be under the catalog root). Collisions: same byte-size →
-  skipped as already-imported; different size → ` (n)` rename (never overwrites). Owner
-  decisions: Year/Month/Day tree, keep filenames. UI: topbar "Import card" dialog with an
+  default `~/Pictures/Raw` (must be under the catalog root). Collisions (#246, owner
+  decision 2026-10-04): a file of the same name and size already there is the same photo,
+  already imported and skipped, only when its EXIF capture time (`DateTimeOriginal` with
+  `SubSecTimeOriginal`) and camera serial (`SerialNumber`, `InternalSerialNumber`, each
+  compared when both files carry it) agree; when neither file has a capture time (a PNG, a
+  stripped JPEG) their contents are compared by streamed SHA-256 instead. Anything else —
+  another size, another sub-second, another body — is a different photo, copied as ` (n)`
+  with its own row and UUID; nothing is ever overwritten. File mtime is never evidence (a
+  copy changes it). The ` (n)` names an earlier import gave are checked too, so importing a
+  card again skips every file. The metadata comes from one exiftool pass per 150 colliding
+  files (`scanner::same_photo`), over both sides of each pair, so a re-import reads a few KB
+  per file rather than hashing the card. The import dialog's "already imported" flag uses
+  the same rule. Owner decisions: Year/Month/Day tree, keep filenames. UI: topbar "Import card" dialog with an
   optional **Import name** that labels the batch (defaults to the source folder); the batch
   keeps its stable UUID underneath. (Cross-volume "import once" by UUID is handled by bundle merge.)
 
@@ -783,7 +793,11 @@ The merge engine (`catalog/merge.rs`) is **pure-DB, no file I/O**:
 The importer (`bundle/importer.rs`) runs in three phases:
 1. **Parse** — open the zip, validate `format_version`.
 2. **Copy** (off the catalog lock) — extract `originals/` into `<root>/YYYY/MM/DD/`;
-   same-size collision → skip; different-size → rename with ` (n)` suffix; never overwrite.
+   a collision is decided by card ingest's rule (#246): the same name, size and capture →
+   already imported, skip; anything else → rename with ` (n)` suffix; never overwrite. The
+   bundle's side is read from the original itself, unpacked beside the library file under a
+   hidden `.chairphoto-import-<name>` until it is decided (the manifest carries no capture
+   time or serial); one that a stop leaves undecided is removed.
    Writes a UUID sidecar beside each original so the index phase can match by identity.
 3. **Index** (secondary connection, off the main lock) — `upsert_photo_with_identity` for
    each extracted file; run `merge_bundle`; assign newly-created photos to the batch;

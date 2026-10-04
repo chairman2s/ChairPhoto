@@ -36,21 +36,27 @@ use chairphoto_core::catalog::Catalog;
 use chairphoto_core::image_pool::{JobKey, Respond};
 use gpui_kit::test::TestWindowExt as _;
 use gpui_kit::{px, size, AppContext as _, TestAppContext};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 /// Answers every request at once with the same small image — or, holding
-/// (`CHAIRPHOTO_GRID_BENCH_HOLD`), never: the frame cost without thumbnails landing.
-struct InstantPool(Loaded, Option<Mutex<Vec<Respond<Loaded>>>>);
+/// (`CHAIRPHOTO_GRID_BENCH_HOLD`, and for the look-scan setup), never: the frame cost
+/// without thumbnails landing.
+struct InstantPool {
+    image: Loaded,
+    holding: AtomicBool,
+    held: Mutex<Vec<Respond<Loaded>>>,
+}
 
 impl Submit for InstantPool {
     fn submit_batch(&self, batch: Vec<(JobKey, Respond<Loaded>)>) {
-        if let Some(held) = &self.1 {
-            held.lock().unwrap().extend(batch.into_iter().map(|(_, respond)| respond));
+        if self.holding.load(Ordering::Relaxed) {
+            self.held.lock().unwrap().extend(batch.into_iter().map(|(_, respond)| respond));
             return;
         }
         for (_, respond) in batch {
-            respond(Ok(self.0.clone()));
+            respond(Ok(self.image.clone()));
         }
     }
 
@@ -134,7 +140,12 @@ fn grid_frame_cost_on_a_large_catalog(cx: &mut TestAppContext) {
     let frames = env_usize("CHAIRPHOTO_GRID_BENCH_FRAMES", 300);
     let (w, h) = (env_usize("CHAIRPHOTO_GRID_BENCH_W", 2560) as f32, env_usize("CHAIRPHOTO_GRID_BENCH_H", 1440) as f32);
     let dir = TempDir::new("grid-bench");
-    let app = start_with_pool(cx, Arc::new(InstantPool(pixels(256, 171), std::env::var_os("CHAIRPHOTO_GRID_BENCH_HOLD").map(|_| Mutex::default()))));
+    let pool = Arc::new(InstantPool {
+        image: pixels(256, 171),
+        holding: AtomicBool::new(std::env::var_os("CHAIRPHOTO_GRID_BENCH_HOLD").is_some()),
+        held: Mutex::default(),
+    });
+    let app = start_with_pool(cx, pool.clone());
     let t = Instant::now();
     open_large_catalog(&app, &dir, n, cx);
     eprintln!("BENCH catalog: {n} rows in {:.0} ms; window {w}x{h}", ms(t.elapsed()));
@@ -186,6 +197,8 @@ fn grid_frame_cost_on_a_large_catalog(cx: &mut TestAppContext) {
     let images = app.wired.images.clone();
     let shell = app.wired.shell.clone();
     let from = shell.read_with(cx, |s, _| s.rows_from().unwrap());
+    // Asked for, not answered: the test platform would redraw the window once per answer.
+    pool.holding.store(true, Ordering::Relaxed);
     let all: Vec<_> = shell.read_with(cx, |s, _| {
         s.library.photos().iter().map(|p| (p.id, chairphoto_model::darkroom::filmstrip::cover_look(p.cover_token.as_deref()))).collect()
     });

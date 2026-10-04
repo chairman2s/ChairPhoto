@@ -25,24 +25,18 @@
 //! in React): consent is keyed by the host the URL names, so it need not move with it.
 //! Until a catalog's settings are read the host is not known and nothing is fetched.
 //!
-//! **Fail closed on an undurable store** (#214). The machine's preferences can be in-memory
-//! only (no app data dir) or simply fail to write (a bad path, a full disk); either way
-//! nothing from this session survives a restart — a fresh process finds the store empty
-//! again. A legacy merge applied in memory anyway would then replay forever on every launch
-//! while the store stays broken, silently re-allowing a host the user explicitly reset,
-//! since that reset is exactly as undurable as the merge it would undo. So
-//! [`MapState::migrate_consent`] holds the merge out of memory until its write is confirmed
-//! durable: on failure the catalog keeps its old answers (as before) but this machine's
-//! answers are untouched, so the affected hosts simply keep asking. On success it replays
-//! the merge onto `self.consent` **as it stands at that moment**, never a snapshot taken
-//! before the write started — [`MapState::set_consent`] (Block, or "Ask again" on a host the
-//! legacy copy would Allow) can land on the UI thread at any point while the write is in
-//! flight, and must never be overwritten by a stale merge arriving after it (`merge_legacy`
-//! itself skips any host already answered, so replaying it late is safe). If that replay
-//! changes anything, it is persisted again, so a `set_consent` write racing the same disk
-//! key cannot silently drop the migrated answers either. `set_consent` itself still applies
-//! at once — it is not an invisible background merge — but a write that fails is surfaced
-//! the same way: [`MapState::consent_write_error`], which Preferences' Map tab shows.
+//! **Fail closed on an undurable store** (#214). [`MachinePrefs`] is the only copy of this
+//! machine's answers; this state reads them from it ([`MapState::host_consent`]) and keeps
+//! none of its own. The user's own answers ([`MapState::set_consent`]) are immediate changes:
+//! applied at once, on any store. A catalog's legacy answers are merged in by a durable
+//! change ([`MapState::migrate_consent`], [`MachinePrefs::modify_durably`]): computed from the
+//! answers as they are when its write runs, visible only once that write is on disk, and
+//! never applied on a store that cannot write — in memory only (no app data dir) or failing.
+//! Otherwise a restart, which finds the store empty again, would replay the merge forever,
+//! re-allowing a host the user reset in a session just as undurable. The catalog's copy is
+//! emptied only after the merge is on disk. A host the user answers while a merge is in
+//! flight is left out of it ([`ConsentAnswers`]), so the user's answer wins. A write that
+//! fails is surfaced: [`MapState::consent_write_error`], which Preferences' Map tab shows.
 
 use super::logic::{Consent, HostConsent, MACHINE_TILE_HOSTS, TILE_HOSTS_KEY, TILE_URL_KEY};
 use crate::machine_prefs::MachinePrefs;
@@ -58,7 +52,8 @@ use chairphoto_core::plugins::map::geocode::GeocodeAllSummary;
 use futures::channel::mpsc::UnboundedSender;
 use gpui_kit::{App, Context, Entity, Global, Subscription};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::collections::BTreeMap;
+use std::sync::{Arc, Mutex, MutexGuard};
 
 /// Whether a read has landed.
 #[derive(Debug, Clone, PartialEq)]
@@ -73,6 +68,37 @@ pub enum Load<T> {
 pub struct MapSettingsData {
     /// The stored `map.tileUrl` (raw), if any.
     pub tile_url: Option<String>,
+}
+
+/// The hosts the user answered ([`MapState::set_consent`]) and in which order, for this app
+/// run (a GPUI global, so it outlives a module reload). A legacy merge notes the sequence
+/// number when it starts and leaves out every host answered after it, so the user's answer
+/// wins over a merge in flight (#214).
+#[derive(Default)]
+pub(crate) struct ConsentAnswers(Arc<Mutex<AnswerLog>>);
+
+impl Global for ConsentAnswers {}
+
+#[derive(Default)]
+struct AnswerLog {
+    seq: u64,
+    /// Each host's latest answer's sequence number.
+    at: BTreeMap<String, u64>,
+}
+
+impl AnswerLog {
+    fn answer(&mut self, host: &str) {
+        self.seq += 1;
+        self.at.insert(host.to_string(), self.seq);
+    }
+
+    fn answered_after(&self, host: &str, since: u64) -> bool {
+        self.at.get(host).is_some_and(|&at| at > since)
+    }
+}
+
+fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 /// Where "Geocode all" stands.
@@ -107,8 +133,6 @@ pub struct MapState {
     pub stored: Option<MapSettingsData>,
     /// The catalog `stored` was read from (the tile URL is saved there).
     settings_from: Option<CatalogIdentity>,
-    /// This machine's per-host answers.
-    consent: HostConsent,
     /// The most recent machine-prefs write for tile consent that failed (#214), surfaced in
     /// Preferences' Map tab. Cleared by the next write that succeeds.
     consent_write_error: Option<String>,
@@ -242,7 +266,6 @@ impl MapState {
             fence_error: None,
             stored: None,
             settings_from: None,
-            consent: HostConsent::parse(MachinePrefs::read(cx, MACHINE_TILE_HOSTS).as_deref()),
             consent_write_error: None,
             source: TileSource::default(),
             source_error: None,
@@ -276,11 +299,11 @@ impl MapState {
     }
 
     /// The consent for the current tile host. `Unknown` until the settings are read.
-    pub fn consent(&self) -> Consent {
+    pub fn consent(&self, cx: &App) -> Consent {
         if self.stored.is_none() {
             return Consent::Unknown; // the host is not known yet
         }
-        self.consent.get(self.source.host())
+        self.host_consent(cx).get(self.source.host())
     }
 
     /// Whether the settings have been read (the consent question can be asked).
@@ -415,27 +438,25 @@ impl MapState {
 
     /// The first read of a catalog that still holds per-catalog answers (`map.tileHosts`,
     /// from before they moved to this machine's preferences): fold them into the machine's
-    /// ([`HostConsent::merge_legacy`]: only allowed/denied entries; denied wins), then empty
-    /// the catalog's copy — in the catalog it was read from — so it is merged once, and a
-    /// later change in Preferences is not undone by the next read.
+    /// ([`HostConsent::merge_legacy_except`]: only allowed/denied entries; denied wins), then
+    /// empty the catalog's copy — in the catalog it was read from — so it is merged once, and
+    /// a later change in Preferences is not undone by the next read.
     ///
-    /// The merge is applied to this machine's answers, and the catalog's copy emptied, only
-    /// **after** the machine's copy is confirmed on disk
-    /// ([`MachinePrefs::set_confirmed_then`], off the UI thread) — never optimistically
-    /// (#214): a store that cannot durably remember the merge (in memory only, or a write
-    /// that fails) must not apply it in memory either, or a restart — which finds the store
-    /// empty again — replays the merge forever, silently re-allowing a host the user reset
-    /// in a session just as undurable. `set_confirmed_then`, not plain `set_then`, matters
-    /// here specifically (#214 M1): unlike `set_consent`'s own answers, which the user sees
-    /// applied at once, this merge must not even reach `MachinePrefs`'s own cache — readable
-    /// by a fresh [`Self::new`] after a module reload, or ridden along on a later write of
-    /// an unrelated key — before its own write actually lands. On failure the catalog keeps
-    /// its answers (gate #119) and the next read tries again, unmerged in the meantime: the
-    /// affected hosts simply keep asking, and [`Self::consent_write_error`] says why. The
-    /// copy also survives when a switch lands before the clear, which `with_catalog_as(from)`
-    /// then refuses. A successful re-merge must not undo the user's "Ask again" meanwhile:
-    /// that is stored as an explicit "ask" entry ([`HostConsent::forget`]), which the merge
-    /// leaves alone (#198).
+    /// The merge is a durable change ([`MachinePrefs::modify_durably`], #214): it is applied
+    /// to this machine's answers as they are when its write runs, becomes visible only once
+    /// that write is on disk, and never applies on a store that cannot write (memory only, a
+    /// failing disk) — or a restart, which finds the store empty again, would replay it
+    /// forever, re-allowing a host the user reset in a session just as undurable. Only then
+    /// (`Ok`) is the catalog's copy emptied, off the UI thread. On failure the catalog keeps
+    /// its answers (gate #119), the affected hosts keep asking, and
+    /// [`Self::consent_write_error`] says why. The copy also survives when a switch lands
+    /// before the clear, which `with_catalog_as(from)` then refuses; the next read merges it
+    /// again, which changes nothing already settled.
+    ///
+    /// A host the user answered since this merge started ([`Self::set_consent`], recorded in
+    /// [`ConsentAnswers`]) is left out of it, so the user's Allow, Block or Ask again wins —
+    /// even an Allow of a host the catalog denied. A host the user sent back to "ask" earlier
+    /// is an explicit "ask" entry, which the merge leaves alone too (#198).
     fn migrate_consent(&mut self, from: CatalogIdentity, legacy: Option<&str>, cx: &mut Context<Self>) {
         let legacy = HostConsent::parse(legacy);
         if legacy.is_empty() {
@@ -444,17 +465,18 @@ impl MapState {
         // Always attempted, even when the merge turns out to be a no-op (every host already
         // settled, or asking again): the catalog may still be holding a copy a previous
         // switch-interrupted clear (#198) left behind, and this is what finally clears it.
-        // This is a snapshot for the *first* write attempt only — see the confirm step below
-        // for why the race this leaves open does not reach `self.consent`.
-        let mut merged = self.consent.clone();
-        merged.merge_legacy(&legacy);
-        let json = merged.to_json();
+        let answers = cx.default_global::<ConsentAnswers>().0.clone();
+        let since = lock(&answers).seq;
+        let merge = move |current: Option<&str>| {
+            let mut machine = HostConsent::parse(current);
+            let log = lock(&answers);
+            machine.merge_legacy_except(&legacy, |host| log.answered_after(host, since));
+            machine.to_json()
+        };
         let (app, key) = (self.app.clone(), self.settings.key(TILE_HOSTS_KEY));
         let (tx, rx) = futures::channel::oneshot::channel();
-        MachinePrefs::set_confirmed_then(cx, MACHINE_TILE_HOSTS, &json, move |saved| {
-            // Still off the UI thread, same as before #214: the clear is catalog I/O, and
-            // only happens once the write is confirmed. `tx` just reports the outcome back so
-            // the in-memory answers change only once the merge is durable too.
+        MachinePrefs::modify_durably(cx, MACHINE_TILE_HOSTS, merge, move |saved| {
+            // Off the UI thread: the clear is catalog I/O, and only follows a merge on disk.
             if saved.is_ok() {
                 if let Err(e) = with_catalog_as(&app, from, |c| c.set_setting(&key, "{}")) {
                     eprintln!("map: could not empty the catalog's old tile answers: {e}");
@@ -465,43 +487,24 @@ impl MapState {
         cx.spawn(async move |this, cx| {
             let Ok(saved) = rx.await else { return };
             this.update(cx, |s, cx| {
-                match saved {
-                    Ok(()) => {
-                        // Re-apply onto `self.consent` as it stands *now*, never the snapshot
-                        // taken before this write started: `set_consent` (Block, or "Ask
-                        // again" on a host the legacy copy would Allow) can run on the UI
-                        // thread at any point while this write is in flight, and its answer
-                        // must win, never be clobbered by a stale merge landing after it.
-                        // `merge_legacy` already skips any host with an answer or an "ask"
-                        // marker, so replaying it now is safe and idempotent.
-                        if s.consent.merge_legacy(&legacy) {
-                            // What changed here is exactly what a racing `set_consent` write
-                            // could have overwritten on disk (both write the whole map under
-                            // one key): make disk match memory again, with a fresh sequence
-                            // number so it is not itself undone by anything still in flight.
-                            let current = s.consent.to_json();
-                            MachinePrefs::set(cx, MACHINE_TILE_HOSTS, &current);
-                        }
-                        s.consent_write_error = None;
-                    }
-                    Err(e) => {
-                        eprintln!(
-                            "map: this machine's preferences could not be written, so the catalog's old tile \
-                             answers were not merged ({e}); the affected hosts will ask again"
-                        );
-                        s.consent_write_error = Some(e);
-                    }
+                if let Err(e) = &saved {
+                    eprintln!(
+                        "map: this machine's preferences could not be written, so the catalog's old tile \
+                         answers were not merged ({e}); the affected hosts will ask again"
+                    );
                 }
-                cx.notify();
+                s.consent_write_error = saved.err();
+                cx.notify(); // the merged answers are visible now: repaint
             })
             .ok();
         })
         .detach();
     }
 
-    /// Every host's answer on this machine (Preferences shows and edits them).
-    pub fn host_consent(&self) -> &HostConsent {
-        &self.consent
+    /// Every host's answer on this machine (Preferences shows and edits them): what
+    /// [`MachinePrefs`] holds — this state keeps no copy that could fall behind it.
+    pub fn host_consent(&self, cx: &App) -> HostConsent {
+        HostConsent::parse(MachinePrefs::read(cx, MACHINE_TILE_HOSTS).as_deref())
     }
 
     /// The most recent machine-prefs write for tile consent (a migration or a Preferences
@@ -512,19 +515,32 @@ impl MapState {
     }
 
     /// Remember the answer for `host` on this machine (the consent prompt, or Preferences);
-    /// `None` is "Ask again", remembered as such. Applied at once — unlike the legacy merge
-    /// (#214), this is the user's own decision, not an invisible background one — but a
-    /// write that fails is still surfaced ([`Self::consent_write_error`]).
+    /// `None` is "Ask again", remembered as such. Applied at once, to the answers as they are
+    /// now (an immediate change, [`MachinePrefs::modify_then`]) — unlike the legacy merge
+    /// (#214), this is the user's own decision, not an invisible background one — and it wins
+    /// over any merge in flight ([`ConsentAnswers`]). A write that fails is surfaced
+    /// ([`Self::consent_write_error`]).
     pub fn set_consent(&mut self, host: &str, allowed: Option<bool>, cx: &mut Context<Self>) {
-        match allowed {
-            Some(a) => self.consent.set(host, a),
-            None => self.consent.forget(host),
-        }
-        let json = self.consent.to_json();
+        // Recorded before the change, so a merge that reads the answers after it sees the host
+        // as the user's (see `migrate_consent`).
+        lock(&cx.default_global::<ConsentAnswers>().0.clone()).answer(host);
         let (tx, rx) = futures::channel::oneshot::channel();
-        MachinePrefs::set_then(cx, MACHINE_TILE_HOSTS, &json, move |saved| {
-            let _ = tx.send(saved);
-        });
+        let host = host.to_string();
+        MachinePrefs::modify_then(
+            cx,
+            MACHINE_TILE_HOSTS,
+            move |current| {
+                let mut consent = HostConsent::parse(current);
+                match allowed {
+                    Some(a) => consent.set(&host, a),
+                    None => consent.forget(&host),
+                }
+                consent.to_json()
+            },
+            move |saved| {
+                let _ = tx.send(saved);
+            },
+        );
         cx.spawn(async move |this, cx| {
             let Ok(saved) = rx.await else { return };
             this.update(cx, |s, cx| {

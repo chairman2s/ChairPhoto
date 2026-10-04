@@ -294,7 +294,7 @@ impl MapView {
     /// The consent card is up: the host was never asked and the settings are known.
     pub fn asking_consent(&self, cx: &App) -> bool {
         let s = self.state.read(cx);
-        s.settings_known() && s.consent() == Consent::Unknown
+        s.settings_known() && s.consent(cx) == Consent::Unknown
     }
 
     /// Answer the consent card (or change the answer from the map's chip).
@@ -310,9 +310,9 @@ impl MapView {
     /// catalog drops everything held and cancels everything pending.
     fn sync_source(&mut self, cx: &mut Context<Self>) {
         let s = self.state.read(cx);
-        let source = (s.consent() == Consent::Allowed).then(|| s.source.clone());
+        let source = (s.consent(cx) == Consent::Allowed).then(|| s.source.clone());
         let others: Vec<String> =
-            s.host_consent().hosts().filter(|&(h, allowed)| allowed && h != s.source.host()).map(|(h, _)| h.to_string()).collect();
+            s.host_consent(cx).hosts().filter(|&(h, allowed)| allowed && h != s.source.host()).map(|(h, _)| h.to_string()).collect();
         self.tiles.set_redirect_hosts(others);
         let gone = self.tiles.set_source(source);
         release(gone, cx);
@@ -1348,7 +1348,7 @@ impl MapView {
             Load::Loading => "Loading…".into(),
             Load::Failed(_) => "GPS points unavailable".into(),
         };
-        let consent = s.consent();
+        let consent = s.consent(cx);
         let host = s.source.host().to_string();
         let tiles_shown = self.tiles.source().is_some();
         let tile_error = self.tiles.last_error().map(str::to_string);

@@ -62,7 +62,7 @@ impl Render for MapSettings {
         let s = self.state.read(cx);
         let template = s.source.template().to_string();
         let known = s.settings_known();
-        let hosts: Vec<(String, bool)> = s.host_consent().hosts().map(|(h, a)| (h.to_string(), a)).collect();
+        let hosts: Vec<(String, bool)> = s.host_consent(cx).hosts().map(|(h, a)| (h.to_string(), a)).collect();
         let consent_write_error = s.consent_write_error().map(str::to_string);
         let geocode = s.geocode.clone();
         if known && self.shown.as_deref() != Some(template.as_str()) {

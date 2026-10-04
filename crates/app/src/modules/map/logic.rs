@@ -80,9 +80,16 @@ impl HostConsent {
     /// again in Preferences). A host the user sent back to "ask" keeps asking: no catalog's
     /// old answer, allowed or denied, settles it (#198). Returns whether anything changed.
     pub fn merge_legacy(&mut self, legacy: &HostConsent) -> bool {
+        self.merge_legacy_except(legacy, |_| false)
+    }
+
+    /// [`merge_legacy`](Self::merge_legacy), leaving out every host `users` says the user
+    /// answered while the merge was in flight: the user's answer wins, even an Allow of a host
+    /// the catalog denied (#214).
+    pub fn merge_legacy_except(&mut self, legacy: &HostConsent, users: impl Fn(&str) -> bool) -> bool {
         let mut changed = false;
         for (host, &allowed) in &legacy.answers {
-            if self.ask.contains(host) {
+            if self.ask.contains(host) || users(host) {
                 continue;
             }
             match self.answers.get(host) {
@@ -311,6 +318,18 @@ mod tests {
         machine.set("b.example", true);
         assert_eq!(machine.get("b.example"), Consent::Allowed);
         assert_eq!(machine.to_json(), r#"{"b.example":true,"c.example":"ask"}"#);
+    }
+
+    /// #214: a host the user answered while the merge was in flight keeps the user's answer —
+    /// an Allow included, though a catalog's Deny would otherwise win; every other host merges
+    /// as usual.
+    #[test]
+    fn a_merge_leaves_out_the_hosts_the_user_answered_meanwhile() {
+        let mut machine = HostConsent::parse(Some(r#"{"b.example":true}"#));
+        let legacy = HostConsent::parse(Some(r#"{"b.example":false,"c.example":true}"#));
+        assert!(machine.merge_legacy_except(&legacy, |h| h == "b.example"));
+        assert_eq!(machine.get("b.example"), Consent::Allowed, "the user's Allow stands");
+        assert_eq!(machine.get("c.example"), Consent::Allowed, "the rest merges");
     }
 
     #[test]

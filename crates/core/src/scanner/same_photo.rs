@@ -10,8 +10,11 @@
 //! `SubSecTimeOriginal`) and the camera serial (`SerialNumber`, `InternalSerialNumber`, each
 //! compared when both files have it) agree. Any difference makes it a different photo, which
 //! is copied under a free ` (n)` name with its own row and UUID; nothing is ever overwritten.
-//! A file with no `DateTimeOriginal` — a camera's video — has its `CreateDate` (QuickTime's)
-//! as its capture time, compared only against the other file's `CreateDate`.
+//! A file with no `DateTimeOriginal` — a camera's video — has its QuickTime `CreateDate`
+//! (read group-qualified, `-QuickTime:CreateDate`) as its capture time, compared only against
+//! the other file's. A still's EXIF or XMP `CreateDate` is not read: it is not the capture
+//! time the owner's rule names, and it has no sub-second to tell a burst apart, so a still
+//! without `DateTimeOriginal` has no capture time.
 //! Only when neither file has a capture time to compare (a PNG, a stripped JPEG) are their
 //! contents compared, by streamed SHA-256. File mtime is never evidence: a copy changes it.
 //!
@@ -47,8 +50,9 @@ pub struct CaptureStamp {
     pub subsec: Option<String>,
     /// Each of [`SERIAL_TAGS`] the file carries, by tag name.
     pub serials: BTreeMap<String, String>,
-    /// `CreateDate`: the capture time of a file with no `DateTimeOriginal` — a camera's
-    /// video (QuickTime `CreateDate`), so a re-imported clip is not hashed whole.
+    /// QuickTime `CreateDate`: the capture time of a file with no `DateTimeOriginal` — a
+    /// camera's video — so a re-imported clip is not hashed whole. Never a still's EXIF or
+    /// XMP `CreateDate` ([`stamp_command`] reads the QuickTime group only).
     pub created: Option<String>,
 }
 
@@ -94,7 +98,9 @@ pub fn same_capture(a: &CaptureStamp, b: &CaptureStamp) -> Option<bool> {
 /// one answer whether exiftool reads them from a path or from stdin.
 fn stamp_command() -> Command {
     let mut cmd = Command::new("exiftool");
-    cmd.args(["-j", "-DateTimeOriginal", "-SubSecTimeOriginal", "-CreateDate"]);
+    // `-QuickTime:CreateDate` is printed as `CreateDate` (no `-G`), and only from the
+    // QuickTime group: a still's EXIF `CreateDate` (DateTimeDigitized) is not read.
+    cmd.args(["-j", "-DateTimeOriginal", "-SubSecTimeOriginal", "-QuickTime:CreateDate"]);
     for tag in SERIAL_TAGS {
         cmd.arg(format!("-{tag}"));
     }
@@ -716,23 +722,71 @@ mod tests {
         assert_eq!(find_in_library(&same, &candidates, &AtomicBool::new(true)), None, "an abort stops it");
     }
 
-    /// L-3: exiftool reads `CreateDate` where `DateTimeOriginal` is absent, so two files of
-    /// one capture time and different bytes are matched by it, not by their contents. An
-    /// all-zero date is no capture time.
+    /// L-3, narrowed by L-b of the second review: a video with no `DateTimeOriginal` is
+    /// matched by its QuickTime `CreateDate` — two clips of one creation time and different
+    /// bytes are the same capture, another time is not — from its path and from stdin alike.
     #[test]
-    fn a_file_without_date_time_original_is_matched_by_its_create_date() {
-        if !test_files::exiftool_available("a_file_without_date_time_original_is_matched_by_its_create_date") {
+    fn a_video_is_matched_by_its_quicktime_create_date() {
+        let test = "a_video_is_matched_by_its_quicktime_create_date";
+        if !test_files::exiftool_available(test) {
             return;
         }
-        let dir = temp("create-date");
-        let write = |name: &str, date: &str, pixel: u8| {
+        if !Command::new("ffmpeg").arg("-version").output().is_ok_and(|o| o.status.success()) {
+            println!("SKIPPED: {test} — ffmpeg is not installed");
+            return;
+        }
+        let dir = temp("quicktime");
+        let clip = |name: &str, color: &str, when: &str| {
+            let p = dir.join(name);
+            let ok = Command::new("ffmpeg")
+                .args(["-loglevel", "error", "-y", "-f", "lavfi", "-i"])
+                .arg(format!("color=c={color}:s=16x16:d=0.1"))
+                .arg("-metadata")
+                .arg(format!("creation_time={when}"))
+                .arg(&p)
+                .status()
+                .unwrap()
+                .success();
+            assert!(ok, "ffmpeg wrote {}", p.display());
+            p
+        };
+        let lib = clip("lib.mp4", "red", "2026-06-28T12:00:00Z");
+        let same = clip("same.mp4", "blue", "2026-06-28T12:00:00Z");
+        let other = clip("other.mp4", "blue", "2026-06-28T12:00:01Z");
+        assert_ne!(std::fs::read(&lib).unwrap(), std::fs::read(&same).unwrap());
+        let stamps = read_capture_stamps(std::slice::from_ref(&lib), &AtomicBool::new(false)).unwrap();
+        assert_eq!(
+            stamps.get(&lib).map(|s| (s.time.clone(), s.created.clone())),
+            Some((None, Some("2026:06:28 12:00:00".into())))
+        );
+        let arrivals = vec![
+            Arrival { file: same.clone(), candidates: vec![lib.clone()] },
+            Arrival { file: other.clone(), candidates: vec![lib.clone()] },
+        ];
+        let found = find_already_imported(&arrivals, &AtomicBool::new(false)).unwrap();
+        assert_eq!(found, vec![Some(lib.clone()), None]);
+        let never = AtomicBool::new(false);
+        let from_stdin = |p: &Path| find_in_library(&std::fs::read(p).unwrap(), std::slice::from_ref(&lib), &never);
+        assert_eq!(from_stdin(&same), Some(Some(lib.clone())), "from stdin too");
+        assert_eq!(from_stdin(&other), Some(None));
+    }
+
+    /// L-b of the second #246 review: a still's EXIF `CreateDate` is not a capture time. Two
+    /// JPEGs carrying only that date, equal to the second, with different pixels are different
+    /// photos (their contents decide); a byte copy is still the same photo.
+    #[test]
+    fn a_stills_exif_create_date_is_not_a_capture_time() {
+        if !test_files::exiftool_available("a_stills_exif_create_date_is_not_a_capture_time") {
+            return;
+        }
+        let dir = temp("exif-create-date");
+        let write = |name: &str, pixel: u8| {
             let p = dir.join(name);
             image::RgbImage::from_pixel(16, 16, image::Rgb([pixel, 80, 40]))
                 .save_with_format(&p, image::ImageFormat::Jpeg)
                 .unwrap();
             let ok = Command::new("exiftool")
-                .args(["-q", "-overwrite_original"])
-                .arg(format!("-CreateDate={date}"))
+                .args(["-q", "-overwrite_original", "-CreateDate=2026:06:28 12:00:00"])
                 .arg(&p)
                 .status()
                 .unwrap()
@@ -740,23 +794,20 @@ mod tests {
             assert!(ok);
             p
         };
-        let lib = write("lib.jpg", "2026:06:28 12:00:00", 120);
-        let same = write("same.jpg", "2026:06:28 12:00:00", 10);
-        let other = write("other.jpg", "2026:06:28 12:00:01", 10);
-        assert_ne!(std::fs::read(&lib).unwrap(), std::fs::read(&same).unwrap());
-        let stamps = read_capture_stamps(&[lib.clone()], &AtomicBool::new(false)).unwrap();
-        assert_eq!(stamps.get(&lib).map(|s| (s.time.clone(), s.created.clone())), Some((None, Some("2026:06:28 12:00:00".into()))));
+        let lib = write("lib.jpg", 120);
+        let other = write("other.jpg", 10);
+        let copy = dir.join("copy.jpg");
+        std::fs::copy(&lib, &copy).unwrap();
+        let stamps = read_capture_stamps(std::slice::from_ref(&lib), &AtomicBool::new(false)).unwrap();
+        assert!(!stamps.get(&lib).cloned().unwrap_or_default().has_capture_time(), "{stamps:?}");
         let arrivals = vec![
-            Arrival { file: same, candidates: vec![lib.clone()] },
-            Arrival { file: other, candidates: vec![lib.clone()] },
+            Arrival { file: other.clone(), candidates: vec![lib.clone()] },
+            Arrival { file: copy.clone(), candidates: vec![lib.clone()] },
         ];
         let found = find_already_imported(&arrivals, &AtomicBool::new(false)).unwrap();
-        assert_eq!(found, vec![Some(lib.clone()), None]);
-        assert_eq!(
-            find_in_library(&std::fs::read(dir.join("same.jpg")).unwrap(), &[lib.clone()], &AtomicBool::new(false)),
-            Some(Some(lib)),
-            "from stdin too"
-        );
+        assert_eq!(found, vec![None, Some(lib.clone())]);
+        let never = AtomicBool::new(false);
+        assert_eq!(find_in_library(&std::fs::read(&other).unwrap(), std::slice::from_ref(&lib), &never), Some(None));
     }
 
     #[test]

@@ -673,8 +673,10 @@ Two modes over the same core location model:
   already imported and skipped, only when its EXIF capture time (`DateTimeOriginal` with
   `SubSecTimeOriginal`) and camera serial (`SerialNumber`, `InternalSerialNumber`, each
   compared when both files carry it) agree. A file with no `DateTimeOriginal` (a camera's
-  video) has its `CreateDate` (QuickTime's) as its capture time, compared only with the
-  other file's `CreateDate`; an all-zero date is no capture time. When neither file has a
+  video) has its QuickTime `CreateDate` as its capture time (read as
+  `-QuickTime:CreateDate`), compared only with the other file's; an all-zero date is no
+  capture time. A still's EXIF or XMP `CreateDate` is not read: a still with no
+  `DateTimeOriginal` has no capture time. When neither file has a
   capture time (a PNG, a stripped JPEG) their contents are compared by streamed SHA-256
   instead. Anything else —
   another size, another sub-second, another body — is a different photo, copied as ` (n)`

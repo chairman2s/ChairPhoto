@@ -79,6 +79,18 @@ fn cold_preview_stage_timings() {
     line("thumb (derived): downscale + encode", (p50, max));
     let (p50, max, _) = time(n, |_| image::load_from_memory(&preview).unwrap());
     line("app: decode the cached preview", (p50, max));
+    // End to end: `preview_bytes` on a cache miss, each run on a fresh copy of the file (a
+    // new cache key, and a colour-space probe not yet memoised), as a cold loupe step pays it.
+    let _env = tests::test_lock();
+    let copies: Vec<PathBuf> = (0..n)
+        .map(|i| {
+            let copy = tmp.path().join(format!("e2e-{i}.{}", path.extension().and_then(|e| e.to_str()).unwrap_or("jpg")));
+            std::fs::copy(&path, &copy).unwrap();
+            copy
+        })
+        .collect();
+    let (p50, max, _) = time(n, |i| preview_bytes(&copies[i]).unwrap());
+    line("end to end: preview_bytes, cold", (p50, max));
     let (p50, max, zoom) = time(1, |_| encode_size(&path, &img, ZOOM).unwrap());
     let zoom = image::load_from_memory(&zoom).unwrap();
     line(&format!("zoom: encode ({}x{})", zoom.width(), zoom.height()), (p50, max));

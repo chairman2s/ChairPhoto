@@ -261,7 +261,11 @@ fn cached(path: &Path, size: Size) -> Result<Vec<u8>, String> {
     // every smaller tier, so derive and cache those too — a lone thumb request stays a
     // thumb decode (no over-decode), but a preview/zoom decode also fills the smaller
     // tiers so the next grid request is a free cache hit.
+    let probe = probe_colour_space_beside(path);
     let img = extract_and_decode(path, size.max)?;
+    if let Some(probe) = probe {
+        let _ = probe.join();
+    }
     run_analyzers(&img, path, size.max);
     let bytes = generate_from_decode(path, &img, size)?;
     for smaller in smaller_sizes(size.max) {
@@ -304,7 +308,11 @@ pub fn warm_all_sizes(path: &Path) -> Result<(), String> {
     }
     // Decode once at the largest needed size; the smaller tiers downscale from it.
     let largest = missing.iter().map(|s| s.max).max().unwrap();
+    let probe = probe_colour_space_beside(path);
     let img = extract_and_decode(path, largest)?;
+    if let Some(probe) = probe {
+        let _ = probe.join();
+    }
     run_analyzers(&img, path, largest);
     for s in missing {
         generate_from_decode(path, &img, s)?;
@@ -412,6 +420,21 @@ fn decode_oriented(
     let mut img = DynamicImage::from_decoder(decoder).map_err(|e| e.to_string())?;
     img.apply_orientation(orientation);
     Ok(img)
+}
+
+/// Start [`is_adobe_rgb`] for `path` on its own thread, for a caller about to decode: the
+/// probe is an `exiftool` run (~75 ms, a quarter of a cold 24 MP preview) that the encode
+/// after the decode needs, and the two need not wait for each other. Join it before encoding;
+/// its answer is in `is_adobe_rgb`'s memo by then (#168). A probe that cannot start leaves
+/// the encode to run it, as before.
+fn probe_colour_space_beside(path: &Path) -> Option<std::thread::JoinHandle<()>> {
+    let path = path.to_path_buf();
+    std::thread::Builder::new()
+        .name("colour-space-probe".into())
+        .spawn(move || {
+            is_adobe_rgb(&path);
+        })
+        .ok()
 }
 
 /// Whether a file's color space is Adobe RGB (Sony tags this as ColorSpace=Uncalibrated

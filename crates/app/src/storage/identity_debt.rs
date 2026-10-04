@@ -114,9 +114,14 @@ impl IdentityDebtPanel {
         let app = storage.read(cx).app_state().clone();
         let ended = cx.subscribe(&storage, |this: &mut Self, _, event: &StorageEvent, cx| match event {
             StorageEvent::RepairEnded => {
-                // Repaired copies left the queue and every later offset shifted.
+                // Repaired copies left the queue and every later offset shifted. The re-read
+                // page 0 opens at the top, not wherever the list happened to be scrolled to —
+                // the same reset `set_page`/`set_owed_page` and the `CatalogSwitched` branch
+                // below already do for their own page resets (#200 follow-up).
                 this.page = 0;
                 this.owed_page = 0;
+                this.debt_scroll.scroll_to_item(0, ScrollStrategy::Top);
+                this.owed_scroll.scroll_to_item(0, ScrollStrategy::Top);
                 this.reload_summary(cx);
                 this.reload_page(cx);
                 this.reload_owed(cx);

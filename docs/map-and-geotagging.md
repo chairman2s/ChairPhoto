@@ -98,9 +98,27 @@ keyed by the host it names, so it need not move. Answers the first port stored p
 (the module setting `map.tileHosts`) move to the machine on that catalog's first read —
 only allowed/denied entries; where they disagree with the machine's or another catalog's,
 denied wins — and the catalog's copy is then emptied, so a later Allow is not undone. It is
-emptied only once the machine's copy is saved, and a switch can interrupt the emptying, so
-a catalog may be merged again; "Ask again" is therefore stored as an explicit `"ask"` entry
-that no catalog's old answer overrides, never as a deleted one that a re-merge could refill.
+emptied only once the machine's copy is saved, and a switch can interrupt the emptying. So
+the merge also records the catalog as merged, by its `settings.catalog_uuid`, in the
+answers' own value (`"#mergedCatalogs": [<uuid>, …]`) and therefore in the same write as the
+merged answers; a later read of a recorded catalog merges nothing and only retries the
+emptying, so its old Deny never undoes an Allow given since (#229). A build before #229
+drops that record when it saves an answer; such a catalog may then be merged again, which
+can only turn an answer to Deny. "Ask again" is stored as an explicit `"ask"` entry that no
+catalog's old answer overrides, never as a deleted one that a re-merge could refill.
+
+The merge is saved before it is shown (a durable change, `MachinePrefs::modify_durably`): on
+a store that cannot be written it never applies, and an answer the user gives while it is
+being saved wins over it. **The one remaining limit** (#229): if the user answers a host
+while the merge's file is being written, the merge is re-applied to that answer and written
+again; if that second write fails, the file briefly holds the first write — the catalog's
+old answer, possibly an Allow the user just blocked — and ChairPhoto at once writes the
+user's answers back over it. Only if that write fails as well, on a disk failing for two
+writes in a row, does the file keep the old answer until a later write succeeds (the user's
+own answer is saved again right after, and every later preference write carries it). A
+restart before any write succeeds reads the old answer. A failed write is shown in Preferences
+→ Map.
+
 Reverse geocoding stays user-initiated per click, as before.
 
 **OSM tile policy.** The default URL is the policy's exact

@@ -34,9 +34,11 @@
 //! never applied on a store that cannot write — in memory only (no app data dir) or failing.
 //! Otherwise a restart, which finds the store empty again, would replay the merge forever,
 //! re-allowing a host the user reset in a session just as undurable. The catalog's copy is
-//! emptied only after the merge is on disk. A host the user answers while a merge is in
-//! flight is left out of it ([`ConsentAnswers`]), so the user's answer wins. A write that
-//! fails is surfaced: [`MapState::consent_write_error`], which Preferences' Map tab shows.
+//! emptied only after the merge is on disk, and the merge records the catalog as merged in
+//! that same write, so a copy whose emptying failed is not merged again (#229). A host the
+//! user answers while a merge is in flight is left out of it ([`ConsentAnswers`]), so the
+//! user's answer wins. A write that fails is surfaced: [`MapState::consent_write_error`],
+//! which Preferences' Map tab shows.
 
 use super::logic::{Consent, HostConsent, MACHINE_TILE_HOSTS, TILE_HOSTS_KEY, TILE_URL_KEY};
 use crate::machine_prefs::MachinePrefs;
@@ -409,13 +411,15 @@ impl MapState {
         self.run(
             cx,
             move |app, _| {
-                with_catalog_identified(app, |c| Ok((c.get_setting(&url_key)?, c.get_setting(&hosts_key)?)))
+                with_catalog_identified(app, |c| {
+                    Ok((c.get_setting(&url_key)?, c.get_setting(&hosts_key)?, c.catalog_uuid()?))
+                })
             },
             |s, result, cx| match result {
-                Ok((from, (tile_url, legacy))) => {
+                Ok((from, (tile_url, legacy, catalog_uuid))) => {
                     s.settings_from = Some(from);
                     s.apply_settings(MapSettingsData { tile_url });
-                    s.migrate_consent(from, legacy.as_deref(), cx);
+                    s.migrate_consent(from, &catalog_uuid, legacy.as_deref(), cx);
                 }
                 Err(e) => eprintln!("map: settings unavailable: {e}"),
             },
@@ -450,27 +454,39 @@ impl MapState {
     /// (`Ok`) is the catalog's copy emptied, off the UI thread. On failure the catalog keeps
     /// its answers (gate #119), the affected hosts keep asking, and
     /// [`Self::consent_write_error`] says why. The copy also survives when a switch lands
-    /// before the clear, which `with_catalog_as(from)` then refuses; the next read merges it
-    /// again, which changes nothing already settled.
+    /// before the clear, which `with_catalog_as(from)` then refuses.
+    ///
+    /// **Merged once per catalog** (#229). The merge records the catalog's UUID
+    /// (`settings.catalog_uuid`) among the machine's answers ([`HostConsent::record_merged`]),
+    /// in the same value and so in the same durable write as the merged answers. A later read
+    /// of a catalog already recorded — its copy survived a refused clear — merges nothing and
+    /// only retries the clear. Merging it again would let its old Deny win over an Allow the
+    /// user gave in between.
     ///
     /// A host the user answered since this merge started ([`Self::set_consent`], recorded in
     /// [`ConsentAnswers`]) is left out of it, so the user's Allow, Block or Ask again wins —
     /// even an Allow of a host the catalog denied. A host the user sent back to "ask" earlier
     /// is an explicit "ask" entry, which the merge leaves alone too (#198).
-    fn migrate_consent(&mut self, from: CatalogIdentity, legacy: Option<&str>, cx: &mut Context<Self>) {
+    fn migrate_consent(&mut self, from: CatalogIdentity, catalog_uuid: &str, legacy: Option<&str>, cx: &mut Context<Self>) {
         let legacy = HostConsent::parse(legacy);
         if legacy.is_empty() {
             return;
         }
         // Always attempted, even when the merge turns out to be a no-op (every host already
-        // settled, or asking again): the catalog may still be holding a copy a previous
-        // switch-interrupted clear (#198) left behind, and this is what finally clears it.
+        // settled, asking again, or the catalog already merged): the catalog may still be
+        // holding a copy a previous switch-interrupted clear (#198) left behind, and this is
+        // what finally clears it.
         let answers = cx.default_global::<ConsentAnswers>().0.clone();
         let since = lock(&answers).seq;
+        let catalog_uuid = catalog_uuid.to_string();
         let merge = move |current: Option<&str>| {
             let mut machine = HostConsent::parse(current);
+            if machine.merged_from(&catalog_uuid) {
+                return current.unwrap_or_default().to_string(); // merged before: unchanged
+            }
             let log = lock(&answers);
             machine.merge_legacy_except(&legacy, |host| log.answered_after(host, since));
+            machine.record_merged(&catalog_uuid);
             machine.to_json()
         };
         let (app, key) = (self.app.clone(), self.settings.key(TILE_HOSTS_KEY));

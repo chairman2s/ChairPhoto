@@ -12,7 +12,7 @@ use chairphoto_core::app::GeocodeProgress;
 use chairphoto_core::plugins::map::geocode::GeocodeAllSummary;
 use crate::modules::map::tiles::fake::{tiny, FakeTiles};
 use crate::machine_prefs::{MachinePrefs, FILE_NAME as MACHINE_PREFS_FILE};
-use crate::modules::map::logic::{Consent, MACHINE_TILE_HOSTS};
+use crate::modules::map::logic::{Consent, MACHINE_TILE_HOSTS, MERGED_CATALOGS};
 use crate::modules::map::tiles::MapTiles;
 use crate::modules::map::view::MapView;
 use crate::modules::map::{MAP_MODULE_ID, MAP_VIEW_ID};
@@ -352,8 +352,28 @@ fn a_tile_url_saved_across_a_switch_does_not_reach_the_new_catalog(cx: &mut Test
     assert_eq!(m.setting(&url_key), None, "the old catalog's URL landed in the new catalog");
 }
 
+/// This machine's tile answers as `MachinePrefs` holds them, without the record of merged
+/// catalogs ([`MERGED_CATALOGS`], see [`merged_catalogs`]).
 fn machine_hosts(cx: &mut TestAppContext) -> Option<String> {
-    cx.update(|cx| MachinePrefs::read(cx, MACHINE_TILE_HOSTS))
+    hosts_only(cx.update(|cx| MachinePrefs::read(cx, MACHINE_TILE_HOSTS)))
+}
+
+/// [`machine_hosts`] as a fresh launch reads them from the file at `prefs`.
+fn disk_hosts(prefs: &std::path::Path) -> Option<String> {
+    hosts_only(MachinePrefs::load(prefs.to_path_buf()).get(MACHINE_TILE_HOSTS))
+}
+
+fn hosts_only(stored: Option<String>) -> Option<String> {
+    let mut map: std::collections::BTreeMap<String, serde_json::Value> = serde_json::from_str(&stored?).unwrap();
+    map.remove(MERGED_CATALOGS);
+    Some(serde_json::to_string(&map).unwrap())
+}
+
+/// The catalogs this machine records as merged, as the file at `prefs` holds them (#229).
+fn merged_catalogs(prefs: &std::path::Path) -> Vec<String> {
+    let stored = MachinePrefs::load(prefs.to_path_buf()).get(MACHINE_TILE_HOSTS).unwrap_or_default();
+    let map: std::collections::BTreeMap<String, serde_json::Value> = serde_json::from_str(&stored).unwrap_or_default();
+    serde_json::from_value(map.get(MERGED_CATALOGS).cloned().unwrap_or_default()).unwrap_or_default()
 }
 
 /// Gate #119, and #214's fail-closed fix. Here every write fails (the store's directory is
@@ -396,7 +416,7 @@ fn a_failed_machine_prefs_write_keeps_the_catalogs_old_answers(cx: &mut TestAppC
     std::fs::remove_file(&blocker).unwrap();
     open_catalog_with_photos(&app, &dir, 1, cx); // the same catalog, read again
     work(&app, cx);
-    assert_eq!(MachinePrefs::load(prefs).get(MACHINE_TILE_HOSTS).as_deref(), Some(legacy), "saved now");
+    assert_eq!(disk_hosts(&prefs).as_deref(), Some(legacy), "saved now");
     assert_eq!(setting(&app).as_deref(), Some("{}"), "and only then emptied");
     assert_eq!(machine_hosts(cx).as_deref(), Some(legacy), "the machine's copy matches what was saved");
 }
@@ -458,7 +478,7 @@ fn probe_r5_unrelated_pref_write_does_not_persist_an_unconfirmed_merge(cx: &mut 
     std::fs::remove_file(&blocker).unwrap();
     cx.update(|cx| MachinePrefs::set(cx, "appearance.mode", "standard"));
     work(&app, cx);
-    let on_disk = MachinePrefs::load(prefs).get(MACHINE_TILE_HOSTS);
+    let on_disk = disk_hosts(&prefs);
     assert!(on_disk.is_none_or(|j| !j.contains("b.example")), "the unconfirmed merge must not be persisted by an unrelated write");
     assert_eq!(
         state.read_with(cx, |s, cx| s.host_consent(cx).get("b.example")),
@@ -495,7 +515,7 @@ fn per_catalog_answers_migrate_to_this_machine_and_show_in_preferences(cx: &mut 
     assert_eq!(machine_hosts(cx).as_deref(), Some(r#"{"b.example":true,"tile.openstreetmap.org":true}"#));
     let setting = |app: &App| app.state.catalog.lock().unwrap().as_ref().unwrap().get_setting(LEGACY_HOSTS).unwrap();
     assert_eq!(setting(&app).as_deref(), Some("{}"), "the catalog's copy was emptied");
-    assert_eq!(MachinePrefs::load(prefs.clone()).get(MACHINE_TILE_HOSTS).as_deref(), machine_hosts(cx).as_deref(), "after the machine's was saved");
+    assert_eq!(disk_hosts(&prefs).as_deref(), machine_hosts(cx).as_deref(), "after the machine's was saved");
     show_map(&app, cx);
     assert!(fake.count() > 0, "allowed by the migrated answer: no question");
 
@@ -700,7 +720,7 @@ fn a_block_racing_the_migrations_write_is_not_overwritten(cx: &mut TestAppContex
         "the migration's confirm must not overwrite the user's Block"
     );
     assert_eq!(
-        MachinePrefs::load(prefs).get(MACHINE_TILE_HOSTS).as_deref(),
+        disk_hosts(&prefs).as_deref(),
         Some(r#"{"b.example":false}"#),
         "and the persisted copy agrees, not the migration's stale Allow"
     );
@@ -739,7 +759,7 @@ fn an_ask_again_racing_the_migrations_write_is_not_overwritten(cx: &mut TestAppC
         "the migration's confirm must not silently re-allow the host"
     );
     assert_eq!(
-        MachinePrefs::load(prefs).get(MACHINE_TILE_HOSTS).as_deref(),
+        disk_hosts(&prefs).as_deref(),
         Some(r#"{"b.example":"ask"}"#),
         "and the persisted copy still asks, not allows"
     );
@@ -803,13 +823,13 @@ fn p214c_a_block_racing_a_migration_survives_an_unrelated_write_and_a_module_rel
     state.update(cx, |s, cx| s.set_consent("b.example", Some(false), cx));
     work(&app, cx);
     assert_eq!(machine_hosts(cx).as_deref(), Some(r#"{"b.example":false}"#), "MachinePrefs keeps the Block");
-    assert_eq!(MachinePrefs::load(prefs.clone()).get(MACHINE_TILE_HOSTS).as_deref(), Some(r#"{"b.example":false}"#));
+    assert_eq!(disk_hosts(&prefs).as_deref(), Some(r#"{"b.example":false}"#));
     assert_eq!(state.read_with(cx, |s, _| s.consent_write_error().map(str::to_string)), None);
 
     cx.update(|cx| MachinePrefs::set(cx, "appearance.mode", "standard"));
     work(&app, cx);
     assert_eq!(
-        MachinePrefs::load(prefs.clone()).get(MACHINE_TILE_HOSTS).as_deref(),
+        disk_hosts(&prefs).as_deref(),
         Some(r#"{"b.example":false}"#),
         "an unrelated write does not persist the stale Allow"
     );
@@ -835,7 +855,7 @@ fn an_allow_racing_a_migration_beats_the_catalogs_deny_and_survives_a_restart(cx
     work(&app, cx);
     let expected = r#"{"b.example":true,"c.example":true}"#;
     assert_eq!(machine_hosts(cx).as_deref(), Some(expected), "the user's Allow stands; c merged");
-    assert_eq!(MachinePrefs::load(prefs.clone()).get(MACHINE_TILE_HOSTS).as_deref(), Some(expected));
+    assert_eq!(disk_hosts(&prefs).as_deref(), Some(expected));
     let setting = |app: &App| app.state.catalog.lock().unwrap().as_ref().unwrap().get_setting(LEGACY_HOSTS).unwrap();
     assert_eq!(setting(&app).as_deref(), Some("{}"), "the migration completed: the catalog's copy is emptied");
 
@@ -851,8 +871,8 @@ fn an_allow_racing_a_migration_beats_the_catalogs_deny_and_survives_a_restart(cx
 /// read and its write held; catalog B (Denies `b`) is opened and read; then A's write runs
 /// last. Both merge whatever order they land in — denied wins for `b` — and each `Ok` is
 /// true: the file holds both. A's clear is refused (B is open), so A keeps its copy; B's is
-/// emptied. After a restart, re-reading A merges again and changes nothing (no Allow lifts
-/// the Deny), and only then empties A's copy.
+/// emptied. After a restart, re-reading A changes nothing (A is recorded as merged, #229;
+/// no Allow lifts the Deny either way), and only then empties A's copy.
 #[gpui_kit::test]
 fn two_quick_migrations_across_a_switch_both_land_and_deny_wins(cx: &mut TestAppContext) {
     let dir = TempDir::new("two-migrations");
@@ -871,7 +891,7 @@ fn two_quick_migrations_across_a_switch_both_land_and_deny_wins(cx: &mut TestApp
     work(&app, cx); // then A's, applied to B's result
     let expected = r#"{"b.example":false,"c.example":true}"#;
     assert_eq!(machine_hosts(cx).as_deref(), Some(expected), "both merged; denied wins");
-    assert_eq!(MachinePrefs::load(prefs.clone()).get(MACHINE_TILE_HOSTS).as_deref(), Some(expected), "both on disk");
+    assert_eq!(disk_hosts(&prefs).as_deref(), Some(expected), "both on disk");
     let setting_of = |dir: &TempDir| {
         let c = chairphoto_core::catalog::Catalog::open(&dir.0.join("photos.chairphoto"), &dir.0.join("photos")).unwrap();
         c.get_setting(LEGACY_HOSTS).unwrap()
@@ -888,14 +908,51 @@ fn two_quick_migrations_across_a_switch_both_land_and_deny_wins(cx: &mut TestApp
     reload_module(&app, cx);
     open_catalog_with_photos(&app, &dir, 1, cx);
     work(&app, cx);
-    assert_eq!(machine_hosts(cx).as_deref(), Some(expected), "re-merging A changes nothing");
+    assert_eq!(machine_hosts(cx).as_deref(), Some(expected), "re-reading A changes nothing");
     assert_eq!(setting_of(&dir).as_deref(), Some("{}"), "and A's copy is emptied now");
+}
+
+/// **#229** (R4): a catalog is merged once. Catalog A's legacy copy Denies `b.example`; the
+/// user Allows it while A's merge is queued, and the core switches before A's clear, so A
+/// keeps its copy. The merge recorded A as merged in the write that carried the answers, so
+/// after a restart, going back to A merges nothing — its old Deny does not win over the
+/// user's Allow — and only retries the clear.
+#[gpui_kit::test]
+fn a_catalog_whose_clear_was_refused_is_not_merged_again(cx: &mut TestAppContext) {
+    let dir = TempDir::new("remerge");
+    let (app, _fake, prefs) = migration_queued(&dir, r#"{"b.example":false}"#, cx);
+    let state = map_state_via_settings(&app, cx);
+    state.update(cx, |s, cx| s.set_consent("b.example", Some(true), cx));
+    let (other, _) = colliding_catalog(&dir, "other", 1);
+    core_switch(&app, other); // before A's merge write and clear run
+    work(&app, cx);
+    assert_eq!(disk_hosts(&prefs).as_deref(), Some(r#"{"b.example":true}"#), "the user's Allow is on disk");
+    let open_a = || chairphoto_core::catalog::Catalog::open(&dir.0.join("photos.chairphoto"), &dir.0.join("photos")).unwrap();
+    let a_uuid = open_a().catalog_uuid().unwrap();
+    assert_eq!(merged_catalogs(&prefs), vec![a_uuid], "A is recorded as merged, on disk");
+    assert_eq!(
+        open_a().get_setting(LEGACY_HOSTS).unwrap().as_deref(),
+        Some(r#"{"b.example":false}"#),
+        "the clear was refused: A keeps its copy"
+    );
+    deliver_switch(&app, cx);
+    work(&app, cx);
+
+    // A restart (the record must come from the file), then back to A.
+    cx.update(|cx| cx.set_global(MachinePrefs::load(prefs.clone())));
+    reload_module(&app, cx);
+    open_catalog_with_photos(&app, &dir, 1, cx);
+    work(&app, cx);
+    assert_eq!(b_consent(&app, cx), Consent::Allowed, "A's old Deny is not merged over the user's Allow");
+    assert_eq!(disk_hosts(&prefs).as_deref(), Some(r#"{"b.example":true}"#));
+    assert_eq!(open_a().get_setting(LEGACY_HOSTS).unwrap().as_deref(), Some("{}"), "and the clear went through now");
 }
 
 /// **#198**, the success path: the machine's copy is saved, but the core switches to
 /// another catalog before the clear runs, so `with_catalog_as(from)` refuses it and the old
 /// catalog keeps its answers. The user sends `b.example` back to "ask"; on that catalog's
-/// next read the answers merge again, and the host still asks. The reset is on disk too.
+/// next read the host still asks (that catalog is recorded as merged, #229; the "ask" entry
+/// would hold against a re-merge too, #198). The reset is on disk too.
 #[gpui_kit::test]
 fn ask_again_survives_a_reread_after_a_switch_interrupted_the_clear(cx: &mut TestAppContext) {
     let dir = TempDir::new("map-ask-again-switch");
@@ -918,7 +975,7 @@ fn ask_again_survives_a_reread_after_a_switch_interrupted_the_clear(cx: &mut Tes
     let (other, _) = colliding_catalog(&dir, "other", 1);
     core_switch(&app, other);
     work(&app, cx);
-    assert_eq!(MachinePrefs::load(prefs.clone()).get(MACHINE_TILE_HOSTS).as_deref(), Some(B_LEGACY), "the machine's copy is saved");
+    assert_eq!(disk_hosts(&prefs).as_deref(), Some(B_LEGACY), "the machine's copy is saved");
     let a = chairphoto_core::catalog::Catalog::open(&dir.0.join("photos.chairphoto"), &dir.0.join("photos")).unwrap();
     assert_eq!(a.get_setting(LEGACY_HOSTS).unwrap().as_deref(), Some(B_LEGACY), "the clear was refused: the old catalog keeps its copy");
     drop(a);
@@ -933,7 +990,7 @@ fn ask_again_survives_a_reread_after_a_switch_interrupted_the_clear(cx: &mut Tes
     work(&m.app, cx);
     show_map(&m.app, cx);
     asks_for_b(&m, before, cx);
-    assert_eq!(MachinePrefs::load(prefs).get(MACHINE_TILE_HOSTS).as_deref(), Some(r#"{"b.example":"ask"}"#), "the reset is saved");
+    assert_eq!(disk_hosts(&prefs).as_deref(), Some(r#"{"b.example":"ask"}"#), "the reset is saved");
     assert_eq!(m.setting(LEGACY_HOSTS).as_deref(), Some("{}"), "and the catalog's copy is emptied now");
 }
 

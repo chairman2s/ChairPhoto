@@ -21,8 +21,10 @@
 //! read by the same pass with the same arguments, so one file's bytes always give one
 //! answer. A bundle's original arrives as bytes in memory ([`find_in_library`]): a library
 //! file holding exactly those bytes is the same photo, and otherwise exiftool reads the
-//! bytes from stdin with the same arguments — they are never written to disk to be compared. A file exiftool cannot read (or no exiftool at all) has no capture time: with the
-//! other side's time known that is a difference, and with neither known the contents decide.
+//! bytes from stdin with the same arguments — they are never written to disk to be
+//! compared. A file exiftool cannot read (or no exiftool at all) has no capture time: with
+//! the other side's time known that is a difference, and with neither known the contents
+//! decide.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -73,8 +75,9 @@ impl CaptureStamp {
 ///
 /// The capture time is `DateTimeOriginal`, or `CreateDate` for a file without one (a video),
 /// compared tag to tag. A capture time on one side only is a difference: the same bytes read
-/// the same way give the same answer. So is a sub-second on one side only. A serial is compared per tag, only
-/// where both files carry that tag (the owner's "when both files have it").
+/// the same way give the same answer. So is a sub-second on one side only. A serial is
+/// compared per tag, only where both files carry that tag (the owner's "when both files have
+/// it").
 pub fn same_capture(a: &CaptureStamp, b: &CaptureStamp) -> Option<bool> {
     match (a.capture_time(), b.capture_time()) {
         (None, None) => None,
@@ -313,29 +316,48 @@ fn numbered(path: &Path, n: u32) -> PathBuf {
 }
 
 /// The library files of `size` bytes that a file arriving as `dest` may already be: `dest`
-/// itself and the ` (n)` names an earlier import gave different photos of that name, as far
-/// as the names run unbroken — the same chain [`unique_dest`] walks to find a free one. So a
-/// second import of a card that holds two photos named alike finds the second one at its
-/// ` (2)` name and does not copy it a third time.
+/// itself and every ` (n)` name beside it — the names an earlier import gave different
+/// photos of that name — in order of `n`. So a second import of a card that holds two photos
+/// named alike finds the second one at its ` (2)` name and does not copy it a third time.
+/// The directory is listed rather than the names probed in turn: a gap in the numbers (a
+/// ` (2)` the user deleted) or a missing `dest` does not hide the names after it.
 pub fn same_size_candidates(dest: &Path, size: u64) -> Vec<PathBuf> {
     let same_size = |p: &Path| std::fs::metadata(p).is_ok_and(|m| m.is_file() && m.len() == size);
     let mut out = Vec::new();
-    if !dest.exists() {
-        return out;
-    }
     if same_size(dest) {
         out.push(dest.to_path_buf());
     }
-    for n in 2..10_000 {
-        let candidate = numbered(dest, n);
-        if !candidate.exists() {
-            break;
-        }
-        if same_size(&candidate) {
-            out.push(candidate);
-        }
-    }
+    let (Some(dir), Some(stem)) = (dest.parent(), dest.file_stem().and_then(|s| s.to_str())) else {
+        return out;
+    };
+    let ext = dest.extension().and_then(|s| s.to_str());
+    let Ok(entries) = std::fs::read_dir(dir) else { return out };
+    let mut numbered: Vec<(u32, PathBuf)> = entries
+        .filter_map(|e| e.ok())
+        .filter_map(|e| {
+            let n = numbered_index(e.file_name().to_str()?, stem, ext)?;
+            Some((n, e.path()))
+        })
+        .filter(|(_, p)| same_size(p))
+        .collect();
+    numbered.sort();
+    out.extend(numbered.into_iter().map(|(_, p)| p));
     out
+}
+
+/// `n` when `name` is `stem (n).ext` ([`numbered`]'s form, `n` ≥ 2 written without leading
+/// zeros), else `None`.
+fn numbered_index(name: &str, stem: &str, ext: Option<&str>) -> Option<u32> {
+    let rest = name.strip_prefix(stem)?.strip_prefix(" (")?;
+    let rest = match ext {
+        Some(ext) => rest.strip_suffix(ext)?.strip_suffix('.')?,
+        None => rest,
+    };
+    let digits = rest.strip_suffix(')')?;
+    if digits.is_empty() || digits.starts_with('0') || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    digits.parse().ok().filter(|n| *n >= 2)
 }
 
 /// A destination path that doesn't exist yet (`name (2).ext`, …), or `None` if no free name
@@ -513,16 +535,35 @@ mod tests {
     }
 
     #[test]
-    fn the_candidates_are_the_same_size_names_of_the_unbroken_chain() {
+    fn the_candidates_are_the_same_size_numbered_names() {
         let dir = temp("chain");
         let dest = dir.join("DSC1.ARW");
         assert!(same_size_candidates(&dest, 4).is_empty());
         std::fs::write(&dest, b"aaaa").unwrap();
         std::fs::write(dir.join("DSC1 (2).ARW"), b"bbbbb").unwrap(); // another size
         std::fs::write(dir.join("DSC1 (3).ARW"), b"cccc").unwrap();
-        std::fs::write(dir.join("DSC1 (5).ARW"), b"dddd").unwrap(); // past the gap
-        assert_eq!(same_size_candidates(&dest, 4), vec![dest.clone(), dir.join("DSC1 (3).ARW")]);
-        assert_eq!(unique_dest(&dest), Some(dir.join("DSC1 (4).ARW")));
+        std::fs::write(dir.join("DSC1 (12).ARW"), b"eeee").unwrap();
+        std::fs::write(dir.join("DSC1 (5).ARW"), b"dddd").unwrap(); // past the gap at (4)
+        // Not ` (n)` names of DSC1.ARW.
+        for other in ["DSC1 (05).ARW", "DSC1 (1).ARW", "DSC1 (x).ARW", "DSC1 (6).JPG", "DSC10 (2).ARW", "DSC1 (7)"] {
+            std::fs::write(dir.join(other), b"ffff").unwrap();
+        }
+        let n = |k: u32| dir.join(format!("DSC1 ({k}).ARW"));
+        assert_eq!(same_size_candidates(&dest, 4), vec![dest.clone(), n(3), n(5), n(12)]);
+        assert_eq!(unique_dest(&dest), Some(n(4)));
+    }
+
+    /// L-5 of the #246 review: the base name gone (the user deleted it) does not hide the
+    /// ` (n)` names beside it.
+    #[test]
+    fn the_numbered_names_count_without_the_base_name() {
+        let dir = temp("chain-no-base");
+        let dest = dir.join("DSC1.ARW");
+        std::fs::write(dir.join("DSC1 (2).ARW"), b"aaaa").unwrap();
+        assert_eq!(same_size_candidates(&dest, 4), vec![dir.join("DSC1 (2).ARW")]);
+        let bare = dir.join("README");
+        std::fs::write(dir.join("README (3)"), b"bbbb").unwrap();
+        assert_eq!(same_size_candidates(&bare, 4), vec![dir.join("README (3)")]);
     }
 
     // --- placing a new file (L-4) ---------------------------------------------------------

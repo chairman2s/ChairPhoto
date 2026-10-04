@@ -292,16 +292,25 @@ mod tests {
         std::fs::read_to_string(path).unwrap()
     }
 
-    /// A hook `write_and_settle` runs between the sidecar write and the settle, once, for
-    /// the write to the original it names — so a test can act inside that window.
-    type Hook = (std::path::PathBuf, Box<dyn FnOnce() + Send>);
-    static BEFORE_SETTLE: std::sync::Mutex<Option<Hook>> = std::sync::Mutex::new(None);
+    type Hook = (std::path::PathBuf, Box<dyn FnOnce()>);
+    thread_local! {
+        /// A hook `write_and_settle` runs between the sidecar write and the settle, once, for
+        /// the write to the original it names — so a test can act inside that window.
+        ///
+        /// Thread-local (#226), not a process-global `Mutex`: `write_and_settle` runs on
+        /// whatever thread calls `save_iptc`/`save_iptc_as` — a plain call in every test here,
+        /// never across a `spawn_blocking` hop — so scoping by thread means a second test that
+        /// adopts this hook in parallel can no longer drop or steal the first's (review of
+        /// #148, N2: one global slot held only one hook, so a second setter silently discarded
+        /// the first's and left its `recv()` to fail loudly on the disconnected channel).
+        static BEFORE_SETTLE: std::cell::RefCell<Option<Hook>> = std::cell::RefCell::new(None);
+    }
 
     pub(super) fn before_settle(original: &std::path::Path) {
-        let hook = {
-            let mut slot = BEFORE_SETTLE.lock().unwrap();
+        let hook = BEFORE_SETTLE.with(|cell| {
+            let mut slot = cell.borrow_mut();
             if slot.as_ref().is_some_and(|(p, _)| p == original) { slot.take() } else { None }
-        };
+        });
         if let Some((_, hook)) = hook {
             hook();
         }
@@ -319,18 +328,20 @@ mod tests {
         let first = IptcFields { title: "t1".into(), ..Default::default() };
         let second = IptcFields { title: "t2".into(), ..Default::default() };
         let (tx, rx) = std::sync::mpsc::channel();
-        *BEFORE_SETTLE.lock().unwrap() = Some((original, Box::new({
-            let state = state.clone();
-            move || {
-                let later = {
-                    let state = state.clone();
-                    std::thread::spawn(move || save_iptc(&state, id, &second))
-                };
-                std::thread::sleep(std::time::Duration::from_millis(200));
-                let stored = state.catalog.lock().unwrap().as_ref().unwrap().get_iptc(id).unwrap();
-                tx.send((later, stored.title)).unwrap();
-            }
-        })));
+        BEFORE_SETTLE.with(|cell| {
+            *cell.borrow_mut() = Some((original, Box::new({
+                let state = state.clone();
+                move || {
+                    let later = {
+                        let state = state.clone();
+                        std::thread::spawn(move || save_iptc(&state, id, &second))
+                    };
+                    std::thread::sleep(std::time::Duration::from_millis(200));
+                    let stored = state.catalog.lock().unwrap().as_ref().unwrap().get_iptc(id).unwrap();
+                    tx.send((later, stored.title)).unwrap();
+                }
+            })));
+        });
 
         let earlier = save_iptc(&state, id, &first).unwrap();
         let (later, title_inside_the_window) = rx.recv().unwrap();

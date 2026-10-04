@@ -39,13 +39,16 @@ const ZOOM_MAX: u32 = 10000;
 const CACHE_VERSION: u32 = 5;
 
 /// Zoom's own cache-directory version, independent of [`CACHE_VERSION`]. The fix making a
-/// tier never upscale changed zoom's output for every original smaller than `ZOOM_MAX` (it
-/// used to be blown up to 10 000 px; now it stays native), but left thumb/preview output
-/// unchanged. Bumping `CACHE_VERSION` would have regenerated all three tiers for no reason;
-/// bumping only this orphans the old `z10000v5` directory (cleaned up best-effort by
-/// [`cleanup_stale_zoom_cache`]) and regenerates zoom alone, at the right size. The next
-/// change that affects zoom specifically bumps this again, independently of
-/// `CACHE_VERSION`.
+/// tier never upscale (#168) changed every tier's output for an original smaller than its
+/// max, not just zoom's: it used to be blown up to fill the box (a 1200x800 original to a
+/// 2048x1365 preview, a 300x200 one to a 512x341 thumb); now each stays native. Bumping
+/// `CACHE_VERSION` would have regenerated thumb and preview in bulk for that too; bumping
+/// only `ZOOM_VERSION` orphans the old `z10000v5` directory (cleaned up best-effort by
+/// [`cleanup_stale_zoom_cache`]) and regenerates zoom alone, at the right size. Thumb and
+/// preview caches already written for such an original keep their old, upscaled pixels
+/// until something else bumps `CACHE_VERSION`; whether to force that regeneration now is
+/// left to the owner (#245). The next change that affects zoom specifically bumps
+/// `ZOOM_VERSION` again, independently of `CACHE_VERSION`.
 const ZOOM_VERSION: u32 = 6;
 
 /// One cache size: its longest-edge cap, on-disk tag, cache-directory version, and JPEG

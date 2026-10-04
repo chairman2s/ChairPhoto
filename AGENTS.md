@@ -150,7 +150,7 @@ Read only the documents triggered by the task:
 
 ```
 crates/core/src/        Rust I/O, catalog, image processing, jobs (`chairphoto-core`, no UI)
-crates/app/src/         GPUI front end, the only UI (`chairphoto-app`, bin `chairphoto-gpui`)
+crates/app/src/         GPUI front end, the only UI (`chairphoto-app`, bin `chairphoto`)
 crates/model/src/       UI logic with no I/O, unit-tested on its own (`chairphoto-model`)
 ```
 
@@ -299,10 +299,14 @@ restarts at `0`, so it is not a patch/minor distinction and carries no compatibi
 
 - **Never zero-pad the month.** `2026.08.0` is not valid semver ("invalid leading zero in
   minor version number") and Cargo refuses to build. Write `2026.8.0`.
-- No Cargo manifest currently carries the version; `packaging/PKGBUILD`'s `pkgver` is the
-  only record (#165 removed the other two files it used to track against). #167 (packaging)
-  sets the single source of truth for the Rust workspace.
-- Tag a release `v2026.8.0`, matching the manifest(s) exactly.
+- **One version source** (#167): `[workspace.package] version` in the root `Cargo.toml`. Every
+  member crate (`chairphoto-core`, `chairphoto-model`, `chairphoto-app`) pulls it with
+  `version.workspace = true` instead of carrying its own. `packaging/PKGBUILD`'s `pkgver`
+  must match it — `prepare()` asserts this on every build — so bump both together; there is
+  no other manifest to keep in step.
+- Tag a release `v2026.8.0`, matching `Cargo.toml` and `PKGBUILD` exactly. The current
+  release is `2026.8.0`; the next one bumps `[workspace.package] version` and `pkgver`
+  together (see `packaging/README.md` "Cutting a release").
 
 ## Runtime Notes
 

@@ -1,8 +1,9 @@
 [package]
 name = "chairphoto-model"
-# Internal crate, never published on its own, so it carries no version: the app's version is
-# the release's (`packaging/PKGBUILD`'s `pkgver` since the Tauri shell's manifest went in #165).
-version = "0.0.0"
+# Internal crate, never published on its own. Its version is the workspace's single source
+# (`[workspace.package] version` at the repository root, #167), which `packaging/PKGBUILD`'s
+# `pkgver` must match.
+version.workspace = true
 publish = false
 description = "ChairPhoto's UI model: front-end state and logic as plain Rust, with no GPUI or Tauri types"
 authors = ["Andreas Henden <chairman2s.ah+github@gmail.com>"]

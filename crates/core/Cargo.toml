@@ -1,8 +1,9 @@
 [package]
 name = "chairphoto-core"
-# Internal crate, never published on its own, so it carries no version: the app's version is
-# the release's (`packaging/PKGBUILD`'s `pkgver` since the Tauri shell's manifest went in #165).
-version = "0.0.0"
+# Internal crate, never published on its own. Its version is the workspace's single source
+# (`[workspace.package] version` at the repository root, #167), which `packaging/PKGBUILD`'s
+# `pkgver` must match.
+version.workspace = true
 publish = false
 description = "ChairPhoto's core: catalog, import, XMP, decode, jobs and module backends"
 authors = ["Andreas Henden <chairman2s.ah+github@gmail.com>"]
@@ -89,7 +90,7 @@ raw = []
 # real `~/.cache` (#228). `cfg(test)` alone only covers this crate's own test binary — a test
 # in `chairphoto-app`, which links this crate as an ordinary dependency, never sees it. Never
 # in `default`; enabled only from chairphoto-app's `[dev-dependencies]`, so the production
-# `chairphoto-gpui` binary (which depends on no dev-dependency) never carries it — verified
+# `chairphoto` binary (which depends on no dev-dependency) never carries it — verified
 # the same way as `hooks` below, by inspecting the release fingerprint.
 test-hooks = []
 

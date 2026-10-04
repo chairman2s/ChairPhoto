@@ -86,3 +86,28 @@ Adobe DNG SDK license, and none of its tables measured from Adobe Camera Raw.
 > HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF
 > CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR
 > THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+The GPUI app (`crates/app`) embeds two more sets of third-party assets, both found while
+fixing #173 (#177):
+
+- **Lucide** icon SVGs (<https://lucide.dev>), ISC License, Copyright (c) 2026 Lucide Icons
+  and Contributors — the icons the app's own code names (`IconName::…`) that gpui-kit's
+  default bundle does not carry (`crates/app/src/assets.rs`'s `ExtraIcons`). They are embedded
+  from the `gpui-kit-assets` crate's own copy of the Lucide set — the same source gpui-kit's
+  default bundle and every icon gpui-component itself draws already use — so no new upstream
+  dependency is introduced, only more icons drawn from it. A subset of Lucide's icons are
+  themselves derived from the Feather project and carry an additional MIT notice (Copyright
+  (c) 2013-present Cole Bemis); both notices are one file, `LICENSE-LUCIDE`, which this repo
+  keeps its own copy of at `crates/app/assets/icons/LICENSE-LUCIDE` and the package installs
+  next to ChairPhoto's own license (`packaging/PKGBUILD`).
+- **Instrument Sans** and **Instrument Serif** (<https://github.com/Instrument/instrument-sans>),
+  Copyright 2022 The Instrument Sans Project Authors, under the **SIL Open Font License 1.1**
+  with no Reserved Font Name — the app's UI and display typefaces, embedded as TTF
+  (`crates/app/assets/fonts/`, `crates/app/src/assets.rs`). The licence texts sit beside the
+  font files (`OFL-InstrumentSans.txt`, `OFL-InstrumentSerif.txt`) and the package installs
+  both next to ChairPhoto's own license (`packaging/PKGBUILD`).
+
+Everything else `crates/app/assets` and the gpui-component/gpui-base/gpui-kit crates bring in
+is Rust source code pulled in as an ordinary Cargo dependency (Apache-2.0, per their own
+`LICENSE-APACHE`), not a bundled asset — the same category as the project's other Rust
+dependencies, which this note does not enumerate individually.

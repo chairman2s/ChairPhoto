@@ -106,7 +106,7 @@ Street Photography/Old Town   →   StreetPhotography/OldTown
 ## Linking back
 
 `chairphoto://` is a real OS-level scheme. An installed build registers it through its
-`.desktop` file (`packaging/chairphoto-gpui.desktop`, `MimeType=x-scheme-handler/chairphoto`);
+`.desktop` file (`packaging/chairphoto.desktop`, `MimeType=x-scheme-handler/chairphoto`);
 `crates/app/src/desktop.rs` covers a dev build's opt-in registration. A single-instance
 protocol (`crates/app/src/single_instance.rs`: a lock file plus a Unix socket under
 `$XDG_RUNTIME_DIR/chairphoto`) forwards a second launch's URL into the already-running app

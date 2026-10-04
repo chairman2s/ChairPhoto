@@ -1,27 +1,25 @@
-//! The `chairphoto://` scheme handler for a development build of the GPUI app.
+//! The `chairphoto://` scheme handler for a development build of the app.
 //!
 //! An installed build registers the scheme through its `.desktop` file
-//! (`packaging/chairphoto-gpui.desktop`, `MimeType=x-scheme-handler/chairphoto`). A dev build
-//! is not installed; the Tauri shell registers its dev build on every start
-//! (`deep_link().register_all()` in `src-tauri/src/lib.rs`). This one does so **only when
-//! asked**: with `CHAIRPHOTO_GPUI_CLAIM_SCHEME=1` it writes
-//! `$XDG_DATA_HOME/applications/chairphoto-gpui-handler.desktop` pointing at its own binary,
+//! (`packaging/chairphoto.desktop`, `MimeType=x-scheme-handler/chairphoto`). A dev build is
+//! not installed, so it does not register itself on every start; it does so **only when
+//! asked**: with `CHAIRPHOTO_CLAIM_SCHEME=1` it writes
+//! `$XDG_DATA_HOME/applications/chairphoto-dev-handler.desktop` pointing at its own binary,
 //! refreshes that directory's MIME cache, and makes itself the default (`xdg-mime default`).
 //! Without the variable it writes nothing.
 //!
 //! **Why nothing by default.** A handler entry alone is not inert: when the user has no
 //! explicit default for `x-scheme-handler/chairphoto` in `mimeapps.list`, the XDG MIME
 //! Applications spec lets any installed entry that lists the type become the handler. A dev
-//! build run once would then quietly take `chairphoto://` links away from whatever the user
-//! expects. Until the cutover the Tauri app owns the scheme (its dev build sets the default
-//! on every start, under its own file name `chairphoto-handler.desktop`, so the two never
-//! overwrite each other); the GPUI build takes it only when someone opts in.
+//! build run once would then quietly take `chairphoto://` links away from the installed
+//! `chairphoto.desktop` entry, or from whatever else the user has set. Its own file name
+//! differs from the installed entry's, so running a dev build never overwrites the packaged
+//! one; it claims the scheme only when someone opts in.
 //!
 //! **Exec quoting.** xdg-open (what Electron apps such as Obsidian open links with) takes the
 //! first word of `Exec` verbatim and looks it up with `command -v`, so a quoted path "does not
-//! exist" and it silently falls back to the browser; gio parses quoting fine. The Tauri shell
-//! strips the quotes `register_all` writes after the fact. Here the line is written unquoted
-//! from the start whenever the path has no character the Desktop Entry spec reserves, and
+//! exist" and it silently falls back to the browser; gio parses quoting fine. The line is
+//! written unquoted whenever the path has no character the Desktop Entry spec reserves, and
 //! quoted per the spec otherwise (gio then still works; xdg-open cannot).
 
 use std::io;
@@ -29,11 +27,11 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 /// The handler entry's file name under `applications/`.
-pub const HANDLER_FILE: &str = "chairphoto-gpui-handler.desktop";
+pub const HANDLER_FILE: &str = "chairphoto-dev-handler.desktop";
 /// The MIME type of the scheme.
 pub const SCHEME_MIME: &str = "x-scheme-handler/chairphoto";
 /// Set to `1` to register the dev build as the scheme's handler and make it the default.
-pub const CLAIM_ENV: &str = "CHAIRPHOTO_GPUI_CLAIM_SCHEME";
+pub const CLAIM_ENV: &str = "CHAIRPHOTO_CLAIM_SCHEME";
 
 /// The `Exec` value for `exe` with the URL placeholder: `<exe> %u`. `None` for a path with a
 /// line break or another control character, which a one-line desktop-file value cannot
@@ -71,7 +69,7 @@ pub fn handler_entry(exe: &Path) -> Option<String> {
     Some(format!(
         "[Desktop Entry]\n\
          Type=Application\n\
-         Name=ChairPhoto (GPUI dev build)\n\
+         Name=ChairPhoto (dev build)\n\
          Exec={}\n\
          Terminal=false\n\
          NoDisplay=true\n\
@@ -193,25 +191,20 @@ mod tests {
 
     #[test]
     fn the_entry_registers_the_scheme() {
-        let entry = handler_entry(Path::new("/x/chairphoto-gpui")).unwrap();
-        assert!(entry.contains("\nExec=/x/chairphoto-gpui %u\n"), "{entry}");
+        let entry = handler_entry(Path::new("/x/chairphoto")).unwrap();
+        assert!(entry.contains("\nExec=/x/chairphoto %u\n"), "{entry}");
         assert!(entry.contains("\nMimeType=x-scheme-handler/chairphoto;\n"), "{entry}");
         assert!(entry.contains("\nNoDisplay=true\n"), "{entry}");
     }
 
-    /// The installed entries (Tauri's today, the GPUI app's for the cutover) declare the
-    /// scheme and pass the URL with `%u`.
+    /// The installed entry declares the scheme and passes the URL with `%u`.
     #[test]
-    fn the_packaged_entries_declare_the_scheme() {
-        for (name, entry, exec) in [
-            ("chairphoto-gpui.desktop", include_str!("../../../packaging/chairphoto-gpui.desktop"), "Exec=chairphoto-gpui %u"),
-            ("chairphoto.desktop", include_str!("../../../packaging/chairphoto.desktop"), "Exec=chairphoto %u"),
-        ] {
-            let lines: Vec<&str> = entry.lines().collect();
-            assert!(lines.contains(&exec), "{name}: {exec}");
-            assert!(lines.contains(&"MimeType=x-scheme-handler/chairphoto;"), "{name}: MimeType");
-            assert!(lines.contains(&"StartupWMClass=chairphoto"), "{name}: StartupWMClass");
-        }
+    fn the_packaged_entry_declares_the_scheme() {
+        let entry = include_str!("../../../packaging/chairphoto.desktop");
+        let lines: Vec<&str> = entry.lines().collect();
+        assert!(lines.contains(&"Exec=chairphoto %u"), "Exec");
+        assert!(lines.contains(&"MimeType=x-scheme-handler/chairphoto;"), "MimeType");
+        assert!(lines.contains(&"StartupWMClass=chairphoto"), "StartupWMClass");
     }
 
     /// Without the opt-in a dev build writes nothing and claims nothing: no `applications/`
@@ -220,7 +213,7 @@ mod tests {
     fn without_the_opt_in_nothing_is_registered() {
         let home = Home::new("no-opt-in");
         let claimed = Cell::new(false);
-        let result = register_dev_handler(&home.0, Path::new("/a/chairphoto-gpui"), false, || claimed.set(true));
+        let result = register_dev_handler(&home.0, Path::new("/a/chairphoto"), false, || claimed.set(true));
         assert_eq!(result.unwrap(), None);
         assert!(!home.0.join("applications").exists(), "a handler entry was written without the opt-in");
         assert!(!claimed.get(), "the default was claimed without the opt-in");
@@ -234,14 +227,14 @@ mod tests {
         let home = Home::new("opt-in");
         let claims = Cell::new(0);
         let claim = || claims.set(claims.get() + 1);
-        let file = register_dev_handler(&home.0, Path::new("/a/chairphoto-gpui"), true, claim).unwrap().unwrap();
+        let file = register_dev_handler(&home.0, Path::new("/a/chairphoto"), true, claim).unwrap().unwrap();
         assert_eq!(file, home.0.join("applications").join(HANDLER_FILE));
-        assert_eq!(Some(std::fs::read_to_string(&file).unwrap()), handler_entry(Path::new("/a/chairphoto-gpui")));
+        assert_eq!(Some(std::fs::read_to_string(&file).unwrap()), handler_entry(Path::new("/a/chairphoto")));
         assert_eq!(claims.get(), 1);
         let modified = std::fs::metadata(&file).unwrap().modified().unwrap();
-        register_dev_handler(&home.0, Path::new("/a/chairphoto-gpui"), true, claim).unwrap();
+        register_dev_handler(&home.0, Path::new("/a/chairphoto"), true, claim).unwrap();
         assert_eq!(std::fs::metadata(&file).unwrap().modified().unwrap(), modified, "unchanged entry is not rewritten");
-        register_dev_handler(&home.0, Path::new("/b/chairphoto-gpui"), true, claim).unwrap();
-        assert!(std::fs::read_to_string(&file).unwrap().contains("Exec=/b/chairphoto-gpui %u"));
+        register_dev_handler(&home.0, Path::new("/b/chairphoto"), true, claim).unwrap();
+        assert!(std::fs::read_to_string(&file).unwrap().contains("Exec=/b/chairphoto %u"));
     }
 }

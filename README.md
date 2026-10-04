@@ -102,8 +102,8 @@ equivalents — also used by CI, `.github/workflows/ci.yml` — and may differ b
 ## Build & run
 
 ```bash
-cargo build --release -p chairphoto-app --bin chairphoto-gpui
-cargo run --release -p chairphoto-app --bin chairphoto-gpui
+cargo build --release -p chairphoto-app --bin chairphoto
+cargo run --release -p chairphoto-app --bin chairphoto
 ```
 
 It opens your real catalog by default (`~/Pictures/Raw`, changeable in Preferences). To try
@@ -111,7 +111,7 @@ it without touching your own library, point it at throwaway data directories ins
 
 ```bash
 XDG_DATA_HOME=/tmp/cp-data XDG_CACHE_HOME=/tmp/cp-cache \
-  cargo run --release -p chairphoto-app --bin chairphoto-gpui
+  cargo run --release -p chairphoto-app --bin chairphoto
 ```
 
 That isolates the catalog database and caches ChairPhoto keeps under
@@ -137,7 +137,7 @@ The Rust side is a Cargo workspace at the repository root, with build output in 
 |---|---|---|
 | `crates/core` | `chairphoto-core` | Catalog, import, decode, XMP, jobs and module backends. No UI dependency. |
 | `crates/model` | `chairphoto-model` | UI logic with no I/O (library session, editing, presets, tag graph layout, deep links, …), shared by the GPUI views and tested on its own. |
-| `crates/app` | `chairphoto-app` | The GPUI front end — the only front end (binary `chairphoto-gpui`). |
+| `crates/app` | `chairphoto-app` | The GPUI front end — the only front end (binary `chairphoto`). |
 
 Feature names are the same in every crate that forwards them.
 

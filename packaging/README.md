@@ -9,8 +9,8 @@ separate source of truth.
 | File | Purpose |
 |---|---|
 | `PKGBUILD` | The package recipe. |
-| `chairphoto.desktop` | Launcher entry, plus the `chairphoto://` scheme registration. |
-| `chairphoto-gpui.desktop` | The GPUI front end's entry and scheme registration (`chairphoto-gpui %u`). Not installed yet: the Tauri entry owns the scheme until the GPUI cutover. |
+| `chairphoto.desktop` | Launcher entry for the `chairphoto` binary, plus the `chairphoto://` scheme registration. |
+| `icons/` | The app icon, installed into `hicolor` at each size `PKGBUILD` needs. |
 | `omarchy/chairphoto.lua` | Hyprland window rule for Omarchy, keeping the app opaque (see below). |
 
 ## Why `omarchy/chairphoto.lua` exists
@@ -117,9 +117,9 @@ a git source with the tarball's directory layout fails too.
  makedepends=(
    'cargo'
    'clang'
+   'fontconfig'
+   'freetype2'
 +  'git'
-   'nodejs>=24'
-   'npm'
    'pkgconf'
  )
 
@@ -173,9 +173,10 @@ verification on new releases starts failing.
 
 ## Cutting a release
 
-1. Make sure `package.json`, `src-tauri/Cargo.toml`, and `src-tauri/tauri.conf.json` all
-   carry the same version — calendar versioning, unpadded month (`2026.8.0`, never
-   `2026.08.0`, which is not valid semver).
+1. Bump `[workspace.package] version` in the root `Cargo.toml` — the one version source
+   (#167; AGENTS.md "Versioning") every crate pulls with `version.workspace = true`.
+   Calendar versioning, unpadded month (`2026.8.0`, never `2026.08.0`, which is not valid
+   semver).
 2. Tag and push. `-s` signs it; `tag.gpgsign` makes that the default, but being explicit
    documents the intent:
    ```bash
@@ -184,7 +185,8 @@ verification on new releases starts failing.
    git push origin v2026.8.1
    ```
 3. Create the GitHub release for that tag so the source tarball URL resolves.
-4. Set `pkgver` in `PKGBUILD` to match, then refresh the checksums:
+4. Set `pkgver` in `PKGBUILD` to match — `prepare()` refuses to build if the two disagree —
+   then refresh the checksums:
    ```bash
    cd packaging
    updpkgsums          # from pacman-contrib
@@ -207,7 +209,7 @@ To exercise the recipe against the working tree, build a tarball shaped like Git
 point the recipe at it:
 
 ```bash
-VER=$(python3 -c "import json;print(json.load(open('../package.json'))['version'])")
+VER=$(sed -n 's/^version = "\(.*\)"/\1/p' ../Cargo.toml | head -n1)
 git -C .. archive --format=tar.gz --prefix="ChairPhoto-$VER/" -o "/tmp/chairphoto-$VER.tar.gz" HEAD
 cp "/tmp/chairphoto-$VER.tar.gz" .
 makepkg -si --skipchecksums   # picks the local tarball over the release URL

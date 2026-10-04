@@ -18,7 +18,10 @@ use std::borrow::Cow;
 
 // **The extra icons** are Lucide's (ISC; the Feather-derived ones MIT), embedded from the
 // `gpui-kit-assets` crate's copy, which carries the upstream licence (`LICENSE-LUCIDE`) — the
-// same source and terms as the default bundle. gpui-kit 0.7.0's default bundle
+// same source and terms as the default bundle (and as every icon gpui-component itself draws,
+// which the app's own icons sit alongside on screen). A copy of that licence text travels in
+// this repo too, at `crates/app/assets/icons/LICENSE-LUCIDE`, for `packaging/PKGBUILD` to
+// install (#177; MODULE_LICENSING.md). gpui-kit 0.7.0's default bundle
 // (`default-icons.txt`) has only the icons its own widgets use; an `IconName` outside it and
 // this list draws nothing (#173). `every_icon_the_app_names_is_served` checks the sources.
 gpui_kit::assets::icon_assets!(

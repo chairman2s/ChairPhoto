@@ -25,7 +25,7 @@ jobs:
       # ChairPhoto compiles its vendored LibRaw at build time (a C++ compiler, zlib and
       # libclang for bindgen) and shells out to the metadata/image tools at runtime. See
       # the Requirements section of the README. The GPUI app links xcb and xkbcommon
-      # (`ldd chairphoto-gpui`) and probes fontconfig/freetype at build time; it loads
+      # (`ldd chairphoto`) and probes fontconfig/freetype at build time; it loads
       # Wayland and Vulkan at runtime.
       - name: Install system dependencies
         run: |

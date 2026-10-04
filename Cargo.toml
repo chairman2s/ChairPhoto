@@ -2,7 +2,7 @@
 #
 # - `crates/core` (`chairphoto-core`) — catalog, import, XMP, decode, jobs, plugins' backends:
 #   everything the app *does*, with no UI toolkit.
-# - `crates/app` (`chairphoto-app`, binary `chairphoto-gpui`) — the native GPUI front end
+# - `crates/app` (`chairphoto-app`, binary `chairphoto`) — the native GPUI front end
 #   (docs/plans/gpui, issue #99). Links the core directly and forwards each of its features to
 #   the core's feature of the same name.
 # - `crates/model` (`chairphoto-model`) — the UI's logic without any UI toolkit: library
@@ -14,6 +14,13 @@
 [workspace]
 members = ["crates/core", "crates/model", "crates/app"]
 resolver = "2"
+
+# The one version source (#167; AGENTS.md "Versioning"). Every member crate pulls this with
+# `version.workspace = true` instead of carrying its own; `packaging/PKGBUILD`'s `pkgver` must
+# match it. Bump it here for the next release, calendar-versioned (`YEAR.MONTH.RELEASE`, never
+# a zero-padded month).
+[workspace.package]
+version = "2026.8.0"
 
 # Optimize image-decoding crates even in dev builds. Our own code stays in debug
 # (fast incremental builds), but decoding a 66 MP embedded RAW preview is ~20x

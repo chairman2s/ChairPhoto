@@ -10,6 +10,8 @@
 //! `SubSecTimeOriginal`) and the camera serial (`SerialNumber`, `InternalSerialNumber`, each
 //! compared when both files have it) agree. Any difference makes it a different photo, which
 //! is copied under a free ` (n)` name with its own row and UUID; nothing is ever overwritten.
+//! A file with no `DateTimeOriginal` — a camera's video — has its `CreateDate` (QuickTime's)
+//! as its capture time, compared only against the other file's `CreateDate`.
 //! Only when neither file has a capture time to compare (a PNG, a stripped JPEG) are their
 //! contents compared, by streamed SHA-256. File mtime is never evidence: a copy changes it.
 //!
@@ -43,16 +45,38 @@ pub struct CaptureStamp {
     pub subsec: Option<String>,
     /// Each of [`SERIAL_TAGS`] the file carries, by tag name.
     pub serials: BTreeMap<String, String>,
+    /// `CreateDate`: the capture time of a file with no `DateTimeOriginal` — a camera's
+    /// video (QuickTime `CreateDate`), so a re-imported clip is not hashed whole.
+    pub created: Option<String>,
+}
+
+impl CaptureStamp {
+    /// The capture time compared, with the tag it came from: `DateTimeOriginal`, else
+    /// `CreateDate`. Two files are compared on the same tag only — a `DateTimeOriginal` on
+    /// one side and only a `CreateDate` on the other is a difference.
+    fn capture_time(&self) -> Option<(&'static str, &str)> {
+        match (&self.time, &self.created) {
+            (Some(t), _) => Some(("DateTimeOriginal", t)),
+            (None, Some(c)) => Some(("CreateDate", c)),
+            (None, None) => None,
+        }
+    }
+
+    /// Whether there is a capture time to compare.
+    pub fn has_capture_time(&self) -> bool {
+        self.capture_time().is_some()
+    }
 }
 
 /// Whether two stamps are one capture: `Some(true)` the same photo, `Some(false)` a
 /// different one, `None` when neither has a capture time and the contents must decide.
 ///
-/// A capture time on one side only is a difference: the same bytes read the same way give
-/// the same answer. So is a sub-second on one side only. A serial is compared per tag, only
+/// The capture time is `DateTimeOriginal`, or `CreateDate` for a file without one (a video),
+/// compared tag to tag. A capture time on one side only is a difference: the same bytes read
+/// the same way give the same answer. So is a sub-second on one side only. A serial is compared per tag, only
 /// where both files carry that tag (the owner's "when both files have it").
 pub fn same_capture(a: &CaptureStamp, b: &CaptureStamp) -> Option<bool> {
-    match (&a.time, &b.time) {
+    match (a.capture_time(), b.capture_time()) {
         (None, None) => None,
         (Some(x), Some(y)) => {
             let serials_agree =
@@ -67,7 +91,7 @@ pub fn same_capture(a: &CaptureStamp, b: &CaptureStamp) -> Option<bool> {
 /// one answer whether exiftool reads them from a path or from stdin.
 fn stamp_command() -> Command {
     let mut cmd = Command::new("exiftool");
-    cmd.args(["-j", "-DateTimeOriginal", "-SubSecTimeOriginal"]);
+    cmd.args(["-j", "-DateTimeOriginal", "-SubSecTimeOriginal", "-CreateDate"]);
     for tag in SERIAL_TAGS {
         cmd.arg(format!("-{tag}"));
     }
@@ -147,7 +171,15 @@ fn parse_stamp(obj: &serde_json::Map<String, serde_json::Value>) -> CaptureStamp
         .iter()
         .filter_map(|tag| text(tag).map(|v| (tag.to_string(), v)))
         .collect();
-    CaptureStamp { time: text("DateTimeOriginal"), subsec: text("SubSecTimeOriginal"), serials }
+    // An all-zero date ("0000:00:00 00:00:00", a camera or muxer that never set it) is no
+    // capture time: two clips both carrying it are not thereby one.
+    let date = |key: &str| text(key).filter(|s| s.chars().any(|c| c.is_ascii_digit() && c != '0'));
+    CaptureStamp {
+        time: date("DateTimeOriginal"),
+        subsec: text("SubSecTimeOriginal"),
+        serials,
+        created: date("CreateDate"),
+    }
 }
 
 /// One file arriving at a name the library already uses: the arriving file, and the
@@ -227,7 +259,7 @@ pub fn find_in_library(bytes: &[u8], candidates: &[PathBuf], abort: &AtomicBool)
         return None;
     }
     let arriving = read_capture_stamp_of(bytes);
-    if arriving.time.is_none() {
+    if !arriving.has_capture_time() {
         // No capture time: only a candidate without one either could be this photo, and the
         // contents decide that pair — they were just found to differ.
         return Some(None);
@@ -358,7 +390,27 @@ mod tests {
             time: time.map(str::to_string),
             subsec: subsec.map(str::to_string),
             serials: serials.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
+            created: None,
         }
+    }
+
+    fn created(date: &str) -> CaptureStamp {
+        CaptureStamp { created: Some(date.to_string()), ..Default::default() }
+    }
+
+    /// L-3 of the #246 review: a file with no `DateTimeOriginal` (a camera's video) is
+    /// compared on its `CreateDate`, tag to tag — never one file's `DateTimeOriginal` against
+    /// the other's `CreateDate`.
+    #[test]
+    fn without_date_time_original_the_create_date_is_the_capture_time() {
+        let a = created("2026:06:28 12:00:00");
+        assert_eq!(same_capture(&a, &a.clone()), Some(true));
+        assert_eq!(same_capture(&a, &created("2026:06:28 12:00:01")), Some(false));
+        assert_eq!(same_capture(&a, &CaptureStamp::default()), Some(false));
+        let dto = stamp(Some("2026:06:28 12:00:00"), None, &[]);
+        assert_eq!(same_capture(&a, &dto), Some(false), "another tag is a difference");
+        let both = CaptureStamp { created: Some("2026:06:28 13:00:00".into()), ..dto.clone() };
+        assert_eq!(same_capture(&dto, &both), Some(true), "DateTimeOriginal wins over CreateDate");
     }
 
     // --- the rule (#246) ----------------------------------------------------------------
@@ -506,6 +558,60 @@ mod tests {
         assert_eq!(find_in_library(b"bytes two", std::slice::from_ref(&png), &never), Some(None));
         assert_eq!(find_in_library(b"bytes one", std::slice::from_ref(&png), &never), Some(Some(png.clone())));
         assert_eq!(find_in_library(&same, &candidates, &AtomicBool::new(true)), None, "an abort stops it");
+    }
+
+    /// L-3: exiftool reads `CreateDate` where `DateTimeOriginal` is absent, so two files of
+    /// one capture time and different bytes are matched by it, not by their contents. An
+    /// all-zero date is no capture time.
+    #[test]
+    fn a_file_without_date_time_original_is_matched_by_its_create_date() {
+        if !test_files::exiftool_available("a_file_without_date_time_original_is_matched_by_its_create_date") {
+            return;
+        }
+        let dir = temp("create-date");
+        let write = |name: &str, date: &str, pixel: u8| {
+            let p = dir.join(name);
+            image::RgbImage::from_pixel(16, 16, image::Rgb([pixel, 80, 40]))
+                .save_with_format(&p, image::ImageFormat::Jpeg)
+                .unwrap();
+            let ok = Command::new("exiftool")
+                .args(["-q", "-overwrite_original"])
+                .arg(format!("-CreateDate={date}"))
+                .arg(&p)
+                .status()
+                .unwrap()
+                .success();
+            assert!(ok);
+            p
+        };
+        let lib = write("lib.jpg", "2026:06:28 12:00:00", 120);
+        let same = write("same.jpg", "2026:06:28 12:00:00", 10);
+        let other = write("other.jpg", "2026:06:28 12:00:01", 10);
+        assert_ne!(std::fs::read(&lib).unwrap(), std::fs::read(&same).unwrap());
+        let stamps = read_capture_stamps(&[lib.clone()], &AtomicBool::new(false)).unwrap();
+        assert_eq!(stamps.get(&lib).map(|s| (s.time.clone(), s.created.clone())), Some((None, Some("2026:06:28 12:00:00".into()))));
+        let arrivals = vec![
+            Arrival { file: same, candidates: vec![lib.clone()] },
+            Arrival { file: other, candidates: vec![lib.clone()] },
+        ];
+        let found = find_already_imported(&arrivals, &AtomicBool::new(false)).unwrap();
+        assert_eq!(found, vec![Some(lib.clone()), None]);
+        assert_eq!(
+            find_in_library(&std::fs::read(dir.join("same.jpg")).unwrap(), &[lib.clone()], &AtomicBool::new(false)),
+            Some(Some(lib)),
+            "from stdin too"
+        );
+    }
+
+    #[test]
+    fn an_all_zero_date_is_no_capture_time() {
+        let obj = serde_json::json!({
+            "SourceFile": "a.mp4",
+            "CreateDate": "0000:00:00 00:00:00",
+            "DateTimeOriginal": "0000:00:00 00:00:00",
+        });
+        let stamp = parse_stamp(obj.as_object().unwrap());
+        assert!(!stamp.has_capture_time(), "{stamp:?}");
     }
 
     /// The first candidate that is the same photo answers; a different one is passed over.

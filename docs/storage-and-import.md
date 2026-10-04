@@ -677,7 +677,8 @@ Two modes over the same core location model:
   another size, another sub-second, another body — is a different photo, copied as ` (n)`
   with its own row and UUID; nothing is ever overwritten. File mtime is never evidence (a
   copy changes it). The ` (n)` names an earlier import gave are checked too, so importing a
-  card again skips every file. The metadata comes from one exiftool pass per 150 colliding
+  card again skips every file. One photo met twice in a run (the same file in two folders
+  of the card) is the same rule against the file already copied: it is copied once. The metadata comes from one exiftool pass per 150 colliding
   files (`scanner::same_photo`), over both sides of each pair, so a re-import reads a few KB
   per file rather than hashing the card. The import dialog's "already imported" flag uses
   the same rule. Owner decisions: Year/Month/Day tree, keep filenames. UI: topbar "Import card" dialog with an

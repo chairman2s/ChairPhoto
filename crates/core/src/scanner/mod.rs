@@ -6,6 +6,7 @@
 
 use crate::catalog::Catalog;
 use crate::metadata::extract_batch;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use walkdir::WalkDir;
@@ -665,9 +666,12 @@ pub fn copy_from_card_abortable(
     // One metadata pass on the source files — reused for the capture date AND indexing.
     let mut meta = extract_batch(&sources);
 
-    // Where each file goes, and the same-size library files of its name it may already be
-    // (#246). Which of those collisions are photos already imported is read in one batched
-    // pass before anything is copied.
+    // Where each file goes, and the files it may already be (#246): the same-size library
+    // files of its name, then the earlier files of this run bound for the same name at that
+    // size — one photo met twice on the card (two folders holding the same file) is copied
+    // once. Which of those collisions are the same photo is read in one batched pass before
+    // anything is copied.
+    let mut bound_for: HashMap<(PathBuf, u64), Vec<PathBuf>> = HashMap::new();
     let planned: Vec<(PathBuf, Vec<PathBuf>)> = sources
         .iter()
         .map(|src| {
@@ -675,10 +679,11 @@ pub fn copy_from_card_abortable(
             let md = std::fs::metadata(src).ok();
             let dir = dest_base.join(date_subdir(capture.as_deref(), mtime_secs(md.as_ref())));
             let size = md.map(|m| m.len()).unwrap_or(0);
-            let candidates = src
-                .file_name()
-                .map(|f| same_photo::same_size_candidates(&dir.join(f), size))
-                .unwrap_or_default();
+            let Some(dest) = src.file_name().map(|f| dir.join(f)) else { return (dir, Vec::new()) };
+            let mut candidates = same_photo::same_size_candidates(&dest, size);
+            let earlier = bound_for.entry((dest, size)).or_default();
+            candidates.extend(earlier.iter().cloned());
+            earlier.push(src.clone());
             (dir, candidates)
         })
         .collect();
@@ -688,6 +693,9 @@ pub fn copy_from_card_abortable(
 
     let mut result = ScanResult::default();
     let mut copied: Vec<CopiedItem> = Vec::new();
+    // The files of this run that are in the library now: copied, or found there already.
+    let mut in_library: HashSet<&PathBuf> = HashSet::new();
+    let this_run: HashSet<&PathBuf> = sources.iter().collect();
     for ((src, (dir, _)), before) in sources.iter().zip(planned).zip(imported_before) {
         if abort.load(Ordering::Relaxed) {
             return Ok((result, copied, true));
@@ -696,8 +704,12 @@ pub fn copy_from_card_abortable(
         progress(result.scanned, total);
         // Take ownership of this file's metadata so it travels to the index phase.
         let m = meta.remove(src);
-        if before.is_some() {
+        // The same photo as a library file, or as an earlier file of this run that made it
+        // into the library (one that failed to copy does not count).
+        let same_photo_imported = before.is_some_and(|p| !this_run.contains(&p) || in_library.contains(&p));
+        if same_photo_imported {
             result.skipped += 1; // this capture is already in the library
+            in_library.insert(src);
             continue;
         }
         if std::fs::create_dir_all(&dir).is_err() {
@@ -718,6 +730,7 @@ pub fn copy_from_card_abortable(
             result.errors += 1;
             continue;
         }
+        in_library.insert(src);
         copied.push(CopiedItem { dest, meta: m });
     }
     Ok((result, copied, false))
@@ -1148,6 +1161,33 @@ mod tests {
             .collect();
         assert_eq!(copies.len(), 2, "{copies:?}");
         assert!(copies.iter().any(|p| p.ends_with("IMG (2).jpg")));
+    }
+
+    /// L-1 of the #246 review: one photo met twice in a run — the same file in two folders of
+    /// the card — is copied once and the second skipped, as before #246; a different photo
+    /// of that name and size in the same run is still kept as ` (2)`.
+    #[test]
+    fn the_same_photo_twice_on_one_card_is_copied_once() {
+        let (catalog, _dir, root, card) = ingest_rig("twice");
+        for (folder, bytes) in [("A", b"\xff\xd8one"), ("B", b"\xff\xd8one"), ("C", b"\xff\xd8two")] {
+            std::fs::create_dir_all(card.join(folder)).unwrap();
+            std::fs::write(card.join(folder).join("IMG.jpg"), bytes).unwrap();
+        }
+        let result = ingest_from_card(&catalog, &card, &root, None).unwrap();
+        assert_eq!((result.scanned, result.skipped, result.created), (3, 1, 2), "{result:?}");
+        // The walk's order decides which of the two photos keeps the plain name.
+        let (mut names, mut contents): (Vec<String>, Vec<Vec<u8>>) = WalkDir::new(&root)
+            .into_iter()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().extension().is_some_and(|x| x == "jpg"))
+            .map(|e| (e.file_name().to_string_lossy().into_owned(), std::fs::read(e.path()).unwrap()))
+            .unzip();
+        names.sort();
+        contents.sort();
+        assert_eq!(names, ["IMG (2).jpg", "IMG.jpg"]);
+        assert_eq!(contents, [b"\xff\xd8one".to_vec(), b"\xff\xd8two".to_vec()]);
+        let again = ingest_from_card(&catalog, &card, &root, None).unwrap();
+        assert_eq!((again.skipped, again.created), (3, 0), "{again:?}");
     }
 
     /// An abort while the collisions are being read copies nothing.

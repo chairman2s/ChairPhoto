@@ -582,7 +582,8 @@ pub fn list_card_photos(source: &Path, dest_base: &Path) -> Result<Vec<CardPhoto
         .collect();
     let meta = extract_batch(&sources);
     // Each photo's capture time and its date-tree destination, and the same-size library
-    // files there it may already be (#246).
+    // files there it may already be (#246), each folder listed once.
+    let mut listings = same_photo::FolderListings::default();
     let planned: Vec<(Option<String>, i64, Vec<PathBuf>)> = sources
         .iter()
         .map(|src| {
@@ -593,7 +594,7 @@ pub fn list_card_photos(source: &Path, dest_base: &Path) -> Result<Vec<CardPhoto
             let candidates = src
                 .file_name()
                 .map(|f| dest_base.join(date_subdir(capture.as_deref(), mtime_secs)).join(f))
-                .map(|d| same_photo::same_size_candidates(&d, size as u64))
+                .map(|d| listings.same_size_candidates(&d, size as u64))
                 .unwrap_or_default();
             (capture, size, candidates)
         })
@@ -671,6 +672,8 @@ pub fn copy_from_card_abortable(
     // size — one photo met twice on the card (two folders holding the same file) is copied
     // once. Which of those collisions are the same photo is read in one batched pass before
     // anything is copied.
+    // Nothing is copied while planning, so each folder is listed once for the whole plan.
+    let mut listings = same_photo::FolderListings::default();
     let mut bound_for: HashMap<(PathBuf, u64), Vec<PathBuf>> = HashMap::new();
     let planned: Vec<(PathBuf, Vec<PathBuf>)> = sources
         .iter()
@@ -680,7 +683,7 @@ pub fn copy_from_card_abortable(
             let dir = dest_base.join(date_subdir(capture.as_deref(), mtime_secs(md.as_ref())));
             let size = md.map(|m| m.len()).unwrap_or(0);
             let Some(dest) = src.file_name().map(|f| dir.join(f)) else { return (dir, Vec::new()) };
-            let mut candidates = same_photo::same_size_candidates(&dest, size);
+            let mut candidates = listings.same_size_candidates(&dest, size);
             let earlier = bound_for.entry((dest, size)).or_default();
             candidates.extend(earlier.iter().cloned());
             earlier.push(src.clone());

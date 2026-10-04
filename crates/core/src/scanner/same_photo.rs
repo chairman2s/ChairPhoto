@@ -327,43 +327,93 @@ fn numbered(path: &Path, n: u32) -> PathBuf {
 /// named alike finds the second one at its ` (2)` name and does not copy it a third time.
 /// The directory is listed rather than the names probed in turn: a gap in the numbers (a
 /// ` (2)` the user deleted) or a missing `dest` does not hide the names after it.
+///
+/// Lists the folder afresh; a run over many files uses one [`FolderListings`].
 pub fn same_size_candidates(dest: &Path, size: u64) -> Vec<PathBuf> {
-    let same_size = |p: &Path| std::fs::metadata(p).is_ok_and(|m| m.is_file() && m.len() == size);
-    let mut out = Vec::new();
-    if same_size(dest) {
-        out.push(dest.to_path_buf());
-    }
-    let (Some(dir), Some(stem)) = (dest.parent(), dest.file_stem().and_then(|s| s.to_str())) else {
-        return out;
-    };
-    let ext = dest.extension().and_then(|s| s.to_str());
-    let Ok(entries) = std::fs::read_dir(dir) else { return out };
-    let mut numbered: Vec<(u32, PathBuf)> = entries
-        .filter_map(|e| e.ok())
-        .filter_map(|e| {
-            let n = numbered_index(e.file_name().to_str()?, stem, ext)?;
-            Some((n, e.path()))
-        })
-        .filter(|(_, p)| same_size(p))
-        .collect();
-    numbered.sort();
-    out.extend(numbered.into_iter().map(|(_, p)| p));
-    out
+    FolderListings::default().same_size_candidates(dest, size)
 }
 
-/// `n` when `name` is `stem (n).ext` ([`numbered`]'s form, `n` ≥ 2 written without leading
-/// zeros), else `None`.
-fn numbered_index(name: &str, stem: &str, ext: Option<&str>) -> Option<u32> {
-    let rest = name.strip_prefix(stem)?.strip_prefix(" (")?;
-    let rest = match ext {
-        Some(ext) => rest.strip_suffix(ext)?.strip_suffix('.')?,
-        None => rest,
-    };
-    let digits = rest.strip_suffix(')')?;
+/// The ` (n)` names in each library folder, listed once per run (L-c of the second #246
+/// review): a card of 5000 files bound for one day's folder would otherwise list that folder
+/// 5000 times — quadratic, and on a NAS each listing is a fresh round of READDIRs. Card
+/// ingest plans every file before it copies one, so its listings hold for the plan; the
+/// bundle importer places files as it goes and records each name it places
+/// ([`Self::placed`]). A file another program puts in a folder after it was listed is not a
+/// candidate — as before, when it could land just after the listing — and is still never
+/// overwritten ([`create_new_file`]).
+#[derive(Default)]
+pub struct FolderListings {
+    /// Per folder: for each `(stem, extension)`, the `n` and path of every
+    /// `stem (n).extension` there.
+    dirs: HashMap<PathBuf, HashMap<NameKey, Vec<(u32, PathBuf)>>>,
+}
+
+/// A file name's stem and extension, as [`numbered`] splits them.
+type NameKey = (String, Option<String>);
+
+impl FolderListings {
+    /// [`same_size_candidates`], from this run's listing of `dest`'s folder.
+    pub fn same_size_candidates(&mut self, dest: &Path, size: u64) -> Vec<PathBuf> {
+        let same_size = |p: &Path| std::fs::metadata(p).is_ok_and(|m| m.is_file() && m.len() == size);
+        let mut out = Vec::new();
+        if same_size(dest) {
+            out.push(dest.to_path_buf());
+        }
+        let (Some(dir), Some(stem)) = (dest.parent(), dest.file_stem().and_then(|s| s.to_str())) else {
+            return out;
+        };
+        let key = (stem.to_string(), dest.extension().and_then(|s| s.to_str()).map(str::to_string));
+        let Some(names) = self.listing(dir).get(&key) else { return out };
+        let mut numbered: Vec<&(u32, PathBuf)> = names.iter().filter(|(_, p)| same_size(p)).collect();
+        numbered.sort();
+        out.extend(numbered.into_iter().map(|(_, p)| p.clone()));
+        out
+    }
+
+    /// Record a file this run placed at `path`, so a later file of the run sees it.
+    pub fn placed(&mut self, path: &Path) {
+        let (Some(dir), Some(name)) = (path.parent(), path.file_name().and_then(|s| s.to_str())) else {
+            return;
+        };
+        // A folder not listed yet will show the file when it is.
+        let Some(listing) = self.dirs.get_mut(dir) else { return };
+        if let Some((key, n)) = numbered_parts(name) {
+            let names = listing.entry(key).or_default();
+            if !names.iter().any(|(_, p)| p == path) {
+                names.push((n, path.to_path_buf()));
+            }
+        }
+    }
+
+    /// `dir`'s ` (n)` names, listed on first use. A folder that cannot be listed (not created
+    /// yet) has none.
+    fn listing(&mut self, dir: &Path) -> &HashMap<NameKey, Vec<(u32, PathBuf)>> {
+        self.dirs.entry(dir.to_path_buf()).or_insert_with(|| {
+            let mut by_key: HashMap<NameKey, Vec<(u32, PathBuf)>> = HashMap::new();
+            for entry in std::fs::read_dir(dir).into_iter().flatten().filter_map(|e| e.ok()) {
+                let Some(name) = entry.file_name().to_str().map(str::to_string) else { continue };
+                if let Some((key, n)) = numbered_parts(&name) {
+                    by_key.entry(key).or_default().push((n, entry.path()));
+                }
+            }
+            by_key
+        })
+    }
+}
+
+/// The base name's `(stem, extension)` and `n` when `name` is `stem (n).ext` or `stem (n)`
+/// ([`numbered`]'s form, `n` ≥ 2 written without leading zeros), else `None`.
+fn numbered_parts(name: &str) -> Option<(NameKey, u32)> {
+    let path = Path::new(name);
+    let stem = path.file_stem()?.to_str()?;
+    let ext = path.extension().and_then(|s| s.to_str());
+    let open = stem.rfind(" (")?;
+    let digits = stem[open + 2..].strip_suffix(')')?;
     if digits.is_empty() || digits.starts_with('0') || !digits.bytes().all(|b| b.is_ascii_digit()) {
         return None;
     }
-    digits.parse().ok().filter(|n| *n >= 2)
+    let n = digits.parse().ok().filter(|n| *n >= 2)?;
+    Some(((stem[..open].to_string(), ext.map(str::to_string)), n))
 }
 
 /// A destination path that is free ([`name_free`]): `path`, or `name (2).ext`, …, or `None`
@@ -580,6 +630,28 @@ mod tests {
         let bare = dir.join("README");
         std::fs::write(dir.join("README (3)"), b"bbbb").unwrap();
         assert_eq!(same_size_candidates(&bare, 4), vec![dir.join("README (3)")]);
+    }
+
+    /// L-c of the second #246 review: a run lists each folder once. A ` (n)` name that
+    /// appears after the listing is a candidate only when the run placed it (`placed`); the
+    /// plain name is looked at directly every time.
+    #[test]
+    fn a_folder_is_listed_once_per_run_and_told_of_what_the_run_places() {
+        let dir = temp("listings");
+        let dest = dir.join("DSC1.ARW");
+        std::fs::write(dir.join("DSC1 (2).ARW"), b"aaaa").unwrap();
+        let mut listings = FolderListings::default();
+        assert_eq!(listings.same_size_candidates(&dest, 4), vec![dir.join("DSC1 (2).ARW")]);
+        std::fs::write(&dest, b"bbbb").unwrap();
+        std::fs::write(dir.join("DSC1 (3).ARW"), b"cccc").unwrap();
+        std::fs::write(dir.join("DSC1 (4).ARW"), b"dddd").unwrap();
+        listings.placed(&dir.join("DSC1 (4).ARW"));
+        assert_eq!(
+            listings.same_size_candidates(&dest, 4),
+            vec![dest.clone(), dir.join("DSC1 (2).ARW"), dir.join("DSC1 (4).ARW")],
+            "not listed again: (3) is not seen, the placed (4) is"
+        );
+        assert_eq!(same_size_candidates(&dest, 4).len(), 4, "a fresh listing sees all");
     }
 
     // --- placing a new file (L-4) ---------------------------------------------------------

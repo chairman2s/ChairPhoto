@@ -167,6 +167,8 @@ pub fn extract_originals_abortable(
         merge: MergeSummary::default(),
     };
     let mut extracted: Vec<ExtractedItem> = Vec::new();
+    // Each date folder is listed once for the unpack, and told of every name placed in it.
+    let mut listings = same_photo::FolderListings::default();
 
     for (i, bp) in manifest.photos.iter().enumerate() {
         if abort.load(std::sync::atomic::Ordering::Relaxed) {
@@ -241,7 +243,7 @@ pub fn extract_originals_abortable(
 
         // A same-name, same-size file may be this photo, already imported (#246): decided
         // now, against the bytes in memory.
-        let candidates = same_photo::same_size_candidates(&dest, orig_bytes.len() as u64);
+        let candidates = listings.same_size_candidates(&dest, orig_bytes.len() as u64);
         let Some(already) = same_photo::find_in_library(&orig_bytes, &candidates, abort) else {
             return Ok((extracted, result, true));
         };
@@ -273,6 +275,7 @@ pub fn extract_originals_abortable(
                 continue;
             }
         };
+        listings.placed(&dest);
         result.copied += 1;
         place_sidecar(archive, &arc_orig, &dest, bp);
         extracted.push(ExtractedItem {
@@ -1108,6 +1111,38 @@ mod tests {
             assert!(catalog.get_photo_by_uuid(ORPHAN_ID).is_err(), "{tag}: the orphan's identity is no row's");
             assert_eq!(catalog.count_photos(&Default::default()).unwrap(), 1, "{tag}: no phantom row");
         }
+    }
+
+    /// L-c of the second #246 review: the unpack lists each folder once and records each name
+    /// it places. The library holds a `DSC1.ARW`; the bundle's first photo is its own
+    /// `DSC1 (2).ARW`, placed at that free name after the folder was listed, and its second
+    /// photo, `DSC1.ARW`, is the same file: it collides with the library's (other bytes, same
+    /// size) and is found at the ` (2)` this unpack placed — skipped, not copied a third time.
+    #[test]
+    fn a_name_placed_earlier_in_the_unpack_is_a_candidate() {
+        let src = temp_dir("lc-src");
+        let (first, second) = (src.join("a/DSC1 (2).ARW"), src.join("b/DSC1.ARW"));
+        for p in [&first, &second] {
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, b"FAKE RAW TWO").unwrap();
+        }
+        let bundle_path = bundle_of(
+            "lc",
+            vec![
+                (plain_photo("uuid-lc-1", "2026/06/28/DSC1 (2).ARW"), Some(first)),
+                (plain_photo("uuid-lc-2", "2026/06/28/DSC1.ARW"), Some(second)),
+            ],
+        );
+        let dest_base = temp_dir("lc-dest");
+        let day = dest_base.join("2026/06/28");
+        std::fs::create_dir_all(&day).unwrap();
+        std::fs::write(day.join("DSC1.ARW"), b"FAKE RAW ONE").unwrap();
+        let (manifest, mut archive) = open_bundle(&bundle_path).unwrap();
+        let (_, partial) = extract_originals(&manifest, &mut archive, &dest_base, |_, _| {}).unwrap();
+        assert_eq!((partial.copied, partial.skipped_duplicate), (1, 1), "{partial:?}");
+        assert_eq!(std::fs::read(day.join("DSC1 (2).ARW")).unwrap(), b"FAKE RAW TWO");
+        assert_eq!(std::fs::read(day.join("DSC1.ARW")).unwrap(), b"FAKE RAW ONE");
+        assert!(!day.join("DSC1 (3).ARW").exists());
     }
 
     /// A sidecar that appears at the name after the original's place was chosen (another

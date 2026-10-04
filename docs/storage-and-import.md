@@ -688,7 +688,9 @@ Two modes over the same core location model:
   other photo, and a new file placed beside it would adopt its identity and metadata. File mtime is never evidence (a
   copy changes it). The ` (n)` names an earlier import gave are checked too (every one in
   the folder, past a gap in the numbers or with the plain name gone), so importing a
-  card again skips every file. One photo met twice in a run (the same file in two folders
+  card again skips every file. Each date folder is listed once per import
+  (`same_photo::FolderListings`), not once per file: card ingest plans every file before
+  copying any, and a bundle's unpack records each name it places. One photo met twice in a run (the same file in two folders
   of the card) is the same rule against the file already copied: it is copied once. The metadata comes from one exiftool pass per 150 colliding
   files (`scanner::same_photo`), over both sides of each pair, so a re-import reads a few KB
   per file rather than hashing the card. The import dialog's "already imported" flag uses

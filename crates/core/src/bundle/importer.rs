@@ -291,7 +291,9 @@ pub fn extract_originals_abortable(
 /// UUID instead of minting a duplicate.
 ///
 /// 1. If the bundle carries a sidecar for this original, extract it as-is (it already
-///    contains `xmp:Identifier`).
+///    contains `xmp:Identifier`) — as a new file only: an existing file at the sidecar's name
+///    is never replaced (`dest` was chosen with that name free, so one there now is another
+///    program's, and is left as it is).
 /// 2. Otherwise, write a fresh merge-safe UUID sidecar from the bundle UUID now, before the
 ///    index phase runs — this is the binding invariant (AGENTS.md). A failure here is not
 ///    the end of it — the photo has no catalog row yet, so index_bundle is the one that
@@ -309,10 +311,19 @@ fn place_sidecar(
         PathBuf::from(s)
     };
     let arc_sidecar = format!("{}.xmp", arc_orig);
+    // Never over an existing file: `dest` was chosen with its sidecar's name free
+    // (`same_photo::unique_dest`), so one there now appeared meanwhile and is someone else's.
+    let write_new = |bytes: &[u8]| -> std::io::Result<()> {
+        use std::io::Write;
+        let mut file = std::fs::OpenOptions::new().write(true).create_new(true).open(&sidecar_dest)?;
+        file.write_all(bytes).and_then(|()| file.sync_all()).inspect_err(|_| {
+            let _ = std::fs::remove_file(&sidecar_dest);
+        })
+    };
     let bundle_sidecar_extracted = if let Ok(mut entry) = archive.by_name(&arc_sidecar) {
         let mut sidecar_bytes = Vec::new();
         if entry.read_to_end(&mut sidecar_bytes).is_ok() {
-            if let Err(e) = std::fs::write(&sidecar_dest, &sidecar_bytes) {
+            if let Err(e) = write_new(&sidecar_bytes) {
                 eprintln!(
                     "bundle import: sidecar write {} failed (non-fatal): {e}",
                     sidecar_dest.display()
@@ -1039,6 +1050,80 @@ mod tests {
         let (_, again) = extract_originals(&manifest, &mut archive, &root, |_, _| {}).unwrap();
         assert_eq!((again.skipped_duplicate, again.copied), (2, 0), "a second import skips both");
         assert!(!root.join("2026/06/29/DSC1 (3).jpg").exists());
+    }
+
+    /// M-a of the second #246 review: an orphan sidecar — another tool's (digiKam's rating,
+    /// keywords and identifier), its original gone — sits at the ` (2)` name a different
+    /// photo would take. The bundle's original goes to ` (3)` instead, whether or not the
+    /// bundle carries a sidecar: the orphan is neither overwritten by the bundle's sidecar nor
+    /// adopted (its identity on the new photo), and the bundle's photo gets one row, at its
+    /// copy, under its own identity.
+    #[test]
+    fn an_orphan_sidecar_at_a_free_name_is_neither_overwritten_nor_adopted() {
+        const THEIRS: &str = "6f1c1f0e-2b7a-4c3d-9e8f-0a1b2c3d4e5f";
+        const ORPHAN_ID: &str = "11111111-1111-4111-8111-111111111111";
+        let orphan_xml = format!(
+            r#"<x:xmpmeta xmlns:x="adobe:ns:meta/"><rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"><rdf:Description rdf:about="" xmlns:xmp="http://ns.adobe.com/xap/1.0/" xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:digiKam="http://www.digikam.org/ns/1.0/" xmp:Rating="5" xmp:Identifier="{ORPHAN_ID}"><dc:subject><rdf:Bag><rdf:li>ForeignKeyword</rdf:li></rdf:Bag></dc:subject><digiKam:TagsList><rdf:Seq><rdf:li>Foreign/Keyword</rdf:li></rdf:Seq></digiKam:TagsList></rdf:Description></rdf:RDF></x:xmpmeta>"#
+        );
+        let bundle_xml = format!(
+            r#"<x:xmpmeta xmlns:x="adobe:ns:meta/"><rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"><rdf:Description rdf:about="" xmlns:xmp="http://ns.adobe.com/xap/1.0/" xmp:Identifier="{THEIRS}"/></rdf:RDF></x:xmpmeta>"#
+        );
+        for (tag, sidecar) in [("ma-with", Some(bundle_xml.as_str())), ("ma-without", None)] {
+            let (catalog, root) = temp_catalog(tag);
+            let dir = root.join("2026/06/28");
+            std::fs::create_dir_all(&dir).unwrap();
+            // Another photo of that name and size (no row), and the orphan at ` (2)`.
+            std::fs::write(dir.join("DSC01234.ARW"), b"OTHER RAWBYTES").unwrap();
+            let orphan = dir.join("DSC01234 (2).ARW.xmp");
+            std::fs::write(&orphan, &orphan_xml).unwrap();
+
+            let bundle_path = make_test_bundle_with(
+                tag,
+                THEIRS,
+                "2026/06/28/DSC01234.ARW",
+                Default::default(),
+                sidecar,
+            );
+            let (manifest, mut archive) = open_bundle(&bundle_path).unwrap();
+            let (extracted, partial) = extract_originals(&manifest, &mut archive, &root, |_, _| {}).unwrap();
+            assert_eq!((partial.copied, partial.skipped_duplicate, partial.errors), (1, 0, 0), "{tag}");
+            let placed = dir.join("DSC01234 (3).ARW");
+            assert_eq!(std::fs::read(&placed).unwrap(), b"FAKE RAW BYTES", "{tag}");
+            assert!(!dir.join("DSC01234 (2).ARW").exists(), "{tag}: nothing placed beside the orphan");
+            assert_eq!(std::fs::read_to_string(&orphan).unwrap(), orphan_xml, "{tag}: the orphan is untouched");
+
+            index_bundle(&catalog, &manifest, &extracted, &root, partial).unwrap();
+            assert_eq!(std::fs::read_to_string(&orphan).unwrap(), orphan_xml, "{tag}: still untouched");
+            assert_eq!(crate::xmp::read_identifier(&placed).as_deref(), Some(THEIRS), "{tag}");
+            assert_eq!(catalog.get_photo_by_uuid(THEIRS).unwrap().path, "2026/06/28/DSC01234 (3).ARW", "{tag}");
+            assert!(catalog.get_photo_by_uuid(ORPHAN_ID).is_err(), "{tag}: the orphan's identity is no row's");
+            assert_eq!(catalog.count_photos(&Default::default()).unwrap(), 1, "{tag}: no phantom row");
+        }
+    }
+
+    /// A sidecar that appears at the name after the original's place was chosen (another
+    /// program wrote it meanwhile) is never replaced by the bundle's: it is left as it is.
+    #[test]
+    fn the_bundles_sidecar_never_replaces_a_file() {
+        const THEIRS: &str = "6f1c1f0e-2b7a-4c3d-9e8f-0a1b2c3d4e5f";
+        let bundle_xml = format!(
+            r#"<x:xmpmeta xmlns:x="adobe:ns:meta/"><rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"><rdf:Description rdf:about="" xmlns:xmp="http://ns.adobe.com/xap/1.0/" xmp:Identifier="{THEIRS}"/></rdf:RDF></x:xmpmeta>"#
+        );
+        let bundle_path = make_test_bundle_with(
+            "ma-race",
+            THEIRS,
+            "2026/06/28/DSC01234.ARW",
+            Default::default(),
+            Some(&bundle_xml),
+        );
+        let (manifest, mut archive) = open_bundle(&bundle_path).unwrap();
+        let dir = temp_dir("ma-race-dest");
+        let dest = dir.join("DSC01234.ARW");
+        std::fs::write(&dest, b"FAKE RAW BYTES").unwrap();
+        std::fs::write(crate::xmp::sidecar_path(&dest), b"written meanwhile").unwrap();
+        let arc_orig = format!("{ORIGINALS_DIR}/2026/06/28/DSC01234.ARW");
+        place_sidecar(&mut archive, &arc_orig, &dest, &manifest.photos[0]);
+        assert_eq!(std::fs::read(crate::xmp::sidecar_path(&dest)).unwrap(), b"written meanwhile");
     }
 
     /// An abort while a collision is being decided copies nothing of it and leaves nothing

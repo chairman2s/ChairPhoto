@@ -1193,6 +1193,38 @@ mod tests {
         assert_eq!((again.skipped, again.created), (3, 0), "{again:?}");
     }
 
+    /// M-a of the second #246 review: an orphan sidecar (another tool's, with an identifier;
+    /// its original gone) at the name a card's file would take is not adopted: the file goes
+    /// to the next name whose sidecar's name is free too, gets a fresh identity of its own,
+    /// and the orphan is untouched.
+    #[test]
+    fn a_card_file_never_lands_beside_an_orphan_sidecar() {
+        const ORPHAN_ID: &str = "11111111-1111-4111-8111-111111111111";
+        let (catalog, _dir, root, card) = ingest_rig("orphan");
+        std::fs::create_dir_all(&card).unwrap();
+        let src = card.join("IMG.jpg");
+        std::fs::write(&src, b"\xff\xd8one").unwrap();
+        // A fixed mtime, so the date folder is known.
+        let mtime = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_782_648_000);
+        std::fs::File::options().write(true).open(&src).unwrap().set_modified(mtime).unwrap();
+        let dir = root.join(date_subdir(None, mtime_secs(std::fs::metadata(&src).ok().as_ref())));
+        std::fs::create_dir_all(&dir).unwrap();
+        let orphan = dir.join("IMG.jpg.xmp");
+        let orphan_xml = format!(
+            r#"<x:xmpmeta xmlns:x="adobe:ns:meta/"><rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"><rdf:Description rdf:about="" xmlns:xmp="http://ns.adobe.com/xap/1.0/" xmp:Rating="5" xmp:Identifier="{ORPHAN_ID}"/></rdf:RDF></x:xmpmeta>"#
+        );
+        std::fs::write(&orphan, &orphan_xml).unwrap();
+
+        let result = ingest_from_card(&catalog, &card, &root, None).unwrap();
+        assert_eq!(result.created, 1, "{result:?}");
+        assert!(!dir.join("IMG.jpg").exists(), "nothing placed beside the orphan");
+        let rows = photos(&catalog);
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].0.ends_with("/IMG (2).jpg"), "{rows:?}");
+        assert_ne!(rows[0].1, ORPHAN_ID, "the orphan's identity is not adopted");
+        assert_eq!(std::fs::read_to_string(&orphan).unwrap(), orphan_xml);
+    }
+
     /// An abort while the collisions are being read copies nothing.
     #[test]
     fn an_abort_before_the_copy_copies_nothing() {

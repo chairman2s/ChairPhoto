@@ -360,13 +360,23 @@ fn numbered_index(name: &str, stem: &str, ext: Option<&str>) -> Option<u32> {
     digits.parse().ok().filter(|n| *n >= 2)
 }
 
-/// A destination path that doesn't exist yet (`name (2).ext`, …), or `None` if no free name
-/// was found — the caller must then NOT copy (never overwrite an existing file).
+/// A destination path that is free ([`name_free`]): `path`, or `name (2).ext`, …, or `None`
+/// if no free name was found — the caller must then NOT copy (never overwrite an existing
+/// file).
 pub fn unique_dest(path: &Path) -> Option<PathBuf> {
-    if !path.exists() {
-        return Some(path.to_path_buf());
-    }
-    (2..10_000).map(|n| numbered(path, n)).find(|c| !c.exists())
+    std::iter::once(path.to_path_buf())
+        .chain((2..10_000).map(|n| numbered(path, n)))
+        .find(|c| name_free(c))
+}
+
+/// Whether a new original may take `path`: nothing is there — a dangling symlink counts as
+/// something — and nothing is at its sidecar's name (`<name>.xmp`) either. A sidecar with no
+/// original beside it (another tool's, or one whose original was removed) belongs to some
+/// other photo: a new original placed beside it would adopt its identity and metadata, and a
+/// bundle's sidecar written there would destroy it.
+fn name_free(path: &Path) -> bool {
+    let absent = |p: &Path| std::fs::symlink_metadata(p).is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound);
+    absent(path) && absent(&crate::xmp::sidecar_path(path))
 }
 
 /// Create a new file at `wanted`, or at the next free ` (n)` name beside it, and fill it with
@@ -567,6 +577,29 @@ mod tests {
     }
 
     // --- placing a new file (L-4) ---------------------------------------------------------
+
+    /// M-a of the second #246 review: a name whose sidecar exists without it (an orphan
+    /// sidecar) is not free, nor is one a dangling symlink holds; the plain name is checked
+    /// the same way.
+    #[test]
+    fn a_name_with_an_orphan_sidecar_or_a_dangling_link_is_not_free() {
+        let dir = temp("orphan");
+        let dest = dir.join("DSC1.ARW");
+        std::fs::write(dir.join("DSC1.ARW.xmp"), b"<orphan/>").unwrap();
+        std::fs::write(dir.join("DSC1 (2).ARW.xmp"), b"<orphan/>").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(dir.join("gone"), dir.join("DSC1 (3).ARW")).unwrap();
+        #[cfg(not(unix))]
+        std::fs::write(dir.join("DSC1 (3).ARW"), b"x").unwrap();
+        assert_eq!(unique_dest(&dest), Some(dir.join("DSC1 (4).ARW")));
+        let placed = create_new_file(&dest, |f| {
+            use std::io::Write;
+            f.write_all(b"arriving")
+        })
+        .unwrap();
+        assert_eq!(placed, dir.join("DSC1 (4).ARW"));
+        assert_eq!(std::fs::read(dir.join("DSC1 (2).ARW.xmp")).unwrap(), b"<orphan/>");
+    }
 
     /// A name found free but taken before it is claimed (another program wrote it in
     /// between) keeps its file: the new one moves on to the next free name.

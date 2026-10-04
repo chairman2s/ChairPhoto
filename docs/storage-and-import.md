@@ -680,7 +680,10 @@ Two modes over the same core location model:
   another size, another sub-second, another body — is a different photo, copied as ` (n)`
   with its own row and UUID; nothing is ever overwritten: the name is claimed by an
   exclusive create (`same_photo::create_new_file`), so a file that appears there after the
-  name was found free sends the copy on to the next free name. File mtime is never evidence (a
+  name was found free sends the copy on to the next free name. A name is free only when
+  nothing is at it and nothing at its sidecar's name (`<name>.xmp`) either: a sidecar with
+  no original beside it (another tool's, or one whose original was removed) belongs to some
+  other photo, and a new file placed beside it would adopt its identity and metadata. File mtime is never evidence (a
   copy changes it). The ` (n)` names an earlier import gave are checked too (every one in
   the folder, past a gap in the numbers or with the plain name gone), so importing a
   card again skips every file. One photo met twice in a run (the same file in two folders
@@ -817,7 +820,10 @@ The importer (`bundle/importer.rs`) runs in three phases:
    owner's photo (the same capture imported separately on each side): it is neither
    upserted nor bound, its sidecar never receives the bundle's identity (even when it
    lacks one, as identity debt), and the bundle's photo is kept apart (below).
-   Writes a UUID sidecar beside each original so the index phase can match by identity.
+   Writes a UUID sidecar beside each original so the index phase can match by identity:
+   the bundle's own sidecar, or a fresh identity sidecar, each only as a new file — a file
+   already at the sidecar's name (the original's name was chosen with it free, so one there
+   now appeared meanwhile) is left as it is, never replaced.
 3. **Index** (secondary connection, off the main lock) — `upsert_photo_with_identity` for
    each extracted file, giving a row created for the bundle's own photo the bundle's full
    state; run `merge_bundle_into`, which fills in what an existing photo lacks; assign

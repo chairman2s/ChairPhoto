@@ -850,18 +850,22 @@ fn keep_stale_preview_sizes(root: &Path, previews: &Path) -> std::io::Result<()>
     // processes sharing one cache dir (`single_instance` is keyed per app *data* dir, not
     // cache dir, so two XDG_DATA_HOMEs with one default cache can run this at once, #245
     // review LOW-2) never share a tmp name and so can never interleave through it:
-    // `create_new` claims a name nothing else has, and only this attempt ever writes to,
-    // renames, or removes it.
+    // `create_new` claims a name nothing else has, and only this attempt writes to or renames
+    // it. Another process's start-up sweep (`sweep_stale_tmp_sizes_files`) can unlink it
+    // mid-write; then this rename fails, this attempt returns `Err`, and `p2048v5` is kept
+    // for the next start — fail-safe, never a partial sizes file.
     static NONCE: AtomicU64 = AtomicU64::new(0);
     let nonce = NONCE.fetch_add(1, Ordering::Relaxed);
     let tmp = root.join(format!("{STALE_PREVIEW_SIZES}.{}.{nonce}.tmp", std::process::id()));
+    // Only a name this attempt created is ever removed: a `create_new` that fails left
+    // whatever holds the name alone.
+    let mut file = std::fs::OpenOptions::new().write(true).create_new(true).open(&tmp)?;
     let write = (|| -> std::io::Result<()> {
-        let mut file = std::fs::OpenOptions::new().write(true).create_new(true).open(&tmp)?;
         file.write_all(lines.concat().as_bytes())?;
         file.sync_all()?;
-        drop(file);
         std::fs::rename(&tmp, root.join(STALE_PREVIEW_SIZES))
     })();
+    drop(file);
     if write.is_err() {
         // Our own attempt's name: remove what we created rather than leave it for the next
         // sweep, best-effort (a failure here changes nothing — it is still only ever read
@@ -875,7 +879,9 @@ fn keep_stale_preview_sizes(root: &Path, previews: &Path) -> std::io::Result<()>
 /// the fixed name a pre-LOW-2 build used, or one of today's unique `<pid>.<nonce>` ones,
 /// left behind by a process that crashed or was killed before its own rename landed.
 /// Harmless either way — nothing ever reads a `.tmp`-suffixed name back as
-/// [`STALE_PREVIEW_SIZES`] — this only keeps them from accumulating. Never a directory: a
+/// [`STALE_PREVIEW_SIZES`] — this only keeps them from accumulating. It matches any
+/// `<STALE_PREVIEW_SIZES>.*.tmp` name, not only the `<pid>.<nonce>` shape: it only ever
+/// looks inside ChairPhoto's own cache directory, where nothing else writes such names. Never a directory: a
 /// name it cannot remove (one planted there instead) is left alone, not traversed into or
 /// removed recursively. Never a symlink's target: `remove_file` unlinks the name itself,
 /// whatever it points to, never the pointed-to file's content.

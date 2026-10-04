@@ -709,17 +709,22 @@ pub(crate) mod tests {
     }
 
     /// Set a JPEG's own `Exif.Image.Orientation` via `exiv2` — real file metadata a decoder
-    /// reads back, not a [`FileProbe`] this crate fabricates in memory. `exiv2` is already an
-    /// unconditional dependency of the HEIF tests in this module (ImageMagick's libheif
-    /// delegate) and of the thumbnails pipeline itself, so this dev/CI machine already has it.
-    fn set_jpeg_orientation(path: &std::path::Path, orientation: u8) {
-        let status = std::process::Command::new("exiv2")
+    /// reads back, not a [`FileProbe`] this crate fabricates in memory. `false` when `exiv2`
+    /// is not installed, so the caller can skip (AGENTS.md: a test a machine cannot run says
+    /// `SKIPPED:` rather than failing); a present `exiv2` that fails is still a failure.
+    fn set_jpeg_orientation(path: &std::path::Path, orientation: u8) -> bool {
+        let status = match std::process::Command::new("exiv2")
             .arg("-M")
             .arg(format!("set Exif.Image.Orientation {orientation}"))
             .arg(path)
             .status()
-            .expect("exiv2 not available");
+        {
+            Ok(status) => status,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return false,
+            Err(e) => panic!("exiv2 could not run: {e}"),
+        };
         assert!(status.success(), "exiv2 failed to set Orientation {orientation} on {}", path.display());
+        true
     }
 
     /// #245 regenerates a small original's preview at its own size: a 1200x800 photo turned a
@@ -744,7 +749,10 @@ pub(crate) mod tests {
 
         let dir = crate::test_support::TestTmpDir::new("faces-regions-regenerated");
         let photo = crate::thumbnails::tests::write_test_jpeg(&dir, "IMG_0245.JPG", 1200, 800);
-        set_jpeg_orientation(&photo, 6);
+        if !set_jpeg_orientation(&photo, 6) {
+            println!("SKIPPED: a_regenerated_preview_writes_what_the_upscaled_one_did — exiv2 is not installed");
+            return;
+        }
 
         let conn = mem_conn();
         conn.execute("INSERT INTO photos (id, width, height, exif_orientation) VALUES (1, 1200, 800, 6)", []).unwrap();

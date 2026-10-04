@@ -722,6 +722,57 @@ fn p201a_a_late_save_refills_only_the_fields_the_user_did_not_touch(cx: &mut Tes
     insp.read_with(cx, |i, cx| assert!(i.iptc.dirty(cx), "Title is still unsaved"));
 }
 
+/// **#230: a landed save's merge bumps the IPTC read sequence, and settles the slot.** Same
+/// setup as the two tests above — two queued saves, navigate to photo 1 and back to photo 0
+/// before either lands. `read_iptc`'s own staleness guard (`this.generation != generation ||
+/// this.data.iptc.seq != seq`) is what would drop a same-generation reshow read that is still
+/// in flight when a save lands, *if* the save's merge moves the sequence number first — so
+/// this captures the reshow read's own seq right after it lands (what such an in-flight read
+/// would also have carried) and asserts the merge moves it. It also puts the slot back in
+/// `Loading` right before the saves land, standing in for "a read is still in flight": with
+/// nothing to settle it, a dropped read's callback never sets `data.iptc.load` either, so
+/// without the fix the slot would stay stuck `Loading` forever — Save silently refused
+/// (`iptc_loaded`) and no fresh read ever re-triggered (`ensure_loaded` only fires on `Idle`).
+///
+/// The end-to-end race itself — a reshow read that executes its catalog query before the
+/// save's store but whose callback lands after the save's merge — could not be forced with
+/// this test's dispatcher (matching the r7 review's own finding for the closely related #227
+/// case): `read_iptc` has no `Runner`-style hold/release, its body has no internal `.await`, so
+/// a single poll both runs its catalog read and resolves it, and in this test harness every
+/// background task shares one deterministic scheduler with the foreground — there is no
+/// exposed way to let that one poll happen early while deferring only its callback (triggering
+/// it through a real reshow, as this test's own setup does, lands it immediately, before the
+/// saves even run). This test instead pins the two things the fix's mechanism depends on
+/// directly and deterministically, without needing the race itself to land in a specific order.
+/// (Mutation-checked: removing `this.data.iptc.seq += 1` leaves `seq_before == seq_after` and
+/// this fails; separately removing `this.data.iptc.load = Load::Ready(saved.clone())` leaves
+/// the slot `Loading` and `iptc_loaded()` false, failing the final assertion.)
+#[gpui_kit::test]
+fn the_landed_saves_merge_bumps_the_iptc_read_sequence(cx: &mut TestAppContext) {
+    let dir = TempDir::new("insp-iptc-r230-seq");
+    let app = start(cx);
+    let ids = open_catalog_with_photos(&app, &dir, 2, cx);
+    let insp = two_iptc_saves(&app, &dir, &ids, cx);
+    select(&app, ids[1], SelectMods::default(), cx);
+    select(&app, ids[0], SelectMods::default(), cx);
+    render(&app, cx);
+    let seq_before = insp.read_with(cx, |i, _| i.data.iptc.seq);
+    assert!(insp.read_with(cx, |i, _| i.data.iptc.load.ready().is_some()), "the reshow read already landed");
+
+    // Stand in for "a same-generation read is still in flight" (see above): nothing but the
+    // save's own merge will settle this again before the next assertion.
+    insp.update(cx, |i, _| i.data.iptc.load = Load::Loading);
+
+    work(cx); // both queued saves land, in order, on the re-shown photo
+    render(&app, cx);
+
+    let stored = catalog(&app, |c| c.get_iptc(ids[0]).unwrap().headline);
+    assert_eq!(stored, "Second", "both saves still land, in order, on photo 0");
+    let seq_after = insp.read_with(cx, |i, _| i.data.iptc.seq);
+    assert_ne!(seq_before, seq_after, "a landed save's merge must bump the read sequence");
+    assert!(insp.read_with(cx, |i, _| i.iptc_loaded()), "the merge must leave the IPTC section loaded, not stuck Loading");
+}
+
 /// **Forced interleaving.** The two saves are pending when the core switches to a catalog
 /// whose photo 0 has the same id (and its own original), with `catalog:switched` withheld or
 /// delivered: neither save writes the new catalog's row or sidecar.

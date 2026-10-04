@@ -973,6 +973,21 @@ impl PhotoInspector {
                     };
                     this.status(line, cx);
                     if shown && ok {
+                        // Drop a reshow read for this same photo that is still in flight
+                        // (#230): `read_iptc` may have read the catalog before this save's
+                        // store, so if its callback were to land after this merge it would
+                        // refill the merged fields with those pre-save values. What this save
+                        // just wrote is already the catalog's ground truth for every field it
+                        // carries, so there is nothing left to read for them; bumping the
+                        // sequence makes `read_iptc`'s own staleness check (`this.data.iptc.seq
+                        // != seq`) drop that read instead of letting it land after this merge,
+                        // the same way a newer `read_iptc` call already drops an older one. A
+                        // dropped read never sets `data.iptc.load` either, so settle it here
+                        // too (`iptc_loaded`/`ensure_loaded` would otherwise see a `Loading`
+                        // slot forever, with Save silently refused and no fresh read ever
+                        // retriggered — this save's own values are as loaded as a read's).
+                        this.data.iptc.seq += 1;
+                        this.data.iptc.load = Load::Ready(saved.clone());
                         this.iptc.merge = Some(saved);
                         cx.notify();
                     }

@@ -10,18 +10,27 @@
 //! The Darkroom (#111/#112) deals it, focuses it (its [`contexts::PROOF_SHEET`] Escape outranks
 //! the Darkroom's own while it has focus, as React's capture-phase listener did) and gives
 //! focus back on [`ProofEvent::Close`] or after an adopt.
+//!
+//! **The pop-out's preview (#250).** While the pointer is over a cell, or — nothing hovered —
+//! a cell has Tab focus, this publishes a [`LoupeProofPreview`] to [`ShellState`], which the
+//! pop-out's `LoupeView` renders at loupe size in place of the active version (its own 320 px
+//! render stands in until that lands). Hover beats focus; neither clears it to "the photo as
+//! it is" — [`Self::sync_preview`]. Cleared on adopt, decline, and whenever this entity is
+//! released (its window closed, the overlay replaced); a catalog switch clears it in
+//! `ShellState` itself, the same way it clears the Darkroom's print.
 
 use crate::image_store::ImageStore;
 use crate::keymap::contexts;
 use crate::loupe::duel::{variant_image, VariantSource};
 use crate::loupe::edit_renders::EditRenders;
 use crate::loupe::{ProofClose, ProofNext, ProofPrevious};
+use crate::shell::state::{LoupeProofPreview, ShellState};
 use crate::shell::style::Colors;
 use chairphoto_core::image_pool::EditJob;
 use chairphoto_model::darkroom::spreads::{ProofCandidate, ProofGroup};
 use gpui_kit::prelude::*;
 use gpui_kit::{
-    div, px, ClickEvent, Context, Entity, EventEmitter, FocusHandle, ObjectFit, SharedString, Subscription,
+    div, px, App, ClickEvent, Context, Entity, EventEmitter, FocusHandle, ObjectFit, SharedString, Subscription,
     TestSupportExt as _, Window,
 };
 
@@ -41,9 +50,12 @@ pub struct ProofSheet {
     source: VariantSource,
     candidates: Vec<ProofCandidate>,
     renders: Entity<EditRenders>,
+    shell: Entity<ShellState>,
     focus: FocusHandle,
     /// One per proof: Tab moves among them, Enter / Space adopts the focused one.
     cell_focus: Vec<FocusHandle>,
+    /// The pointer is over this cell (`Self::sync_preview`'s precedence: hover beats focus).
+    hovered: Option<usize>,
     closed: bool,
     _observers: [Subscription; 1],
 }
@@ -53,17 +65,39 @@ impl EventEmitter<ProofEvent> for ProofSheet {}
 impl ProofSheet {
     pub fn new(
         images: &Entity<ImageStore>,
+        shell: Entity<ShellState>,
         source: VariantSource,
         candidates: Vec<ProofCandidate>,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
         let pool = images.read(cx).pool();
         let renders = cx.new(|cx| EditRenders::new(pool, cx));
         let jobs: Vec<EditJob> = candidates.iter().map(|c| source.job(&c.record, PROOF_EDGE)).collect();
         renders.update(cx, |r, cx| r.want(&jobs, cx));
-        let _observers = [cx.observe(&renders, |_, _, cx| cx.notify())];
+        // Keeps the 320 px placeholder the pop-out's preview shows fresh as it settles, on
+        // top of the plain re-render every other `EditRenders` observer does (#250).
+        let _observers = [cx.observe_in(&renders, window, |this, _, window, cx| {
+            this.sync_preview(window, cx);
+            cx.notify();
+        })];
         let cell_focus = candidates.iter().map(|_| cx.focus_handle()).collect();
-        ProofSheet { source, candidates, renders, focus: cx.focus_handle(), cell_focus, closed: false, _observers }
+        let this = ProofSheet {
+            source,
+            candidates,
+            renders,
+            shell,
+            focus: cx.focus_handle(),
+            cell_focus,
+            hovered: None,
+            closed: false,
+            _observers,
+        };
+        // Whatever ends this entity's life without going through `close`/`adopt` — the
+        // overlay dropped from under it, the window it was mounted in closing — still takes
+        // the preview down (#250).
+        cx.on_release(|this: &mut Self, cx| this.clear_preview(cx)).detach();
+        this
     }
 
     pub fn focus_handle(&self) -> &FocusHandle {
@@ -83,6 +117,19 @@ impl ProofSheet {
         self.cell_focus.iter().position(|f| f.is_focused(window))
     }
 
+    /// The pointer entered (`hovering`) or left cell `i` (`on_hover`'s own bookkeeping, then
+    /// [`Self::sync_preview`]).
+    fn set_hovered(&mut self, i: usize, hovering: bool, window: &mut Window, cx: &mut Context<Self>) {
+        self.hovered = if hovering {
+            Some(i)
+        } else if self.hovered == Some(i) {
+            None
+        } else {
+            self.hovered
+        };
+        self.sync_preview(window, cx);
+    }
+
     /// Tab / Shift+Tab: focus the next (previous) proof, wrapping; from the backdrop, the
     /// first (last).
     fn cycle(&mut self, forward: bool, window: &mut Window, cx: &mut Context<Self>) {
@@ -97,6 +144,7 @@ impl ProofSheet {
             (None, false) => n - 1,
         };
         window.focus(&self.cell_focus[next], cx);
+        self.sync_preview(window, cx);
         cx.notify();
     }
 
@@ -120,6 +168,22 @@ impl ProofSheet {
     fn end(&mut self, cx: &mut Context<Self>) {
         self.closed = true;
         self.renders.update(cx, |r, cx| r.want(&[], cx));
+        self.clear_preview(cx);
+    }
+
+    /// The pop-out's preview: the hovered cell, else the Tab-focused one, else none (the
+    /// photo as it is) — published to [`ShellState`] (#250).
+    fn sync_preview(&mut self, window: &Window, cx: &mut Context<Self>) {
+        let i = if self.closed { None } else { self.hovered.or_else(|| self.focused(window)) };
+        let preview = i.and_then(|i| self.candidates.get(i)).map(|c| {
+            let cell = self.renders.read(cx).get(&self.source.job(&c.record, PROOF_EDGE));
+            LoupeProofPreview { photo_id: self.source.photo_id, source: self.source.clone(), candidate: c.clone(), cell }
+        });
+        self.shell.update(cx, |s, cx| s.set_loupe_proof_preview(preview, cx));
+    }
+
+    fn clear_preview(&mut self, cx: &mut App) {
+        self.shell.update(cx, |s, cx| s.set_loupe_proof_preview(None, cx));
     }
 }
 
@@ -161,6 +225,9 @@ impl Render for ProofSheet {
                     })
                     .overflow_hidden()
                     .cursor_pointer()
+                    .on_hover(cx.listener(move |this, hovering: &bool, window, cx| {
+                        this.set_hovered(i, *hovering, window, cx)
+                    }))
                     .on_click(cx.listener(move |this, _, _, cx| this.adopt(i, cx)))
                     .child(div().h(px(160.)).bg(colors.well).child(variant_image(("proof-image", i as u64), state, ObjectFit::Cover, "…", colors)))
                     .child(

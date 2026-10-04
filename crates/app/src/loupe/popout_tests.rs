@@ -445,3 +445,138 @@ fn the_pop_out_shows_the_darkrooms_print(cx: &mut TestAppContext) {
     assert!(app.wired.shell.read_with(cx, |s, _| s.loupe_print().is_none()), "a switch takes it down");
     assert_eq!(shown(h, cx), None);
 }
+
+// --- the proof sheet's previewed candidate on the pop-out (#250) -----------------------------
+
+/// While a proof sheet's candidate is previewed, the pop-out renders it at loupe size from
+/// the Darkroom's own source, through the 320 px cell's own render as a placeholder until the
+/// loupe-size one lands, labelled "Proof: <label> — not applied"; with no pop-out open, no
+/// loupe-size render is ever asked for.
+#[cfg(feature = "edit")]
+#[gpui_kit::test]
+fn the_pop_out_shows_a_proof_sheets_previewed_candidate(cx: &mut TestAppContext) {
+    use crate::loupe::duel::VariantSource;
+    use crate::loupe::edit_renders::RenderState;
+    use crate::shell::state::LoupeProofPreview;
+    use chairphoto_core::image_pool::EditJob;
+    use chairphoto_core::plugins::edit::SourceToken;
+    use chairphoto_model::darkroom::spreads::proof_spread;
+    use chairphoto_model::editing::VersionEdit;
+
+    let (app, pool, _dir, ids) = app_with(2, "pop-proof", cx);
+    select(&app, ids[1], cx);
+    pool.finish(&preview(ids[1]), Ok(pixels(300, 200)));
+    cx.run_until_parked();
+
+    let candidate = proof_spread(&VersionEdit::default(), &VersionEdit::default(), &[], None)[1].clone();
+    let source = VariantSource::new(ids[1], 0, SourceToken::Preview);
+    let cell = RenderState::Ready(pixels(40, 30).image);
+    let publish = |cx: &mut TestAppContext| {
+        app.wired.shell.update(cx, |s, cx| {
+            s.set_loupe_proof_preview(
+                Some(LoupeProofPreview {
+                    photo_id: ids[1],
+                    source: source.clone(),
+                    candidate: candidate.clone(),
+                    cell: cell.clone(),
+                }),
+                cx,
+            )
+        });
+        cx.run_until_parked();
+    };
+    let loupe_jobs = |pool: &FakePool| -> Vec<EditJob> {
+        pool.batches
+            .lock()
+            .unwrap()
+            .iter()
+            .flatten()
+            .filter_map(|k| match k {
+                JobKey::Edit(job) if job.max_edge == 2560 => Some(job.clone()),
+                _ => None,
+            })
+            .collect()
+    };
+
+    // No pop-out open: nothing is asked for at loupe size.
+    publish(cx);
+    assert!(loupe_jobs(&pool).is_empty(), "no pop-out, no loupe-size render");
+
+    let h = open(cx);
+    cx.run_until_parked();
+    let jobs = loupe_jobs(&pool);
+    assert_eq!(jobs.len(), 1, "the pop-out asks for the previewed candidate at loupe size");
+    let job = jobs[0].clone();
+    assert_eq!(
+        (job.photo_id, job.edit_json.as_str(), &job.source),
+        (ids[1], candidate.record.to_json().as_str(), &SourceToken::Preview)
+    );
+
+    // Before the loupe-size render lands, the 320 px cell's own render stands in.
+    render_popout(h, cx);
+    assert_eq!(popout_zoom(cx).read_with(cx, |z, _| z.drawn()), Some((ids[1], Drawn::OverrideLo)), "the cell render stands in");
+    let label = cx.update_window(h, |_, window, _| window.find("loupe-tag-proof").label().map(str::to_string)).unwrap();
+    assert_eq!(label, Some(format!("Proof: {} — not applied", candidate.label)));
+
+    pool.finish(&JobKey::Edit(job), Ok(pixels(400, 300)));
+    cx.run_until_parked();
+    render_popout(h, cx);
+    assert_eq!(popout_zoom(cx).read_with(cx, |z, _| z.drawn()), Some((ids[1], Drawn::OverrideLo)), "now the loupe-size render");
+
+    close(cx);
+}
+
+/// The previewed candidate is scoped to the photo it was published for: a selection change to
+/// another photo (even with no catalog switch) never shows it there, and a catalog switch —
+/// even to one whose ids collide — takes it down, the same way it takes the Darkroom's print
+/// down.
+#[cfg(feature = "edit")]
+#[gpui_kit::test]
+fn a_proof_preview_is_scoped_to_its_own_photo_and_catalog(cx: &mut TestAppContext) {
+    use crate::loupe::duel::VariantSource;
+    use crate::loupe::edit_renders::RenderState;
+    use crate::shell::state::LoupeProofPreview;
+    use chairphoto_core::plugins::edit::SourceToken;
+    use chairphoto_model::darkroom::spreads::proof_spread;
+    use chairphoto_model::editing::VersionEdit;
+
+    let (app, pool, dir, ids) = app_with(3, "pop-proof-scope", cx);
+    select(&app, ids[1], cx);
+    let h = open(cx);
+    pool.finish(&preview(ids[1]), Ok(pixels(300, 200)));
+    cx.run_until_parked();
+
+    let candidate = proof_spread(&VersionEdit::default(), &VersionEdit::default(), &[], None)[1].clone();
+    let source = VariantSource::new(ids[1], 0, SourceToken::Preview);
+    let preview_for = |id: i64| LoupeProofPreview {
+        photo_id: id,
+        source: source.clone(),
+        candidate: candidate.clone(),
+        cell: RenderState::Absent,
+    };
+    app.wired.shell.update(cx, |s, cx| s.set_loupe_proof_preview(Some(preview_for(ids[1])), cx));
+    cx.run_until_parked();
+
+    // Selecting a different photo: the preview was published for ids[1], not this one.
+    select(&app, ids[0], cx);
+    pool.finish(&preview(ids[0]), Ok(pixels(300, 200)));
+    cx.run_until_parked();
+    assert_eq!(shown(h, cx), Some(ids[0]));
+    assert_eq!(
+        popout_zoom(cx).read_with(cx, |z, _| z.drawn()),
+        Some((ids[0], Drawn::Preview)),
+        "the real photo, not the stale proof"
+    );
+    assert!(app.wired.shell.read_with(cx, |s, _| s.loupe_proof_preview().is_some()), "still published — just not for this photo");
+
+    // A catalog switch to colliding ids takes the preview down, the same way it takes the
+    // Darkroom's print down.
+    let (other, new_ids) = colliding_catalog(&dir, "other", 3);
+    assert_eq!(new_ids, ids, "ids collide");
+    core_switch(&app, other);
+    deliver_switch(&app, cx);
+    assert!(app.wired.shell.read_with(cx, |s, _| s.loupe_proof_preview().is_none()), "a switch takes it down");
+    select(&app, new_ids[1], cx);
+    assert_eq!(shown(h, cx), Some(new_ids[1]));
+    assert_eq!(popout_zoom(cx).read_with(cx, |z, _| z.drawn()), None, "not the old catalog's stale proof");
+}

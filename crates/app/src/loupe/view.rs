@@ -18,7 +18,10 @@
 //!   `LoupeView`, with [`Follow::Window`], over the same entities: it follows the target
 //!   whatever the main stage shows, has no "Back to grid", and ignores Enter/Esc and C. While
 //!   the Darkroom has a print up (`ShellState::set_loupe_print`, `edit` feature) it shows
-//!   that record, rendered from the print's own source, instead. When its window closes it
+//!   that record, rendered from the print's own source, instead; failing that, a proof
+//!   sheet's previewed candidate (`ShellState::set_loupe_proof_preview`, `edit` feature, #250)
+//!   does the same, on its own photo only, labelled "Proof: <label> — not applied" and shown
+//!   through its 320 px cell render until the loupe-size one lands. When its window closes it
 //!   is [released](LoupeView::release).
 //!
 //! Keys ([`contexts::LOUPE`]): ←/→/↑/↓ step (Shift extends), Enter/Esc back to the grid, C
@@ -269,14 +272,23 @@ impl LoupeView {
         const LOUPE_EDGE: u32 = 2560;
         let target = self.zoom.read(cx).photo();
         let epoch = self.model.read(cx).catalog_epoch;
-        // The record to render and its pixels: the Darkroom's print (pop-out only), else the
-        // active version — each only on its own photo.
+        // The record to render and its pixels: the Darkroom's print (pop-out only), else a
+        // proof sheet's previewed candidate (pop-out only, #250), else the active version —
+        // each only on its own photo (the trailing filter, below). The proof case also keeps
+        // its 320 px cell render, a placeholder until its own loupe-size render lands.
         let shell = self.shell.read(cx);
-        let record = match self.print(cx) {
-            Some(print) => Some((print.photo.id, print.edit_json.clone(), print.source.clone())),
-            None => shell.active_version().map(|v| (v.photo_id, v.edit_json.clone(), SourceToken::Preview)),
-        }
-        .filter(|(photo, _, _)| Some(*photo) == target);
+        let print = self.print(cx).cloned();
+        let proof =
+            if self.follow == Follow::Window { shell.loupe_proof_preview().cloned() } else { None };
+        let (record, placeholder) = if let Some(print) = &print {
+            (Some((print.photo.id, print.edit_json.clone(), print.source.clone())), None)
+        } else if let Some(p) = &proof {
+            (Some((p.photo_id, (p.source.encode)(&p.candidate.record), p.source.source.clone())), Some(p.cell.clone()))
+        } else {
+            (shell.active_version().map(|v| (v.photo_id, v.edit_json.clone(), SourceToken::Preview)), None)
+        };
+        let record = record.filter(|(photo, _, _)| Some(*photo) == target);
+        let placeholder = if record.is_some() { placeholder } else { None };
         let Some((photo, edit_json, source)) = record else {
             self.renders.update(cx, |r, cx| r.want(&[], cx));
             self.zoom.update(cx, |z, cx| z.set_override(None, cx));
@@ -295,6 +307,12 @@ impl LoupeView {
             RenderState::Ready(image) => over.lo = Some(image),
             RenderState::Failed(e) => over.failed = Some(e),
             _ => {}
+        }
+        // The proof sheet's own 320 px render, until the loupe-size one above lands (#250).
+        if over.lo.is_none() {
+            if let Some(RenderState::Ready(image)) = placeholder {
+                over.lo = Some(image);
+            }
         }
         match renders.get(&hi) {
             RenderState::Ready(image) => over.hi = Some(image),
@@ -389,8 +407,15 @@ impl LoupeView {
             }
             _ => {}
         }
-        if let Some(name) = version {
-            tags = tags.child(tag("loupe-tag-version", format!("· {name}"), colors.accent));
+        // A proof sheet's previewed candidate (pop-out only, #250) stands in for the version
+        // tag: it is a candidate record, not what the photo actually holds.
+        match proof_preview_label(&self.shell, self.follow, photo.id, cx) {
+            Some(label) => tags = tags.child(tag("loupe-tag-proof", format!("Proof: {label} — not applied"), colors.accent)),
+            None => {
+                if let Some(name) = version {
+                    tags = tags.child(tag("loupe-tag-version", format!("· {name}"), colors.accent));
+                }
+            }
         }
         div()
             .id("loupe-bar")
@@ -467,6 +492,25 @@ fn faces_enabled(modules: &Entity<ModuleRegistry>, cx: &App) -> bool {
     {
         let _ = (modules, cx);
         false
+    }
+}
+
+/// The proof sheet's previewed candidate's label for `photo_id`, shown on the pop-out's bar
+/// in place of the active version's name while it is up (#250). `None` without the `edit`
+/// feature (there is no proof sheet) or in the inline loupe (the proof sheet's own Darkroom
+/// view shows the real thing behind it).
+fn proof_preview_label(shell: &Entity<ShellState>, follow: Follow, photo_id: i64, cx: &App) -> Option<String> {
+    #[cfg(feature = "edit")]
+    {
+        if follow != Follow::Window {
+            return None;
+        }
+        shell.read(cx).loupe_proof_preview().filter(|p| p.photo_id == photo_id).map(|p| p.candidate.label.clone())
+    }
+    #[cfg(not(feature = "edit"))]
+    {
+        let _ = (shell, follow, photo_id, cx);
+        None
     }
 }
 

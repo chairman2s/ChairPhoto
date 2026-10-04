@@ -999,8 +999,9 @@ mod overlays {
         let (handle, sheet) = cx
             .update(|cx| {
                 let candidates = candidates.clone();
-                gpui_kit::open_window(Default::default(), cx, |_, cx| {
-                    cx.new(|cx| ProofSheet::new(&images, source, candidates, cx))
+                let shell = app.wired.shell.clone();
+                gpui_kit::open_window(Default::default(), cx, |window, cx| {
+                    cx.new(|cx| ProofSheet::new(&images, shell, source, candidates, window, cx))
                 })
             })
             .unwrap();
@@ -1024,9 +1025,10 @@ mod overlays {
         let (handle, sheet) = cx
             .update(|cx| {
                 let images = app.wired.images.clone();
+                let shell = app.wired.shell.clone();
                 let source = VariantSource::new(ids[0], 0, SourceToken::Preview);
-                gpui_kit::open_window(Default::default(), cx, |_, cx| {
-                    cx.new(|cx| ProofSheet::new(&images, source, candidates, cx))
+                gpui_kit::open_window(Default::default(), cx, |window, cx| {
+                    cx.new(|cx| ProofSheet::new(&images, shell, source, candidates, window, cx))
                 })
             })
             .unwrap();
@@ -1043,6 +1045,121 @@ mod overlays {
         .unwrap();
         cx.run_until_parked();
         assert!(*closed.borrow());
+    }
+
+    // --- the proof sheet's preview on the pop-out (#250) --------------------------------------
+
+    /// Hovering a proof cell previews it (`ShellState::loupe_proof_preview`); leaving it falls
+    /// back to the Tab-focused cell, else nothing (the pop-out shows the photo as it is).
+    #[gpui_kit::test]
+    fn hovering_a_proof_previews_it_falling_back_to_the_focused_cell(cx: &mut TestAppContext) {
+        let (app, _pool, _dir, ids) = app_with(1, "proof-preview-hover", cx);
+        let images = app.wired.images.clone();
+        let shell = app.wired.shell.clone();
+        let candidates = proof_spread(&VersionEdit::default(), &VersionEdit::default(), &[], None);
+        let source = VariantSource::new(ids[0], 0, SourceToken::Preview);
+        let (handle, sheet) = cx
+            .update(|cx| {
+                let candidates = candidates.clone();
+                let shell = shell.clone();
+                gpui_kit::open_window(Default::default(), cx, |window, cx| {
+                    cx.new(|cx| ProofSheet::new(&images, shell, source, candidates, window, cx))
+                })
+            })
+            .unwrap();
+        let preview =
+            |cx: &mut TestAppContext| shell.read_with(cx, |s, _| s.loupe_proof_preview().map(|p| p.candidate.clone()));
+        assert_eq!(preview(cx), None, "the backdrop has focus, nothing hovered");
+
+        // Tab from the backdrop to cell 0: focus alone previews it.
+        cx.update_window(handle, |_, window, cx| {
+            sheet.read(cx).focus_handle().clone().focus(window, cx);
+            window.render_frame(cx);
+            window.press("tab", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        assert_eq!(preview(cx), Some(candidates[0].clone()), "Tab focus alone previews it");
+
+        // Hovering cell 1 overrides the focused cell.
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            window.hover(("proof-cell", 1u64), cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        assert_eq!(preview(cx), Some(candidates[1].clone()), "hover wins over focus");
+
+        // Leaving the hovered cell falls back to the still Tab-focused one.
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            window.hover("proof-close", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        assert_eq!(preview(cx), Some(candidates[0].clone()), "falls back to the focused cell");
+    }
+
+    /// Clicking a proof adopts it; Esc declines. Either way the preview clears.
+    #[gpui_kit::test]
+    fn adopting_or_declining_a_proof_clears_its_preview(cx: &mut TestAppContext) {
+        let (app, _pool, _dir, ids) = app_with(1, "proof-preview-end", cx);
+        let images = app.wired.images.clone();
+        let shell = app.wired.shell.clone();
+        let candidates = proof_spread(&VersionEdit::default(), &VersionEdit::default(), &[], None);
+        let previewed = |cx: &mut TestAppContext| shell.read_with(cx, |s, _| s.loupe_proof_preview().is_some());
+
+        let (handle, _sheet) = cx
+            .update(|cx| {
+                let candidates = candidates.clone();
+                let shell = shell.clone();
+                let source = VariantSource::new(ids[0], 0, SourceToken::Preview);
+                gpui_kit::open_window(Default::default(), cx, |window, cx| {
+                    cx.new(|cx| ProofSheet::new(&images, shell, source, candidates, window, cx))
+                })
+            })
+            .unwrap();
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            window.hover(("proof-cell", 2u64), cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        assert!(previewed(cx), "hovered");
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            window.click(("proof-cell", 2u64), cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        assert!(!previewed(cx), "adopting clears it");
+
+        // A fresh sheet, declined by Escape.
+        let (handle, sheet) = cx
+            .update(|cx| {
+                let images = app.wired.images.clone();
+                let shell = shell.clone();
+                let source = VariantSource::new(ids[0], 0, SourceToken::Preview);
+                gpui_kit::open_window(Default::default(), cx, |window, cx| {
+                    cx.new(|cx| ProofSheet::new(&images, shell, source, candidates, window, cx))
+                })
+            })
+            .unwrap();
+        cx.update_window(handle, |_, window, cx| {
+            sheet.read(cx).focus_handle().clone().focus(window, cx);
+            window.render_frame(cx);
+            window.hover(("proof-cell", 0u64), cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        assert!(previewed(cx), "hovered again");
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            window.press("escape", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        assert!(!previewed(cx), "declining clears it");
     }
 
     /// An edit render that was no longer wanted when it finished is dropped, never shown.

@@ -667,7 +667,8 @@ impl DarkroomView {
         let d = self.darkroom.read(cx);
         let (Some(source), Some(candidates)) = (d.variant_source(), d.proof_candidates()) else { return };
         let images = d.images().clone();
-        let sheet = cx.new(|cx| ProofSheet::new(&images, source, candidates, cx));
+        let shell = d.shell().clone();
+        let sheet = cx.new(|cx| ProofSheet::new(&images, shell, source, candidates, window, cx));
         let sub = cx.subscribe_in(&sheet, window, |this, _, e: &ProofEvent, window, cx| {
             if let ProofEvent::Adopt(c) = e {
                 let c = c.clone();

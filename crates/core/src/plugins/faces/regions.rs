@@ -469,17 +469,26 @@ pub(crate) mod tests {
     use crate::plugins::faces::store;
     use crate::xmp::FrameDoubt;
 
-    /// A hook [`write_photo_regions`] runs once its photo's path is resolved and before the
-    /// sidecar is opened, once, for the photo path it names — so a test can act in the window
-    /// between a writer deciding to write and taking the sidecar's file lock (#156).
-    type Hook = (std::path::PathBuf, Box<dyn FnOnce() + Send>);
-    pub(crate) static BEFORE_REGION_WRITE: std::sync::Mutex<Option<Hook>> = std::sync::Mutex::new(None);
+    type Hook = (std::path::PathBuf, Box<dyn FnOnce()>);
+    thread_local! {
+        /// A hook [`write_photo_regions`] runs once its photo's path is resolved and before
+        /// the sidecar is opened, once, for the photo path it names — so a test can act in
+        /// the window between a writer deciding to write and taking the sidecar's file lock
+        /// (#156).
+        ///
+        /// Thread-local (#226), not a process-global `Mutex`: every caller reaches
+        /// `write_photo_regions` by a plain call on the thread that set the hook (see
+        /// `matcher::tests::BEFORE_ACCEPT_UPDATE`'s doc for why that holds here too), so a
+        /// second test that adopts this hook in parallel can no longer drop or steal the
+        /// first's single slot (same class as #148's `BEFORE_SETTLE`, review N2).
+        pub(crate) static BEFORE_REGION_WRITE: std::cell::RefCell<Option<Hook>> = std::cell::RefCell::new(None);
+    }
 
     pub(super) fn before_region_write(path: &std::path::Path) {
-        let hook = {
-            let mut slot = BEFORE_REGION_WRITE.lock().unwrap_or_else(|e| e.into_inner());
+        let hook = BEFORE_REGION_WRITE.with(|cell| {
+            let mut slot = cell.borrow_mut();
             if slot.as_ref().is_some_and(|(p, _)| p == path) { slot.take() } else { None }
-        };
+        });
         if let Some((_, hook)) = hook {
             hook();
         }

@@ -1345,37 +1345,54 @@ pub(crate) mod tests {
 
     // ── Test scaffolding ────────────────────────────────────────────────────────
 
-    /// A hook [`accept_suggestion`] runs once, right after its read confirms the face is still
-    /// suggested as the person shown and before its conditional `UPDATE` — the window #217
-    /// names. The hook gets the connection (really: the open transaction) `accept_suggestion`
-    /// is using, so a test can land a conflicting write there — standing in for another
-    /// connection's reject, reassignment or reset, which `IMMEDIATE` (see `accept_shown`'s doc
-    /// comment) keeps out of this window in production — and prove the `UPDATE`'s own
-    /// re-check reports it stale rather than losing the race silently.
-    pub(crate) static BEFORE_ACCEPT_UPDATE: std::sync::Mutex<Option<Box<dyn FnOnce(&Connection) + Send>>> =
-        std::sync::Mutex::new(None);
+    thread_local! {
+        /// A hook [`accept_suggestion`] runs once, right after its read confirms the face is
+        /// still suggested as the person shown and before its conditional `UPDATE` — the
+        /// window #217 names. The hook gets the connection (really: the open transaction)
+        /// `accept_suggestion` is using, so a test can land a conflicting write there —
+        /// standing in for another connection's reject, reassignment or reset, which
+        /// `IMMEDIATE` (see `accept_shown`'s doc comment) keeps out of this window in
+        /// production — and prove the `UPDATE`'s own re-check reports it stale rather than
+        /// losing the race silently.
+        ///
+        /// Thread-local (#226), not a process-global `Mutex`: every caller in this module and
+        /// in `app::faces::tests` reaches `accept_suggestion` by a plain call on the thread
+        /// that set the hook (never across a `spawn_blocking`/`thread::spawn` hop), so scoping
+        /// by thread is exact — a parallel test's `accept_suggestion` never sees, and can
+        /// never consume, this thread's hook (the #217 merge-verify flake: face ids restart at
+        /// 1 in every fresh in-memory catalog, so a global slot let one test's `open_match`
+        /// steal another's hook).
+        pub(crate) static BEFORE_ACCEPT_UPDATE: std::cell::RefCell<Option<Box<dyn FnOnce(&Connection)>>> =
+            std::cell::RefCell::new(None);
+    }
 
     pub(super) fn before_accept_update(conn: &Connection) {
-        let hook = BEFORE_ACCEPT_UPDATE.lock().unwrap_or_else(|e| e.into_inner()).take();
+        let hook = BEFORE_ACCEPT_UPDATE.with(|cell| cell.borrow_mut().take());
         if let Some(hook) = hook {
             hook(conn);
         }
     }
 
-    /// A hook [`open_match`] runs once for a given face, right after its `is_rejected` read
-    /// has already found the pair not rejected and before it calls `write_suggestion` — the
-    /// window #217's test gap names (the run's own rejection read, then its write). The hook
-    /// gets the connection `open_match` is using, so it can land a reject there and a test can
-    /// prove `write_suggestion`'s own fresh `NOT_REJECTED` check — not just this read — is what
-    /// stops a stale write.
-    pub(crate) static BEFORE_SUGGESTION_WRITE: std::sync::Mutex<Option<(i64, Box<dyn FnOnce(&Connection) + Send>)>> =
-        std::sync::Mutex::new(None);
+    thread_local! {
+        /// A hook [`open_match`] runs once for a given face, right after its `is_rejected`
+        /// read has already found the pair not rejected and before it calls
+        /// `write_suggestion` — the window #217's test gap names (the run's own rejection
+        /// read, then its write). The hook gets the connection `open_match` is using, so it
+        /// can land a reject there and a test can prove `write_suggestion`'s own fresh
+        /// `NOT_REJECTED` check — not just this read — is what stops a stale write.
+        ///
+        /// Thread-local (#226): see [`BEFORE_ACCEPT_UPDATE`]. The face-id key alone was not
+        /// enough — every fresh in-memory test catalog numbers faces from 1, so two tests'
+        /// faces can share an id — scoping by thread closes that the rest of the way.
+        pub(crate) static BEFORE_SUGGESTION_WRITE: std::cell::RefCell<Option<(i64, Box<dyn FnOnce(&Connection)>)>> =
+            std::cell::RefCell::new(None);
+    }
 
     pub(super) fn before_suggestion_write(conn: &Connection, face_id: i64) {
-        let hook = {
-            let mut slot = BEFORE_SUGGESTION_WRITE.lock().unwrap_or_else(|e| e.into_inner());
+        let hook = BEFORE_SUGGESTION_WRITE.with(|cell| {
+            let mut slot = cell.borrow_mut();
             if slot.as_ref().is_some_and(|(id, _)| *id == face_id) { slot.take() } else { None }
-        };
+        });
         if let Some((_, hook)) = hook {
             hook(conn);
         }
@@ -1800,12 +1817,14 @@ pub(crate) mod tests {
         let f = add_face(&conn, 1, &embed(0, 0.0));
         set_suggested(&conn, f, alice);
 
-        *BEFORE_ACCEPT_UPDATE.lock().unwrap() = Some(Box::new(move |conn: &Connection| {
-            assert!(reject_shown(conn, f, Some(alice), 0).unwrap(), "the reject applies");
-        }));
+        BEFORE_ACCEPT_UPDATE.with(|cell| {
+            *cell.borrow_mut() = Some(Box::new(move |conn: &Connection| {
+                assert!(reject_shown(conn, f, Some(alice), 0).unwrap(), "the reject applies");
+            }));
+        });
 
         assert_eq!(accept_suggestion(&conn, f, alice).unwrap(), None, "the race landed first; not overwritten");
-        assert!(BEFORE_ACCEPT_UPDATE.lock().unwrap().is_none(), "the hook ran");
+        assert!(BEFORE_ACCEPT_UPDATE.with(|cell| cell.borrow().is_none()), "the hook ran");
         assert_eq!(face_state(&conn, f).0, STATE_UNASSIGNED, "the reject stands");
     }
 
@@ -1826,20 +1845,22 @@ pub(crate) mod tests {
         add_photo(&conn, 2);
         let f = add_face(&conn, 2, &embed(0, 0.05)); // would open-match Alice
 
-        *BEFORE_SUGGESTION_WRITE.lock().unwrap() = Some((
-            f,
-            Box::new(move |conn: &Connection| {
-                conn.execute(
-                    "INSERT INTO faces__rejections (face_id, person_tag_id, rejected_at) VALUES (?1, ?2, 0)",
-                    rusqlite::params![f, alice],
-                )
-                .unwrap();
-            }),
-        ));
+        BEFORE_SUGGESTION_WRITE.with(|cell| {
+            *cell.borrow_mut() = Some((
+                f,
+                Box::new(move |conn: &Connection| {
+                    conn.execute(
+                        "INSERT INTO faces__rejections (face_id, person_tag_id, rejected_at) VALUES (?1, ?2, 0)",
+                        rusqlite::params![f, alice],
+                    )
+                    .unwrap();
+                }),
+            ));
+        });
 
         let out = run_matching(&conn, &MatchSettings::default(), 1000).unwrap();
 
-        assert!(BEFORE_SUGGESTION_WRITE.lock().unwrap().is_none(), "the hook ran");
+        assert!(BEFORE_SUGGESTION_WRITE.with(|cell| cell.borrow().is_none()), "the hook ran");
         assert_eq!(out.open, 0, "the pair rejected mid-run is not suggested");
         // open_match already marks a face `resolved` (so clustering skips it) once it has a
         // best candidate, before the write is attempted — a face the race stops from being
@@ -1848,6 +1869,75 @@ pub(crate) mod tests {
         assert_eq!(face_state(&conn, f).0, "unassigned", "not suggested as Alice, and not lost to it");
         assert_eq!(face_state(&conn, f).1, None, "no person assigned");
         assert_eq!(out.clustered, 0, "resolved before the write was attempted, so not offered to clustering either");
+    }
+
+    // ── Thread-local hook scoping (#226) ────────────────────────────────────────
+
+    /// #226: `BEFORE_SUGGESTION_WRITE` is thread-local, not a process-global slot, so one
+    /// thread's hook can never fire on another thread's connection, even though every fresh
+    /// in-memory catalog gives its second added face the same id (2) — the actual collision
+    /// that let `accept_and_assign_mutations`, which arms no hook of its own, pick up another
+    /// parallel test's leftover `BEFORE_SUGGESTION_WRITE` under the old global `Mutex`.
+    ///
+    /// Forced, not timed: this thread arms a hook keyed to face id 2 and a barrier holds the
+    /// second thread's real `run_matching` call — whose own face also lands on id 2, and which
+    /// arms no hook of its own — until after the hook is armed. A shared slot would then hand
+    /// this thread's hook to the second thread's connection, exactly as `accept_and_assign_mutations`
+    /// suffered; thread-local storage must not.
+    #[test]
+    fn suggestion_write_hook_never_fires_on_another_threads_connection() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::{Arc, Barrier};
+
+        fn pending_face_on_alice(conn: &Connection) -> (i64, i64) {
+            let alice = add_person(conn, 100, "Alice");
+            add_photo(conn, 1);
+            tag_photo(conn, 1, alice);
+            add_face(conn, 1, &embed(0, 0.0)); // Alice's seed/centroid — id 1
+            add_photo(conn, 2);
+            (alice, add_face(conn, 2, &embed(0, 0.05))) // id 2, every time
+        }
+
+        let armed = Arc::new(Barrier::new(2));
+        let fired_while_armed = Arc::new(AtomicBool::new(false));
+
+        let conn_a = mem_conn();
+        let (alice, f_a) = pending_face_on_alice(&conn_a);
+        assert_eq!(f_a, 2, "the collision this test forces depends on both threads' pending face being id 2");
+
+        BEFORE_SUGGESTION_WRITE.with(|cell| {
+            *cell.borrow_mut() = Some((f_a, {
+                let fired_while_armed = fired_while_armed.clone();
+                Box::new(move |_conn: &Connection| {
+                    fired_while_armed.store(true, Ordering::SeqCst);
+                })
+            }));
+        });
+
+        let other = {
+            let armed = armed.clone();
+            std::thread::spawn(move || {
+                let conn_b = mem_conn();
+                let (_, f_b) = pending_face_on_alice(&conn_b); // sets no hook of its own
+                assert_eq!(f_b, 2, "thread B's pending face must collide with thread A's for this to prove anything");
+                armed.wait(); // thread A's hook is armed before this call starts
+                let out = run_matching(&conn_b, &MatchSettings::default(), 1000).unwrap();
+                (out.open, face_state(&conn_b, f_b).1)
+            })
+        };
+
+        armed.wait();
+        let (b_open, b_person) = other.join().unwrap();
+
+        assert!(!fired_while_armed.load(Ordering::SeqCst), "thread A's hook must not fire on thread B's call");
+        assert_eq!(b_open, 1, "thread B's own write must land undisturbed; it owes thread A's hook nothing");
+        assert_eq!(b_person, Some(alice), "thread B suggested Alice, untouched by thread A's armed hook");
+
+        // Thread A's own hook is still armed on this thread (never taken by thread B) and
+        // fires for real once this thread makes its own call.
+        let out_a = run_matching(&conn_a, &MatchSettings::default(), 1000).unwrap();
+        assert!(fired_while_armed.load(Ordering::SeqCst), "thread A's hook fires on thread A's own connection");
+        assert_eq!(out_a.open, 1, "thread A's hook here only records that it ran; it does not reject the pair");
     }
 
     /// `reject_shown` remembers the person shown on a face a run has reset (#208), and leaves

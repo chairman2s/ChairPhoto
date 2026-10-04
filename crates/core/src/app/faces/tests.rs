@@ -465,14 +465,15 @@ fn a_face_verb_during_the_pre_marker_conversion_is_not_overwritten() {
         let state = state.clone();
         move || crate::app::with_catalog(&state, |c| ignore(c, alice)).unwrap()
     };
-    *BEFORE_REGION_WRITE.lock().unwrap() = Some((resolved.clone(), Box::new(verb)));
+    BEFORE_REGION_WRITE.with(|cell| *cell.borrow_mut() = Some((resolved.clone(), Box::new(verb))));
 
     let claim = begin_index_job(&state, None).unwrap();
     run_index_job(&crate::app::NoEvents, claim);
 
-    let hook = BEFORE_REGION_WRITE.lock().unwrap();
-    assert!(hook.as_ref().is_none_or(|(p, _)| *p != resolved), "the pass never reached the photo");
-    drop(hook);
+    BEFORE_REGION_WRITE.with(|cell| {
+        let hook = cell.borrow();
+        assert!(hook.as_ref().is_none_or(|(p, _)| *p != resolved), "the pass never reached the photo");
+    });
     let state_of_alice = crate::app::with_catalog(&state, |c| Ok(face_state(c, alice))).unwrap();
     assert_eq!(state_of_alice, "ignored");
     let xml = std::fs::read_to_string(crate::xmp::sidecar_path(&path)).unwrap();
@@ -877,15 +878,17 @@ fn a_concurrent_writer_cannot_land_between_accepts_read_and_write() {
     // transaction still holds the write lock (its read has run; its `UPDATE` has not): it
     // cannot have changed the row, whatever it got back for trying.
     let other_path = c.db_path().to_path_buf();
-    *BEFORE_ACCEPT_UPDATE.lock().unwrap() = Some(Box::new(move |_conn: &rusqlite::Connection| {
-        let other = rusqlite::Connection::open(&other_path).unwrap();
-        let attempted = matcher::reject_shown(&other, f, Some(alice), 1000);
-        assert!(!attempted.unwrap_or(false), "a concurrent reject never actually lands here");
-    }));
+    BEFORE_ACCEPT_UPDATE.with(|cell| {
+        *cell.borrow_mut() = Some(Box::new(move |_conn: &rusqlite::Connection| {
+            let other = rusqlite::Connection::open(&other_path).unwrap();
+            let attempted = matcher::reject_shown(&other, f, Some(alice), 1000);
+            assert!(!attempted.unwrap_or(false), "a concurrent reject never actually lands here");
+        }));
+    });
 
     let verdict = accept_shown(&c, f, alice).unwrap();
 
-    assert!(BEFORE_ACCEPT_UPDATE.lock().unwrap().is_none(), "the hook ran");
+    assert!(BEFORE_ACCEPT_UPDATE.with(|cell| cell.borrow().is_none()), "the hook ran");
     assert_eq!(verdict, ShownVerdict::Applied, "accept_shown's own call never saw a busy error");
     assert_eq!(face_state(&c, f), "confirmed");
     assert!(has_tag(&c, p, alice));

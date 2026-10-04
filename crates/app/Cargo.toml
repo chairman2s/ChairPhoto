@@ -1,9 +1,9 @@
 [package]
 name = "chairphoto-app"
-# Never published on its own. It carries no version yet: the release's version is
-# `packaging/PKGBUILD`'s `pkgver` since the Tauri shell's manifest went (#165), until the
-# packaging ticket (#167) gives the workspace a single version source.
-version = "0.0.0"
+# Never published on its own. Its version is the workspace's single source
+# (`[workspace.package] version` at the repository root, #167), which `packaging/PKGBUILD`'s
+# `pkgver` must match.
+version.workspace = true
 publish = false
 description = "ChairPhoto's native GPUI front end (docs/plans/gpui)"
 authors = ["Andreas Henden <chairman2s.ah+github@gmail.com>"]
@@ -16,10 +16,10 @@ edition = "2021"
 [lib]
 name = "chairphoto_app"
 
-# `chairphoto-gpui`, the name the Tauri shell's `chairphoto` left free. The packaging ticket
-# (#167) renames it together with the PKGBUILD and the desktop file that launch it.
+# Renamed from `chairphoto-gpui` at the GPUI cutover (#167): the GPUI app is the only front
+# end now, so it takes the name the Tauri shell's binary used to own.
 [[bin]]
-name = "chairphoto-gpui"
+name = "chairphoto"
 path = "src/main.rs"
 
 # The Map module's offline CPU bench (#119): needs the map backend.
@@ -99,6 +99,6 @@ gpui-kit = { version = "=0.7.0", features = ["test-support"] }
 # Turns on the core's `test-hooks` feature (its slideshow frame-root override, #228) for this
 # crate's own test binary only. Cargo unifies a path dependency's features across
 # `[dependencies]` and `[dev-dependencies]` for a compilation that pulls in both — a test
-# target does, the `chairphoto-gpui` binary does not — so the feature never reaches the
+# target does, the `chairphoto` binary does not — so the feature never reaches the
 # shipped binary even though it is declared here unconditionally.
 chairphoto-core = { path = "../core", default-features = false, features = ["test-hooks"] }

@@ -329,9 +329,14 @@ restarts at `0`, so it is not a patch/minor distinction and carries no compatibi
 
 - **Never zero-pad the month.** `2026.08.0` is not valid semver ("invalid leading zero in
   minor version number") and Cargo refuses to build. Write `2026.8.0`.
-- One version, three files, always in step: `package.json`, `src-tauri/Cargo.toml`, and
-  `src-tauri/tauri.conf.json`. Bumping one alone ships a build that disagrees with itself.
-- Tag a release `v2026.8.0`, matching the manifests exactly.
+- **One version source** (#167): `[workspace.package] version` in the root `Cargo.toml`. Every
+  member crate (`chairphoto-core`, `chairphoto-model`, `chairphoto-app`) pulls it with
+  `version.workspace = true` instead of carrying its own. `packaging/PKGBUILD`'s `pkgver`
+  must match it — `prepare()` asserts this on every build — so bump both together; there is
+  no longer a `package.json` or `src-tauri/*` manifest to keep in step.
+- Tag a release `v2026.8.0`, matching `Cargo.toml` and `PKGBUILD` exactly. The current
+  release is `2026.8.0`; the next one bumps `[workspace.package] version` and `pkgver`
+  together (see `packaging/README.md` "Cutting a release").
 
 ## Runtime Notes
 

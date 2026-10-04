@@ -714,7 +714,9 @@ mod tests {
     #[test]
     fn a_claim_bound_to_another_catalog_fails_closed() {
         // Switches catalogs: phase one releases develop's process-wide resident image, so
-        // this must not interleave with the develop tests that assert on it (#133).
+        // this must not interleave with the develop tests that assert on it (#133). `develop`
+        // exists only with `raw`+`edit` (#239); without either, there is no such test to race.
+        #[cfg(all(feature = "raw", feature = "edit"))]
         let _serial = crate::develop::serial();
         let (dir, state, _p, ids) = setup("identity", 2);
         let identity = crate::app::catalog_identity(&state).unwrap();
@@ -734,7 +736,9 @@ mod tests {
     #[test]
     fn cancel_a_newer_render_or_a_switch_kills_a_running_encode() {
         // Switches catalogs: phase one releases develop's process-wide resident image, so
-        // this must not interleave with the develop tests that assert on it (#133).
+        // this must not interleave with the develop tests that assert on it (#133). `develop`
+        // exists only with `raw`+`edit` (#239); without either, there is no such test to race.
+        #[cfg(all(feature = "raw", feature = "edit"))]
         let _serial = crate::develop::serial();
         for how in ["cancel", "newer", "switch"] {
             let (dir, state, progress, ids) = setup(&format!("abort-{how}"), 2);

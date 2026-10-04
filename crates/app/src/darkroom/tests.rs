@@ -11,8 +11,11 @@ use crate::image_tests::{pixels, FakePool};
 use crate::shell::state::Surface;
 use crate::storage::Runner;
 use crate::tests::{click, colliding_catalog, core_switch, open_catalog_with_photos, start_with_pool, App, TempDir};
-use chairphoto_core::app::{CoreEvent, EventSink as _, CATALOG_CHANGED};
+use chairphoto_core::app::{CoreEvent, CATALOG_CHANGED};
+#[cfg(feature = "raw")]
+use chairphoto_core::app::EventSink as _;
 use chairphoto_core::catalog::Catalog;
+#[cfg(feature = "raw")]
 use chairphoto_core::develop::session::DevelopSourceEvent;
 use chairphoto_core::develop_source::DevelopSource;
 use chairphoto_core::image_pool::{EditJob, JobKey};
@@ -686,6 +689,10 @@ fn the_filmstrip_and_arrows_step_through_the_library_saving_first(cx: &mut TestA
 /// The RAW arrives (`develop:source` with a token): the stage moves to the working image,
 /// Kelvin white balance appears, saves are stamped engine 2, and the clipping layer can be
 /// asked for. An event for another photo changes nothing.
+///
+/// `CoreEvent::DevelopSource` exists only with `raw` (#239), so this test — which simulates
+/// that event — needs it too. `darkroom` itself only needs `edit`.
+#[cfg(feature = "raw")]
 #[gpui_kit::test]
 fn the_raw_source_moves_the_stage_and_stamps_the_record(cx: &mut TestAppContext) {
     let rig = rig("dk-source", 2, cx);
@@ -1228,6 +1235,10 @@ fn a_change_during_new_version_then_leaving_is_saved_into_the_new_version(cx: &m
 /// editable), not made on screen and then silently dropped as React did. The version left
 /// keeps what it held; the one arrived at shows its own record. "+ New version" copies the
 /// record instead, so a change made while it is written is kept and saved into it.
+///
+/// The new-engine-fork half simulates `CoreEvent::DevelopSource`, which exists only with
+/// `raw` (#239); `darkroom` itself only needs `edit`.
+#[cfg(feature = "raw")]
 #[gpui_kit::test]
 fn changes_during_a_switch_or_a_new_engine_fork_are_refused_not_dropped(cx: &mut TestAppContext) {
     use chairphoto_model::darkroom::controls::EffectKey;
@@ -1300,6 +1311,10 @@ fn changes_during_a_switch_or_a_new_engine_fork_are_refused_not_dropped(cx: &mut
 
 /// "Develop with the new engine": an engine-1 version's framing as a fresh engine-2 version
 /// "<name> (RAW)"; the engine-1 version is left as it was.
+///
+/// Simulates `CoreEvent::DevelopSource`, which exists only with `raw` (#239); `darkroom`
+/// itself only needs `edit`.
+#[cfg(feature = "raw")]
 #[gpui_kit::test]
 fn develop_with_the_new_engine_forks_the_framing_onto_the_raw(cx: &mut TestAppContext) {
     let rig = rig("dk-engine", 1, cx);

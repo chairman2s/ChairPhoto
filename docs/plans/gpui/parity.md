@@ -379,10 +379,12 @@ starting folder).
 Built since the audit by #159/#160: `apply_auto_tags` at startup (the boot chain, `model.rs`
 `boot_after_open`);
 a rescan's result starts the cache warm-up (`app::cache`, an owned job:
-`JobRegistry::cache`, tripped by a newer warm-up or a catalog switch), with previews while
-"Cache previews on import" is on, its job-scoped `cache:progress` on the bench's status line
-("Caching N/M…") and its own result ending it ("Cache ready" / "Cache failed: …",
-`storage/state.rs`);
+`JobRegistry::cache`, tripped by a newer warm-up or a catalog switch) while "Cache previews
+on import" is on, its job-scoped `cache:progress` on the bench's status line ("Caching N/M…")
+and its own result ending it ("Cache ready" / "Cache failed: …", `storage/state.rs`).
+Difference (owner decision, #195, fb0f365): with that setting off GPUI starts no warm-up at
+all, where React still warms thumbnails; B&W flags and the monochrome auto-tag then refresh
+when a preview is next generated;
 the layout (`panel.leftW`/`rightW`/`leftHidden`/`rightHidden`/`thumbSize`/`inspectorTab`) is
 restored from and written to `MachinePrefs` with React's keys and values
 (`shell/layout_prefs.rs`;

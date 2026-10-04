@@ -708,45 +708,104 @@ pub(crate) mod tests {
         assert!(near(stored[0].bbox, (0.2, 0.6, 0.4, 0.3)), "{:?}", stored[0].bbox);
     }
 
+    /// Set a JPEG's own `Exif.Image.Orientation` via `exiv2` — real file metadata a decoder
+    /// reads back, not a [`FileProbe`] this crate fabricates in memory. `false` when `exiv2`
+    /// is not installed, so the caller can skip (AGENTS.md: a test a machine cannot run says
+    /// `SKIPPED:` rather than failing); a present `exiv2` that fails is still a failure.
+    fn set_jpeg_orientation(path: &std::path::Path, orientation: u8) -> bool {
+        let status = match std::process::Command::new("exiv2")
+            .arg("-M")
+            .arg(format!("set Exif.Image.Orientation {orientation}"))
+            .arg(path)
+            .status()
+        {
+            Ok(status) => status,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return false,
+            Err(e) => panic!("exiv2 could not run: {e}"),
+        };
+        assert!(status.success(), "exiv2 failed to set Orientation {orientation} on {}", path.display());
+        true
+    }
+
     /// #245 regenerates a small original's preview at its own size: a 1200x800 photo turned a
     /// quarter had an upscaled 1365x2048 preview and now has an 800x1200 one. Its faces are
     /// stored normalized and the cross-check compares aspects only, so the regenerated preview
     /// writes the very sidecar the old one did — and refuses what the old one refused.
+    ///
+    /// Review Nit-2: goes through the real path — [`write_photo_regions`] (not
+    /// `_probed`), whose [`FileProbe::of`] calls the real
+    /// [`crate::thumbnails::cached_preview_size`] — against a real JPEG (a genuine
+    /// `exiv2`-set Orientation 6, so the real decode in [`crate::thumbnails::preview_bytes`]
+    /// actually turns it) and a real `p2048v5` old-preview directory that
+    /// [`crate::thumbnails::cleanup_stale_caches`] actually cleans up. An injected
+    /// [`FileProbe`] (as `write_photo_regions_probed` took before this fix) would pass
+    /// unchanged on the pre-#245 parent commit — it never touches anything #245 changed.
     #[test]
     fn a_regenerated_preview_writes_what_the_upscaled_one_did() {
+        let _guard = crate::thumbnails::tests::test_lock();
+        let cache_tmp = crate::thumbnails::tests::TestTmpDir::new("faces-regions-regenerated-cache");
+        let cache = cache_tmp.path().join("cache");
+        std::env::set_var("XDG_CACHE_HOME", &cache);
+
         let dir = crate::test_support::TestTmpDir::new("faces-regions-regenerated");
-        let photo = dir.join("IMG_0245.JPG");
-        std::fs::write(&photo, b"jpeg").unwrap();
+        let photo = crate::thumbnails::tests::write_test_jpeg(&dir, "IMG_0245.JPG", 1200, 800);
+        if !set_jpeg_orientation(&photo, 6) {
+            println!("SKIPPED: a_regenerated_preview_writes_what_the_upscaled_one_did — exiv2 is not installed");
+            return;
+        }
+
         let conn = mem_conn();
         conn.execute("INSERT INTO photos (id, width, height, exif_orientation) VALUES (1, 1200, 800, 6)", []).unwrap();
         conn.execute("INSERT INTO tags (id, name, full_path) VALUES (10, 'Alice', 'People/Alice')", []).unwrap();
         confirm(&conn, 1, 10, "[0.1,0.2,0.3,0.4]", "drawn", "confirmed");
-        let preview = |size| move |_: &std::path::Path| FileProbe { container: None, preview_size: Some(size) };
         let sidecar = crate::xmp::sidecar_path(&photo);
-        let mut written = Vec::new();
-        for size in [(1365, 2048), (800, 1200)] {
+
+        let write_and_capture = |label: &str| -> String {
             let _ = std::fs::remove_file(&sidecar);
-            write_photo_regions_probed(&conn, 1, |_| Ok(Some(photo.clone())), preview(size))
-                .unwrap_or_else(|e| panic!("{size:?}: {e:?}"));
+            write_photo_regions(&conn, 1, |_| Ok(Some(photo.clone()))).unwrap_or_else(|e| panic!("{label}: {e}"));
             let stored = crate::xmp::read_face_regions(&photo);
-            assert!(near(stored[0].bbox, (0.2, 0.6, 0.4, 0.3)), "{size:?}: {:?}", stored[0].bbox);
+            assert!(near(stored[0].bbox, (0.2, 0.6, 0.4, 0.3)), "{label}: {:?}", stored[0].bbox);
             let mut xml = std::fs::read_to_string(&sidecar).unwrap();
             // The write stamps its time; everything else must match.
             if let (Some(start), Some(end)) = (xml.find("<chairphoto:LastWrite>"), xml.find("</chairphoto:LastWrite>")) {
                 xml.replace_range(start..end, "");
             }
-            written.push(xml);
-        }
-        assert_eq!(written[0], written[1]);
+            xml
+        };
 
-        // A record in the display frame is refused under either preview.
+        // Pre-#245: an old build's upscaled preview, before the real one is ever generated.
+        crate::thumbnails::tests::plant_old_preview_tier(&cache, &photo, 1365, 2048);
+        assert_eq!(crate::thumbnails::cached_preview_size(&photo), Some((1365, 2048)), "served from the old directory");
+        let from_old_dir = write_and_capture("old directory");
+
+        // #245's cleanup: the old directory is gone, the preview's size kept in the sizes file.
+        crate::thumbnails::cleanup_stale_caches();
+        assert_eq!(crate::thumbnails::cached_preview_size(&photo), Some((1365, 2048)), "served from the sizes file");
+        let from_sizes_file = write_and_capture("sizes file");
+        assert_eq!(from_old_dir, from_sizes_file, "the sizes file writes the same sidecar as the old directory");
+
+        // A record in the display frame is refused, still served from the sizes file.
         conn.execute("UPDATE photos SET width = 800, height = 1200 WHERE id = 1", []).unwrap();
         let _ = std::fs::remove_file(&sidecar);
-        for size in [(1365, 2048), (800, 1200)] {
-            let err = write_photo_regions_probed(&conn, 1, |_| Ok(Some(photo.clone())), preview(size)).expect_err("refused");
-            assert!(matches!(err, RegionWriteError::Refused(_)), "{size:?}: {err:?}");
-            assert!(!sidecar.exists(), "{size:?}");
-        }
+        let err = write_photo_regions(&conn, 1, |_| Ok(Some(photo.clone()))).expect_err("display frame, sizes file");
+        assert!(matches!(err, RegionWriteError::Refused(_)), "{err:?}");
+        assert!(!sidecar.exists());
+        conn.execute("UPDATE photos SET width = 1200, height = 800 WHERE id = 1", []).unwrap();
+
+        // #245's regeneration: the real preview, at its own native size, actually turned —
+        // no more upscale.
+        let preview = image::load_from_memory(&crate::thumbnails::preview_bytes(&photo).unwrap()).unwrap();
+        assert_eq!((preview.width(), preview.height()), (800, 1200), "regenerated at its native, turned size");
+        assert_eq!(crate::thumbnails::cached_preview_size(&photo), Some((800, 1200)), "served from the real preview");
+        let from_regenerated = write_and_capture("regenerated");
+        assert_eq!(from_old_dir, from_regenerated, "the regenerated preview writes the same sidecar as the old one");
+
+        // A record in the display frame is refused, now served from the real preview.
+        conn.execute("UPDATE photos SET width = 800, height = 1200 WHERE id = 1", []).unwrap();
+        let _ = std::fs::remove_file(&sidecar);
+        let err = write_photo_regions(&conn, 1, |_| Ok(Some(photo.clone()))).expect_err("display frame, regenerated");
+        assert!(matches!(err, RegionWriteError::Refused(_)), "{err:?}");
+        assert!(!sidecar.exists());
     }
 
     /// The probe folds a HEIF's turn in and carries the preview's size; a file that is not a

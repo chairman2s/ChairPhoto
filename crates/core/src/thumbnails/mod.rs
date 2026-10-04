@@ -219,7 +219,12 @@ pub fn cached_preview_size(path: &Path) -> Option<(u32, u32)> {
     }
     let name = cache_path.file_name()?.to_str()?;
     let root = cache_dir().join("chairphoto");
-    regular_file_size(&root.join(STALE_PREVIEW_DIR).join(name))
+    let old_dir = root.join(STALE_PREVIEW_DIR);
+    // Same check as `cleanup_stale_caches`: a symlinked old directory is never followed,
+    // here either — read its own real directory only, never through a link (review Nit-1).
+    is_own_dir(&old_dir)
+        .then(|| regular_file_size(&old_dir.join(name)))
+        .flatten()
         .or_else(|| stale_preview_sizes(&root)?.get(name).copied())
 }
 
@@ -828,6 +833,7 @@ fn is_cache_file_name(name: &str) -> bool {
 /// sizes did not land.
 fn keep_stale_preview_sizes(root: &Path, previews: &Path) -> std::io::Result<()> {
     use std::io::Write;
+    sweep_stale_tmp_sizes_files(root);
     let mut sizes = read_stale_preview_sizes(&root.join(STALE_PREVIEW_SIZES));
     for entry in std::fs::read_dir(previews)? {
         let entry = entry?;
@@ -840,27 +846,77 @@ fn keep_stale_preview_sizes(root: &Path, previews: &Path) -> std::io::Result<()>
     }
     let mut lines: Vec<String> = sizes.iter().map(|(name, (w, h))| format!("{name} {w} {h}\n")).collect();
     lines.sort();
-    // A fresh temporary file: whatever is at its name is removed first (a symlink itself, never
-    // its target), and `create_new` refuses anything that appears there meanwhile.
-    let tmp = root.join(format!("{STALE_PREVIEW_SIZES}.tmp"));
-    match std::fs::symlink_metadata(&tmp) {
-        Ok(meta) if meta.file_type().is_dir() => return Err(std::io::ErrorKind::AlreadyExists.into()),
-        Ok(_) => std::fs::remove_file(&tmp)?,
-        Err(_) => {}
-    }
+    // A name unique to this attempt — this process's id plus a per-process nonce — so two
+    // processes sharing one cache dir (`single_instance` is keyed per app *data* dir, not
+    // cache dir, so two XDG_DATA_HOMEs with one default cache can run this at once, #245
+    // review LOW-2) never share a tmp name and so can never interleave through it:
+    // `create_new` claims a name nothing else has, and only this attempt writes to or renames
+    // it. Another process's start-up sweep (`sweep_stale_tmp_sizes_files`) can unlink it
+    // mid-write; then this rename fails, this attempt returns `Err`, and `p2048v5` is kept
+    // for the next start — fail-safe, never a partial sizes file.
+    static NONCE: AtomicU64 = AtomicU64::new(0);
+    let nonce = NONCE.fetch_add(1, Ordering::Relaxed);
+    let tmp = root.join(format!("{STALE_PREVIEW_SIZES}.{}.{nonce}.tmp", std::process::id()));
+    // Only a name this attempt created is ever removed: a `create_new` that fails left
+    // whatever holds the name alone.
     let mut file = std::fs::OpenOptions::new().write(true).create_new(true).open(&tmp)?;
-    file.write_all(lines.concat().as_bytes())?;
-    file.sync_all()?;
+    let write = (|| -> std::io::Result<()> {
+        file.write_all(lines.concat().as_bytes())?;
+        file.sync_all()?;
+        std::fs::rename(&tmp, root.join(STALE_PREVIEW_SIZES))
+    })();
     drop(file);
-    std::fs::rename(&tmp, root.join(STALE_PREVIEW_SIZES))
+    if write.is_err() {
+        // Our own attempt's name: remove what we created rather than leave it for the next
+        // sweep, best-effort (a failure here changes nothing — it is still only ever read
+        // back as a `.tmp`-suffixed name no code treats as [`STALE_PREVIEW_SIZES`]).
+        let _ = std::fs::remove_file(&tmp);
+    }
+    write
 }
 
-/// Parse [`STALE_PREVIEW_SIZES`]. Lines that are not `<cache file name> <w> <h>` are skipped;
-/// a missing or unreadable file, or one that is not a regular file, is empty.
+/// Best-effort removal of a previous attempt's leftover temporary sizes file under `root`:
+/// the fixed name a pre-LOW-2 build used, or one of today's unique `<pid>.<nonce>` ones,
+/// left behind by a process that crashed or was killed before its own rename landed.
+/// Harmless either way — nothing ever reads a `.tmp`-suffixed name back as
+/// [`STALE_PREVIEW_SIZES`] — this only keeps them from accumulating. It matches any
+/// `<STALE_PREVIEW_SIZES>.*.tmp` name, not only the `<pid>.<nonce>` shape: it only ever
+/// looks inside ChairPhoto's own cache directory, where nothing else writes such names. Never a directory: a
+/// name it cannot remove (one planted there instead) is left alone, not traversed into or
+/// removed recursively. Never a symlink's target: `remove_file` unlinks the name itself,
+/// whatever it points to, never the pointed-to file's content.
+fn sweep_stale_tmp_sizes_files(root: &Path) {
+    let Ok(entries) = std::fs::read_dir(root) else { return };
+    let prefix = format!("{STALE_PREVIEW_SIZES}.");
+    for entry in entries.flatten() {
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else { continue };
+        if !(name.starts_with(&prefix) && name.ends_with(".tmp")) {
+            continue;
+        }
+        if matches!(std::fs::symlink_metadata(entry.path()), Ok(meta) if meta.file_type().is_dir()) {
+            continue;
+        }
+        let _ = std::fs::remove_file(entry.path());
+    }
+}
+
+/// Parse [`STALE_PREVIEW_SIZES`]. Lines that are not `<cache file name> <w> <h>` are skipped.
+/// The write is tmp + fsync + rename, so a complete file always ends in `\n`; one that
+/// doesn't was truncated mid-write (external damage — disk full, a killed process without
+/// our own tmp+rename, a copy cut short) and its last line may be only part of a write, so
+/// that line is dropped rather than parsed — fail safe to no size (the cross-check is
+/// skipped for that photo) rather than a wrong one. A missing or unreadable file, or one
+/// that is not a regular file, is empty.
 fn read_stale_preview_sizes(file: &Path) -> HashMap<String, (u32, u32)> {
     let regular = matches!(std::fs::symlink_metadata(file), Ok(meta) if meta.file_type().is_file());
     let text = if regular { std::fs::read_to_string(file).unwrap_or_default() } else { String::new() };
-    text.lines()
+    let complete_lines = if text.is_empty() || text.ends_with('\n') {
+        text.as_str()
+    } else {
+        text.rsplit_once('\n').map_or("", |(head, _)| head)
+    };
+    complete_lines
+        .lines()
         .filter_map(|line| {
             let mut parts = line.split_ascii_whitespace();
             let name = parts.next().filter(|n| is_cache_file_name(n))?;
@@ -1017,6 +1073,18 @@ pub(crate) mod tests {
         std::fs::write(dir.join(name), bytes.into_inner()).unwrap();
     }
 
+    /// [`plant_old_tier`] at `img`'s own preview cache name, under [`STALE_PREVIEW_DIR`] in
+    /// `cache` (a `XDG_CACHE_HOME`) — for tests outside this module that exercise the real
+    /// [`cached_preview_size`] path against a pre-#245 upscaled preview (review Nit-2).
+    /// Its only caller today is behind `faces` (`plugins::faces::regions`), which `plugins`
+    /// itself compiles out without that feature (`#[cfg(feature = "faces")] pub mod faces;`),
+    /// so this is gated the same way rather than warning as dead code without it.
+    #[cfg(feature = "faces")]
+    pub(crate) fn plant_old_preview_tier(cache: &Path, img: &Path, w: u32, h: u32) {
+        let name = cache_path_for(img, PREVIEW).unwrap().file_name().unwrap().to_owned();
+        plant_old_tier(&cache.join("chairphoto").join(STALE_PREVIEW_DIR), &name, w, h);
+    }
+
     /// The owner's decision on #245: a small original whose upscaled thumbnail and preview an
     /// old build cached gets them regenerated at its own size — the old files are never served.
     #[test]
@@ -1084,6 +1152,102 @@ pub(crate) mod tests {
         cleanup_stale_caches();
         assert_eq!(cached_preview_size(&a), Some((2048, 1536)));
         assert_eq!(cached_preview_size(&b), Some((1536, 2048)));
+    }
+
+    // --- review fix245b: truncated sizes file, racing writers, symlinked old dir ---------
+
+    /// LOW-1: a truncated last line — written by something other than
+    /// [`keep_stale_preview_sizes`]'s own tmp+fsync+rename, which always ends the file in
+    /// `\n` — parses as no entry for that line, not a wrong one. Dropping the whole line
+    /// (not just letting its own parse fail) is what tells apart "the name is cut short
+    /// too" (still three whitespace-separated tokens; the digits after a truncated name
+    /// would mis-parse as a plausible but wrong size) from a line that is simply absent.
+    #[test]
+    fn read_stale_preview_sizes_drops_an_unterminated_last_line() {
+        let dir = TestTmpDir::new("stale-sizes-truncated");
+        let file = dir.path().join("p2048v5.sizes");
+
+        // A complete file (trailing '\n'): every line is trusted.
+        std::fs::write(&file, b"0123456789abcdef.jpg 2048 1365\n").unwrap();
+        assert_eq!(
+            read_stale_preview_sizes(&file),
+            HashMap::from([("0123456789abcdef.jpg".to_string(), (2048, 1365))]),
+        );
+
+        // The review's own example: one line, truncated, no trailing newline at all.
+        std::fs::write(&file, b"0123456789abcdef.jpg 2048 13").unwrap();
+        assert_eq!(read_stale_preview_sizes(&file), HashMap::new(), "an unterminated line is never trusted");
+
+        // A complete line followed by a truncated one: the undamaged line still lands,
+        // only the damaged tail is dropped.
+        std::fs::write(&file, b"0123456789abcdef.jpg 2048 1365\nfedcba9876543210.jpg 2048 13").unwrap();
+        assert_eq!(
+            read_stale_preview_sizes(&file),
+            HashMap::from([("0123456789abcdef.jpg".to_string(), (2048, 1365))]),
+            "only the undamaged line is kept"
+        );
+    }
+
+    /// LOW-2: a leftover temporary sizes file — the fixed name a pre-fix build used, or one
+    /// of this fix's own `<pid>.<nonce>` ones — left behind by a process that crashed or was
+    /// killed before its rename landed is swept on the next cleanup. Harmless even without
+    /// the sweep (nothing ever reads a `.tmp`-suffixed name back as the real sizes file),
+    /// but a directory planted at such a name is left alone rather than removed, and a
+    /// normal cleanup leaves no `.tmp` file behind at all.
+    #[test]
+    fn stray_tmp_sizes_files_are_swept_or_left_harmless() {
+        let _guard = test_lock();
+        let tmp_dir = TestTmpDir::new("stale-sizes-stray-tmp");
+        let cache = tmp_dir.path().join("cache");
+        std::env::set_var("XDG_CACHE_HOME", &cache);
+        let img = write_test_jpeg(tmp_dir.path(), "stray.jpg", 64, 48);
+        let root = cache.join("chairphoto");
+        let old_dir = root.join(STALE_PREVIEW_DIR);
+        let name = cache_path_for(&img, PREVIEW).unwrap().file_name().unwrap().to_owned();
+        plant_old_tier(&old_dir, &name, 2048, 1536);
+
+        std::fs::create_dir_all(&root).unwrap();
+        // A pre-fix build's fixed name, and a stray unique one from an earlier crashed attempt.
+        std::fs::write(root.join(format!("{STALE_PREVIEW_SIZES}.tmp")), b"leftover").unwrap();
+        std::fs::write(root.join(format!("{STALE_PREVIEW_SIZES}.4242.7.tmp")), b"leftover too").unwrap();
+        // A directory squatting a plausible tmp name: left alone, not traversed into.
+        let dir_at_tmp_name = root.join(format!("{STALE_PREVIEW_SIZES}.9999.0.tmp"));
+        std::fs::create_dir_all(&dir_at_tmp_name).unwrap();
+        std::fs::write(dir_at_tmp_name.join("keep.txt"), b"not ours to remove").unwrap();
+
+        cleanup_stale_caches();
+
+        assert!(!root.join(format!("{STALE_PREVIEW_SIZES}.tmp")).exists(), "the pre-fix fixed name is swept");
+        assert!(!root.join(format!("{STALE_PREVIEW_SIZES}.4242.7.tmp")).exists(), "a stray unique temp is swept");
+        assert!(dir_at_tmp_name.join("keep.txt").exists(), "a directory at a tmp-shaped name is left alone");
+        assert_eq!(cached_preview_size(&img), Some((2048, 1536)), "the real write still landed");
+        let any_tmp_file_left = std::fs::read_dir(&root).unwrap().flatten().any(|e| {
+            e.file_name().to_str().is_some_and(|n| n.ends_with(".tmp"))
+                && !matches!(std::fs::symlink_metadata(e.path()), Ok(meta) if meta.file_type().is_dir())
+        });
+        assert!(!any_tmp_file_left, "no .tmp regular file remains after a successful cleanup");
+    }
+
+    /// Nit-1: [`cached_preview_size`]'s fallback refuses a symlinked old preview directory
+    /// just as [`cleanup_stale_caches`] does — never following it to read a header.
+    #[test]
+    #[cfg(unix)]
+    fn cached_preview_size_never_follows_a_symlinked_old_directory() {
+        let _guard = test_lock();
+        let tmp_dir = TestTmpDir::new("stale-preview-symlink-read");
+        let cache = tmp_dir.path().join("cache");
+        std::env::set_var("XDG_CACHE_HOME", &cache);
+        let img = write_test_jpeg(tmp_dir.path(), "linked.jpg", 1200, 800);
+
+        let elsewhere = tmp_dir.path().join("elsewhere");
+        let name = cache_path_for(&img, PREVIEW).unwrap().file_name().unwrap().to_owned();
+        plant_old_tier(&elsewhere, &name, 2048, 1365);
+
+        let root = cache.join("chairphoto");
+        std::fs::create_dir_all(&root).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, root.join(STALE_PREVIEW_DIR)).unwrap();
+
+        assert_eq!(cached_preview_size(&img), None, "a symlinked old directory is never read");
     }
 
     // --- decode-once chain + analyzer hook -----------------------------------

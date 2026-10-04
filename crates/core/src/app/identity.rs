@@ -260,6 +260,355 @@ fn resolve_in(
         .map_err(|e| e.to_string())
 }
 
+// --- identity repair ownership (#34): switch, cancel, supersede, no catalog ---------------
+// Moved from the Tauri shell's `commands/storage.rs` when it was removed (#165); they always
+// drove this module's claim and the catalog's repair pass directly.
+#[cfg(test)]
+mod identity_repair_ownership_tests {
+    use super::*;
+    use crate::app::{detach_catalog_and_trip_jobs, publish_catalog_and_reset_jobs};
+    use crate::catalog::SidecarIdentity;
+    use std::path::Path;
+    use std::sync::atomic::Ordering;
+    use std::sync::Mutex;
+
+    /// A catalog with `photos` files, each already owing its sidecar identity — the queue a
+    /// repair pass exists to work through. Every file is reachable and its sidecar carries no
+    /// identifier, so a pass that reaches a row BINDS it, which is what makes "did the
+    /// aborted worker keep going?" observable on disk.
+    fn temp_catalog_with_debt(
+        tag: &str,
+        photos: usize,
+    ) -> (Catalog, crate::test_support::TestSubPath, PathBuf) {
+        let dir = crate::test_support::TestTmpDir::new(&format!("identity-own-{tag}"));
+        let root = dir.join("photos");
+        std::fs::create_dir_all(&root).unwrap();
+        let db = dir.join("catalog.chairphoto");
+        let catalog = Catalog::open(&db, &root).unwrap();
+        for i in 0..photos {
+            let p = root.join(format!("p{i}.arw"));
+            std::fs::write(&p, b"raw").unwrap();
+            let up = catalog.upsert_photo(&p, None, 1, 3).unwrap();
+            catalog
+                .record_sidecar_identity(up.id, &p, &SidecarIdentity::Unreachable)
+                .unwrap();
+        }
+        (catalog, dir.into_subpath("catalog.chairphoto"), root)
+    }
+
+    fn state_with(catalog: Catalog) -> AppState {
+        let state = AppState::default();
+        *state.catalog.lock().unwrap() = Some(catalog);
+        state
+    }
+
+    /// Un-dismissed queue rows in the catalog at `db`, read on a connection of this test's
+    /// own — so it reports what is durably in the file, not what some handle believes.
+    fn queued_rows(db: &Path) -> i64 {
+        let conn = rusqlite::Connection::open(db).unwrap();
+        conn.query_row(
+            "SELECT count(*) FROM pending_sidecar_identity WHERE dismissed_at = 0",
+            [],
+            |r| r.get::<_, i64>(0),
+        )
+        .unwrap_or(0)
+    }
+
+    /// **Forced race.** A catalog switch stops a running repair pass at its next row: no
+    /// further sidecar written, no further queue row cleared in the catalog the user left,
+    /// and nothing at all in the catalog they switched to.
+    ///
+    /// This is the AGENTS.md invariant the pass was the last command to violate — before
+    /// #34 it held its own secondary connection to the old database and nothing could trip
+    /// it, so a pass started against a 74k-row queue kept writing sidecars for a catalog the
+    /// app had already closed.
+    ///
+    /// The interleaving is forced, not timed: the switch runs inside the pass's own progress
+    /// callback, so it lands between copy 1 and copy 2 every time.
+    #[test]
+    fn a_catalog_switch_stops_a_running_repair_pass() {
+        let (cat_a, db_a, root_a) = temp_catalog_with_debt("switch-a", 4);
+        let (cat_b, db_b, _root_b) = temp_catalog_with_debt("switch-b", 0);
+        let state = state_with(cat_a);
+
+        // Start the pass exactly the way `claim_identity_repair` does.
+        let JobClaim { db_path, root, abort, job, slot } =
+            begin_identity_repair_job(&state).unwrap();
+        assert_eq!(db_path, db_a.to_path_buf());
+        assert_eq!(root, root_a);
+        assert_eq!(
+            state.jobs.identity.status().unwrap().map(|s| s.job),
+            Some(job),
+            "the start must claim the status slot before the command returns"
+        );
+
+        let sec = Catalog::open_secondary(&db_path, &root).unwrap();
+        let switch_to = Mutex::new(Some(cat_b));
+        let mut progress: Vec<usize> = Vec::new();
+        let summary = sec
+            .run_identity_repair(&abort, |s| {
+                progress.push(s.done());
+                slot.publish(|job| IdentityRepairJobStatus {
+                    job,
+                    done: s.done(),
+                    total: s.total,
+                });
+                // The user switches catalogs while this worker is still running.
+                if let Some(cat) = switch_to.lock().unwrap().take() {
+                    detach_catalog_and_trip_jobs(&state).unwrap();
+                    publish_catalog_and_reset_jobs(&state, cat).unwrap();
+                }
+            })
+            .unwrap();
+
+        assert!(summary.aborted, "the switch must abort the running pass");
+        assert_eq!(summary.total, 4, "all four copies were queued");
+        assert_eq!(
+            (summary.bound, summary.done()),
+            (1, 1),
+            "only the copy already recorded when the switch happened: {summary:?}"
+        );
+        assert_eq!(progress, vec![1], "no progress after the switch");
+        assert_eq!(
+            queued_rows(&db_a),
+            3,
+            "the aborted worker must clear no further rows in the catalog it was repairing"
+        );
+        assert!(
+            crate::xmp::read_identifier(&root_a.join("p0.arw")).is_some(),
+            "sanity: the pass really did bind the copy it reached"
+        );
+        for i in 1..4 {
+            assert!(
+                crate::xmp::read_identifier(&root_a.join(format!("p{i}.arw"))).is_none(),
+                "the aborted worker wrote a sidecar for copy {i} after the switch"
+            );
+        }
+        assert_eq!(queued_rows(&db_b), 0, "nothing may land in the catalog switched to");
+
+        // The switch made the pass unreachable as an OWNER, not just abortable: its slot was
+        // cleared, and the straggler it published above could not put it back.
+        assert!(
+            state.jobs.identity.status().unwrap().is_none(),
+            "phase one must clear the status slot, or the debt panel re-adopts a dead pass"
+        );
+        assert!(!slot.owns());
+
+        // The old flag stays tripped and the new catalog's generation is a different,
+        // un-tripped Arc, so no Cancel or later switch can revive the old worker.
+        assert!(abort.load(Ordering::Relaxed), "the old flag must stay tripped");
+        let installed = state.jobs.identity.installed().unwrap();
+        assert!(
+            !Arc::ptr_eq(&installed, &abort),
+            "the switch must install a fresh generation, not reuse the aborted one"
+        );
+        assert!(!installed.load(Ordering::Relaxed));
+    }
+
+    /// **Forced race.** `identity_repair_cancel` stops the pass at its next row — the point
+    /// of the whole exercise for a pass against an unmounted NAS, where every remaining row
+    /// costs a mount timeout.
+    ///
+    /// Cancel runs inside the pass's own progress callback, so it lands between copy 1 and
+    /// copy 2 every time rather than whenever a test thread happens to get scheduled.
+    #[test]
+    fn a_cancel_stops_the_running_repair_pass_at_its_next_copy() {
+        let (cat, db, root) = temp_catalog_with_debt("cancel", 5);
+        let state = state_with(cat);
+        let JobClaim { db_path, root: claim_root, abort, job: _, slot: _ } =
+            begin_identity_repair_job(&state).unwrap();
+
+        let sec = Catalog::open_secondary(&db_path, &claim_root).unwrap();
+        let cancelled = std::cell::Cell::new(false);
+        let summary = sec
+            .run_identity_repair(&abort, |_| {
+                if !cancelled.get() {
+                    cancelled.set(true);
+                    // Exactly what `cancel_identity_repair` does.
+                    state.jobs.identity.cancel().unwrap();
+                }
+            })
+            .unwrap();
+
+        assert!(cancelled.get(), "the fixture never got to cancel");
+        assert!(summary.aborted, "a cancelled pass must say it was cancelled: {summary:?}");
+        assert_eq!(summary.done(), 1, "the pass ran on past the cancel: {summary:?}");
+        assert_eq!(queued_rows(&db), 4, "four copies must be left for the next pass");
+        assert!(
+            crate::xmp::read_identifier(&root.join("p4.arw")).is_none(),
+            "a cancelled pass must not keep writing sidecars"
+        );
+    }
+
+    /// A second pass supersedes the first rather than running both at the queue: the first
+    /// is tripped, loses the status slot, and its handle knows it.
+    #[test]
+    fn a_second_repair_pass_trips_the_first_and_takes_the_slot() {
+        let (cat, _db, _root) = temp_catalog_with_debt("supersede", 2);
+        let state = state_with(cat);
+
+        let first = begin_identity_repair_job(&state).unwrap();
+        let second = begin_identity_repair_job(&state).unwrap();
+
+        assert!(first.abort.load(Ordering::Relaxed), "the superseded pass must be tripped");
+        assert!(!second.abort.load(Ordering::Relaxed));
+        assert_ne!(first.job, second.job, "the two passes must be told apart by id");
+        assert!(!first.slot.owns());
+        assert!(second.slot.owns());
+        assert_eq!(state.jobs.identity.status().unwrap().map(|s| s.job), Some(second.job));
+
+        // And the superseded pass's straggler cannot overwrite the running one's slot.
+        first.slot.publish(|job| IdentityRepairJobStatus { job, done: 99, total: 99 });
+        assert_eq!(
+            state.jobs.identity.status().unwrap().map(|s| (s.job, s.done)),
+            Some((second.job, 0)),
+            "a superseded pass republished over the running one"
+        );
+    }
+
+    /// A repair pass started with no catalog open must touch nothing — no generation
+    /// installed, no job id consumed, no slot claimed. This is the state a start blocked
+    /// between the two switch phases observes.
+    #[test]
+    fn a_repair_start_with_no_catalog_open_touches_nothing() {
+        let state = AppState::default();
+        let before = state.jobs.identity.installed().unwrap();
+
+        let err = begin_identity_repair_job(&state).unwrap_err();
+
+        assert_eq!(err, "No catalog is open");
+        assert!(Arc::ptr_eq(&before, &state.jobs.identity.installed().unwrap()));
+        assert_eq!(state.jobs.identity.abort().job_ids_issued(), 0);
+        assert!(state.jobs.identity.status().unwrap().is_none());
+    }
+}
+
+// --- identity debt bound to the catalog it was read from (#164) ---------------------------
+// Moved from the Tauri shell's `commands/storage.rs` when it was removed (#165). There the
+// shell's commands bound these same core calls to the identity the panel passed; here the
+// test drives the core calls directly. The open catalog is swapped for a byte copy
+// (`VACUUM INTO`: the same photo ids, volume ids, relative paths, UUIDs and owed
+// generations), as a switch to a copied catalog publishes it before `catalog:switched`
+// reaches the UI. Every read and action carrying the old identity fails closed and leaves
+// the copy's debt as it was.
+#[cfg(test)]
+mod catalog_bound_debt_tests {
+    use super::*;
+    use crate::app::iptc_owed::{dismiss_owed_iptc_as, list_owed_iptc, retry_owed_iptc_as};
+    use crate::app::{with_catalog_as, CatalogIdentity, CATALOG_CHANGED};
+    use crate::catalog::{IdentityConflictAction, IptcFields, SidecarIdentity};
+
+    struct Rig {
+        state: AppState,
+        /// The identity the panel captured, from catalog A.
+        a: CatalogIdentity,
+        photo_id: i64,
+        uuid: String,
+        generation: i64,
+        volume_id: i64,
+        relative_path: String,
+        _dir: crate::test_support::TestTmpDir,
+    }
+
+    /// Catalog A with one photo whose copy is in conflict and whose IPTC is owed; then A is
+    /// replaced, as the open catalog, by its byte copy B.
+    fn swapped_for_a_copy(tag: &str) -> Rig {
+        let dir = crate::test_support::TestTmpDir::new(&format!("bound-debt-{tag}"));
+        let root = dir.join("photos");
+        let file = root.join("2026/p0.ARW");
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, b"raw").unwrap();
+        let a = Catalog::open(&dir.join("a.chairphoto"), &root).unwrap();
+        let photo_id = a.upsert_photo(&file, None, 0, 1).unwrap().id;
+        a.record_sidecar_identity(photo_id, &file, &SidecarIdentity::Conflict("another photo's uuid".into()))
+            .unwrap();
+        a.set_iptc(photo_id, &IptcFields { title: "A's".into(), ..Default::default() }).unwrap();
+        let owed = a.list_owed_iptc_page(10, 0).unwrap().remove(0);
+        let copy = a.list_pending_identity_page(10, 0, false).unwrap().remove(0);
+        let b_path = dir.join("b.chairphoto");
+        a.conn().execute("VACUUM INTO ?1", [b_path.to_string_lossy()]).unwrap();
+        let b = Catalog::open(&b_path, &root).unwrap();
+        assert_eq!(b.list_owed_iptc_page(10, 0).unwrap(), vec![owed.clone()], "B is a copy of A");
+
+        let state = AppState::default();
+        *state.catalog.lock().unwrap() = Some(a);
+        // What a front end captures when it opens, serialized and back: an identity is an
+        // opaque string wherever it is stored or sent.
+        let wire = serde_json::to_value(crate::app::catalog_identity(&state).unwrap()).unwrap();
+        assert!(wire.is_string(), "an identity serializes as a string: {wire}");
+        let a_identity: CatalogIdentity = serde_json::from_value(wire).unwrap();
+        // The switch publishes B before `catalog:switched` reaches the UI.
+        *state.catalog.lock().unwrap() = Some(b);
+        Rig {
+            state,
+            a: a_identity,
+            photo_id,
+            uuid: owed.uuid,
+            generation: owed.generation,
+            volume_id: copy.volume_id,
+            relative_path: copy.relative_path,
+            _dir: dir,
+        }
+    }
+
+    fn b_debt(rig: &Rig) -> (usize, i64) {
+        let guard = rig.state.catalog.lock().unwrap();
+        let c = guard.as_ref().unwrap();
+        (c.list_owed_iptc_page(10, 0).unwrap().len(), c.summarize_pending_identity().unwrap().dismissed)
+    }
+
+    #[test]
+    fn reads_bound_to_the_old_catalog_fail_closed() {
+        let rig = swapped_for_a_copy("reads");
+        let a = rig.a;
+        let pending = with_catalog_as(&rig.state, a, |c| c.list_pending_identity_page(10, 0, false));
+        assert_eq!(pending.unwrap_err(), CATALOG_CHANGED);
+        assert_eq!(with_catalog_as(&rig.state, a, |c| c.summarize_pending_identity()).unwrap_err(), CATALOG_CHANGED);
+        assert_eq!(with_catalog_as(&rig.state, a, |c| c.list_owed_iptc_page(10, 0)).unwrap_err(), CATALOG_CHANGED);
+        // Unbound (the title bar's count) and bound to the open catalog, they read B.
+        let (b, owed) = list_owed_iptc(&rig.state, 10, 0).unwrap();
+        assert_ne!(b, a, "the copy is another catalog");
+        assert_eq!(owed.len(), 1);
+        assert_eq!(with_catalog_as(&rig.state, b, |c| c.summarize_pending_identity()).unwrap().iptc_owed, 1);
+        assert_eq!(with_catalog_as(&rig.state, b, |c| c.list_pending_identity_page(10, 0, false)).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn actions_bound_to_the_old_catalog_never_touch_the_copy() {
+        let rig = swapped_for_a_copy("actions");
+        let a = rig.a;
+        let dismiss = dismiss_owed_iptc_as(&rig.state, Some(a), rig.photo_id, &rig.uuid, rig.generation);
+        assert_eq!(dismiss.unwrap_err(), CATALOG_CHANGED);
+        let retry = retry_owed_iptc_as(&rig.state, Some(a), rig.photo_id, &rig.uuid);
+        assert_eq!(retry.unwrap_err(), CATALOG_CHANGED);
+        let resolve = resolve_identity_conflict_as(
+            &rig.state,
+            a,
+            rig.photo_id,
+            rig.volume_id,
+            &rig.relative_path,
+            IdentityConflictAction::Dismiss,
+        );
+        assert_eq!(resolve.unwrap_err(), CATALOG_CHANGED);
+        assert_eq!(b_debt(&rig), (1, 0), "the copy's owed IPTC and conflict are as they were");
+
+        // The control: bound to the open catalog, the same calls act.
+        let b = crate::app::catalog_identity(&rig.state).unwrap();
+        let resolve = resolve_identity_conflict_as(
+            &rig.state,
+            b,
+            rig.photo_id,
+            rig.volume_id,
+            &rig.relative_path,
+            IdentityConflictAction::Dismiss,
+        );
+        assert_eq!(resolve.unwrap().action, "dismiss");
+        let dismiss = dismiss_owed_iptc_as(&rig.state, Some(b), rig.photo_id, &rig.uuid, rig.generation);
+        assert_eq!(dismiss.unwrap(), crate::catalog::OwedDismissal::Dismissed);
+        assert_eq!(b_debt(&rig), (0, 1));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

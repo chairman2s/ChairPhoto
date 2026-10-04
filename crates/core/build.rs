@@ -3,7 +3,7 @@ fn main() {
     // git submodule) into the binary and generates FFI bindings from *that tree's* header, so
     // the struct ABI matches the compiled library by construction. Only when the feature is
     // on — keeps `--no-default-features` builds free of C++/libclang. The link directives
-    // below propagate to every binary that links this crate (the Tauri shell, the tests).
+    // below propagate to every binary that links this crate (the GPUI app, the tests).
     if std::env::var("CARGO_FEATURE_RAW").is_ok() {
         build_vendored_libraw();
     }

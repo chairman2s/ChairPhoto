@@ -119,15 +119,6 @@ pub fn render_still_needed(outcome: &Result<PostOutcome, String>) -> bool {
     }
 }
 
-/// The outcome's wire name (`posted`, `awaitingReview`, `needsLogin`).
-pub fn outcome_name(outcome: PostOutcome) -> &'static str {
-    match outcome {
-        PostOutcome::Posted => "posted",
-        PostOutcome::AwaitingReview => "awaitingReview",
-        PostOutcome::NeedsLogin => "needsLogin",
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

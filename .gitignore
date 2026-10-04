@@ -1,17 +1,17 @@
 # Logs
 logs
 *.log
-npm-debug.log*
-yarn-debug.log*
-yarn-error.log*
-pnpm-debug.log*
-lerna-debug.log*
 
+# Left behind in existing checkouts by the removed React/Vite front end (#165): still
+# ignored so `git add -A` there cannot sweep them in.
 node_modules
 dist
-# Cargo's build output for the workspace (crates/core + src-tauri)
+# The same for the removed Tauri shell's own build output and generated schemas.
+/src-tauri/target/
+/src-tauri/gen/
+
+# Cargo's build output for the workspace (crates/core, crates/model, crates/app)
 /target/
-dist-ssr
 *.local
 
 # Agent tooling and local workflow state

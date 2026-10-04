@@ -12,21 +12,20 @@
 //!
 //! Reports, per tier (thumb, preview):
 //! - `render_image` (resolve + cached JPEG decode + rotation) and the BGRA conversion — the
-//!   whole "decode → RenderImage" the pool worker does — against the Tauri path's
-//!   `render_bytes` + a decode of its bytes;
+//!   whole "decode → RenderImage" the pool worker does;
 //! - loupe navigation through a real `ImagePool<Loaded>`: from `submit_batch([N, N+1, N−1])`
 //!   to the current photo's `RenderImage` in hand;
 //! - the LRU under churn: decoded bytes held and process RSS while thousands of previews
 //!   stream through a small budget.
 //!
-//! The decode analyzers `app::boot` registers (sharpness, pHash) are not installed here;
+//! The decode analyzers `app::boot_with` registers (sharpness, pHash) are not installed here;
 //! they run only on a cache miss that decodes at preview size or larger.
 
 use chairphoto_app::image_store::{ImageKey, ImageLru, Loaded};
 use chairphoto_core::app::{runtime, with_catalog, AppState};
 use chairphoto_core::catalog::PhotoQuery;
 use chairphoto_core::image_pool::{self, ImageKind, ImagePool, JobKey};
-use chairphoto_core::media::{render_bytes, render_image};
+use chairphoto_core::media::render_image;
 use std::sync::mpsc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -79,7 +78,7 @@ fn main() {
     // --- decode → RenderImage, per tier -----------------------------------------------------
     for kind in [ImageKind::Thumb, ImageKind::Preview] {
         for pass in ["first pass", "second pass"] {
-            let (mut decode, mut convert, mut total, mut tauri) = (vec![], vec![], vec![], vec![]);
+            let (mut decode, mut convert, mut total) = (vec![], vec![], vec![]);
             let mut pixels = 0u64;
             for &id in &ids {
                 let t0 = Instant::now();
@@ -97,20 +96,11 @@ fn main() {
                 decode.push(t1 - t0);
                 convert.push(t2 - t1);
                 total.push(t2 - t0);
-
-                // The Tauri path, for comparison: the protocol's bytes, decoded as a webview would.
-                let t3 = Instant::now();
-                if let Ok(bytes) = render_bytes(&state, JobKey::photo(id, kind)) {
-                    let _ = image::load_from_memory(&bytes);
-                    tauri.push(t3.elapsed());
-                }
             }
             println!("{kind:?}, {pass} (avg {:.2} MP):", pixels as f64 / ids.len() as f64 / 1e6);
             summary("  render_image (resolve + JPEG decode)", decode);
             summary("  to_bgra", convert);
             summary("  decode → RenderImage", total);
-            // Runs after render_image, so on a first pass it finds the tier already cached.
-            summary("  Tauri path: render_bytes + decode (after)", tauri);
         }
     }
 

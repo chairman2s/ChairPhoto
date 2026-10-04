@@ -2,8 +2,8 @@
 //! on the main thread.
 //!
 //! [`GpuiSink`] is the [`EventSink`] the app installs with `AppState::set_events` before
-//! `app::boot`, so nothing the core starts can send into the void. `send` only pushes onto an
-//! unbounded channel — it never blocks a worker. [`spawn_router`] is the one foreground task
+//! `app::boot_with`, so nothing the core starts can send into the void. `send` only pushes onto
+//! an unbounded channel — it never blocks a worker. [`spawn_router`] is the one foreground task
 //! that drains the channel and hands each event to [`route`], which gives it to the entity
 //! that owns it:
 //!

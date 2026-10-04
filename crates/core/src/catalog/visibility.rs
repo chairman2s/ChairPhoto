@@ -46,13 +46,20 @@ mod tests {
         Path::new(env!("CARGO_MANIFEST_DIR")).join("src")
     }
 
-    /// Every source tree whose SQL this rule governs: this crate's, and the Tauri shell's,
-    /// whose commands still carry queries of their own (split out in #95). Asserted to
-    /// exist, so moving or deleting the shell narrows the rule on purpose, not silently.
+    /// Every source tree whose SQL this rule governs: this crate's, and the workspace's other
+    /// crates that link it — the GPUI app and the UI model — so a query written there is held
+    /// to the same rule. (The Tauri shell's commands were scanned too until it went in #165.)
+    /// Each is asserted to exist, so moving or deleting one narrows the rule on purpose, not
+    /// silently.
     fn scanned_dirs() -> Vec<PathBuf> {
-        let shell = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../src-tauri/src");
-        assert!(shell.is_dir(), "the Tauri shell's source is not at {}", shell.display());
-        vec![src_dir(), shell]
+        let crates = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+        let mut dirs = vec![src_dir()];
+        for sibling in ["app/src", "model/src"] {
+            let dir = crates.join(sibling);
+            assert!(dir.is_dir(), "the workspace crate's source is not at {}", dir.display());
+            dirs.push(dir);
+        }
+        dirs
     }
 
     fn rust_files() -> Vec<PathBuf> {

@@ -145,6 +145,290 @@ pub fn begin_index_job(
         .begin_as(&state.catalog, expected, |job| FacesJobStatus { job, done: 0, total: 0, stage: STAGE_INDEXING })
 }
 
+// --- face job ownership across a catalog switch or re-root (#22, #51) ---------------------
+// Moved from the Tauri shell's `commands/faces.rs` when it was removed (#165); they always
+// drove the core's claims and switch phases directly.
+//
+/// Catalog-switch ownership for both face job families, indexing and matching.
+///
+/// Each is a real background job, which means the catalog-switch protocol has to reach it: a
+/// job left running against a catalog the user has left would keep writing into it, and would
+/// keep owning a status slot the panel re-queries on mount.
+///
+/// These drive the two switch phases directly, as Smart Tagging's ownership tests do.
+#[cfg(test)]
+mod faces_job_ownership_tests {
+    use super::*;
+    use crate::app::faces as core_faces;
+    use crate::app::{detach_catalog_and_trip_jobs, publish_catalog_and_reset_jobs};
+    use std::sync::atomic::Ordering;
+    use std::sync::Arc;
+
+    fn temp_catalog(tag: &str) -> (Catalog, crate::test_support::TestSubPath) {
+        let dir = crate::test_support::TestTmpDir::new(&format!("faces-match-own-{tag}"));
+        let root = dir.join("photos");
+        std::fs::create_dir_all(&root).unwrap();
+        let db = dir.join("catalog.chairphoto");
+        let catalog = Catalog::open(&db, &root).unwrap();
+        (catalog, dir.into_subpath("catalog.chairphoto"))
+    }
+
+    fn state_with(catalog: Catalog) -> AppState {
+        let state = AppState::default();
+        *state.catalog.lock().unwrap() = Some(catalog);
+        state
+    }
+
+    /// Phase one trips the running match **and** clears its status slot. Tripping alone
+    /// would leave the old job reachable as the slot's owner, so `faces_match_status`
+    /// would keep reporting a run belonging to a catalog that is gone.
+    #[test]
+    fn a_catalog_switch_trips_and_unpublishes_a_running_match() {
+        let (cat_a, db_a) = temp_catalog("switch-a");
+        let (cat_b, _db_b) = temp_catalog("switch-b");
+        let state = state_with(cat_a);
+
+        let claim = core_faces::begin_match_job(&state, None).unwrap();
+        assert_eq!(claim.db_path, db_a.to_path_buf());
+        assert!(!claim.abort.load(Ordering::Relaxed));
+        assert_eq!(
+            state.jobs.faces_match.status().unwrap().map(|s| s.job),
+            Some(claim.job)
+        );
+        let abort = claim.abort.clone();
+
+        detach_catalog_and_trip_jobs(&state).unwrap();
+
+        assert!(abort.load(Ordering::Relaxed), "phase one must trip the running match");
+        assert!(
+            state.jobs.faces_match.status().unwrap().is_none(),
+            "phase one must clear the slot, or the panel re-adopts a dead job"
+        );
+
+        // Phase two installs a fresh, un-tripped generation without reviving the old one.
+        publish_catalog_and_reset_jobs(&state, cat_b).unwrap();
+        let current = state.jobs.faces_match.installed().unwrap();
+        assert!(!current.load(Ordering::Relaxed), "the new generation must start clean");
+        assert!(!Arc::ptr_eq(&current, &abort), "phase two must not reuse the tripped flag");
+        assert!(abort.load(Ordering::Relaxed), "the old worker's flag must stay tripped");
+    }
+
+    /// A start that lands between the two switch phases finds no catalog and must touch
+    /// nothing — no new generation, no slot, no consumed job id — so the switch's abort
+    /// signal cannot be stranded behind a fresh, live flag.
+    #[test]
+    fn a_match_start_between_switch_phases_touches_nothing() {
+        let (cat_a, _db_a) = temp_catalog("between-a");
+        let state = state_with(cat_a);
+
+        detach_catalog_and_trip_jobs(&state).unwrap();
+
+        let before = state.jobs.faces_match.installed().unwrap();
+        let seq_before = state.jobs.faces_match.abort().job_ids_issued();
+
+        let err = core_faces::begin_match_job(&state, None).unwrap_err();
+        assert_eq!(err, "No catalog is open");
+
+        let after = state.jobs.faces_match.installed().unwrap();
+        assert!(Arc::ptr_eq(&before, &after), "a start mid-switch must not install a generation");
+        assert_eq!(
+            state.jobs.faces_match.abort().job_ids_issued(),
+            seq_before,
+            "a rejected start must not consume a job id"
+        );
+        assert!(state.jobs.faces_match.status().unwrap().is_none());
+    }
+
+    /// Starting a second match trips the first: two matching runs on one catalog would
+    /// race each other's suggestion writes.
+    #[test]
+    fn a_second_match_start_trips_the_first() {
+        let (cat, _db) = temp_catalog("supersede");
+        let state = state_with(cat);
+
+        let first = core_faces::begin_match_job(&state, None).unwrap();
+        let second = core_faces::begin_match_job(&state, None).unwrap();
+
+        assert!(first.abort.load(Ordering::Relaxed), "the superseded run must be tripped");
+        assert!(!second.abort.load(Ordering::Relaxed));
+        assert_ne!(first.job, second.job);
+        assert_eq!(
+            state.jobs.faces_match.status().unwrap().map(|s| s.job),
+            Some(second.job)
+        );
+        assert!(!first.slot.owns(), "the superseded run must lose the slot");
+    }
+
+    // --- issue #51: the face *indexing* slot ------------------------------------------
+
+    /// The #51 regression. A switch tripped the indexing abort flag but never cleared the
+    /// indexing status slot — it cleared Smart Tagging's and face matching's and omitted this
+    /// one — so between the switch and the worker next noticing its flag,
+    /// `faces_index_status` returned a `FacesJobStatus` describing the replaced catalog.
+    ///
+    /// The interleaving is forced, not timed: the job is claimed through the real
+    /// `begin_index_job` (the same transition `faces_index_photos` runs), the switch is
+    /// driven synchronously, and the slot is read straight afterwards. No worker runs at all,
+    /// so there is no window for one to clean up on our behalf and make this pass for the
+    /// wrong reason — which is exactly what made the original defect invisible.
+    #[test]
+    fn a_catalog_switch_trips_and_unpublishes_a_running_index() {
+        let (cat_a, db_a) = temp_catalog("index-switch-a");
+        let (cat_b, _db_b) = temp_catalog("index-switch-b");
+        let state = state_with(cat_a);
+
+        let claim = begin_index_job(&state, None).unwrap();
+        assert_eq!(claim.db_path, db_a.to_path_buf());
+        assert!(!claim.abort.load(Ordering::Relaxed));
+        assert_eq!(
+            state.jobs.faces.status().unwrap().map(|s| s.job),
+            Some(claim.job),
+            "the start must own the slot before the switch"
+        );
+        let abort = claim.abort.clone();
+
+        detach_catalog_and_trip_jobs(&state).unwrap();
+
+        assert!(abort.load(Ordering::Relaxed), "phase one must trip the running index");
+        assert!(
+            state.jobs.faces.status().unwrap().is_none(),
+            "phase one must clear the face-indexing slot too — leaving it is #51, where \
+             faces_index_status reports a job against the catalog the user has left"
+        );
+
+        // Phase two installs a fresh, un-tripped generation without reviving the old one.
+        publish_catalog_and_reset_jobs(&state, cat_b).unwrap();
+        let current = state.jobs.faces.installed().unwrap();
+        assert!(!current.load(Ordering::Relaxed), "the new generation must start clean");
+        assert!(!Arc::ptr_eq(&current, &abort), "phase two must not reuse the tripped flag");
+        assert!(abort.load(Ordering::Relaxed), "the old worker's flag must stay tripped");
+        assert!(
+            state.jobs.faces.status().unwrap().is_none(),
+            "phase two must not resurrect a slot phase one cleared"
+        );
+    }
+
+    /// All three slots, one switch. The per-family tests above each prove their own slot is
+    /// cleared; this one pins that a single switch clears *every* slot together, which is the
+    /// property #51 is actually about — two of three were cleared, and nothing asserted the
+    /// third alongside them.
+    #[test]
+    fn a_catalog_switch_clears_every_job_status_slot_at_once() {
+        let (cat_a, _db_a) = temp_catalog("all-slots-a");
+        let (cat_b, _db_b) = temp_catalog("all-slots-b");
+        let state = state_with(cat_a);
+
+        let index = begin_index_job(&state, None).unwrap();
+        let matching = core_faces::begin_match_job(&state, None).unwrap();
+        assert_eq!(state.jobs.faces.status().unwrap().map(|s| s.job), Some(index.job));
+        assert_eq!(
+            state.jobs.faces_match.status().unwrap().map(|s| s.job),
+            Some(matching.job)
+        );
+
+        detach_catalog_and_trip_jobs(&state).unwrap();
+
+        assert!(state.jobs.faces.status().unwrap().is_none(), "face indexing slot");
+        assert!(state.jobs.faces_match.status().unwrap().is_none(), "face matching slot");
+        #[cfg(feature = "smarttags")]
+        assert!(state.jobs.smarttags.status().unwrap().is_none(), "smart tagging slot");
+
+        publish_catalog_and_reset_jobs(&state, cat_b).unwrap();
+    }
+
+    // --- issue #22: set_library_root runs the same transition -------------------------
+
+    /// The #22 regression. `set_library_root` replaces the catalog handle exactly as a switch
+    /// does, but used to hold the lock across persist -> reopen -> swap and trip nothing, so a
+    /// running job kept indexing a catalog the app had replaced.
+    ///
+    /// This drives the real re-root body (`catalogs::reroot_library`), not the two phases it
+    /// delegates to: #22 *is* "the re-root does not run the shared transition", so a test of
+    /// the phases alone would still pass with a hand-rolled swap in its place. The
+    /// interleaving is forced: a real indexing job is claimed first, the re-root runs
+    /// synchronously, and the assertions read the flag and slot directly. No worker exists to
+    /// tidy up and make this pass for the wrong reason.
+    ///
+    /// It also pins the ordering constraint peculiar to re-rooting: `catalog_root` is written
+    /// through the *outgoing* handle inside phase one, because `Catalog::open` adopts the
+    /// stored setting over its `root` argument. Persisting after the reopen — or skipping the
+    /// write — would silently re-root back to the old path, which the final assertion catches.
+    #[test]
+    fn a_root_change_trips_running_jobs_and_persists_the_new_root() {
+        use crate::app::catalogs::reroot_library;
+
+        let dir = crate::test_support::TestTmpDir::new("reroot-ownership");
+        let old_root = dir.join("photos-old");
+        let new_root = dir.join("photos-new");
+        std::fs::create_dir_all(&old_root).unwrap();
+        let db = dir.join("catalog.chairphoto");
+        let state = state_with(Catalog::open(&db, &old_root).unwrap());
+
+        let claim = begin_index_job(&state, None).unwrap();
+        assert_eq!(state.jobs.faces.status().unwrap().map(|s| s.job), Some(claim.job));
+        let abort = claim.abort.clone();
+
+        reroot_library(&state, new_root.clone(), &db).unwrap();
+
+        assert!(
+            abort.load(Ordering::Relaxed),
+            "a root change must trip a running index — leaving it live is #22, where the \
+             worker keeps writing into a catalog the app has replaced"
+        );
+        assert!(
+            state.jobs.faces.status().unwrap().is_none(),
+            "a root change must clear the status slot, like a switch does"
+        );
+
+        let current = state.jobs.faces.installed().unwrap();
+        assert!(!current.load(Ordering::Relaxed), "the new generation must start clean");
+        assert!(!Arc::ptr_eq(&current, &abort), "phase two must not reuse the tripped flag");
+        assert!(abort.load(Ordering::Relaxed), "the old worker's flag must stay tripped");
+
+        // The re-root actually took, and took through the persisted setting: `Catalog::open`
+        // adopts the stored `catalog_root` over its `root` argument, so had the write not
+        // happened inside phase one this would still read the old root.
+        let guard = state.catalog.lock().unwrap();
+        assert_eq!(
+            guard.as_ref().unwrap().root(),
+            new_root.as_path(),
+            "the published catalog must be rooted at the new path"
+        );
+    }
+
+    /// A failing persist must abort the whole transition rather than leave a half-applied one:
+    /// nothing tripped, slot intact, catalog still open. That is why `before_drop` runs after
+    /// every guard is acquired but before the first mutation.
+    #[test]
+    fn a_failed_root_persist_leaves_the_transition_untouched() {
+        use crate::app::detach_catalog_and_trip_jobs_with;
+
+        let (cat_a, _db_a) = temp_catalog("reroot-fail");
+        let state = state_with(cat_a);
+        let claim = begin_index_job(&state, None).unwrap();
+
+        let err = detach_catalog_and_trip_jobs_with(&state, |_| {
+            Err("simulated persist failure".to_string())
+        })
+        .unwrap_err();
+        assert_eq!(err, "simulated persist failure");
+
+        assert!(
+            !claim.abort.load(Ordering::Relaxed),
+            "a failed persist must not trip the job"
+        );
+        assert_eq!(
+            state.jobs.faces.status().unwrap().map(|s| s.job),
+            Some(claim.job),
+            "a failed persist must not clear the status slot"
+        );
+        assert!(
+            state.catalog.lock().unwrap().is_some(),
+            "a failed persist must leave the catalog open"
+        );
+    }
+}
+
 /// Begin (or resume) the background face-indexing job and return its id. The worker opens
 /// its own secondary catalog connection; progress goes out as `faces:progress` and the end as
 /// a terminal `faces:index_done`, both carrying the id, through `state`'s event sink.

@@ -1,15 +1,14 @@
-//! Application state and the services every frontend shares — Tauri-free.
+//! Application state and the services the front end calls, with no UI toolkit.
 //!
 //! [`AppState`] (the open catalog, volume health, and every background job's ownership
-//! state in [`jobs::JobRegistry`]) plus the helpers more than one domain needs. The Tauri
-//! command layer (`commands/`) re-exports all of it; a native frontend links it directly.
+//! state in [`jobs::JobRegistry`]) plus the helpers more than one domain needs. The GPUI app
+//! links it directly.
 //!
-//! Startup is [`boot`] (crash markers, upload sweep, theme watcher, decode analyzers, the
-//! image pool) and then [`open_default_catalog`]; every front end runs the same two.
+//! Startup is [`boot_with`] (crash markers, upload sweep, theme watcher, decode analyzers, the
+//! image pool) and then [`open_default_catalog`].
 //!
-//! Blocking work goes through [`spawn_blocking`] on the runtime from [`runtime`], which the
-//! Tauri shell also installs as its own async runtime, so there is one tokio runtime
-//! whichever frontend is running.
+//! Blocking work goes through [`spawn_blocking`] on the runtime from [`runtime`], the one
+//! tokio runtime of the process.
 
 use crate::catalog::Catalog;
 use std::path::PathBuf;
@@ -52,9 +51,9 @@ pub mod storage;
 pub mod tags;
 pub mod uploads;
 
-pub use boot::{boot, boot_with, Boot};
-// `catalogs::switch_catalog` is deliberately not re-exported here: the Tauri shell re-exports
-// this module flat beside a command of the same name.
+pub use boot::{boot_with, Boot};
+// `catalogs::switch_catalog` is not re-exported here: the Tauri shell re-exported this module
+// flat beside a command of the same name (removed in #165). Callers name it by its module.
 pub use catalogs::{
     default_catalog_path, detach_catalog_and_trip_jobs, detach_catalog_and_trip_jobs_with,
     load_recent_catalogs, load_recent_catalogs_in, open_default_catalog,
@@ -68,7 +67,7 @@ pub use jobs::JobRegistry;
 pub use jobs::{JobClaim, JobStatus};
 
 /// The process's tokio runtime handle: the current one when called from inside a runtime
-/// (a Tauri command, a test's `#[tokio::test]`), otherwise a process-wide multi-thread
+/// (a test's `#[tokio::test]`), otherwise a process-wide multi-thread
 /// runtime created on first use.
 pub fn runtime() -> tokio::runtime::Handle {
     static RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
@@ -264,8 +263,7 @@ pub fn begin_scan_generation(state: &AppState) -> Result<Arc<AtomicBool>, String
 /// caller that waits for it here parks every repaint for as long as the workers keep the
 /// lock busy. That was a 2.2 s freeze on every Develop → Library switch in the Tauri app
 /// (the Library mounts ~25 commands at once, and the `get_setting`s among them blocked the
-/// window while the tag counts ran). Tauri commands are held to this by
-/// `commands_that_take_the_catalog_lock_never_run_on_the_main_thread`.
+/// window while the tag counts ran). The GPUI app runs catalog work on its job runner.
 pub fn with_catalog<T>(
     state: &AppState,
     f: impl FnOnce(&Catalog) -> crate::catalog::Result<T>,
@@ -342,8 +340,9 @@ impl CatalogIdentity {
     }
 }
 
-/// Over IPC (the Tauri shell, #164) an identity is an opaque decimal string: a front end
-/// only hands it back. A string, not a number, so no JavaScript number ever rounds it.
+/// Serialized (it crossed the Tauri shell's IPC until #165, and an event payload can carry it)
+/// an identity is an opaque decimal string: a front end only hands it back. A string, not a
+/// number, so no JavaScript number ever rounds it.
 /// Forging one gains nothing: it is a guard compared under the catalog lock, never a key.
 impl serde::Serialize for CatalogIdentity {
     fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
@@ -409,9 +408,9 @@ pub fn photo_storage_statuses(
 //     separate `static ENV_LOCK` inside individual test modules; separate statics
 //     are independent instances and provide no cross-module exclusion.
 //
-// The module lives in its own file so the Tauri shell's command tests can compile the same
-// helper into their own test binary (`#[cfg(test)]` items are invisible across crates, and a
-// separate process needs its own lock anyway).
+// The module lives in its own file so that another crate's test binary could compile the same
+// helper into itself, as the Tauri shell's did until #165 (`#[cfg(test)]` items are invisible
+// across crates, and a separate process needs its own lock anyway).
 #[cfg(test)]
 pub(crate) mod test_env_helpers;
 

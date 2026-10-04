@@ -216,7 +216,7 @@ fn module_ids_are_settings_namespaces() {
 }
 
 /// Every `"<prefix>.<key>"` settings key the host uses — constants and literal keys passed to
-/// `get_setting`/`set_setting` in the core, the model, the Tauri shell and this crate — is in a
+/// `get_setting`/`set_setting` in the core, the model and this crate — is in a
 /// reserved namespace or a module's backend namespace, so no module id can reach it.
 #[test]
 fn every_host_settings_prefix_is_reserved() {
@@ -235,7 +235,7 @@ fn every_host_settings_prefix_is_reserved() {
             }
         }
     }
-    for dir in ["crates/core/src", "crates/model/src", "crates/app/src", "src-tauri/src"] {
+    for dir in ["crates/core/src", "crates/model/src", "crates/app/src"] {
         walk(&root.join(dir), &mut files);
     }
     // `const X_KEY: &str = "p.k"` / `X_SETTING` / `SETTING_X`, and `get_setting("p.k"`.

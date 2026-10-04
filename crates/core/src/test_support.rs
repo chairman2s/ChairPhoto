@@ -31,9 +31,9 @@
 //! this one and `tests/common/mod.rs` — cost one duplicated ~25-line struct instead, and
 //! need no manifest change at all. If this fixture's shape ever changes, update both.
 //!
-//! Since the core/shell split (#95) this file is also the Tauri shell's fixture: its
-//! `lib.rs` compiles it into the shell's unit-test binary with `#[path]`, so it must keep
-//! depending on nothing but `std`.
+//! From the core/shell split (#95) until the shell went (#165) this file was also the Tauri
+//! shell's fixture, compiled into its unit-test binary with `#[path]`; it still depends on
+//! nothing but `std`.
 use std::ops::Deref;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};

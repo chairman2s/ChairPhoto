@@ -1,7 +1,7 @@
 [package]
 name = "chairphoto-model"
-# Internal crate, never published on its own: the app's version is the shell's
-# (`src-tauri/Cargo.toml`, see AGENTS.md § Versioning), so this one carries none.
+# Internal crate, never published on its own, so it carries no version: the app's version is
+# the release's (`packaging/PKGBUILD`'s `pkgver` since the Tauri shell's manifest went in #165).
 version = "0.0.0"
 publish = false
 description = "ChairPhoto's UI model: front-end state and logic as plain Rust, with no GPUI or Tauri types"
@@ -29,7 +29,6 @@ serde_json = "1"
 [features]
 # Test-only: builds core's render engine so a test can feed it the records this crate writes
 # (`plugins::edit::record_engine`). `cargo test -p chairphoto-model --features edit-parity`
-# runs it. (It was made opt-in while the shell assumed core's features equal its own; since
-# gpui #99's db7facf the shell survives a core with more features, but opt-in still keeps
-# the plain model test run free of core's render engine.)
+# runs it. (It was made opt-in while the Tauri shell assumed core's features equal its own;
+# opt-in still keeps the plain model test run free of core's render engine.)
 edit-parity = ["chairphoto-core/edit"]

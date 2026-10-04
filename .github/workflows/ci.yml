@@ -10,23 +10,6 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  frontend:
-    name: Frontend (typecheck + tests)
-    runs-on: ubuntu-latest
-    # Green in well under a minute; the cap is here so a wedged `npm ci` fails fast.
-    timeout-minutes: 15
-    steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-node@v7
-        with:
-          node-version: 24
-          cache: npm
-      - run: npm ci
-      - name: Typecheck
-        run: npx tsc --noEmit
-      - name: Tests
-        run: npm test
-
   backend:
     name: Backend (tests + feature gating)
     runs-on: ubuntu-latest
@@ -41,18 +24,21 @@ jobs:
 
       # ChairPhoto compiles its vendored LibRaw at build time (a C++ compiler, zlib and
       # libclang for bindgen) and shells out to the metadata/image tools at runtime. See
-      # the Requirements section of the README.
+      # the Requirements section of the README. The GPUI app links xcb and xkbcommon
+      # (`ldd chairphoto-gpui`) and probes fontconfig/freetype at build time; it loads
+      # Wayland and Vulkan at runtime.
       - name: Install system dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            libwebkit2gtk-4.1-dev libgtk-3-dev librsvg2-dev \
+            libxkbcommon-dev libxkbcommon-x11-dev libxcb1-dev libxcb-xkb-dev \
+            libfontconfig-dev libfreetype-dev libwayland-dev libvulkan-dev \
             zlib1g-dev clang pkg-config \
             libimage-exiftool-perl exiv2 ffmpeg imagemagick
 
       - uses: dtolnay/rust-toolchain@stable
-      # The Cargo workspace is the repository root (crates/core + src-tauri), so the default
-      # `. -> target` is the right cache key.
+      # The Cargo workspace is the repository root (crates/core, crates/model, crates/app),
+      # so the default `. -> target` is the right cache key.
       - uses: Swatinem/rust-cache@v2
 
       # The model-dependent tests (faces) auto-skip when the ONNX models are absent,
@@ -69,13 +55,13 @@ jobs:
 
       # Single-feature checks catch hidden coupling between optional backends. Cargo's default
       # and all-feature builds can both pass while `--features smarttags` alone fails. Both
-      # packages: the shell's check builds the core only as a library, not its test targets.
+      # packages: the app's check builds the core only as a library, not its test targets.
       - name: Check individual backend features
         env:
           RUSTFLAGS: "-D warnings"
         run: |
           for feature in ai edit raw instagram collage slideshow localsend map faces smarttags flickr smugmug; do
-            for pkg in chairphoto-core chairphoto; do
+            for pkg in chairphoto-core chairphoto-app; do
               echo "::group::cargo check -p ${pkg} --no-default-features --features ${feature} --all-targets"
               cargo check -p "${pkg}" --no-default-features --features "${feature}" --all-targets
               echo "::endgroup::"

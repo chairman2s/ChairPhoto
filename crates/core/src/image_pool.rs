@@ -2,7 +2,7 @@
 //!
 //! # Design
 //!
-//! A fast grid scroll can fire hundreds of `thumb://` requests within milliseconds.
+//! A fast grid scroll can ask for hundreds of thumbnails within milliseconds.
 //! The old approach spawned one OS thread per request, potentially launching hundreds
 //! of threads and exiv2/exiftool subprocesses in parallel, all racing each other with
 //! no priority ordering.
@@ -18,7 +18,7 @@
 //! 3. **In-flight deduplication** — if the same `(photo_id, kind)` key is submitted
 //!    while it is already queued or actively rendering, the new responder is attached
 //!    to the existing job. The runner is called exactly once and all responders share
-//!    the result bytes.
+//!    the result.
 //!
 //! # Safety invariants
 //!
@@ -27,18 +27,16 @@
 //!   than the time the key lives in `stack` (which ends when a worker pops it), which
 //!   is what makes mid-render attach work.
 //!
-//! * Every responder is *always* called — success, error, or panic. Dropping a
-//!   `UriSchemeResponder` without calling `respond()` hangs the webview request
-//!   forever.
+//! * Every responder is *always* called — success, error, or panic. A responder dropped
+//!   without being called leaves its requester waiting forever.
 //!
 //! * A panicking runner maps to `Err("render panicked")` via `catch_unwind`; the
 //!   worker thread itself is never killed.
 //!
 //! # What a job returns
 //!
-//! The pool is generic over its result `T` (default `Vec<u8>`): the Tauri shell's pool renders
-//! encoded bytes for its URI protocols (`media::render_bytes`), the GPUI app's renders decoded
-//! pixels (`media::render_image`, #101). The pool never looks at `T`; it only clones it for a
+//! The pool is generic over its result `T`: the GPUI app's renders decoded pixels
+//! (`media::render_image`, #101). The pool never looks at `T`; it only clones it for a
 //! job's extra responders, so a cheap-to-clone `T` (an `Arc`) is what a multi-responder job
 //! wants.
 //!
@@ -54,8 +52,7 @@ use std::collections::HashMap;
 use std::panic::{self, AssertUnwindSafe};
 use std::sync::{Arc, Condvar, Mutex};
 
-/// Which cached tier of a photo a job renders — the `thumb://`, `preview://` and `zoom://`
-/// protocols in the Tauri shell each map to one. Lives here, beside the key that carries it,
+/// Which cached tier of a photo a job renders. Lives here, beside the key that carries it,
 /// so the pool needs nothing from a front end.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum ImageKind {
@@ -65,8 +62,8 @@ pub enum ImageKind {
 }
 
 /// Key identifying a unique image job. A photo tier is `(photo_id, kind)`; an edit render
-/// (the `edit://` protocol, `edit` feature) carries its whole request, so two identical
-/// URLs coalesce into one render and any difference is a different job. The pool never
+/// (the `edit` feature) carries its whole request, so two identical requests coalesce into
+/// one render and any difference is a different job. The pool never
 /// inspects a key — it only hashes and compares it.
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub enum JobKey {
@@ -129,39 +126,37 @@ impl AvatarJob {
     }
 }
 
-/// One `edit://` render request, parsed by `protocol::edit_job_from_uri` and rendered by
-/// `media::render_edit_bytes`.
+/// One edit render request (the Darkroom's frame), rendered by `media::render_edit_image`.
 #[cfg(feature = "edit")]
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub struct EditJob {
     pub photo_id: i64,
-    /// The edit record, verbatim — the URL carries it base64url-encoded.
+    /// The edit record, verbatim.
     pub edit_json: String,
     /// Longest output edge; 0 = full size.
     pub max_edge: u32,
     /// Render from the native-size zoom tier instead of the 2048 px proxy.
     pub hi_res: bool,
-    /// Geometry only, no look, as lossless PNG — the GL drag tier's base texture.
+    /// Geometry only, no look.
     pub base_only: bool,
-    /// Which pixels to render from (`s=` in the URL): the camera preview, or a resident
-    /// RAW working image by token.
+    /// Which pixels to render from: the camera preview, or a resident RAW working image by
+    /// token.
     pub source: crate::plugins::edit::SourceToken,
-    /// The sensor-clipping overlay (`k=1`) instead of the render: a transparent PNG with
-    /// the same geometry and size, marked where the RAW itself clipped. Engine 2 only.
+    /// The sensor-clipping overlay instead of the render: a transparent image with the same
+    /// geometry and size, marked where the RAW itself clipped. Engine 2 only.
     pub clip: bool,
     /// Which catalog the caller had open when it asked (the GPUI app's
     /// `AppModel::catalog_epoch`). Photo ids from different catalogs are different photos, so
     /// two otherwise identical requests across a catalog switch are different jobs and must
-    /// never merge into one render. Neither the pool nor the renderer reads it. The Tauri
-    /// shell does not track one and passes 0.
+    /// never merge into one render. Neither the pool nor the renderer reads it.
     pub catalog_epoch: u64,
 }
 
 /// A one-shot callback that receives the rendered result (or an error string).
-pub type Respond<T = Vec<u8>> = Box<dyn FnOnce(Result<T, String>) + Send>;
+pub type Respond<T> = Box<dyn FnOnce(Result<T, String>) + Send>;
 
 /// The render function. Must be `Send + Sync` so it can be shared across workers.
-pub type Runner<T = Vec<u8>> = Arc<dyn Fn(JobKey) -> Result<T, String> + Send + Sync>;
+pub type Runner<T> = Arc<dyn Fn(JobKey) -> Result<T, String> + Send + Sync>;
 
 /// The error every responder of a [cancelled](ImagePool::cancel) job receives.
 pub const CANCELLED: &str = "cancelled";
@@ -176,7 +171,7 @@ struct PoolInner<T> {
 
 /// Bounded image-render pool. Create with [`ImagePool::start_with_runner`] and
 /// submit work with [`ImagePool::submit`].
-pub struct ImagePool<T = Vec<u8>> {
+pub struct ImagePool<T> {
     inner: Mutex<PoolInner<T>>,
     cond: Condvar,
 }
@@ -354,7 +349,7 @@ mod tests {
 
         let (entered_tx, entered_rx) = std::sync::mpsc::channel::<()>();
 
-        let runner2: Runner = Arc::new(move |_key| {
+        let runner2: Runner<Vec<u8>> = Arc::new(move |_key| {
             run_count4.fetch_add(1, Ordering::SeqCst);
             let _ = entered_tx.send(());
             gate_wait4.wait(); // block
@@ -411,7 +406,7 @@ mod tests {
         let key_c: JobKey = JobKey::photo(3, ImageKind::Thumb);
 
         let key_a_in = key_a.clone();
-        let runner: Runner = Arc::new(move |key| {
+        let runner: Runner<Vec<u8>> = Arc::new(move |key| {
             if key == key_a_in {
                 let _ = a_entered_tx.send(());
                 gate2.wait(); // block until released
@@ -463,7 +458,7 @@ mod tests {
         let ok_key:    JobKey = JobKey::photo(1, ImageKind::Thumb);
 
         let panic_key_in = panic_key.clone();
-        let runner: Runner = Arc::new(move |key| {
+        let runner: Runner<Vec<u8>> = Arc::new(move |key| {
             if key == panic_key_in {
                 panic!("deliberate test panic");
             }
@@ -498,7 +493,7 @@ mod tests {
 
         let key: JobKey = JobKey::photo(77, ImageKind::Thumb);
 
-        let runner: Runner = Arc::new(move |_key| {
+        let runner: Runner<Vec<u8>> = Arc::new(move |_key| {
             let _ = entered_tx.send(());
             gate2.wait();
             Ok(b"shared-bytes".to_vec())
@@ -532,14 +527,14 @@ mod tests {
 
     /// A 1-thread pool whose runner blocks on `gate` for photo 0 and records every photo it
     /// renders, in order.
-    fn gated_pool() -> (Arc<ImagePool>, Arc<Barrier>, std::sync::mpsc::Receiver<i64>, std::sync::mpsc::Receiver<()>) {
+    fn gated_pool() -> (Arc<ImagePool<Vec<u8>>>, Arc<Barrier>, std::sync::mpsc::Receiver<i64>, std::sync::mpsc::Receiver<()>) {
         let gate = Arc::new(Barrier::new(2));
         let (ran_tx, ran_rx) = std::sync::mpsc::channel::<i64>();
         let (entered_tx, entered_rx) = std::sync::mpsc::channel::<()>();
         let g = Arc::clone(&gate);
         let ran_tx = std::sync::Mutex::new(ran_tx);
         let entered_tx = std::sync::Mutex::new(entered_tx);
-        let runner: Runner = Arc::new(move |key| {
+        let runner: Runner<Vec<u8>> = Arc::new(move |key| {
             if key.photo_id() == 0 {
                 let _ = entered_tx.lock().unwrap().send(());
                 g.wait();
@@ -550,7 +545,7 @@ mod tests {
         (ImagePool::start_with_runner(1, runner), gate, ran_rx, entered_rx)
     }
 
-    fn noop() -> Respond {
+    fn noop() -> Respond<Vec<u8>> {
         Box::new(|_| {})
     }
 
@@ -607,7 +602,7 @@ mod tests {
     fn cancel_answers_a_queued_job_and_leaves_a_rendering_one() {
         let (pool, gate, ran, entered) = gated_pool();
         let (tx, rx) = std::sync::mpsc::channel::<(i64, Result<Vec<u8>, String>)>();
-        let respond = |id: i64| -> Respond {
+        let respond = |id: i64| -> Respond<Vec<u8>> {
             let tx = tx.clone();
             Box::new(move |r| { let _ = tx.send((id, r)); })
         };

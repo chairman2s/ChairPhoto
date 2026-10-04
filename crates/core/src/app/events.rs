@@ -1,13 +1,11 @@
 //! Backend → frontend events, independent of any UI toolkit.
 //!
 //! Background work reports progress and terminal results as [`CoreEvent`]s through an
-//! [`EventSink`]. The Tauri shell's sink forwards each one as the webview event of the same
-//! name with the same payload; a native frontend routes them to its views.
+//! [`EventSink`]; the GPUI app's sink routes each one to the view that owns it.
 //!
-//! Every event has a stable wire name (`scan:progress`, `faces:index_done`, …) — the
-//! Tauri frontend listens by that name — and a payload type that serializes exactly as the
-//! frontend's DTO expects. The payload types that used to live beside their commands are
-//! defined here, so the event vocabulary does not depend on the command layer.
+//! Every event has a stable name (`scan:progress`, `faces:index_done`, …) and a serializable
+//! payload — the names and JSON shapes the removed Tauri webview listened for (#165). The
+//! payload types are defined here, so the event vocabulary depends on no front end.
 
 use serde::Serialize;
 

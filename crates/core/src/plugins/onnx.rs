@@ -373,13 +373,19 @@ mod tests {
     fn ort_sessions_are_only_built_through_this_module() {
         let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
         let facade = src.join("plugins").join("onnx.rs");
-        // The Tauri shell (a separate crate since #95) links ort through this crate too, so
-        // its source is held to the same rule. Asserted to exist so that moving or deleting
-        // it narrows the scan on purpose, not silently.
-        let shell = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../src-tauri/src");
-        assert!(shell.is_dir(), "the Tauri shell's source is not at {}", shell.display());
+        // The workspace's other crates — the GPUI app and the UI model — link ort through this
+        // crate too, so their source is held to the same rule (as the Tauri shell's was until
+        // it went in #165). Each is asserted to exist so that moving or deleting one narrows
+        // the scan on purpose, not silently.
+        let crates = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+        let mut dirs = vec![src.clone()];
+        for sibling in ["app/src", "model/src"] {
+            let dir = crates.join(sibling);
+            assert!(dir.is_dir(), "the workspace crate's source is not at {}", dir.display());
+            dirs.push(dir);
+        }
 
-        let offenders: Vec<String> = [src.clone(), shell]
+        let offenders: Vec<String> = dirs
             .iter()
             .flat_map(walkdir::WalkDir::new)
             .filter_map(Result::ok)

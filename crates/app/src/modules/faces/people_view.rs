@@ -30,6 +30,7 @@ use crate::loupe::zoom::fitted;
 use crate::shell::style::Colors;
 use crate::storage::ui;
 use chairphoto_core::app::faces::{FaceBboxJson, Verdict};
+use chairphoto_core::app::CatalogIdentity;
 use chairphoto_core::image_pool::ImageKind;
 use gpui_kit::assets::IconName;
 use gpui_kit::component::input::{Input, InputEvent, InputState};
@@ -211,12 +212,22 @@ impl PeopleView {
 
     /// What an avatar of `photo`'s `face` draws from: its thumbnail (placed by its box), or
     /// — when that thumbnail is the cover version's render — the small crop already cut and
-    /// sized for it (rv151 L4, #223 F1). Empty until it lands.
-    fn avatar_source(&self, photo: i64, face: i64, cx: &mut Context<Self>) -> AvatarSource {
+    /// sized for it (rv151 L4, #223 F1). Empty until it lands. `from` is the row's own
+    /// catalog, captured when it was drawn (AGENTS.md "Catalog identity"); both the
+    /// thumbnail and the crop are run through [`ImageStore::foreign`] (#223 L5), the same
+    /// check the grid applies, so a tier rendered under a catalog this row no longer belongs
+    /// to — a switch landing between claim and paint — is never drawn under it. `pub(crate)`
+    /// for its own tests (#223 L5).
+    pub(crate) fn avatar_source(&self, photo: i64, face: i64, from: CatalogIdentity, cx: &mut Context<Self>) -> AvatarSource {
         match &self.images {
-            Some(i) => i.update(cx, |s, _| match s.get(photo, ImageKind::Thumb) {
-                ImageState::Ready(l) if l.cover => AvatarSource::Crop(s.get_avatar(photo, face)),
-                other => AvatarSource::Plain(other),
+            Some(i) => i.update(cx, |s, _| {
+                let thumb = s.get(photo, ImageKind::Thumb).filter(|l| !s.foreign(l, from));
+                match thumb {
+                    ImageState::Ready(l) if l.cover => {
+                        AvatarSource::Crop(s.get_avatar(photo, face).filter(|l| !s.foreign(l, from)))
+                    }
+                    other => AvatarSource::Plain(other),
+                }
             }),
             None => AvatarSource::Plain(ImageState::Absent),
         }
@@ -241,8 +252,9 @@ impl PeopleView {
 
 /// What [`PeopleView::avatar_source`] found: a plain thumbnail, placed by the face's box
 /// (unchanged, #223 F1 scope: a non-cover avatar already uses a small tier, shared with the
-/// grid), or a crop already cut and sized for the avatar (the cover case).
-enum AvatarSource {
+/// grid), or a crop already cut and sized for the avatar (the cover case). `pub(crate)`
+/// for `avatar_source`'s own tests (#223 L5).
+pub(crate) enum AvatarSource {
     Plain(ImageState),
     Crop(ImageState),
 }
@@ -500,7 +512,7 @@ impl PeopleView {
         match kind {
             Rows::People => {
                 let x = data.people.get(i)?.clone();
-                let source = self.avatar_source(x.avatar_photo_id, x.avatar_face_id, cx);
+                let source = self.avatar_source(x.avatar_photo_id, x.avatar_face_id, data.from, cx);
                 let tag = x.tag_id;
                 Some(
                     card(format!("faces-person-{tag}"), format!("Filter Library to {}", x.full_path), false, false, colors)
@@ -516,7 +528,7 @@ impl PeopleView {
                 let c = data.clusters.get(i)?.clone();
                 let picked = p.picked_clusters.contains(&c.cluster_id);
                 let free = !p.matching(cx);
-                let source = self.avatar_source(c.avatar_photo_id, c.avatar_face_id, cx);
+                let source = self.avatar_source(c.avatar_photo_id, c.avatar_face_id, data.from, cx);
                 let id = c.cluster_id;
                 let toggle = {
                     let people = people.clone();
@@ -559,7 +571,7 @@ impl PeopleView {
                 let sheet = p.sheet.as_ref()?;
                 let f = sheet.faces.as_ref()?.get(i)?.clone();
                 let picked = sheet.picked.contains(&f.face_id);
-                let source = self.avatar_source(f.photo_id, f.face_id, cx);
+                let source = self.avatar_source(f.photo_id, f.face_id, sheet.from, cx);
                 let id = f.face_id;
                 Some(
                     card(format!("faces-face-{id}"), if picked { "Picked face" } else { "Face" }, false, picked, colors)
@@ -577,10 +589,11 @@ impl PeopleView {
     fn suggestion(&mut self, i: usize, colors: Colors, cx: &mut Context<Self>) -> Option<AnyElement> {
         let people = self.people.clone();
         let p = people.read(cx);
-        let e = p.data.as_ref()?.suggestions.get(i)?.clone();
+        let data = p.data.as_ref()?;
+        let e = data.suggestions.get(i)?.clone();
         let below = !reaches(e.confidence, p.threshold);
         let free = !p.busy && !p.matching(cx);
-        let source = self.avatar_source(e.photo_id, e.face_id, cx);
+        let source = self.avatar_source(e.photo_id, e.face_id, data.from, cx);
         let face = e.face_id;
         let pct = (e.confidence * 100.).round() as i64;
         let verdict = |id: String, label: &'static str, color, v: Verdict| {

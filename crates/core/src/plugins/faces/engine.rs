@@ -339,29 +339,31 @@ impl<T> Drop for Checkout<'_, T> {
     }
 }
 
-/// A pooled item whose first use may still be guarded by something that must be dropped
-/// exactly once it is safely past (#216) — a CUDA session's crash marker, kept armed through
-/// its first `Run`, not just through building it: the documented crash (a partial cuDNN
-/// install aborting ONNX Runtime) may be in CUDA's lazy per-session init, which the build's
-/// own guard (#210) had already released — "survived" — by the time inference even started.
+/// A pooled item whose first use still owes the crash marker a turn (#216 L3) — a CUDA
+/// session's, armed for exactly the duration of its first `Run`, not from the moment it was
+/// built: the documented crash (a partial cuDNN install aborting ONNX Runtime) may be in
+/// CUDA's lazy per-session init, which does not run until the first actual inference call, so
+/// arming any earlier leaves the marker sitting open for however long the session then waits
+/// in the pool before anyone checks it out — possibly the rest of the process, for a pool
+/// built larger than this run's load ever needs. Entered there instead, an *unrelated* crash
+/// (LibRaw, the GPU driver, `kill -9`) while the session sits idle would otherwise strike
+/// CUDA; and a pool rebuild or process exit dropping a session that was simply never run
+/// would otherwise look like one more clean "survived" that never happened at all.
 ///
-/// `first_run` is `Some` only for a session that landed on CUDA (`build_pool`); the caller
-/// that first checks it out ([`run_yunet`]/[`run_auraface`]) clears it right after that run,
-/// whatever it returned — a plain `Err` means the process is still alive to clear it; only an
-/// actual crash leaves it armed, which is exactly what should happen. A CPU session, or a
-/// CUDA session already past its first run, carries `None`: nothing left to guard, and no
-/// marker write for the faces after the first. Generic over the guard type `G` so the
-/// checkout/first-use mechanics are unit-testable against the real [`crate::crash_marker`]
-/// without a GPU (`Guarded<usize, crate::crash_marker::Guard<'_>>` in tests), the same reasoning
-/// as [`Pool`]'s own tests.
+/// `first_run_subject` is `Some` only for a session that landed on CUDA (`build_pool`); never
+/// a pre-armed guard, only the crash-marker subject to arm one under, so holding it costs
+/// nothing but a `String` until [`arm_first_run`] actually takes it — the caller that first
+/// checks the session out ([`run_yunet`]/[`run_auraface`]) — clearing it, and arming the
+/// marker only for the scope that call's own `Run` lives in. A CPU session, or a CUDA session
+/// already past its first run, carries `None`: nothing left to arm.
 #[cfg(feature = "faces")]
-struct Guarded<T, G> {
+struct Guarded<T> {
     value: T,
-    first_run: Option<G>,
+    first_run_subject: Option<String>,
 }
 
 #[cfg(feature = "faces")]
-impl<T, G> std::ops::Deref for Guarded<T, G> {
+impl<T> std::ops::Deref for Guarded<T> {
     type Target = T;
     fn deref(&self) -> &T {
         &self.value
@@ -369,17 +371,27 @@ impl<T, G> std::ops::Deref for Guarded<T, G> {
 }
 
 #[cfg(feature = "faces")]
-impl<T, G> std::ops::DerefMut for Guarded<T, G> {
+impl<T> std::ops::DerefMut for Guarded<T> {
     fn deref_mut(&mut self) -> &mut T {
         &mut self.value
     }
+}
+
+/// Take `item`'s first-run crash-marker subject, if any, and arm it through `enter` for
+/// exactly the scope the returned guard lives in (#216 L3) — in production
+/// [`crate::crash_marker::enter`] against the process-global store; a fake in tests, so this
+/// is exercised without a GPU or touching that global state. A session that is never run
+/// never has this called on it, so nothing is ever armed, and nothing "survives", for it.
+#[cfg(feature = "faces")]
+fn arm_first_run<T, G>(item: &mut Guarded<T>, enter: impl FnOnce(&str) -> G) -> Option<G> {
+    item.first_run_subject.take().map(|subject| enter(&subject))
 }
 
 /// Process-global keyed caches, one per model — see [`PoolKey`] and
 /// [`crate::plugins::onnx::KeyedCache`]. Separate slots (rather than one cache keyed by model
 /// too) because each model has its own fixed spec; the pool *configuration* is what's shared.
 #[cfg(feature = "faces")]
-type SessionItem = Guarded<ort::session::Session, crate::crash_marker::Guard<'static>>;
+type SessionItem = Guarded<ort::session::Session>;
 #[cfg(feature = "faces")]
 static YUNET_CACHE: crate::plugins::onnx::KeyedCache<PoolKey, Pool<SessionItem>> =
     crate::plugins::onnx::KeyedCache::new();
@@ -444,21 +456,24 @@ fn build_pool(spec: &models::ModelSpec, key: &PoolKey) -> Result<Pool<SessionIte
         // A CUDA build is native code that can take the process down (a partial cuDNN can
         // abort ONNX Runtime during CUDA init), so it runs under a crash marker: two crashes
         // with this driver and runtime and CUDA is skipped, on CPU, until either changes.
+        // This covers the build call only (#210's original marker, unchanged) — dropped,
+        // "survived", right below regardless of whether the session landed on CUDA; the
+        // *first Run's* own marker (#216 L3) is a separate window, armed later, only for a
+        // session that actually lands on CUDA, and only once something actually checks it
+        // out and runs it ([`arm_first_run`], [`run_yunet`]/[`run_auraface`]).
         let crash_guard =
             cuda_subject.as_ref().map(|subject| crate::crash_marker::enter(KIND_CUDA_SESSION, subject, CUDA_LABEL));
         let (session, cuda) = crate::plugins::onnx::build_session(&path, key.intra_threads, |b| {
             try_register_cuda(b, cuda_subject.is_none())
         })?;
+        drop(crash_guard);
         used_cuda |= cuda;
-        // Carried into the pooled item only when this session actually landed on CUDA
-        // (#216): a CPU session (not tried, or fallen back) has nothing left to guard, so
-        // its guard, if any, simply drops here — survived, same as before #216. A CUDA
-        // session's guard stays armed through its first `Run` (`run_yunet`/`run_auraface`
-        // clear it, once, right after) rather than dropping — "survived" — the instant the
-        // build above returns: the documented crash may be in CUDA's lazy per-session init,
-        // a window the build alone does not cover.
-        let first_run = if cuda { crash_guard } else { None };
-        sessions.push(Guarded { value: session, first_run });
+        // Remembered only as a plain subject string when this session actually landed on
+        // CUDA (#216 L3) — never a pre-armed guard: a session this is never taken from
+        // (pool overcapacity, a rebuild, the process quitting while it sat idle) arms
+        // nothing and "survives" nothing when it is eventually dropped.
+        let first_run_subject = if cuda { cuda_subject.clone() } else { None };
+        sessions.push(Guarded { value: session, first_run_subject });
     }
     // Record where this pool landed. `active_ep()` reflects whichever pool (yunet or
     // auraface, any key) was built most recently — a best-effort "where did we last run"
@@ -518,13 +533,17 @@ const CUDA_LABEL: &str = "the CUDA execution provider (face models)";
 /// CUDA a fresh chance. (A cuDNN repair alone does not change it: `faces.force_cpu` is moot
 /// then, and clearing the app data's `crash-markers/` retries.)
 ///
-/// The session build and its first `Run` are under the marker — one write per session, not
-/// per face (#216): the documented crash is in CUDA's init, which may be lazy and per-session
-/// (cuDNN/cuBLAS handles created on first compute, not at session build), so the build's own
-/// guard alone could already read "survived" by the time that init actually runs. A marker
-/// write for every later inference on an already-proven session would put file I/O on the hot
-/// path for no further protection — [`Guarded`] carries the one guard from the build into the
-/// pool, and [`run_yunet`]/[`run_auraface`] clear it after that session's first use.
+/// The session build and its first `Run` are each under their own marker window — one write
+/// per session for each, never per face (#216): the documented crash is in CUDA's init,
+/// which may be lazy and per-session (cuDNN/cuBLAS handles created on first compute, not at
+/// session build), so the build's own guard alone could already read "survived" by the time
+/// that init actually runs. A marker write for every later inference on an already-proven
+/// session would put file I/O on the hot path for no further protection — [`Guarded`]
+/// carries only the subject (not an armed guard) from the build into the pool, and
+/// [`run_yunet`]/[`run_auraface`] arm and clear the first-Run marker themselves, through
+/// [`arm_first_run`], only once something actually checks that session out and runs it
+/// (#216 L3: a session that never does must not be a crash-marker liability for as long as
+/// it sits unused).
 ///
 /// [`BLOCK_AFTER`]: crate::crash_marker::BLOCK_AFTER
 #[cfg(all(feature = "faces", feature = "faces-cuda"))]
@@ -594,13 +613,13 @@ fn run_yunet(input: &[f32]) -> Result<YunetOutputs, EngineError> {
 
     let pool = yunet_pool()?;
     let mut session = pool.checkout().map_err(EngineError::Inference)?;
-    // This session's first Run is still under its build's crash marker (#216): taken out
-    // before the call and never touched again, so it drops — "survived", exactly once per
-    // session — wherever this function returns, `?` included. Only an actual crash during
-    // the call below would skip that drop, which is the point: the marker then stays on
-    // disk, where `build_pool`'s own guard no longer leaves it by itself. A later Run on the
-    // same (now proven) session finds `first_run` already `None`: nothing to take.
-    let _first_run = session.first_run.take();
+    // This session's first Run is armed right here (#216 L3), not from the build: taken and
+    // entered before the call and never touched again, so it drops — "survived", exactly
+    // once per session — wherever this function returns, `?` included. Only an actual crash
+    // during the call below would skip that drop, which is the point: the marker then stays
+    // on disk. A later Run on the same (now proven) session finds `first_run_subject`
+    // already `None`: nothing to arm.
+    let _first_run = arm_first_run(&mut session, |subject| crate::crash_marker::enter(KIND_CUDA_SESSION, subject, CUDA_LABEL));
 
     let shape = [1i64, 3, DET_SIZE as i64, DET_SIZE as i64];
     let tensor = Tensor::from_array((shape, input.to_vec()))
@@ -759,10 +778,9 @@ fn run_auraface(input: &[f32]) -> Result<[f32; EMBED_DIM], EngineError> {
 
     let pool = auraface_pool()?;
     let mut session = pool.checkout().map_err(EngineError::Inference)?;
-    // This session's first Run is still under its build's crash marker (#216) — see
-    // `run_yunet`'s identical comment on why this is taken out before the call rather than
-    // cleared after it.
-    let _first_run = session.first_run.take();
+    // This session's first Run is armed right here (#216 L3) — see `run_yunet`'s identical
+    // comment on why this happens at the call rather than at the build.
+    let _first_run = arm_first_run(&mut session, |subject| crate::crash_marker::enter(KIND_CUDA_SESSION, subject, CUDA_LABEL));
 
     let shape = [1i64, 3, ALIGN_SIZE as i64, ALIGN_SIZE as i64];
     let tensor = Tensor::from_array((shape, input.to_vec()))
@@ -1143,9 +1161,10 @@ mod tests {
         assert_eq!(*g2, 42);
     }
 
-    // ── A CUDA session's first Run stays under the build's crash marker (#216) ──────────
+    // ── A CUDA session's first Run is armed only at the Run, never from the build (#216 L3) ──
     //
-    // No GPU needed: `Guarded` is generic over the guard type, so these exercise the real
+    // No GPU needed: `Guarded`'s `first_run_subject` is a plain `String`, and `arm_first_run`
+    // is generic over what arming produces, so these exercise the real
     // `crash_marker::Markers` (a test-local store, not the app's) with a plain `usize`
     // standing in for the session — same reasoning as `Pool`'s own tests above. What
     // `build_pool`/`run_yunet`/`run_auraface` actually do with a real session needs ONNX
@@ -1158,45 +1177,48 @@ mod tests {
         (dir.clone(), crate::crash_marker::Markers::open(&dir))
     }
 
-    /// `build_pool`'s choice: a session's build guard is carried into the pool only when it
-    /// landed on CUDA. Carried but never used (no `run_yunet`/`run_auraface` call reached
-    /// it), a crash right now — the guard leaked, never dropped, same as `crash_marker`'s own
-    /// tests simulate one — is still a strike: the build alone having succeeded is not
-    /// enough, which is the whole point of #216.
+    /// **r5 review, #216 L3.** A session that is never checked out and run — pool
+    /// overcapacity, a rebuild, the process quitting while it sat idle — must arm nothing:
+    /// `build_pool` only remembers its subject as a plain string, so there is no guard to
+    /// drop when the item goes away. Even a simulated crash right now (`mem::forget`, the
+    /// same technique `crash_marker`'s own tests and the pre-fix version of this test used)
+    /// strikes nothing, because nothing was ever armed for it.
     #[cfg(feature = "faces")]
     #[test]
-    fn an_unused_cuda_sessions_guard_is_still_armed() {
+    fn a_never_run_sessions_subject_arms_nothing_even_if_the_process_dies_with_it_unused() {
         let (dir, markers) = crash_store("unused");
-        let guard = markers.enter("onnx-cuda-session-test", "subject", "label");
-        let item = Guarded { value: 1usize, first_run: Some(guard) };
-        std::mem::forget(item); // the simulated crash: the guard never drops
+        let item = Guarded { value: 1usize, first_run_subject: Some("subject".into()) };
+        std::mem::forget(item); // the simulated crash: nothing was armed, so nothing to catch it
 
-        assert_eq!(markers.recover().len(), 1, "an unused CUDA session's guard still protects");
+        assert_eq!(markers.recover(), Vec::new(), "a never-run session must not be mistaken for a CUDA crash");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// `run_yunet`/`run_auraface`'s pattern: take `first_run` out of the checked-out item
-    /// before the risky call, touch it no further. Once that call is behind the function
-    /// (crashed or not — here, simulated by simply letting the local drop), the guard has
-    /// survived: nothing left in flight, and a second checkout of the same (now proven)
-    /// session finds `first_run` already `None` — no second marker write for it.
+    /// `run_yunet`/`run_auraface`'s pattern: [`arm_first_run`] takes the checked-out item's
+    /// subject and arms the marker for exactly the scope the guard it returns lives in. Once
+    /// that call is behind the function (crashed or not — here, simulated by simply letting
+    /// the local drop), the guard has survived: nothing left in flight, and a second checkout
+    /// of the same (now proven) session has nothing left to arm.
     #[cfg(feature = "faces")]
     #[test]
-    fn a_sessions_first_use_clears_its_guard_exactly_once() {
+    fn a_sessions_first_run_is_armed_at_the_run_and_clears_exactly_once() {
         let (dir, markers) = crash_store("used");
-        let guard = markers.enter("onnx-cuda-session-test", "subject", "label");
-        let pool = Pool::new(vec![Guarded { value: 7usize, first_run: Some(guard) }]);
+        let pool = Pool::new(vec![Guarded { value: 7usize, first_run_subject: Some("subject".into()) }]);
 
         {
             let mut checkout = pool.checkout().unwrap();
-            let _first_run = checkout.first_run.take(); // armed until this scope ends
+            let _first_run =
+                arm_first_run(&mut checkout, |s| markers.enter("onnx-cuda-session-test", s, "label")); // armed until this scope ends
             assert_eq!(checkout.value, 7, "the session itself is still reachable through Guarded");
         }
-        assert_eq!(markers.recover(), Vec::new(), "the first use is past: survived, nothing left in flight");
+        assert_eq!(markers.recover(), Vec::new(), "the first run is past: survived, nothing left in flight");
 
-        // A second checkout (a later face, same session) has nothing to take or clear.
+        // A second checkout (a later face, same session) has nothing left to arm.
         let mut checkout = pool.checkout().unwrap();
-        assert!(checkout.first_run.take().is_none(), "no second marker write for the same session");
+        assert!(
+            arm_first_run(&mut checkout, |s| markers.enter("onnx-cuda-session-test", s, "label")).is_none(),
+            "no second marker write for the same session"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

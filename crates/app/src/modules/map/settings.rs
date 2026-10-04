@@ -108,8 +108,9 @@ impl Render for MapSettings {
             body = body.child(ui::error(
                 "map-consent-write-error",
                 format!(
-                    "This machine's tile-server preferences could not be saved ({e}). Answers above apply only \
-                     for this session and will be asked again after a restart."
+                    "This machine's tile-server preferences could not be saved ({e}). The change you just made \
+                     here applies only for this session and may be asked again after a restart; any answer \
+                     saved earlier is unaffected."
                 ),
                 colors,
             ));

@@ -25,8 +25,8 @@ use crate::shell::state::InspectorTab;
 use crate::storage::Runner;
 use chairphoto_core::app::faces::{self as core_faces, FaceBboxJson};
 use chairphoto_core::app::{
-    CatalogIdentity, FacesIndexDone, FacesJobStatus, FacesMatchDone, FacesMatchJobStatus, FacesMatchProgressEvent,
-    FacesProgressEvent, JobClaim, CATALOG_CHANGED,
+    catalog_identity, CatalogIdentity, FacesIndexDone, FacesJobStatus, FacesMatchDone, FacesMatchJobStatus,
+    FacesMatchProgressEvent, FacesProgressEvent, JobClaim, CATALOG_CHANGED,
 };
 use chairphoto_core::image_pool::{ImageKind, JobKey};
 use chairphoto_core::plugins::faces::models::{ModelReport, ModelStatus};
@@ -517,13 +517,15 @@ fn a_switch_drops_the_old_run_and_adopts_the_new_catalogs(cx: &mut TestAppContex
     work(&f.app, cx);
     assert_eq!(
         f.phase(cx),
-        IndexPhase::Running { job: theirs.job, done: 0, total: 0, progress: true, stage: core_faces::STAGE_INDEXING },
+        // `theirs` is a bare claim — no progress event has ever landed for it — so #192's
+        // fix reads it as "Starting…" (`progress: false`), not an active "Indexing: 0 / …".
+        IndexPhase::Running { job: theirs.job, done: 0, total: 0, progress: false, stage: core_faces::STAGE_INDEXING },
         "the new catalog's run is followed"
     );
     send_done(&f.app, old, 7, 7, cx);
     assert_eq!(
         f.phase(cx),
-        IndexPhase::Running { job: theirs.job, done: 0, total: 0, progress: true, stage: core_faces::STAGE_INDEXING },
+        IndexPhase::Running { job: theirs.job, done: 0, total: 0, progress: false, stage: core_faces::STAGE_INDEXING },
         "the old end is ignored"
     );
 }
@@ -1378,7 +1380,7 @@ fn overlay_boxes_turn_with_the_user_rotation(cx: &mut TestAppContext) {
 // --- the People view (#130) -----------------------------------------------------------------
 
 use crate::modules::faces::people::{People, Tab, PEOPLE_VIEW_ID, WAIT_FOR_MATCHING};
-use crate::modules::faces::people_view::PeopleView;
+use crate::modules::faces::people_view::{AvatarSource, PeopleView};
 use crate::shell::state::Surface;
 
 /// Put `face` in cluster `cluster` (the clustering step's output).
@@ -1472,6 +1474,134 @@ fn the_wall_filters_the_library_by_person(cx: &mut TestAppContext) {
     f.click(&format!("faces-person-{alice}"), cx);
     assert!(status(&f.app, cx).contains(CATALOG_CHANGED), "{}", status(&f.app, cx));
     f.app.wired.shell.read_with(cx, |s, _| assert_eq!(s.library.scope().tag_id, None, "the scope is untouched"));
+}
+
+// --- #223 L5: the People view's avatar crop and thumbnail follow the foreign-render filter --
+
+/// The avatar crop's own foreign check, independent of its thumbnail (#223 L5): a colliding
+/// catalog B takes the backend over, `catalog:switched` withheld (rv151 L1's window) — a
+/// plain re-render of the *thumbnail* lands bound to B (unrefused, rv134 M1), legitimately
+/// not foreign to B, so `avatar_source` still takes the Crop branch; but the avatar crop
+/// itself is untouched, still A's. Before this fix the crop was never checked at all, so it
+/// would have drawn under B's thumbnail regardless.
+#[gpui_kit::test]
+fn avatar_sources_crop_is_never_foreign_to_the_row_even_when_its_thumbnail_is_not(cx: &mut TestAppContext) {
+    let f = open_faces(2, true, "people-foreign-crop", cx);
+    let photo = f.ids[1];
+    let face = add_face(&f.app, photo, "[0.25,0.25,0.5,0.5]");
+    let a = catalog_identity(&f.app.state).unwrap();
+    let images = f.app.wired.images.clone();
+    let bbox = (0.25, 0.25, 0.5, 0.5);
+
+    let thumb_key = JobKey::photo(photo, ImageKind::Thumb);
+    images.update(cx, |s, _| s.request(photo, ImageKind::Thumb));
+    f.pool.finish(&thumb_key, Ok(cover_pixels(200, 200)));
+    images.update(cx, |s, _| s.request_avatar_batch(&[(photo, face, bbox)]));
+    let avatar_key = f.pool.last_batch().into_iter().next().unwrap();
+    f.pool.finish(&avatar_key, Ok(pixels(144, 144)));
+    work(&f.app, cx);
+
+    let (view, _people) = f.people(cx);
+    view.update(cx, |v, cx| {
+        assert!(
+            matches!(v.avatar_source(photo, face, a, cx), AvatarSource::Crop(ImageState::Ready(_))),
+            "precondition: A's own cover thumbnail and crop both show"
+        );
+    });
+
+    let (b_cat, _) = colliding_catalog(&f._dir, "b", 2); // same ids: same cache keys
+    core_switch(&f.app, b_cat);
+    let b = catalog_identity(&f.app.state).unwrap();
+    images.update(cx, |s, cx| s.evict(|k| k.photo == photo && k.kind == ImageKind::Thumb, cx));
+    images.update(cx, |s, _| s.request(photo, ImageKind::Thumb));
+    f.pool.finish(&thumb_key, Ok(cover_pixels(200, 200))); // B's render, stamped rendered_in = B
+    work(&f.app, cx);
+
+    view.update(cx, |v, cx| {
+        assert!(
+            matches!(v.avatar_source(photo, face, b, cx), AvatarSource::Crop(ImageState::Absent)),
+            "B's thumbnail is not foreign to B, so the Crop branch is taken — but A's crop \
+             must not be drawn under it"
+        );
+    });
+}
+
+/// The thumbnail's own foreign check in the Plain (non-cover) case: a colliding catalog B
+/// takes the backend over, `catalog:switched` withheld — a plain re-render lands bound to
+/// B, and the row (still reading as A, since the view has not heard of the switch) must not
+/// draw it.
+#[gpui_kit::test]
+fn avatar_sources_plain_thumbnail_is_never_foreign_to_the_row_in_a_switchs_window(cx: &mut TestAppContext) {
+    let f = open_faces(2, true, "people-foreign-plain-thumb", cx);
+    let photo = f.ids[1];
+    let face = add_face(&f.app, photo, "[0.25,0.25,0.5,0.5]");
+    let a = catalog_identity(&f.app.state).unwrap();
+    let images = f.app.wired.images.clone();
+
+    let thumb_key = JobKey::photo(photo, ImageKind::Thumb);
+    images.update(cx, |s, _| s.request(photo, ImageKind::Thumb));
+    f.pool.finish(&thumb_key, Ok(pixels(200, 200))); // not a cover render: the Plain branch
+    work(&f.app, cx);
+
+    let (view, _people) = f.people(cx);
+    view.update(cx, |v, cx| {
+        assert!(
+            matches!(v.avatar_source(photo, face, a, cx), AvatarSource::Plain(ImageState::Ready(_))),
+            "precondition: A's own thumbnail shows"
+        );
+    });
+
+    let (b_cat, _) = colliding_catalog(&f._dir, "b", 2); // same ids: same cache key
+    core_switch(&f.app, b_cat);
+    images.update(cx, |s, cx| s.evict(|k| k.photo == photo && k.kind == ImageKind::Thumb, cx));
+    images.update(cx, |s, _| s.request(photo, ImageKind::Thumb));
+    f.pool.finish(&thumb_key, Ok(pixels(200, 200))); // B's render, stamped rendered_in = B
+    work(&f.app, cx);
+
+    // The People view never heard of the switch: it is still asking as A.
+    view.update(cx, |v, cx| {
+        assert!(
+            matches!(v.avatar_source(photo, face, a, cx), AvatarSource::Plain(ImageState::Absent)),
+            "B's thumbnail must not be drawn under A's still-current row"
+        );
+    });
+}
+
+/// Once `catalog:switched` is actually delivered, [`ImageStore::clear`]
+/// (`clear_images_on_catalog_switch`) already empties every tier and avatar crop, pending
+/// included (its generation check drops a late answer for an abandoned job) — so there is
+/// nothing left in the cache for a foreign-render check to have to catch; this only confirms
+/// `avatar_source` does not then *wrongly* withhold a fresh, legitimately-B render (a
+/// `from` wired to the wrong field, say). It is a plumbing sanity check, not a
+/// reproduction of #223 L5's bug: unlike the two tests above, reverting the fix does not
+/// make this one fail, because `clear` alone already protects the delivered case.
+#[gpui_kit::test]
+fn avatar_source_shows_a_fresh_render_once_catalog_switched_is_delivered(cx: &mut TestAppContext) {
+    let f = open_faces(2, true, "people-after-delivered-switch", cx);
+    let photo = f.ids[1];
+    let face = add_face(&f.app, photo, "[0.25,0.25,0.5,0.5]");
+    let images = f.app.wired.images.clone();
+    let thumb_key = JobKey::photo(photo, ImageKind::Thumb);
+    images.update(cx, |s, _| s.request(photo, ImageKind::Thumb));
+    f.pool.finish(&thumb_key, Ok(pixels(200, 200)));
+    work(&f.app, cx);
+
+    let (b_cat, _) = colliding_catalog(&f._dir, "b", 2);
+    core_switch(&f.app, b_cat);
+    deliver_switch(&f.app, cx);
+    let b = catalog_identity(&f.app.state).unwrap();
+    work(&f.app, cx);
+
+    let (view, _people) = f.people(cx);
+    images.update(cx, |s, _| s.request(photo, ImageKind::Thumb));
+    f.pool.finish(&thumb_key, Ok(pixels(200, 200))); // B's own, legitimate render
+    work(&f.app, cx);
+    view.update(cx, |v, cx| {
+        assert!(
+            matches!(v.avatar_source(photo, face, b, cx), AvatarSource::Plain(ImageState::Ready(_))),
+            "B's own render, after the switch is fully delivered, is not wrongly withheld"
+        );
+    });
 }
 
 /// Name a cluster from its card (Enter saves), merge two picked clusters into the same person

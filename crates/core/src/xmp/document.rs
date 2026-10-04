@@ -94,9 +94,24 @@ pub(super) struct SidecarDocument {
     /// Where this open copied the pre-existing sidecar, if it did. Reported so a
     /// destructive writer can tell the user what it preserved and where.
     backup: Option<PathBuf>,
+    /// Where [`Self::force_pending_backup`] will copy the pre-existing sidecar, if asked —
+    /// computed at open, but not acted on until then (#222 L1). `None` once decided there is
+    /// nothing to back up (no sidecar existed, the policy did not want one, or a backup
+    /// already exists), the same as `backup` is for the ordinary, at-open timing.
+    pending_backup: Option<PathBuf>,
     /// This sidecar's file lock, held from before the read until the commit's rename (or
     /// the drop). A leaf in the lock order: see `lock`'s module docs.
     _turn: super::lock::Ticket,
+}
+
+/// When [`SidecarDocument::open_impl`] performs the backup copy it decided on (#222 L1): at
+/// open, with every other policy, or deferred until [`SidecarDocument::force_pending_backup`]
+/// is called — [`SidecarDocument::open_checking_before_backup`], whose caller has a guard to
+/// run on the identifiers already in the file before committing to destroying any of them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BackupTiming {
+    AtOpen,
+    Deferred,
 }
 
 impl SidecarDocument {
@@ -105,24 +120,34 @@ impl SidecarDocument {
     /// present (defaulting to `""`), applies the backup-once policy (see module docs), and
     /// declares the base chairphoto namespace set every writer needs.
     pub(super) fn open(photo_path: &Path) -> Result<Self, String> {
-        Self::open_impl(photo_path, BackupPolicy::BeforeFirstWrite)
+        Self::open_impl(photo_path, BackupPolicy::BeforeFirstWrite, BackupTiming::AtOpen)
     }
 
     /// Same as [`Self::open`], but never backs up — for export destination writers, which are
     /// not subject to the in-library backup-once rule (AGENTS.md: "Export-only destination
     /// copies are not subject to this rule").
     pub(super) fn open_no_backup(photo_path: &Path) -> Result<Self, String> {
-        Self::open_impl(photo_path, BackupPolicy::Never)
+        Self::open_impl(photo_path, BackupPolicy::Never, BackupTiming::AtOpen)
     }
 
     /// Same as [`Self::open`], but backs up an existing sidecar even when chairphoto has
     /// written it before — for the one writer that destroys a field it does not own
     /// ([`super::overwrite_identifier`], issue #33's Overwrite). See the module docs.
     pub(super) fn open_forcing_backup(photo_path: &Path) -> Result<Self, String> {
-        Self::open_impl(photo_path, BackupPolicy::Always)
+        Self::open_impl(photo_path, BackupPolicy::Always, BackupTiming::AtOpen)
     }
 
-    fn open_impl(photo_path: &Path, backup_policy: BackupPolicy) -> Result<Self, String> {
+    /// Same backup policy as [`Self::open_forcing_backup`] — an identity Overwrite's — but
+    /// the copy itself waits for [`Self::force_pending_backup`] (#222 L1): for
+    /// [`super::overwrite_identifier_checked`], whose `guard` must run, under this same file
+    /// lock, before any file I/O happens at all. Before this, a refused guard still left a
+    /// `.chairphoto-backup` beside the sidecar, because the backup was copied here at open —
+    /// before the caller had even looked at what it was about to destroy.
+    pub(super) fn open_checking_before_backup(photo_path: &Path) -> Result<Self, String> {
+        Self::open_impl(photo_path, BackupPolicy::Always, BackupTiming::Deferred)
+    }
+
+    fn open_impl(photo_path: &Path, backup_policy: BackupPolicy, timing: BackupTiming) -> Result<Self, String> {
         let path = sidecar_path(photo_path);
         // Before the read: the read-modify-write is one turn (issue #149).
         let turn = super::lock::FILE_TURNS.lock(super::lock::key(&path));
@@ -179,15 +204,19 @@ impl SidecarDocument {
         // one. `BeforeFirstWrite` reaches an existing backup only through a repair (the first
         // write stamps `chairphoto:LastWrite`): the backup from that first write is older.
         let backup_name = file_name(&backup_path)?;
-        let backup = if wants_backup && !folder.exists(backup_name) {
-            folder.copy(name, backup_name).ok().map(|_| backup_path)
-        } else {
-            None
+        let should_copy = wants_backup && !folder.exists(backup_name);
+        // `AtOpen` copies now, exactly as before; `Deferred` only remembers that it would —
+        // the copy itself waits for `force_pending_backup`, so a caller that refuses before
+        // calling it (#222 L1) never touched the filesystem for this at all.
+        let (backup, pending_backup) = match timing {
+            BackupTiming::AtOpen if should_copy => (folder.copy(name, backup_name).ok().map(|_| backup_path), None),
+            BackupTiming::AtOpen => (None, None),
+            BackupTiming::Deferred => (None, should_copy.then_some(backup_path)),
         };
 
         declare_namespaces(desc);
 
-        Ok(Self { original: photo_path.to_path_buf(), path, folder, root, backup, _turn: turn })
+        Ok(Self { original: photo_path.to_path_buf(), path, folder, root, backup, pending_backup, _turn: turn })
     }
 
     /// Where this open copied the pre-existing sidecar, if it did. `None` when nothing was
@@ -195,6 +224,19 @@ impl SidecarDocument {
     /// existed and was therefore left alone.
     pub(super) fn backup(&self) -> Option<&Path> {
         self.backup.as_deref()
+    }
+
+    /// Perform the backup copy [`Self::open_checking_before_backup`] decided on but did not
+    /// yet make — called once a caller's guard has passed and a write is actually about to
+    /// happen (#222 L1), so a refusal before this is called leaves no `.chairphoto-backup`
+    /// beside the sidecar. A no-op when nothing was pending (no sidecar existed, or a backup
+    /// already exists — the same "never replaced" rule as the at-open timing).
+    pub(super) fn force_pending_backup(&mut self) -> Result<(), String> {
+        let Some(backup_path) = self.pending_backup.take() else { return Ok(()) };
+        let name = file_name(&self.path)?;
+        let backup_name = file_name(&backup_path)?;
+        self.backup = self.folder.copy(name, backup_name).ok().map(|_| backup_path);
+        Ok(())
     }
 
     /// The `rdf:Description` element every writer mutates.

@@ -34,11 +34,35 @@ pub fn read_identifier(photo_path: &Path) -> Option<String> {
         for child in &desc.children {
             if let XMLNode::Element(e) = child {
                 if e.namespace.as_deref() == Some(NS_XMP) && e.name == "Identifier" {
-                    if let Some(text) = first_text(e) {
+                    if let Some(text) = first_identifier_text(e) {
                         return Some(text);
                     }
                 }
             }
+        }
+    }
+    None
+}
+
+/// [`first_text`], but skipping an `xmpidq:*` qualifier the way [`identifiers_in_rdf`]'s own
+/// walk does (#222 L2) — the qualifier is not a value of its own, it names a scheme for the
+/// `rdf:value` beside it (XMP Basic's qualified form). Before this, a scheme-first `rdf:li`
+/// (`xmpidq:Scheme` before `rdf:value`, which is valid XML — element order inside a struct is
+/// not significant) made the plain [`first_text`] return the scheme name (e.g. `"DAM"`) as
+/// the identifier, because it is simply the first text node depth-first. `read_identifiers`
+/// already skipped it; this is what makes the singular reader agree with it rather than
+/// minting `legacy_photo_identity` from a scheme name shared by every sidecar in that layout.
+fn first_identifier_text(e: &xmltree::Element) -> Option<String> {
+    for node in &e.children {
+        match node {
+            XMLNode::Text(t) if !t.trim().is_empty() => return Some(t.trim().to_string()),
+            XMLNode::Element(child) if child.namespace.as_deref() == Some(NS_XMPIDQ) => {}
+            XMLNode::Element(child) => {
+                if let Some(t) = first_identifier_text(child) {
+                    return Some(t);
+                }
+            }
+            _ => {}
         }
     }
     None
@@ -154,15 +178,27 @@ pub enum CheckedOverwriteError {
 /// be checked by a separate, unlocked [`read_identifiers`] call before this function's own
 /// open took the lock. A value another tool appended to the sidecar in that gap was then
 /// destroyed unseen: the precondition passed against a snapshot the write never acted on.
-/// Reading from the already-open, already-locked document closes that gap — there is no
-/// read the write's own open did not also make.
+/// Reading from the already-open, already-locked document narrows that gap against
+/// ChairPhoto's own writers to nothing — there is no read the write's own open did not also
+/// make — though not against an external tool: [`super::lock::FILE_TURNS`] is in-process
+/// only, so `exiftool` or a DAM writing between this open's read and the commit is still
+/// possible (#222 N4; this call is no slower at closing that particular door than any other
+/// sidecar writer).
+///
+/// The backup this Overwrite always forces is deferred until `guard` passes (#222 L1):
+/// before this, a refused Overwrite still left a `.chairphoto-backup` beside the sidecar,
+/// because the open that read what `guard` was about to judge had already copied it. `guard`
+/// now runs against an open that has made no file-system change of its own; only once it
+/// returns `Ok` does the backup — still *before* the destructive write itself — actually
+/// happen.
 pub fn overwrite_identifier_checked(
     photo_path: &Path,
     uuid: &str,
     guard: impl FnOnce(&[String]) -> Result<(), String>,
 ) -> Result<Option<PathBuf>, CheckedOverwriteError> {
-    let mut doc = SidecarDocument::open_forcing_backup(photo_path).map_err(CheckedOverwriteError::Io)?;
+    let mut doc = SidecarDocument::open_checking_before_backup(photo_path).map_err(CheckedOverwriteError::Io)?;
     guard(&identifiers_in_rdf(doc.rdf_mut())).map_err(CheckedOverwriteError::Refused)?;
+    doc.force_pending_backup().map_err(CheckedOverwriteError::Io)?;
     let backup = doc.backup().map(|p| p.to_path_buf());
     doc.replace_owned(
         &[(NS_XMP, "Identifier")],
@@ -365,6 +401,43 @@ mod tests {
         assert_eq!(read_identifier(&photo).as_deref(), Some("dam:asset/2"));
     }
 
+    /// **r5 review, #222 L2.** Same qualified Bag item, but `xmpidq:Scheme` written
+    /// *before* `rdf:value` — valid XML, since element order inside an `rdf:parseType`
+    /// struct carries no meaning. The test above happens to put `rdf:value` first, which
+    /// hid this: `first_text`'s plain depth-first search returns whichever text node comes
+    /// first in the file, so a scheme-first struct made the singular reader answer "DAM" —
+    /// every sidecar of this shape then shared one `legacy_photo_identity`. Independently
+    /// checked against Python's `xml.etree.ElementTree` (`.find('rdf:value')` /
+    /// `.find('xmpidq:Scheme')` on this exact document): the value is `dam:asset/2`, the
+    /// scheme is `DAM`.
+    #[test]
+    fn read_identifier_agrees_with_read_identifiers_when_the_scheme_comes_first() {
+        let dir = crate::test_support::TestTmpDir::new("xmp-identifier-scheme-first");
+        let photo = dir.join("DSC32.ARW");
+        std::fs::write(&photo, b"raw").unwrap();
+        let existing = r#"<?xml version="1.0" encoding="UTF-8"?>
+<x:xmpmeta xmlns:x="adobe:ns:meta/">
+ <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
+  <rdf:Description rdf:about=""
+    xmlns:xmp="http://ns.adobe.com/xap/1.0/"
+    xmlns:xmpidq="http://ns.adobe.com/xmp/Identifier/qual/1.0/">
+   <xmp:Identifier>
+    <rdf:Bag>
+     <rdf:li rdf:parseType="Resource">
+      <xmpidq:Scheme>DAM</xmpidq:Scheme>
+      <rdf:value>dam:asset/2</rdf:value>
+     </rdf:li>
+    </rdf:Bag>
+   </xmp:Identifier>
+  </rdf:Description>
+ </rdf:RDF>
+</x:xmpmeta>"#;
+        std::fs::write(sidecar_path(&photo), existing).unwrap();
+
+        assert_eq!(read_identifiers(&photo), vec!["dam:asset/2".to_string()]);
+        assert_eq!(read_identifier(&photo).as_deref(), Some("dam:asset/2"), "not the scheme name \"DAM\"");
+    }
+
     /// A second, genuinely distinct Bag item beside a qualified one is still seen: the
     /// qualifier skip must not swallow a real second value.
     #[test]
@@ -459,6 +532,39 @@ mod tests {
             "the guard must see what the write's own open reads under the lock, not a value \
              read before this call ever waited for its turn"
         );
+    }
+
+    // --- a refused checked Overwrite leaves no backup (#222 L1) -------------------------
+
+    /// Before this fix, the backup this Overwrite always forces was copied at open — before
+    /// `guard` ever ran — so a refusal (the caller's own "this isn't allowed" validation)
+    /// still left `.chairphoto-backup` beside the sidecar, even though nothing about the
+    /// sidecar itself was going to change. The guard here refuses unconditionally, whatever
+    /// it is shown.
+    #[test]
+    fn a_refused_checked_overwrite_leaves_no_backup() {
+        let dir = crate::test_support::TestTmpDir::new("xmp-identifiers-checked-refuse");
+        let photo = dir.join("DSC33.ARW");
+        std::fs::write(&photo, b"raw").unwrap();
+        let sidecar = sidecar_path(&photo);
+        let existing = r#"<?xml version="1.0" encoding="UTF-8"?>
+<x:xmpmeta xmlns:x="adobe:ns:meta/">
+ <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
+  <rdf:Description rdf:about="" xmlns:xmp="http://ns.adobe.com/xap/1.0/">
+   <xmp:Identifier>dam:refused</xmp:Identifier>
+  </rdf:Description>
+ </rdf:RDF>
+</x:xmpmeta>"#;
+        std::fs::write(&sidecar, existing).unwrap();
+        let before: Vec<_> = std::fs::read_dir(&*dir).unwrap().map(|e| e.unwrap().file_name()).collect();
+
+        let r = overwrite_identifier_checked(&photo, "0b5f8a6e-1111-4222-8333-444455556666", |_| Err("no".into()));
+
+        assert!(matches!(r, Err(CheckedOverwriteError::Refused(_))));
+        assert!(!sidecar_backup_path(&sidecar).exists(), "a refused overwrite must create no backup");
+        let after: Vec<_> = std::fs::read_dir(&*dir).unwrap().map(|e| e.unwrap().file_name()).collect();
+        assert_eq!(before.len(), after.len(), "a refused overwrite created a file");
+        assert_eq!(std::fs::read_to_string(&sidecar).unwrap(), existing, "the sidecar itself is untouched");
     }
 
     #[test]

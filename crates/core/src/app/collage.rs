@@ -626,7 +626,9 @@ mod tests {
     #[test]
     fn writes_bound_to_a_catalog_that_is_no_longer_open_fail_closed() {
         // Switches catalogs: phase one releases develop's process-wide resident image, so
-        // this must not interleave with the develop tests that assert on it (#133).
+        // this must not interleave with the develop tests that assert on it (#133). `develop`
+        // exists only with `raw`+`edit` (#239); without either, there is no such test to race.
+        #[cfg(all(feature = "raw", feature = "edit"))]
         let _serial = crate::develop::serial();
         let (dir, state, ids) = setup("identity");
         let a = crate::app::catalog_identity(&state).unwrap();
@@ -649,7 +651,9 @@ mod tests {
     #[test]
     fn a_switch_during_a_library_save_indexes_nothing_and_removes_the_file() {
         // Switches catalogs: phase one releases develop's process-wide resident image, so
-        // this must not interleave with the develop tests that assert on it (#133).
+        // this must not interleave with the develop tests that assert on it (#133). `develop`
+        // exists only with `raw`+`edit` (#239); without either, there is no such test to race.
+        #[cfg(all(feature = "raw", feature = "edit"))]
         let _serial = crate::develop::serial();
         let (dir, state, ids) = setup("save-switch");
         let switched = std::sync::atomic::AtomicBool::new(false);
@@ -674,7 +678,9 @@ mod tests {
     #[test]
     fn a_library_save_indexing_mid_switch_removes_the_file() {
         // Switches catalogs: phase one releases develop's process-wide resident image, so
-        // this must not interleave with the develop tests that assert on it (#133).
+        // this must not interleave with the develop tests that assert on it (#133). `develop`
+        // exists only with `raw`+`edit` (#239); without either, there is no such test to race.
+        #[cfg(all(feature = "raw", feature = "edit"))]
         let _serial = crate::develop::serial();
         let (dir, state, ids) = setup("save-mid-switch");
         let detached = std::sync::atomic::AtomicBool::new(false);

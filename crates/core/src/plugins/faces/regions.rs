@@ -708,6 +708,47 @@ pub(crate) mod tests {
         assert!(near(stored[0].bbox, (0.2, 0.6, 0.4, 0.3)), "{:?}", stored[0].bbox);
     }
 
+    /// #245 regenerates a small original's preview at its own size: a 1200x800 photo turned a
+    /// quarter had an upscaled 1365x2048 preview and now has an 800x1200 one. Its faces are
+    /// stored normalized and the cross-check compares aspects only, so the regenerated preview
+    /// writes the very sidecar the old one did — and refuses what the old one refused.
+    #[test]
+    fn a_regenerated_preview_writes_what_the_upscaled_one_did() {
+        let dir = crate::test_support::TestTmpDir::new("faces-regions-regenerated");
+        let photo = dir.join("IMG_0245.JPG");
+        std::fs::write(&photo, b"jpeg").unwrap();
+        let conn = mem_conn();
+        conn.execute("INSERT INTO photos (id, width, height, exif_orientation) VALUES (1, 1200, 800, 6)", []).unwrap();
+        conn.execute("INSERT INTO tags (id, name, full_path) VALUES (10, 'Alice', 'People/Alice')", []).unwrap();
+        confirm(&conn, 1, 10, "[0.1,0.2,0.3,0.4]", "drawn", "confirmed");
+        let preview = |size| move |_: &std::path::Path| FileProbe { container: None, preview_size: Some(size) };
+        let sidecar = crate::xmp::sidecar_path(&photo);
+        let mut written = Vec::new();
+        for size in [(1365, 2048), (800, 1200)] {
+            let _ = std::fs::remove_file(&sidecar);
+            write_photo_regions_probed(&conn, 1, |_| Ok(Some(photo.clone())), preview(size))
+                .unwrap_or_else(|e| panic!("{size:?}: {e:?}"));
+            let stored = crate::xmp::read_face_regions(&photo);
+            assert!(near(stored[0].bbox, (0.2, 0.6, 0.4, 0.3)), "{size:?}: {:?}", stored[0].bbox);
+            let mut xml = std::fs::read_to_string(&sidecar).unwrap();
+            // The write stamps its time; everything else must match.
+            if let (Some(start), Some(end)) = (xml.find("<chairphoto:LastWrite>"), xml.find("</chairphoto:LastWrite>")) {
+                xml.replace_range(start..end, "");
+            }
+            written.push(xml);
+        }
+        assert_eq!(written[0], written[1]);
+
+        // A record in the display frame is refused under either preview.
+        conn.execute("UPDATE photos SET width = 800, height = 1200 WHERE id = 1", []).unwrap();
+        let _ = std::fs::remove_file(&sidecar);
+        for size in [(1365, 2048), (800, 1200)] {
+            let err = write_photo_regions_probed(&conn, 1, |_| Ok(Some(photo.clone())), preview(size)).expect_err("refused");
+            assert!(matches!(err, RegionWriteError::Refused(_)), "{size:?}: {err:?}");
+            assert!(!sidecar.exists(), "{size:?}");
+        }
+    }
+
     /// The probe folds a HEIF's turn in and carries the preview's size; a file that is not a
     /// HEIF keeps the catalog's orientation.
     #[test]

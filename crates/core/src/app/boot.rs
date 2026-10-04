@@ -91,10 +91,10 @@ pub fn boot_with<T: Clone + Send + 'static>(state: &AppState, runner: image_pool
     static ANALYZERS: Once = Once::new();
     ANALYZERS.call_once(|| register_decode_analyzers(state));
 
-    // One-time, best-effort cleanup of the zoom tier's pre-no-upscale-fix cache directory
-    // (#168 review): disk I/O that nothing waits on, so it runs on its own thread rather
-    // than blocking boot.
-    std::thread::spawn(crate::thumbnails::cleanup_stale_zoom_cache);
+    // One-time, best-effort cleanup of the cache directories made before tiers stopped
+    // upscaling (#168 review, #245): disk I/O that nothing waits on, so it runs on its own
+    // thread rather than blocking boot.
+    std::thread::spawn(crate::thumbnails::cleanup_stale_caches);
 
     // The bounded LIFO image pool every media request goes through.
     let n_threads = image_pool::default_thread_count();

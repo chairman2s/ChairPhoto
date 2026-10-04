@@ -15,7 +15,11 @@ use std::path::{Path, PathBuf};
 /// Long edge of a cover thumbnail — the grid's thumbnail tier.
 pub const COVER_EDGE: u32 = 512;
 /// Bumped when the cover render changes, so old cached covers are never served.
-const COVER_FORMAT: u32 = 1;
+///
+/// v2 (#245): an engine-1 cover renders from the 2048 px preview, which before 2497fa2 was
+/// upscaled for an original under 2048 px — so a v1 cover of an original under 512 px is
+/// enlarged too. `thumbnails::cleanup_stale_caches` removes the old `cover512v1` directory.
+const COVER_FORMAT: u32 = 2;
 
 fn fnv1a(s: &str) -> u64 {
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
@@ -102,6 +106,18 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         d
+    }
+
+    /// Covers cache under `cover512v2`: `cover512v1` holds covers rendered from the upscaled
+    /// pre-#245 previews, which must never be served (and which the stale-cache cleanup removes).
+    #[test]
+    fn covers_cache_under_the_post_245_directory() {
+        let dir = tmp("dir-name");
+        let original = dir.join("a.jpg");
+        std::fs::write(&original, b"x").unwrap();
+        let file = cache_path(&dir, &original, "{}").unwrap();
+        assert_eq!(file.parent().unwrap().file_name().unwrap(), "cover512v2");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A cover renders once per (file, settings); a new look or a changed file renders

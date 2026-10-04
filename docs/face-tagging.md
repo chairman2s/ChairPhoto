@@ -182,7 +182,12 @@ the size of the cached 2048 px preview the faces were found on
 are known, the preview must have the stored aspect turned by the orientation — swapped for
 5–8, as is for 1–4 and for an unknown orientation — within 2%; otherwise the photo's region
 write is refused and its import reads nothing. With no cached preview the check is skipped
-and the rules below apply as before. On the development machine it refuses 6 of the 7 iPhone HEICs without EXIF
+and the rules below apply as before. Only the preview's aspect counts, never its pixel size,
+and the face boxes are stored normalized, so a preview regenerated at another size (#245:
+a small original's preview, once upscaled to 2048 px, is now its own size) changes nothing
+written. Until a photo's preview is regenerated, the size of the one it replaces stands in —
+from the old `p2048v5` cache directory, or from the `p2048v5.sizes` list the cleanup keeps
+of it before removing that directory — so the version bump does not turn the check off. On the development machine it refuses 6 of the 7 iPhone HEICs without EXIF
 Orientation: their pixels were re-rendered (cropped or turned upright, apparently by an edit
 on the phone) while their EXIF still records the original 4032×3024 size.
 

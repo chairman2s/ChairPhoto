@@ -28,27 +28,30 @@ const PREVIEW_MAX: u32 = 2048;
 const ZOOM_MAX: u32 = 10000;
 
 /// Bump when generation logic changes in a way that affects output (orientation,
-/// preview selection, …), so stale cached images are regenerated, not reused.
+/// preview selection, …), so stale cached images are regenerated, not reused. A bump orphans
+/// the previous directories; [`cleanup_stale_caches`] removes the ones it names.
 ///
 /// v5: single-decode downscale chain — a preview/zoom decode now opportunistically
 /// derives (and caches) the smaller sizes from the one in-hand decode. Thumbnails
 /// derived from a larger decode differ pixel-for-pixel from an independently
 /// extracted small embedded preview, so old caches must not be reused.
 ///
+/// v6 (#245): a tier never upscales (2497fa2, #168). Before it, `image`'s `thumbnail` fitted
+/// every decode to the tier's box both ways, so an original smaller than a tier was enlarged
+/// into it: a 1200×800 photo had a 2048×1365 preview and a 300×200 one a 512×341 thumbnail.
+/// Those files are not told apart from a real downscale by their size (every v5 preview's
+/// long edge is 2048), so the whole of `t512v5` and `p2048v5` is left behind and both tiers
+/// regenerate lazily, on the image pool, at their native size. The face-region writer's
+/// preview cross-check keeps the old previews' sizes meanwhile ([`cached_preview_size`]).
+///
 /// Shared by thumb and preview only — see [`ZOOM_VERSION`] for why zoom keeps its own.
-const CACHE_VERSION: u32 = 5;
+const CACHE_VERSION: u32 = 6;
 
-/// Zoom's own cache-directory version, independent of [`CACHE_VERSION`]. The fix making a
-/// tier never upscale (#168) changed every tier's output for an original smaller than its
-/// max, not just zoom's: it used to be blown up to fill the box (a 1200x800 original to a
-/// 2048x1365 preview, a 300x200 one to a 512x341 thumb); now each stays native. Bumping
-/// `CACHE_VERSION` would have regenerated thumb and preview in bulk for that too; bumping
-/// only `ZOOM_VERSION` orphans the old `z10000v5` directory (cleaned up best-effort by
-/// [`cleanup_stale_zoom_cache`]) and regenerates zoom alone, at the right size. Thumb and
-/// preview caches already written for such an original keep their old, upscaled pixels
-/// until something else bumps `CACHE_VERSION`; whether to force that regeneration now is
-/// left to the owner (#245). The next change that affects zoom specifically bumps
-/// `ZOOM_VERSION` again, independently of `CACHE_VERSION`.
+/// Zoom's own cache-directory version, independent of [`CACHE_VERSION`], so a change that
+/// affects one tier's output does not regenerate the others. The no-upscale fix (#168) moved
+/// zoom to v6 first, orphaning `z10000v5` (whose files were blown up to 10 000 px); thumb and
+/// preview followed in #245, when `CACHE_VERSION` went to 6 for the same fix. The two numbers
+/// being equal now is a coincidence: the directory names differ by tier tag (`z`, `p`, `t`).
 const ZOOM_VERSION: u32 = 6;
 
 /// One cache size: its longest-edge cap, on-disk tag, cache-directory version, and JPEG
@@ -201,9 +204,35 @@ pub fn preview_bytes(path: &Path) -> Result<Vec<u8>, String> {
 /// faces indexer detects on), read from the cached file's header. `None` when it is not
 /// cached — nothing is generated — or its header cannot be read. The face-region writer
 /// cross-checks the recorded frame against it (#154).
+///
+/// Until the current preview is generated, the pre-#245 one stands in: its file in the old
+/// `p2048v5` directory if that is still there, else the size [`cleanup_stale_caches`] kept of
+/// it before removing the directory. The cross-check compares aspects only, and an upscaled
+/// preview has its decode's aspect (to a pixel of rounding on a 2048 px edge), so the old
+/// size says what the new one will; it is also the frame the faces indexed before #245 were
+/// found on. Without it the version bump would skip the cross-check for every photo whose
+/// preview had not been regenerated yet.
 pub fn cached_preview_size(path: &Path) -> Option<(u32, u32)> {
     let cache_path = cache_path_for(path, PREVIEW).ok()?;
-    ImageReader::open(cache_path).ok()?.with_guessed_format().ok()?.into_dimensions().ok()
+    if let Some(size) = image_size(&cache_path) {
+        return Some(size);
+    }
+    let name = cache_path.file_name()?.to_str()?;
+    let root = cache_dir().join("chairphoto");
+    regular_file_size(&root.join(STALE_PREVIEW_DIR).join(name))
+        .or_else(|| stale_preview_sizes(&root)?.get(name).copied())
+}
+
+/// The pixel size in an image file's header, or `None`.
+fn image_size(file: &Path) -> Option<(u32, u32)> {
+    ImageReader::open(file).ok()?.with_guessed_format().ok()?.into_dimensions().ok()
+}
+
+/// [`image_size`] of a regular file only — never through a symlink, never a FIFO — for the
+/// old cache files ChairPhoto no longer writes.
+fn regular_file_size(file: &Path) -> Option<(u32, u32)> {
+    std::fs::symlink_metadata(file).ok().filter(|m| m.file_type().is_file())?;
+    image_size(file)
 }
 
 /// Whether a decoded JPEG (e.g. a cached thumbnail) is effectively grayscale (B&W).
@@ -726,31 +755,141 @@ fn cache_path_for(path: &Path, size: Size) -> Result<PathBuf, String> {
     Ok(base.join(format!("{hash:016x}.jpg")))
 }
 
-/// Old zoom cache directory name, before `ZOOM_VERSION` split off from `CACHE_VERSION` —
-/// kept only so [`cleanup_stale_zoom_cache`] can find and remove it.
-const STALE_ZOOM_DIR: &str = "z10000v5";
-
-/// One-time, best-effort removal of the zoom tier's pre-no-upscale-fix cache directory
-/// (`<cache_dir>/chairphoto/z10000v5`). Those cached JPEGs are upscaled for any original
-/// under `ZOOM_MAX`; nothing reads that directory any more now that zoom writes under its
-/// own [`ZOOM_VERSION`], so removing it only reclaims disk space.
+/// Cache directories older builds wrote and nothing reads any more, by their fixed names under
+/// `<cache_dir>/chairphoto`, kept only so [`cleanup_stale_caches`] can find them.
 ///
-/// Safe by construction: the path is always this process's own `cache_dir()` joined with a
-/// fixed literal, never anything caller-supplied, and the removal refuses unless that exact
+/// `z10000v5`: zoom before `ZOOM_VERSION` split off from `CACHE_VERSION` (#168), upscaled to
+/// 10 000 px for any original smaller than that.
+const STALE_ZOOM_DIR: &str = "z10000v5";
+/// `t512v5`: thumbnails before `CACHE_VERSION` 6 (#245), upscaled for originals under 512 px.
+const STALE_THUMB_DIR: &str = "t512v5";
+/// `p2048v5`: previews before `CACHE_VERSION` 6 (#245), upscaled for originals under 2048 px.
+const STALE_PREVIEW_DIR: &str = "p2048v5";
+/// `cover512v1`: cover thumbnails (`plugins::edit::cover`) before its `COVER_FORMAT` 2 (#245),
+/// rendered from those upscaled previews, so enlarged for originals under 512 px.
+const STALE_COVER_DIR: &str = "cover512v1";
+/// What [`cleanup_stale_caches`] keeps of [`STALE_PREVIEW_DIR`] for [`cached_preview_size`]:
+/// one `<file name> <width> <height>` line per old preview.
+const STALE_PREVIEW_SIZES: &str = "p2048v5.sizes";
+
+/// One-time, best-effort removal of the cache directories older builds left behind:
+/// [`STALE_ZOOM_DIR`] (#168), [`STALE_THUMB_DIR`], [`STALE_PREVIEW_DIR`] and
+/// [`STALE_COVER_DIR`] (#245). Nothing reads their images any more, so removing them only
+/// reclaims disk space — except that the face-region writer's cross-check still wants the old
+/// previews' pixel sizes until each photo's preview is regenerated ([`cached_preview_size`]).
+/// Those are written first, to [`STALE_PREVIEW_SIZES`] (through a temporary file renamed into
+/// place), and the preview directory is removed only once they have landed; if they cannot be
+/// kept the directory stays for the next start.
+///
+/// Safe by construction: every path is this process's own `cache_dir()` joined with a fixed
+/// literal, never anything caller-supplied, and a directory is removed only if that exact
 /// path is a real directory — in particular never a symlink (checked with
 /// [`std::fs::symlink_metadata`], which does not follow it), so a symlink planted at that
 /// name is left untouched rather than followed. `fs::remove_dir_all` itself does not follow
-/// symlinks it finds inside the tree either, so no entry under the directory can redirect
-/// the removal elsewhere. A missing directory or any I/O error is silently a no-op: this is
-/// disk-space cleanup, not correctness-critical, so it never panics or reports a failure.
+/// symlinks it finds inside the tree either, and the size pass reads only regular files
+/// named as cache files, so no entry under a directory can redirect anything elsewhere. A
+/// missing directory or any I/O error is silently a no-op: this never panics or reports a
+/// failure.
 ///
-/// Call off the UI thread — it is disk I/O and nothing waits on it (`app::boot_with` spawns
-/// it on its own thread).
-pub fn cleanup_stale_zoom_cache() {
-    let dir = cache_dir().join("chairphoto").join(STALE_ZOOM_DIR);
-    if matches!(std::fs::symlink_metadata(&dir), Ok(meta) if meta.file_type().is_dir()) {
-        let _ = std::fs::remove_dir_all(&dir);
+/// Call off the UI thread — it is disk I/O (a header read per old preview) and nothing waits
+/// on it (`app::boot_with` spawns it on its own thread).
+pub fn cleanup_stale_caches() {
+    let root = cache_dir().join("chairphoto");
+    remove_own_dir(&root.join(STALE_ZOOM_DIR));
+    remove_own_dir(&root.join(STALE_THUMB_DIR));
+    remove_own_dir(&root.join(STALE_COVER_DIR));
+    let previews = root.join(STALE_PREVIEW_DIR);
+    if is_own_dir(&previews) && keep_stale_preview_sizes(&root, &previews).is_ok() {
+        remove_own_dir(&previews);
     }
+}
+
+/// Whether `dir` is a real directory, not a symlink to one.
+fn is_own_dir(dir: &Path) -> bool {
+    matches!(std::fs::symlink_metadata(dir), Ok(meta) if meta.file_type().is_dir())
+}
+
+/// Remove `dir` if it [`is_own_dir`]; errors are ignored.
+fn remove_own_dir(dir: &Path) {
+    if is_own_dir(dir) {
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}
+
+/// Whether `name` is a cache file's ([`cache_path_for`]): 16 lowercase hex digits and `.jpg`.
+fn is_cache_file_name(name: &str) -> bool {
+    name.strip_suffix(".jpg")
+        .is_some_and(|hash| hash.len() == 16 && hash.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')))
+}
+
+/// Write the pixel size of every preview in `previews` to [`STALE_PREVIEW_SIZES`] under
+/// `root`, merged with what an earlier, interrupted pass kept. A preview whose header cannot
+/// be read is left out, as [`cached_preview_size`] could not read it either. `Err` when the
+/// sizes did not land.
+fn keep_stale_preview_sizes(root: &Path, previews: &Path) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut sizes = read_stale_preview_sizes(&root.join(STALE_PREVIEW_SIZES));
+    for entry in std::fs::read_dir(previews)? {
+        let entry = entry?;
+        let Some(name) = entry.file_name().to_str().filter(|n| is_cache_file_name(n)).map(str::to_owned) else {
+            continue;
+        };
+        if let Some(size) = regular_file_size(&entry.path()) {
+            sizes.insert(name, size);
+        }
+    }
+    let mut lines: Vec<String> = sizes.iter().map(|(name, (w, h))| format!("{name} {w} {h}\n")).collect();
+    lines.sort();
+    // A fresh temporary file: whatever is at its name is removed first (a symlink itself, never
+    // its target), and `create_new` refuses anything that appears there meanwhile.
+    let tmp = root.join(format!("{STALE_PREVIEW_SIZES}.tmp"));
+    match std::fs::symlink_metadata(&tmp) {
+        Ok(meta) if meta.file_type().is_dir() => return Err(std::io::ErrorKind::AlreadyExists.into()),
+        Ok(_) => std::fs::remove_file(&tmp)?,
+        Err(_) => {}
+    }
+    let mut file = std::fs::OpenOptions::new().write(true).create_new(true).open(&tmp)?;
+    file.write_all(lines.concat().as_bytes())?;
+    file.sync_all()?;
+    drop(file);
+    std::fs::rename(&tmp, root.join(STALE_PREVIEW_SIZES))
+}
+
+/// Parse [`STALE_PREVIEW_SIZES`]. Lines that are not `<cache file name> <w> <h>` are skipped;
+/// a missing or unreadable file, or one that is not a regular file, is empty.
+fn read_stale_preview_sizes(file: &Path) -> HashMap<String, (u32, u32)> {
+    let regular = matches!(std::fs::symlink_metadata(file), Ok(meta) if meta.file_type().is_file());
+    let text = if regular { std::fs::read_to_string(file).unwrap_or_default() } else { String::new() };
+    text.lines()
+        .filter_map(|line| {
+            let mut parts = line.split_ascii_whitespace();
+            let name = parts.next().filter(|n| is_cache_file_name(n))?;
+            let w = parts.next()?.parse().ok()?;
+            let h = parts.next()?.parse().ok()?;
+            parts.next().is_none().then(|| (name.to_owned(), (w, h)))
+        })
+        .collect()
+}
+
+/// [`STALE_PREVIEW_SIZES`] under `root`, parsed once per version of the file: the faces
+/// indexer asks for one photo after another, and the cleanup may write the file after the
+/// first ask, so the memo is keyed by the file's path, length and mtime. `None` when there is
+/// no such file.
+fn stale_preview_sizes(root: &Path) -> Option<Arc<HashMap<String, (u32, u32)>>> {
+    type Key = (PathBuf, u64, Option<std::time::SystemTime>);
+    static MEMO: Mutex<Option<(Key, Arc<HashMap<String, (u32, u32)>>)>> = Mutex::new(None);
+    let file = root.join(STALE_PREVIEW_SIZES);
+    let meta = std::fs::symlink_metadata(&file).ok().filter(|m| m.file_type().is_file())?;
+    let key = (file, meta.len(), meta.modified().ok());
+    let mut memo = MEMO.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((memo_key, sizes)) = memo.as_ref() {
+        if *memo_key == key {
+            return Some(sizes.clone());
+        }
+    }
+    let sizes = Arc::new(read_stale_preview_sizes(&key.0));
+    *memo = Some((key, sizes.clone()));
+    Some(sizes)
 }
 
 /// A unique temp dir for one extraction, avoiding collisions between concurrent
@@ -835,12 +974,12 @@ pub(crate) mod tests {
         assert_eq!(dims(&tall, PREVIEW), (205, 2048), "a long edge over the box still shrinks");
     }
 
-    /// Zoom caches under its own version ([`ZOOM_VERSION`]), independent of thumb/preview's
-    /// shared [`CACHE_VERSION`]: the no-upscale fix changed only zoom's output, so only
-    /// zoom's directory name should change — old `z10000v5` zooms must never be read back as
-    /// current, while thumb/preview keep the directories they already had.
+    /// Each tier's cache directory: zoom under its own [`ZOOM_VERSION`], thumb and preview
+    /// under the shared [`CACHE_VERSION`] — and none of them a directory an older build wrote
+    /// upscaled files into (`z10000v5` before #168, `t512v5`/`p2048v5` before #245), which
+    /// must never be read back as current.
     #[test]
-    fn zoom_caches_under_its_own_version_directory() {
+    fn each_tier_caches_under_a_directory_no_upscaling_build_wrote() {
         let _guard = test_lock();
         let tmp_dir = TestTmpDir::new("zoom-version");
         let tmp = tmp_dir.path().to_path_buf();
@@ -854,7 +993,97 @@ pub(crate) mod tests {
         assert_eq!(zoom_dir, format!("z{ZOOM_MAX}v{ZOOM_VERSION}").as_str());
         assert_eq!(preview_dir, format!("p{PREVIEW_MAX}v{CACHE_VERSION}").as_str());
         assert_eq!(thumb_dir, format!("t{THUMB_MAX}v{CACHE_VERSION}").as_str());
-        assert_ne!(ZOOM_VERSION, CACHE_VERSION, "zoom's version must differ to orphan z10000v5");
+        assert_eq!(
+            (zoom_dir.to_str().unwrap(), preview_dir.to_str().unwrap(), thumb_dir.to_str().unwrap()),
+            ("z10000v6", "p2048v6", "t512v6")
+        );
+        for stale in [STALE_ZOOM_DIR, STALE_PREVIEW_DIR, STALE_THUMB_DIR] {
+            assert!(![&zoom_dir, &preview_dir, &thumb_dir].contains(&&std::ffi::OsString::from(stale)), "{stale}");
+        }
+    }
+
+    // --- pre-#245 thumbnails and previews regenerate at native size (#245) ---------------
+    // Before 2497fa2 a tier fitted every decode to its box both ways, so a small original's
+    // thumbnail and preview were enlarged. Those files sit in `t512v5`/`p2048v5` under the
+    // same file names the current tiers use (the name hashes path, mtime and length only).
+
+    /// A solid JPEG of `w`×`h` as an old build cached it, at `dir/name`.
+    fn plant_old_tier(dir: &Path, name: &std::ffi::OsStr, w: u32, h: u32) {
+        std::fs::create_dir_all(dir).unwrap();
+        let mut bytes = Cursor::new(Vec::new());
+        DynamicImage::ImageRgb8(RgbImage::from_pixel(w, h, image::Rgb([200, 10, 10])))
+            .write_with_encoder(JpegEncoder::new_with_quality(&mut bytes, 80))
+            .unwrap();
+        std::fs::write(dir.join(name), bytes.into_inner()).unwrap();
+    }
+
+    /// The owner's decision on #245: a small original whose upscaled thumbnail and preview an
+    /// old build cached gets them regenerated at its own size — the old files are never served.
+    #[test]
+    fn an_old_upscaled_thumbnail_and_preview_are_not_served() {
+        let _guard = test_lock();
+        let tmp_dir = TestTmpDir::new("old-upscaled");
+        let cache = tmp_dir.path().join("cache");
+        std::env::set_var("XDG_CACHE_HOME", &cache);
+        let img = write_test_jpeg(tmp_dir.path(), "small.jpg", 300, 200);
+        let name = cache_path_for(&img, PREVIEW).unwrap().file_name().unwrap().to_owned();
+        assert_eq!(name, cache_path_for(&img, THUMB).unwrap().file_name().unwrap());
+        // What the build before 2497fa2 cached for this 300x200 original.
+        plant_old_tier(&cache.join("chairphoto").join(STALE_THUMB_DIR), &name, 512, 341);
+        plant_old_tier(&cache.join("chairphoto").join(STALE_PREVIEW_DIR), &name, 2048, 1365);
+
+        let dims = |bytes: Vec<u8>| image::load_from_memory(&bytes).map(|i| (i.width(), i.height())).unwrap();
+        assert_eq!(dims(thumbnail_bytes(&img).unwrap()), (300, 200), "thumbnail");
+        assert_eq!(dims(preview_bytes(&img).unwrap()), (300, 200), "preview");
+    }
+
+    /// The face-region writer's cross-check (#154) keeps the old preview's size until the
+    /// photo's preview is regenerated: from the old file while it is there, then from what
+    /// the cleanup kept of it, and once regenerated from the new preview — the same aspect
+    /// throughout, so the cross-check answers as it did before the bump.
+    #[test]
+    fn the_preview_size_outlives_the_old_preview_directory() {
+        let _guard = test_lock();
+        let tmp_dir = TestTmpDir::new("old-preview-size");
+        let cache = tmp_dir.path().join("cache");
+        std::env::set_var("XDG_CACHE_HOME", &cache);
+        let img = write_test_jpeg(tmp_dir.path(), "faces.jpg", 1200, 800);
+        let other = write_test_jpeg(tmp_dir.path(), "other.jpg", 600, 400);
+        let old_dir = cache.join("chairphoto").join(STALE_PREVIEW_DIR);
+        let name = |p: &Path| cache_path_for(p, PREVIEW).unwrap().file_name().unwrap().to_owned();
+        plant_old_tier(&old_dir, &name(&img), 2048, 1365);
+
+        assert_eq!(cached_preview_size(&img), Some((2048, 1365)), "from the old file");
+        assert_eq!(cached_preview_size(&other), None, "never cached is still unknown");
+
+        cleanup_stale_caches();
+        assert!(!old_dir.exists(), "the old preview directory is removed");
+        assert_eq!(cached_preview_size(&img), Some((2048, 1365)), "from the kept sizes");
+        assert_eq!(cached_preview_size(&other), None);
+        assert!(!cache_path_for(&img, PREVIEW).unwrap().exists(), "asking generated nothing");
+
+        preview_bytes(&img).unwrap();
+        assert_eq!(cached_preview_size(&img), Some((1200, 800)), "the regenerated preview wins");
+    }
+
+    /// An interrupted cleanup (sizes kept, directory partly removed) loses nothing on the next
+    /// start: the sizes already kept are merged with the files still there.
+    #[test]
+    fn a_second_cleanup_keeps_the_sizes_the_first_kept() {
+        let _guard = test_lock();
+        let tmp_dir = TestTmpDir::new("old-preview-merge");
+        let cache = tmp_dir.path().join("cache");
+        std::env::set_var("XDG_CACHE_HOME", &cache);
+        let a = write_test_jpeg(tmp_dir.path(), "a.jpg", 64, 48);
+        let b = write_test_jpeg(tmp_dir.path(), "b.jpg", 64, 48);
+        let old_dir = cache.join("chairphoto").join(STALE_PREVIEW_DIR);
+        let name = |p: &Path| cache_path_for(p, PREVIEW).unwrap().file_name().unwrap().to_owned();
+        plant_old_tier(&old_dir, &name(&a), 2048, 1536);
+        cleanup_stale_caches();
+        plant_old_tier(&old_dir, &name(&b), 1536, 2048);
+        cleanup_stale_caches();
+        assert_eq!(cached_preview_size(&a), Some((2048, 1536)));
+        assert_eq!(cached_preview_size(&b), Some((1536, 2048)));
     }
 
     // --- decode-once chain + analyzer hook -----------------------------------
@@ -938,65 +1167,101 @@ pub(crate) mod tests {
         path
     }
 
-    // --- stale zoom cache cleanup (#168 review) ------------------------------
+    // --- stale cache cleanup (#168 review, #245) ------------------------------
     // Shares the env-var lock with the tests above: XDG_CACHE_HOME is process-global.
 
     #[test]
-    fn cleanup_stale_zoom_cache_removes_only_the_old_directory() {
+    fn cleanup_stale_caches_removes_only_the_old_directories() {
         let _guard = test_lock();
-        let tmp_dir = TestTmpDir::new("stale-zoom");
+        let tmp_dir = TestTmpDir::new("stale-dirs");
         let cache = tmp_dir.path().join("cache");
         std::env::set_var("XDG_CACHE_HOME", &cache);
+        let root = cache.join("chairphoto");
 
-        let stale = cache.join("chairphoto").join(STALE_ZOOM_DIR);
-        std::fs::create_dir_all(&stale).unwrap();
-        std::fs::write(stale.join("deadbeefdeadbeef.jpg"), b"old upscaled zoom").unwrap();
+        for stale in [STALE_ZOOM_DIR, STALE_THUMB_DIR, STALE_PREVIEW_DIR, STALE_COVER_DIR] {
+            std::fs::create_dir_all(root.join(stale)).unwrap();
+            std::fs::write(root.join(stale).join("deadbeefdeadbeef.jpg"), b"old upscaled tier").unwrap();
+        }
+        // The current tiers and the id-keyed persistent thumbnails must survive untouched.
+        let keep = ["z10000v6", "p2048v6", "t512v6", "cover512v2", "persist"];
+        for dir in keep {
+            std::fs::create_dir_all(root.join(dir)).unwrap();
+            std::fs::write(root.join(dir).join("keep.jpg"), b"current").unwrap();
+        }
 
-        // A sibling tier directory (current preview cache, say) must survive untouched.
-        let sibling = cache.join("chairphoto").join("p2048v5");
-        std::fs::create_dir_all(&sibling).unwrap();
-        std::fs::write(sibling.join("keep.jpg"), b"current preview").unwrap();
+        cleanup_stale_caches();
 
-        cleanup_stale_zoom_cache();
-
-        assert!(!stale.exists(), "the old z10000v5 directory should be gone");
-        assert!(sibling.join("keep.jpg").exists(), "an unrelated tier must be untouched");
+        for stale in [STALE_ZOOM_DIR, STALE_THUMB_DIR, STALE_PREVIEW_DIR, STALE_COVER_DIR] {
+            assert!(!root.join(stale).exists(), "{stale} should be gone");
+        }
+        for dir in keep {
+            assert!(root.join(dir).join("keep.jpg").exists(), "{dir} must be untouched");
+        }
+        // The unreadable old "preview" kept no size, but the sizes file was still written.
+        assert!(root.join(STALE_PREVIEW_SIZES).is_file());
     }
 
     #[test]
-    fn cleanup_stale_zoom_cache_is_a_silent_no_op_when_absent() {
+    fn cleanup_stale_caches_is_a_silent_no_op_when_absent() {
         let _guard = test_lock();
-        let tmp_dir = TestTmpDir::new("stale-zoom-absent");
-        std::env::set_var("XDG_CACHE_HOME", tmp_dir.path().join("cache"));
-        // Nothing to remove; must not panic.
-        cleanup_stale_zoom_cache();
+        let tmp_dir = TestTmpDir::new("stale-absent");
+        let cache = tmp_dir.path().join("cache");
+        std::env::set_var("XDG_CACHE_HOME", &cache);
+        // Nothing to remove; must not panic, and makes nothing.
+        cleanup_stale_caches();
+        assert!(!cache.exists());
     }
 
-    /// A symlink planted at the exact stale name is never followed: neither it nor whatever
+    /// A symlink planted at an exact stale name is never followed: neither it nor whatever
     /// it points at is touched. `symlink_metadata` sees the link, not a directory, so the
-    /// removal refuses outright.
+    /// removal refuses outright. A symlink inside the old preview directory is not read for
+    /// a size, and one at the sizes file's temporary name is replaced, not written through.
     #[test]
     #[cfg(unix)]
-    fn cleanup_stale_zoom_cache_never_follows_a_symlink() {
+    fn cleanup_stale_caches_never_follows_a_symlink() {
         let _guard = test_lock();
-        let tmp_dir = TestTmpDir::new("stale-zoom-symlink");
+        let tmp_dir = TestTmpDir::new("stale-symlink");
         let cache = tmp_dir.path().join("cache");
         std::env::set_var("XDG_CACHE_HOME", &cache);
 
         let elsewhere = tmp_dir.path().join("elsewhere");
         std::fs::create_dir_all(&elsewhere).unwrap();
         std::fs::write(elsewhere.join("precious.txt"), b"not ours to delete").unwrap();
+        plant_old_tier(&elsewhere, std::ffi::OsStr::new("0123456789abcdef.jpg"), 40, 30);
 
-        let chairphoto_dir = cache.join("chairphoto");
-        std::fs::create_dir_all(&chairphoto_dir).unwrap();
-        let link = chairphoto_dir.join(STALE_ZOOM_DIR);
-        std::os::unix::fs::symlink(&elsewhere, &link).unwrap();
+        let root = cache.join("chairphoto");
+        std::fs::create_dir_all(&root).unwrap();
+        for stale in [STALE_ZOOM_DIR, STALE_THUMB_DIR, STALE_PREVIEW_DIR, STALE_COVER_DIR] {
+            std::os::unix::fs::symlink(&elsewhere, root.join(stale)).unwrap();
+        }
 
-        cleanup_stale_zoom_cache();
+        cleanup_stale_caches();
 
-        let meta = std::fs::symlink_metadata(&link).expect("the symlink itself must still exist");
-        assert!(meta.file_type().is_symlink(), "must remain a symlink, not be removed or replaced");
-        assert!(elsewhere.join("precious.txt").exists(), "the symlink's target must be untouched");
+        for stale in [STALE_ZOOM_DIR, STALE_THUMB_DIR, STALE_PREVIEW_DIR, STALE_COVER_DIR] {
+            let meta = std::fs::symlink_metadata(root.join(stale)).expect("the symlink itself must still exist");
+            assert!(meta.file_type().is_symlink(), "{stale} must remain a symlink, not be removed or replaced");
+        }
+        assert!(elsewhere.join("precious.txt").exists(), "the symlinks' target must be untouched");
+        assert!(!root.join(STALE_PREVIEW_SIZES).exists(), "a symlinked preview directory is not read");
+
+        // A real old preview directory holding a symlinked "preview", and a symlink at the
+        // sizes file's temporary name.
+        std::fs::remove_file(root.join(STALE_PREVIEW_DIR)).unwrap();
+        std::fs::create_dir_all(root.join(STALE_PREVIEW_DIR)).unwrap();
+        let inner = root.join(STALE_PREVIEW_DIR).join("0123456789abcdef.jpg");
+        std::os::unix::fs::symlink(elsewhere.join("0123456789abcdef.jpg"), inner).unwrap();
+        let target = elsewhere.join("tmp-target");
+        std::fs::write(&target, b"not ours to write").unwrap();
+        std::os::unix::fs::symlink(&target, root.join(format!("{STALE_PREVIEW_SIZES}.tmp"))).unwrap();
+
+        cleanup_stale_caches();
+
+        assert!(!root.join(STALE_PREVIEW_DIR).exists(), "the real directory is removed");
+        assert_eq!(std::fs::read(&target).unwrap(), b"not ours to write", "the temporary name's target is untouched");
+        assert!(elsewhere.join("0123456789abcdef.jpg").exists(), "a symlinked preview's target is untouched");
+        let sizes = std::fs::read_to_string(root.join(STALE_PREVIEW_SIZES)).unwrap();
+        assert_eq!(sizes, "", "a symlinked preview kept no size");
+        assert!(std::fs::symlink_metadata(root.join(STALE_PREVIEW_SIZES)).unwrap().file_type().is_file());
     }
 
     #[test]

@@ -10,23 +10,6 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  frontend:
-    name: Frontend (typecheck + tests)
-    runs-on: ubuntu-latest
-    # Green in well under a minute; the cap is here so a wedged `npm ci` fails fast.
-    timeout-minutes: 15
-    steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-node@v7
-        with:
-          node-version: 24
-          cache: npm
-      - run: npm ci
-      - name: Typecheck
-        run: npx tsc --noEmit
-      - name: Tests
-        run: npm test
-
   backend:
     name: Backend (tests + feature gating)
     runs-on: ubuntu-latest

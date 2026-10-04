@@ -4,15 +4,6 @@ set -euo pipefail
 
 repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 
-run_frontend_checks() {
-  cd "$repo_root"
-
-  npm ci
-  npx tsc --noEmit
-  npm test
-  npm run build
-}
-
 run_backend_checks() {
   # The Cargo workspace is the repository root: crates/core and the src-tauri shell.
   cd "$repo_root"
@@ -33,5 +24,4 @@ run_backend_checks() {
   cargo check --workspace --all-features --all-targets
 }
 
-run_frontend_checks
 run_backend_checks

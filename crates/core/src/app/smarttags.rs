@@ -1,12 +1,11 @@
-//! Smart Tagging — the bodies of the Tauri `smarttags_*` commands the GPUI Smart Tagging
-//! module runs (#126): the CLIP model's status and download, the embedding-index job, the
-//! per-photo kNN suggestions with accept/reject, deleting the index and training the per-tag
-//! classifiers.
+//! Smart Tagging — the bodies the GPUI Smart Tagging module runs (#126): the CLIP model's
+//! status and download, the embedding-index job, the per-photo kNN suggestions with
+//! accept/reject, deleting the index and training the per-tag classifiers.
 //!
 //! **Blocking.** Everything here takes the catalog or does disk/model work: call it on a
 //! worker, never a UI thread. The per-photo verbs take a `&Catalog`, so a caller picks the
-//! lock: the Tauri commands run them under `with_catalog`, the GPUI app under
-//! `with_catalog_as` with the [`CatalogIdentity`] the suggestions were read under, so a photo
+//! lock: the GPUI app runs them under `with_catalog_as` with the
+//! [`CatalogIdentity`] the suggestions were read under, so a photo
 //! id read from one catalog is never written into the next (map #92, "Catalog identity").
 //!
 //! **The index job** is the shared catalog → abort → slot ownership transition

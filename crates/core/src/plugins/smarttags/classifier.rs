@@ -305,7 +305,7 @@ pub fn load_classifier(
 
 // ── Bulk training: `smarttags_train_classifiers` ─────────────────────────────
 
-/// Outcome reported back to the Tauri command.
+/// What a [`train_all`] run produced.
 #[derive(Debug, Default)]
 pub struct TrainOutcome {
     /// Tags examined (those with ≥ `min_samples` confirmed embeddings).
@@ -559,9 +559,9 @@ pub fn persist_classifiers(
 ///
 /// This composes [`scan_stale_tags`], [`load_training_set`], [`train`] and
 /// [`persist_classifiers`] with no lock handling, which makes it the right entry point
-/// for tests and for any caller that already owns its connection exclusively. The Tauri
-/// command uses the four steps directly instead, so it can drop the catalog lock around
-/// the CPU-bound [`train`] call.
+/// for tests and for any caller that already owns its connection exclusively. The production
+/// training job (`app::smarttags`) uses the four steps directly instead, so it can drop the
+/// catalog lock around the CPU-bound [`train`] call.
 pub fn train_all(conn: &Connection, min_samples: usize) -> Result<TrainOutcome, String> {
     let scan = scan_stale_tags(conn, min_samples)?;
     let mut trained = Vec::new();

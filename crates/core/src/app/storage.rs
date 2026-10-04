@@ -1,6 +1,4 @@
-//! The storage lifecycle's jobs — the bodies of the Tauri `reconcile_now`,
-//! `apply_offload_policy`, `backup_photo`, `offload_photo`, `restore_photo`,
-//! `restore_photos` and `empty_trash` commands, and what the GPUI app runs for the back-up
+//! The storage lifecycle's jobs — the bodies the GPUI app runs for the back-up
 //! queue, reconcile-on-focus and the Trash dialog.
 //!
 //! Every function here **blocks** (file copies over a possibly slow mount, hashing, volume
@@ -154,8 +152,7 @@ pub fn restore_photo(state: &AppState, photo_id: i64) -> Result<(), String> {
 }
 
 /// Re-point a photo at a file the user moved (under the library root), then bind that
-/// file's sidecar to the photo's UUID — the body of the Tauri `relocate_photo` command, and
-/// the GPUI app's Relocate….
+/// file's sidecar to the photo's UUID — the body the GPUI app's Relocate… runs.
 ///
 /// The relocation and the identity binding are one operation: when the sidecar cannot be
 /// bound the row still moves (the user asked for that, and the file is where they said), and
@@ -660,8 +657,9 @@ pub fn empty_trash_as(
 
 /// Delete every copy of each photo, or none of them.
 ///
-/// Split out of the command because this is where the destructive decision is made, and a
-/// decision reachable only through a Tauri `State` is a decision nobody can test. Pure file
+/// Split out of the command handler because this is where the destructive decision is made,
+/// and a decision reachable only through a front end's own handler type is a decision
+/// nobody can test. Pure file
 /// IO — no catalog lock — so it runs on the blocking worker like the rest of the lifecycle.
 ///
 /// Returns the report and the ids whose files are now gone, for the caller to forget.
@@ -669,9 +667,9 @@ pub fn empty_trash_as(
 /// where ownership actually matters.
 ///
 /// Split out because the two interleavings that make this dangerous are otherwise
-/// reachable only through a Tauri `State`, and a race nobody can test is a race nobody has
-/// checked. `still_trashed` is a callback so a test can make a photo come back mid-run the
-/// way Restore does.
+/// reachable only through a front end's own handler type, and a race nobody can test is a
+/// race nobody has checked. `still_trashed` is a callback so a test can make a photo come
+/// back mid-run the way Restore does.
 ///
 /// Stops at the first sign it is no longer the owner. `abort` is tripped by a catalog
 /// switch (so an old worker cannot apply one catalog's ids to another's rows) and by

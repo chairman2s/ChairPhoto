@@ -251,8 +251,8 @@ fn presence_check(path: &Path, is_custom: bool) -> Result<(), ModelError> {
 ///
 /// `progress` is called approximately every 1 MiB (or 1% of total when total is known) with
 /// `(bytes_done, total_bytes)`. Pass `None` when the caller does not need progress reporting.
-/// The callback is `Send + Sync` so it can be an `AppHandle`-based emitter; `models.rs` itself
-/// stays free of Tauri types.
+/// The callback is `Send + Sync` so it can wrap any emitter — today a core `EventSink`
+/// closure; `models.rs` itself stays free of any event-system or UI-toolkit types.
 pub async fn ensure(
     model_path_setting: Option<&str>,
     progress: Option<&(dyn Fn(u64, Option<u64>) + Send + Sync)>,

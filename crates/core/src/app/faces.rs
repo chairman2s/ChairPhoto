@@ -1,12 +1,12 @@
-//! Face tagging — the bodies of the Tauri `faces_*` commands the GPUI Faces module runs:
-//! settings (inference line, `indexing.speed`), the indexing job, the per-photo face list and
-//! the per-face review verbs, and the MWG-Regions sidecar wiring they share (#129); the
-//! matching job ([`matching`]) and the People view's reads and verbs ([`people`]) (#130).
+//! Face tagging — the bodies the GPUI Faces module runs: settings (inference line,
+//! `indexing.speed`), the indexing job, the per-photo face list and the per-face review
+//! verbs, and the MWG-Regions sidecar wiring they share (#129); the matching job
+//! ([`matching`]) and the People view's reads and verbs ([`people`]) (#130).
 //!
 //! **Blocking.** Everything here takes the catalog (or does disk/model work): call it on a
 //! worker, never a UI thread. The per-face verbs take a `&Catalog`, so a caller picks the
-//! lock: the Tauri commands run them under `with_catalog_blocking`, the GPUI app under
-//! `with_catalog_as` with the [`super::CatalogIdentity`] the face rows were read under, so a
+//! lock: the GPUI app runs them under `with_catalog_as` with the
+//! [`super::CatalogIdentity`] the face rows were read under, so a
 //! face id read from one catalog can never be written into the next (map #92, "Catalog
 //! identity").
 //!
@@ -789,7 +789,8 @@ pub fn reject_shown(c: &Catalog, face_id: i64, shown: Option<i64>) -> CatalogRes
 /// Reject the face's suggested person: remember the pair so it is never re-proposed, return
 /// the face to `unassigned`, and re-export the photo's (possibly smaller) confirmed set. It
 /// rejects whomever the face holds *now*; a front end that shows the person uses
-/// [`reject_shown`] (#208). (The Tauri `faces_reject`, frozen with React, still calls this.)
+/// [`reject_shown`] (#208). (The removed Tauri `faces_reject`, frozen with React, called
+/// this; no GPUI caller does.)
 pub fn reject(c: &Catalog, face_id: i64) -> CatalogResult<()> {
     let photo_id = photo_of(c.conn(), face_id)?;
     matcher::reject(c.conn(), face_id, now_secs())?;

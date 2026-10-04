@@ -92,9 +92,10 @@ RGB copy, the look loop, JPEG and PNG encode, base64 — plus the end-to-end
 `render_image`, at the 720 px drag tier and the 1400 px settled tier, and the 1024 px
 masses pass the settle also pays. Medians of N runs, one JSON line per edge.
 
-Run it in **both** profiles: `tauri dev` ships the debug profile, where this crate is
+Run it in **both** profiles: a debug `cargo run` ships the debug profile, where this crate is
 unoptimized (only the decoders are, the root `Cargo.toml`'s `[profile.dev.package.*]`), and the
-release profile is what users install. The numbers differ by an order of magnitude.
+release profile (`cargo run --release`) is what users install. The numbers differ by an order
+of magnitude.
 
 ```bash
 cargo test plugins::edit::bench::render_stage_timings -- --ignored --nocapture
@@ -135,18 +136,19 @@ probe (`GlSpike.tsx`), whose last report is kept under `editor.glSpike.lastRepor
 ### Shell transition timing
 
 With the same Darkroom toggle on, leaving Develop records one transition under
-`editor.renderTiming.lastShell` (`src/modules/shellTiming.ts`): time from Back to the grid's
-React commit, first and last thumbnail loaded, the grid's scroll to the selection, the
-longest gap between animation frames (a main-thread or UI-process stall), and every backend
-command that took ≥ 50 ms during the transition, by name with a row-count hint. Read it with
+`editor.renderTiming.lastShell` (`chairphoto_model::shell_timing`, `crates/app/src/shell/timing.rs`):
+time from Back to the grid's first render, first and last thumbnail loaded, the grid's
+scroll to the selection, the longest gap between animation frames (a UI-thread stall), and
+every call into the core that took ≥ 50 ms during the transition, by name with a row-count
+hint. Read it with
 
 ```bash
 sqlite3 -readonly ~/.local/share/chairphoto/default.chairphoto \
   "select value from settings where key='editor.renderTiming.lastShell'"
 ```
 
-This is what found the 2.2 s Develop → Library freeze (sync commands waiting for the
-catalog lock on the main thread; see `with_catalog` in `src-tauri/src/commands/mod.rs`).
+This is what found the 2.2 s Develop → Library freeze (synchronous calls waiting for the
+catalog lock on the main thread; see `with_catalog` in `crates/core/src/app/mod.rs`).
 
 ## Tag-count bench
 
@@ -160,4 +162,4 @@ CHAIRPHOTO_TAG_BENCH_DB=~/.local/share/chairphoto/default.chairphoto \
 ```
 
 On a 144k-photo / 1.6k-tag catalog (2026-09-19): closure 240 ms → two queries + walk 106 ms
-in release; 1028 → 630 ms in the debug profile `tauri dev` runs.
+in release; 1028 → 630 ms in the debug profile a plain `cargo run` uses.

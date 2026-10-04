@@ -199,7 +199,7 @@ fn read_body(r: &mut impl Read, key: &CacheKey, file_len: u64) -> Option<LinearD
 /// Read `n` little-endian `u16`s. On a little-endian machine the file's bytes already are
 /// the values, so they are read straight into the buffer with no per-value loop — which
 /// matters beyond release builds: a 67 MP decode is 200 million values, and a loop over
-/// them takes ~11 s at opt-level 0 (`tauri dev`), longer than the LibRaw decode it saves.
+/// them takes ~11 s at opt-level 0 (a debug `cargo run`), longer than the LibRaw decode it saves.
 fn read_u16s(r: &mut impl Read, n: usize) -> Option<Vec<u16>> {
     let mut v = vec![0u16; n];
     // SAFETY: `v` owns `n` initialised u16s = `2n` bytes; u8 has alignment 1, so viewing

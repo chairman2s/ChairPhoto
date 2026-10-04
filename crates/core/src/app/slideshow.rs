@@ -1,5 +1,5 @@
-//! Rendering a slideshow movie — the body of the Tauri `make_slideshow` command and of the
-//! GPUI Slideshow module's Render (docs/slideshow.md).
+//! Rendering a slideshow movie — the body the GPUI Slideshow module's Render runs
+//! (docs/slideshow.md).
 //!
 //! A render is a job (`JobRegistry::slideshow`): [`claim_slideshow`] resolves the photos'
 //! Originals and takes ownership (catalog → the slideshow abort, one transition), and
@@ -370,7 +370,7 @@ fn sweep_stale_frame_dirs(root: &Path, owner: Option<u32>, now: std::time::Syste
     }
 }
 
-/// Trip the installed render (the Tauri shell's single-render Cancel). A no-op when idle.
+/// Trip the installed render (one render at a time). A no-op when idle.
 pub fn cancel_slideshow(state: &AppState) -> Result<(), String> {
     state.jobs.slideshow.trip()
 }

@@ -134,10 +134,10 @@ chrono = { version = "0.4", default-features = false, features = ["std"] }
 sha2 = "0.10"
 zip = { version = "2", default-features = false, features = ["deflate"] }
 # Parses the Omarchy runtime theme's `colors.toml` for the "Follow Omarchy" appearance
-# mode (src/appearance, docs/appearance.md). Already resolved in Cargo.lock at 1.1.2 via
-# tauri-utils' dependency tree (`cargo tree -i toml@1`), so promoting it to a direct
-# dependency is the same no-new-download/no-new-compile-unit story as `socket2` and
-# `libc` below.
+# mode (src/appearance, docs/appearance.md), at 1.1.2 (`cargo tree -i toml@1`). Before
+# #165 removed Tauri, this was already resolved in Cargo.lock via `tauri-utils`'
+# dependency tree, so promoting it to a direct dependency cost nothing new; now
+# `chairphoto-core` is the only thing pulling it in, unlike `socket2` and `libc` below.
 toml = "1"
 # Only compiled when the `ai`/`instagram`/`flickr`/`smugmug` feature is on (see [features]).
 # Flickr's upload is multipart/form-data, but we build that body by hand (avoids reqwest's

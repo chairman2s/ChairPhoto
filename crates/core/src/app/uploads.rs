@@ -1,7 +1,6 @@
 //! Publishing one photo to an online service — Flickr, SmugMug, or a supervised Instagram post
 //! (docs/publications.md) — as an owned job: the shared claim and render that `app::flickr`,
-//! `app::smugmug` and `app::instagram` run before their upload, for the Tauri commands and the
-//! GPUI publish targets alike.
+//! `app::smugmug` and `app::instagram` run before their upload, for the GPUI publish targets.
 //!
 //! Every publish is its own job, numbered per service ([`UploadService`],
 //! `JobRegistry::upload_*`), and several may run side by side — a second photo published
@@ -74,8 +73,9 @@ impl UploadService {
 /// One service's own settings — the catalog `settings` keys `<service>.<key>` (API key and
 /// secret, OAuth tokens, max long edge, album cache). `key` is the part after the dot.
 ///
-/// The Tauri commands use [`CatalogSettings`] (whichever catalog is open); the GPUI app's
-/// module settings handle implements it bound to one catalog. **Blocking** (the catalog lock).
+/// [`CatalogSettings`] implements it unbound (whichever catalog is open) and has no current
+/// caller; the GPUI app's module settings handle implements it bound to one catalog
+/// instead. **Blocking** (the catalog lock).
 /// Values may be secrets (OAuth tokens): never log one.
 pub trait ServiceSettings: Send + Sync {
     fn get(&self, key: &str) -> Result<Option<String>, String>;
@@ -85,7 +85,7 @@ pub trait ServiceSettings: Send + Sync {
     fn set_all(&self, pairs: &[(&str, &str)]) -> Result<(), String>;
 }
 
-/// [`ServiceSettings`] over whichever catalog is open, under `<prefix>.` (the Tauri commands).
+/// [`ServiceSettings`] over whichever catalog is open, under `<prefix>.`. No current caller.
 #[derive(Clone)]
 pub struct CatalogSettings {
     state: AppState,
@@ -175,9 +175,10 @@ impl Stop {
 /// Claim a publish of `photo_id` (`version_id`: `None` = Original) to `service`.
 ///
 /// `expected`: the catalog the id was read from — `Some` fails closed with
-/// [`CATALOG_CHANGED`] once another catalog is open; `None` = the open one (the Tauri
-/// commands). The identity check, the resolve and the claim run under one catalog lock, the
-/// service's abort generation joined inside it (catalog → abort). Stops no other publish.
+/// [`CATALOG_CHANGED`] once another catalog is open; `None` = the open one, whichever that
+/// is (the GPUI app always passes `Some`). The identity check, the resolve and the claim run
+/// under one catalog lock, the service's abort generation joined inside it (catalog →
+/// abort). Stops no other publish.
 pub fn claim_upload(
     state: &AppState,
     expected: Option<CatalogIdentity>,

@@ -78,14 +78,10 @@ is never overwritten.
   hand-off to an `InstagramDriver` (Chrome; tests fake it and never launch a browser).
   A stopped job (its own Cancel or a catalog switch) stops before Chrome sees the render; a
   newer post never stops an older one.
-- `src-tauri/src/commands/instagram.rs` — `post_to_instagram` and
-  `build_instagram_caption`, thin wrappers gated on the `instagram` feature.
-- `crates/app/src/modules/instagram/` — the GPUI publish target: version, caption (prefilled
-  until edited), "Publish automatically", Post, Cancel until Chrome has the render, and the
-  "Did you click Share?" confirmation, which records the photo and version that were
-  composed in the catalog they came from.
-- `src/modules/plugins/instagram.tsx` — the publish target in the unified Publish dialog:
-  version picker, caption box, auto-publish toggle, and the post-run confirmation.
+- `crates/app/src/modules/instagram/` — the GPUI publish target in the unified Publish dialog:
+  version picker, caption box (prefilled until edited), "Publish automatically" toggle, Post,
+  Cancel until Chrome has the render, and the "Did you click Share?" confirmation, which
+  records the photo and version that were composed in the catalog they came from.
 
 The module declares `publicationMarker: "instagram"`, so the host stamps the marker and
 posts appear under "Published to → Instagram" and the `published:instagram` facet — the

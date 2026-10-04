@@ -1,6 +1,5 @@
-//! Tag maintenance over a real catalog — the bodies of the Tauri `merge_tags`, `split_tag`
-//! and `add_tag_to_group` commands, shared with the GPUI tag panel's Merge and Split dialogs
-//! and its tag-groups manager (`docs/taxonomy.md` § Tag maintenance).
+//! Tag maintenance over a real catalog — the bodies the GPUI tag panel's Merge and Split
+//! dialogs and its tag-groups manager run (`docs/taxonomy.md` § Tag maintenance).
 //!
 //! Two things happen here that cannot happen in `catalog::tag_maintenance`:
 //!

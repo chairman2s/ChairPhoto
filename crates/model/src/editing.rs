@@ -1043,7 +1043,8 @@ mod tests {
     // --- JSON compatibility with records the TS app wrote (new; no TS counterpart) ---
 
     /// Every record shape the TS tests feed `parseEdit`, parsed and written back: the same
-    /// JSON value (key order aside), so the Tauri app reads what the GPUI app writes.
+    /// JSON value (key order aside), so a record saved before the GPUI cutover (#165) still
+    /// parses and re-serializes identically.
     #[test]
     fn records_from_the_ts_tests_round_trip_value_for_value() {
         let records = [

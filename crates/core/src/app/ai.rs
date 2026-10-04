@@ -1,9 +1,9 @@
-//! AI tagging — the bodies of the Tauri `ai_*` commands the GPUI AI tagging module runs
+//! AI tagging — the bodies the GPUI AI tagging module runs
 //! (#126): suggest tags for one photo (optionally a boxed region, optionally a follow-up
 //! question), the grouped burst run and its pre-dispatch estimate, and accept/reject.
 //!
-//! The DTOs are compiled in every build (the Tauri shell's commands answer "not included in
-//! this build" without the feature); everything that runs a provider is behind `ai`.
+//! The DTOs are compiled in every build (so a caller without the feature still gets a
+//! well-typed "not included in this build" answer); everything that runs a provider is behind `ai`.
 //!
 //! **Privacy.** Which provider runs is the catalog's `ai.provider` setting — `ollama` (local,
 //! the default) or a cloud provider the user chose, whose own API key must be saved. The
@@ -18,7 +18,8 @@
 //! **Catalog identity.** Every body takes an optional [`CatalogIdentity`]: with one, each of
 //! its catalog phases runs under `with_catalog_as`, so a run started against one catalog
 //! fails closed ([`super::CATALOG_CHANGED`]) instead of reading or writing the next one's rows
-//! after a switch (map #92). The Tauri shell passes `None`.
+//! after a switch (map #92). Tests exercise the unbound (`None`) form; the GPUI app always
+//! passes a real identity.
 //!
 //! **Blocking.** The catalog phases take the lock and the preview decode is disk/CPU work;
 //! the async bodies move both to blocking workers. Call the sync ones from a worker.

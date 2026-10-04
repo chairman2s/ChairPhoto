@@ -1,5 +1,4 @@
-//! Instagram posting (docs/instagram.md) — the body of the Tauri `post_to_instagram` /
-//! `build_instagram_caption` commands and of the GPUI Instagram module.
+//! Instagram posting (docs/instagram.md) — the body the GPUI Instagram module runs.
 //!
 //! A post is a publish job ([`super::uploads`], the Instagram family): claimed, rendered
 //! 1080 px wide into its own private directory, then handed to Chrome by an

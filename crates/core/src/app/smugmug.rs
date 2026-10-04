@@ -1,6 +1,6 @@
-//! SmugMug publishing (docs/smugmug.md) — the bodies of the Tauri `smugmug_*` /
-//! `post_to_smugmug` commands and of the GPUI SmugMug module: sign-in ([`super::oauth`]), the
-//! albums, and the upload of a rendered publish job ([`super::uploads`]) into one.
+//! SmugMug publishing (docs/smugmug.md) — the bodies the GPUI SmugMug module runs: sign-in
+//! ([`super::oauth`]), the albums, and the upload of a rendered publish job
+//! ([`super::uploads`]) into one.
 //!
 //! The network is a [`SmugMugApi`]: [`LiveSmugMug`] calls `crate::smugmug`; tests hand in a
 //! fake. Every function is **blocking**: run it on a worker.
@@ -97,9 +97,9 @@ pub fn upload(
 }
 
 /// The whole publish of `photo_id` from whichever catalog is open, for a caller with no steps
-/// to show (the Tauri command): check the album and the connection, then claim, render, upload
-/// — so a call that cannot publish claims nothing. Another publish running meanwhile is
-/// neither stopped nor stops this one.
+/// to show: check the album and the connection, then claim, render, upload — so a call that
+/// cannot publish claims nothing. Another publish running meanwhile is neither stopped nor
+/// stops this one.
 #[allow(clippy::too_many_arguments)]
 pub fn post(
     api: &dyn SmugMugApi,
@@ -229,7 +229,7 @@ mod tests {
         assert!(list_albums(&api, &MemSettings::default()).is_err(), "unconfigured");
     }
 
-    /// The Tauri command's path checks the album and the connection before it claims
+    /// `post()`'s path checks the album and the connection before it claims
     /// anything: a call that cannot publish takes no job id and leaves a running publish be;
     /// two posts both upload.
     #[test]

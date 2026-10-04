@@ -749,7 +749,7 @@ fn cluster_leftovers(
 
 // The matcher reads its candidates once, then writes them one by one on its own connection,
 // outside any transaction, so the user can confirm, name, assign or ignore a face in between
-// (the inspector, the loupe overlay, the People view, the Tauri UI). Every write below
+// (the inspector, the loupe overlay, the People view). Every write below
 // therefore re-checks, in the UPDATE itself, that the face is still undecided: a decision
 // made during a run always stands, in the catalog and so in the sidecar it was exported to
 // (#137).
@@ -824,10 +824,10 @@ fn is_rejected(conn: &Connection, face_id: i64, person_tag_id: i64) -> rusqlite:
 
 // ── Mutations (accept / reject / ignore / assign) ───────────────────────────────
 //
-// These are the low-level DB mutations behind the Tauri commands. `accept` also needs to
-// assign the person tag to the *photo* through the catalog's `assign_tag` path (XMP export +
-// merge-safe). That side effect lives in commands.rs, which owns the `Catalog`; here we only
-// return the `(photo_id, person_tag_id)` the caller must assign.
+// These are the low-level DB mutations behind accept/reject/ignore/assign. `accept` also
+// needs to assign the person tag to the *photo* through the catalog's `assign_tag` path (XMP
+// export + merge-safe). That side effect lives in `app/faces.rs`, which owns the `Catalog`;
+// here we only return the `(photo_id, person_tag_id)` the caller must assign.
 
 /// What [`accept`] answers for a face with no person to confirm. (It used to say "face has
 /// no assigned person to accept" — misleading for a face the user saw suggested, #208.)

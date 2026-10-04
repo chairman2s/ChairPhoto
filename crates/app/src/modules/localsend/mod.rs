@@ -31,7 +31,7 @@ use std::sync::Arc;
 pub const LOCALSEND_ID: &str = "localsend";
 pub const SNAPCHAT_ID: &str = "snapchat";
 
-/// How long a discovery pass listens after its announcement burst (the Tauri default).
+/// How long a discovery pass listens after its announcement burst.
 pub const DISCOVERY_MS: u64 = 2500;
 
 /// Where the network comes from: discovery and running a claimed send. Both are blocking and

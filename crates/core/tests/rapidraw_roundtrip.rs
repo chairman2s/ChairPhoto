@@ -1,6 +1,6 @@
 //! Integration tests for the "Edit in RapidRAW" round-trip state machine.
 //!
-//! These drive `rapidraw::run_roundtrip` (the Tauri-free core of the round-trip) against a
+//! These drive `rapidraw::run_roundtrip` (the front-end-free core of the round-trip) against a
 //! **mock** RapidRAW binary — a shell script written to a temp dir — so no real editor GUI is
 //! ever launched. Each test exercises one branch of the completion state machine:
 //! happy path, error path, forwarded (exit-0-without-output) + cancel, and size-stability.

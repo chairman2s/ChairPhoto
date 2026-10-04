@@ -3,8 +3,8 @@
 //! Left at their default action these signals kill the process on the spot: no quit
 //! observers, no `crash_marker::clean_exit`, so a logout, a `kill` or a Ctrl+C in the
 //! launching terminal during a LibRaw decode would count as a crash strike against that
-//! file. (The Tauri shell has the same gap: neither it nor tao/wry/tauri installs a handler
-//! for these signals, so they take the default action there too.)
+//! file. (The Tauri shell had the same gap: neither it nor tao/wry/tauri installed a handler
+//! for these signals, so they took the default action there too.)
 //!
 //! The handler does the one async-signal-safe thing it can: it writes the signal number to
 //! a pipe (the self-pipe trick). A watcher thread reads the pipe and calls the app's

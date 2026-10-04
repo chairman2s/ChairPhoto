@@ -49,42 +49,31 @@ rejects an empty `platform`.
 ## Markers are declared by the publishing module
 
 The backend never invents a platform string. A publishing module declares
-`publicationMarker` on its `ChairPhotoModule` (in `src/modules/registry.ts`); if it omits
-one, the host falls back to the module `id`.
+`publication_marker` on its `ModuleMeta` (`crates/app/src/modules/mod.rs`); if it omits one,
+`ModuleMeta::marker()` falls back to the module's own id.
 
-A module records a publication through its injected `ChairPhotoAPI` — and **never passes
-the platform string itself**:
+A publish target reads its own module's marker — `host.meta().marker()`, from the
+`ModuleHost` its `load()` was given — and passes it to core's
+`app::publications::record_publications_as`, bound to the catalog its photo ids were read
+from (`with_catalog_as`), so a record never lands in a catalog opened since, and run in one
+transaction (`Catalog::record_publications`), so a failing row records none.
 
-```ts
-// inside a module, `api` is the injected ChairPhotoAPI
-await api.recordPublication(photoId, versionId /* null = Original */, postUrl);
-const pubs = await api.listPublications(photoId);
-await api.deletePublication(pubs[0].id);
-```
+Modules are first-party Rust now, not sandboxed third-party code, so there is no host
+boundary forcing the marker the way an injected, host-mediated `recordPublication` call
+once did: the guarantee is "every publish target reads and passes its own `marker()`," held
+by convention and code review rather than by construction. The **Flickr and SmugMug
+modules** are the reference implementation of this contract — see [flickr.md](flickr.md)
+and [smugmug.md](smugmug.md).
 
-In the GPUI app a module's marker is `ModuleMeta::marker()` (declared `publication_marker`,
-else the id), and a publish target records through core's
-`app::publications::record_publications_as`, bound to the catalog its photo ids were read from
-(`with_catalog_as`), so a record never lands in a catalog opened since, and run in one
-transaction (`Catalog::record_publications`), so a failing row records none. The React host below did the same stamping in TypeScript.
-
-The host wires `recordPublication` to stamp the calling module's marker
-(`getPublicationMarker(mod.id)` in `src/modules/host.ts`), so the "module declares it,
-host enforces the fallback" rule holds for every module by construction — a module can't
-record under the wrong platform. The **Flickr and SmugMug modules** are the reference
-implementation of this contract — see [flickr.md](flickr.md) and [smugmug.md](smugmug.md).
-
-Instagram, Flickr, and SmugMug are all modules now and record this way (on a confirmed
-post), each via its publish target in the unified Publish dialog. One lower-level escape
-hatch remains for core UI: the raw `recordPublication(photoId, versionId, platform, url)`
-wrapper in `src/modules/api.ts`, which takes an explicit platform.
+Instagram, Flickr, SmugMug, LocalSend and Snapchat all record this way (on a confirmed
+post), each via its publish target in the unified Publish dialog.
 
 ## How it's surfaced
 
 - **Auto-record:** a confirmed Instagram post records a publication with the version it
-  actually rendered — the React module after `post_to_instagram`, the GPUI module in the post's
-  own job (`crates/app/src/modules/instagram/`); a supervised post only on "Yes, I posted it".
-- **Manual:** the inspector's **Published to** panel (`src/components/PublishedPanel.tsx`)
+  actually rendered, from within the post's own job (`crates/app/src/modules/instagram/`); a
+  supervised post only on "Yes, I posted it".
+- **Manual:** the inspector's **Published to** panel (`crates/app/src/modules/publishing/panel.rs`)
   lists publications and lets the user mark a Flickr/SmugMug/other post by picking a
   platform and which version (defaults to the inspector's active version).
 - **Filtering:** dynamic facets keyed `published:<platform>` are appended by
@@ -96,9 +85,9 @@ What each publish path reports while it runs, as of this writing:
 
 | path | progress | cancellation |
 |---|---|---|
-| Flickr, SmugMug | the GPUI panel shows the job's step (Preparing…, Rendering…, Uploading to X…); the Tauri command reports nothing until it returns | every publish is its own job (`app::uploads`), so publishes run side by side and a newer one never stops an older one; the GPUI panel's Cancel (that publish only) or a catalog switch (all of them) stops it before its render or its upload; **an upload already in flight is not interrupted**. A publish whose dialog was closed reports how it ended — published, failed, cancelled or the catalog changed — on the status line |
+| Flickr, SmugMug | the GPUI panel shows the job's step (Preparing…, Rendering…, Uploading to X…) | every publish is its own job (`app::uploads`), so publishes run side by side and a newer one never stops an older one; the GPUI panel's Cancel (that publish only) or a catalog switch (all of them) stops it before its render or its upload; **an upload already in flight is not interrupted**. A publish whose dialog was closed reports how it ended — published, failed, cancelled or the catalog changed — on the status line |
 | Instagram | the GPUI panel shows Preparing…, Rendering…, then Composing the post in Chrome…; the supervised flow ends by handing you the composer | as Flickr's until Chrome has the render; from then on closing the browser window is the cancel |
-| LocalSend | `localsend:progress` `{ done, total, job }` after each file; a panel shows only its own job's | the GPUI panel's Cancel, a newer send or a catalog switch trips the send job (`app::localsend`): it stops before its next render or file, or mid-upload, and calls `POST /cancel?sessionId=` (React's panel has no Cancel) |
+| LocalSend | `localsend:progress` `{ done, total, job }` after each file; a panel shows only its own job's | the GPUI panel's Cancel, a newer send or a catalog switch trips the send job (`app::localsend`): it stops before its next render or file, or mid-upload, and calls `POST /cancel?sessionId=` |
 
 **Only a LocalSend send can be stopped mid-transfer** (a multi-photo send was where a wrong
 selection meant waiting out every file). A single-photo publish stops only *before* its upload:

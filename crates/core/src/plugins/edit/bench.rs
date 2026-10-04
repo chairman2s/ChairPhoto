@@ -4,7 +4,7 @@
 //! the look loop, JPEG/PNG encode, base64 — plus the end-to-end `render_image`, at the
 //! 720 px fast tier and the 1400 px settled tier, and the 1024 px masses pass. Medians of
 //! N runs, one JSON line per edge, in whichever profile it was compiled for. Run it both
-//! ways: `tauri dev` ships the debug profile, the release build is what users install.
+//! ways: a debug `cargo run` ships the debug profile, the release build is what users install.
 //!
 //! Source: `CHAIRPHOTO_EDIT_BENCH_JPEG=/path/to/proxy.jpg` (a real 2048 px preview) or a
 //! synthetic 2048×1365 gradient-plus-noise proxy. `CHAIRPHOTO_EDIT_BENCH_LUT=/path.cube`

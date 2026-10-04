@@ -10,6 +10,10 @@ Measurements: `cargo run --release -p chairphoto-app --example tag_graph_bench`.
 Base: `feature/gpui` at `ebe3259`. Toolchain: gpui-pre 0.3.7 (with gpui-pre-wgpu 0.3.7) and
 rustc 1.98.1, measured 2026-09-30.
 
+**GPUI rewrite: done.** React and the Tauri shell were removed at the cutover (#165); the
+module this research shaped is GPUI-only from here on. The TypeScript/d3-force references
+below are this document's research record of the pre-cutover tree and are left as written.
+
 ## The question rests on a wrong premise
 
 The ticket asks what should replace d3-force (many-body, link, center, collide) for

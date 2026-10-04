@@ -1,8 +1,8 @@
 //! Opt-in per-stage timings for the render path (increment 1 of the GPU-smoothness
 //! work, docs/plans/darkroom/00-status.md). With `CHAIRPHOTO_EDIT_TIMING=1` in the
 //! environment every render prints one `[edit-timing]` line to stderr: the stages in
-//! order with their milliseconds, the total, and the build profile — `tauri dev` runs
-//! this crate at opt-level 0, so a debug number is not a release number, and the line
+//! order with their milliseconds, the total, and the build profile — a debug `cargo run`
+//! runs this crate at opt-level 0, so a debug number is not a release number, and the line
 //! says which it is. Off (the default) a render costs one atomic load and takes no
 //! clocks; nothing here touches pixels.
 use std::sync::OnceLock;

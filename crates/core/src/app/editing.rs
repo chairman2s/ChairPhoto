@@ -1,5 +1,5 @@
-//! The Darkroom's backend bodies, shared by the Tauri commands (`commands::develop`,
-//! `commands::editing`) and the GPUI Darkroom (`crates/app/src/darkroom`): opening a photo
+//! The Darkroom's backend bodies, used by the GPUI Darkroom (`crates/app/src/darkroom`):
+//! opening a photo
 //! for development, the tone strip's zone masses, the proof sheet's auto-tone fragment, the
 //! `.cube` LUT folder, and writing a version's settings with the monochrome refresh every such
 //! write owes.
@@ -11,7 +11,7 @@
 //! GPUI app passes the identity it read the photo or version under, so a catalog switch in
 //! between fails the call closed with [`CATALOG_CHANGED`](super::CATALOG_CHANGED) instead of
 //! reading or writing the new catalog's row with the same id (map #92, "Catalog identity").
-//! The Tauri commands pass `None`, which is their behaviour before this module existed.
+//! Tests exercise the unbound (`None`) form.
 
 use super::{with_catalog, with_catalog_as, AppState, CatalogIdentity};
 use crate::catalog::Catalog;
@@ -629,7 +629,7 @@ mod tests {
             assert_eq!(b.list_versions(photo).unwrap()[0].edit_json, "{}", "the new catalog's version was written");
             assert!(b.version_history(version).unwrap().steps.is_empty());
         }
-        // Unbound (the Tauri commands), the call reads the open catalog.
+        // Unbound (as a test does), the call reads the open catalog.
         assert!(original_path(&state, None, photo).unwrap_err().contains("no reachable copy"));
     }
 

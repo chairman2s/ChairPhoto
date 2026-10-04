@@ -252,8 +252,9 @@ pub(super) const RECORD_LEGACY_IDENTIFIER_SQL: &str =
 
 /// Prefixes of `settings` keys that end in a photo's uuid, which a migration that changes the
 /// uuid must carry over ([`Catalog::carry_photo_keyed_settings`]). Only the Obsidian module's
-/// photo note record (`obsidian.note.<uuid>`, written by the React and GPUI modules alike)
-/// today; its tag notes are keyed by a tag's uuid, which no photo migration touches. Searched
+/// photo note record (`obsidian.note.<uuid>`, written by the GPUI module, and by the removed
+/// React module before it) today; its tag notes are keyed by a tag's uuid, which no photo
+/// migration touches. Searched
 /// for `#146`: settings keys built from a photo's uuid in crates/, src-tauri/ and src/.
 const PHOTO_KEYED_SETTING_PREFIXES: &[&str] = &["obsidian.note."];
 
@@ -895,22 +896,22 @@ impl Catalog {
     /// a copy owing both `identifier` and `import_batch` is two of these.
     ///
     /// Unbounded — pulls the whole queue, which reached 74,488 rows on the 100k harness
-    /// shape in #20 (tens of MB of JSON if this crossed IPC — but it never does: this is
-    /// Rust-only, not a Tauri command). Kept for internal/test callers that want one
-    /// assertion per (copy, field) — see [`PendingIdentityRow`]'s struct doc: this file's
-    /// own test suite is the only caller today (no production code path uses it — the
-    /// repair pass has its own field-grained query, [`Catalog::plan_identity_repairs`]).
-    /// The IPC command and the frontend debt panel use
-    /// [`Catalog::list_pending_identity_page`] instead, which groups by copy.
+    /// shape in #20 (tens of MB of JSON if this crossed a process boundary — but it never
+    /// does: this is Rust-only, called in-process). Kept for internal/test callers that want
+    /// one assertion per (copy, field) — see [`PendingIdentityRow`]'s struct doc: this
+    /// file's own test suite is the only caller today (no production code path uses it —
+    /// the repair pass has its own field-grained query, [`Catalog::plan_identity_repairs`]).
+    /// The GPUI debt panel uses [`Catalog::list_pending_identity_page`] instead, which
+    /// groups by copy.
     pub fn list_pending_identity(&self) -> Result<Vec<PendingIdentityRow>> {
         let mut stmt = self.conn.prepare(PENDING_IDENTITY_QUERY)?;
         let rows = stmt.query_map([], map_pending_identity_row)?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
-    /// A bounded window over the pending-identity queue, grouped by COPY — for the Tauri
-    /// command and the debt panel, so a 74k-row queue is never pulled across IPC in one
-    /// payload, AND so the page's row count is always a slice of the same unit
+    /// A bounded window over the pending-identity queue, grouped by COPY — for the GPUI
+    /// debt panel, so a 74k-row queue is never pulled, or shown, in one page at once, AND
+    /// so the page's row count is always a slice of the same unit
     /// [`Catalog::summarize_pending_identity`] counts (copies), never more. A copy owing
     /// both `identifier` and `import_batch` is ONE row on this page, with both fields
     /// folded into `PendingIdentity::fields`, never split across two rows the way
@@ -1708,8 +1709,9 @@ impl Catalog {
     }
 
     /// Retry every queued repair, uninterruptibly and without reporting progress.
-    /// Composes plan → IO → record for tests and simple callers; the Tauri command runs the
-    /// same steps under a job's abort flag (see [`Catalog::run_identity_repair`]).
+    /// Composes plan → IO → record for tests and simple callers; the GPUI app's identity
+    /// repair job runs the same steps under a job's abort flag (see
+    /// [`Catalog::run_identity_repair`]).
     pub fn repair_pending_identity(&self) -> Result<IdentityRepairSummary> {
         self.run_identity_repair(&AtomicBool::new(false), |_| {})
     }

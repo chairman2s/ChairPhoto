@@ -471,7 +471,7 @@ fn cancel_stops_only_the_followed_run(cx: &mut TestAppContext) {
     work(&f.app, cx);
     let ours = f.fake.claims.lock().unwrap()[0].abort.clone();
 
-    // A start from elsewhere (the Tauri shell, a second window) supersedes it.
+    // A start from elsewhere (a second window) supersedes it.
     let newer = core_faces::begin_index_job(&f.app.state, None).unwrap();
     state.update(cx, |s, cx| s.cancel_index(cx));
     work(&f.app, cx);

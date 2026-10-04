@@ -6,8 +6,8 @@
 //!   cached list at once, Refresh, "+ New", the last album remembered) and no tags. A publish
 //!   records a `smugmug` publication with the image's URL.
 //!
-//! The bodies are core's (`chairphoto_core::app::{oauth, smugmug, uploads}`), shared with the
-//! Tauri commands; the network is a [`SmugMugApi`], which tests fake — they never reach
+//! The bodies are core's (`chairphoto_core::app::{oauth, smugmug, uploads}`); the network is a
+//! [`SmugMugApi`], which tests fake — they never reach
 //! SmugMug.
 //!
 //! **Privacy.** Enabling the module and connecting are the opt-in; a photo leaves only on the

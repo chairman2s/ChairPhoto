@@ -4,8 +4,8 @@
 //! view adds: a cluster's faces, naming several clusters as one person (merge) or some of a
 //! cluster's faces (split), ignoring faces, and reviewing suggestions as they were shown.
 //!
-//! **Blocking**, and each takes a `&Catalog` so the caller picks the lock: the Tauri commands
-//! `with_catalog_blocking`, the GPUI app `with_catalog_as` bound to the identity the ids were
+//! **Blocking**, and each takes a `&Catalog` so the caller picks the lock: the GPUI app uses
+//! `with_catalog_as`, bound to the identity the ids were
 //! read under (map #92, "Catalog identity").
 //!
 //! **Avatars.** Each row carries its photo's `user_rotation`: thumbnails are drawn turned by

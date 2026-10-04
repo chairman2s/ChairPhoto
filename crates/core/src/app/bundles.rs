@@ -1,5 +1,5 @@
-//! Importing a `.chairphoto` bundle (F1d) — the bodies of the Tauri `preview_bundle` and
-//! `import_bundle_cmd` commands, and of the GPUI bundle-import dialog. Both **block** (zip
+//! Importing a `.chairphoto` bundle (F1d) — the bodies the GPUI bundle-import dialog calls.
+//! Both **block** (zip
 //! reads, copies of possibly gigabytes of RAW files): run them on a worker.
 //!
 //! An import owns the import generation (`JobRegistry::import`), like a card import: a newer

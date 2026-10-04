@@ -140,7 +140,7 @@ fn decode_tier(id: i64, kind: ImageKind, resolved: Resolved) -> Result<(DynamicI
             let bytes = thumbnail_bytes(&absolute)?;
             let img = rotate(decode(&bytes)?);
             // The persistent copy: the cached JPEG as-is, or, for a rotated photo, a q90
-            // re-encode of these same pixels (the file the Tauri shell's byte path wrote too).
+            // re-encode of these same pixels (the file the Tauri shell's byte path used to write too).
             if ((rotation % 360) + 360) % 360 == 0 {
                 crate::thumbnails::save_persistent_thumb(id, &bytes);
             } else if let Ok(rotated) = crate::thumbnails::encode_rotated_jpeg(&img) {

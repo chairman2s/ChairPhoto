@@ -1,5 +1,5 @@
-//! The batch cache warm-up as an owned job — the body of the Tauri `cache_images` command and
-//! of the GPUI app's warm-up after a rescan (App.tsx `onScan` → `cacheImages`). It **blocks**
+//! The batch cache warm-up as an owned job — called by the GPUI app's warm-up after a
+//! rescan. It **blocks**
 //! (decodes every reachable original, possibly off a NAS): run it on a worker.
 //!
 //! Every photo whose original is reachable gets its grid thumbnail generated and cached, and

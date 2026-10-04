@@ -422,7 +422,7 @@ impl FacesState {
                         (*done, *total, *step, *progress) = (p.done, p.total, p.phase, true);
                     }
                     MatchPhase::Starting => self.matching.early.push(event.clone()),
-                    // Possibly a run started elsewhere (the Tauri shell, a second window) — or
+                    // Possibly a run started elsewhere (a second window) — or
                     // a straggler of the old catalog's run after a switch. The event cannot
                     // tell; the status slot can (a switch clears it): adopt from there.
                     MatchPhase::Idle if !self.match_finished.contains(&p.job) => {

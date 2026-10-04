@@ -1,4 +1,4 @@
-//! Collage bodies shared by the Tauri commands and the GPUI Collage module (docs/collage.md):
+//! Collage bodies used by the GPUI Collage module (docs/collage.md):
 //! the justified auto-arrange, the freeform render to a folder, and the freeform render saved
 //! into the library.
 //!

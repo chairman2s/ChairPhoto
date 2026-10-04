@@ -59,25 +59,26 @@ into the library rather than a dead end.
 ## Where it lives
 
 ```
-src/modules/plugins/tagGraph.tsx      the view, registered via registerMainView
-src/modules/plugins/tagGraphBundle.ts  the radial layout — pure, unit-tested
-src/modules/plugins/tagGraph.css
-src-tauri/src/commands/graph.rs:66    library_graph — nodes and edges
-crates/core/src/catalog/mod.rs:1841     the queries
+crates/core/src/catalog/mod.rs       Catalog::library_graph / Catalog::photo_tag_graph — the queries
+crates/model/src/tag_graph/          the radial layout (bundle.rs, graph.rs) — pure, unit-tested
+crates/app/src/modules/tag_graph/    the module, its view, and the tiny-skia raster
 ```
 
-The module id is `tag-graph`. It is **frontend-only** — no `backendFeature`, and `library_graph`
-is registered unconditionally, so it is available in every build including
+The module id is `tag-graph`. It is **app-only** — no `backend_feature`, and `library_graph`
+is defined unconditionally in core, so it is available in every build including
 `--no-default-features`.
 
-`commands/graph.rs` also exposes `photo_tag_graph`, the photo↔tag bipartite graph, for views that
-want individual photos as nodes rather than the tag-level projection this module draws.
+`Catalog::photo_tag_graph` is the photo↔tag bipartite graph, for a caller that wants individual
+photos as nodes rather than the tag-level projection this module draws; no current caller
+builds that view (the bipartite mode was dropped at the GPUI port, below).
 
 ## Limits
 
-- The graph is computed live on each open and is not cached. The bipartite Photo ↔ tag mode
-  keeps only the 1,500 most-tagged photos so its force layout stays animatable.
+- The graph is computed live on each open and is not cached.
 - Photos marked missing are excluded, so the picture reflects what the catalog can currently
   reach.
+- **Communities only.** The GPUI port dropped the legacy bipartite Photo ↔ tag view (an
+  owner decision, docs/plans/gpui/tag-graph.md); `Catalog::photo_tag_graph` still exists for
+  it but has no current caller.
 - It is a view of the vocabulary, not an editor — reparenting and merging tags happen in the tag
   tree (see [taxonomy.md](taxonomy.md)).

@@ -4,15 +4,11 @@ A catalog-first photo organizer for people with a lot of photos and a NAS.
 
 ChairPhoto keeps a SQLite catalog of your library, never modifies your originals, and
 writes everything it knows into XMP sidecars so your work survives the catalog. It is a
-desktop application built with Tauri — a Rust backend doing all I/O and image work, and a
-React frontend that only displays.
+native desktop application written in Rust: a core that does all I/O and image work, and a
+[GPUI](https://www.gpui.rs/) front end over it — no webview, no IPC, no browser engine.
 
 > **Status: early.** This is a personal project released in the hope it's useful to
 > someone else. It works on the author's machine and library; expect rough edges.
-
-> **In transition.** The React/Tauri front end is being replaced by a native Rust front
-> end built on [GPUI](https://www.gpui.rs/). Both build from this tree until the
-> switch-over; see [The GPUI front end](#the-gpui-front-end).
 
 ## What it does
 
@@ -35,12 +31,13 @@ React frontend that only displays.
 - **Publishing** — LAN transfer via LocalSend. Flickr and SmugMug are supported through their
   official APIs but are not built by default; enable them with `--features flickr,smugmug`.
 
-Most of this lives in **modules** you can turn off. See [Modules](#modules).
+Most of this lives in **modules** you can turn off, or leave out of the build entirely. See
+[Modules](#modules).
 
 ## Platform
 
-Developed and tested on **Linux**. Tauri itself is cross-platform, but ChairPhoto's system
-dependencies and packaging have not been exercised on macOS or Windows — reports welcome.
+Developed and tested on **Linux**. ChairPhoto's system dependencies and packaging have not
+been exercised on macOS or Windows — reports welcome.
 
 **Hyprland / Omarchy.** Omarchy makes every window slightly translucent by default, which
 mixes the wallpaper into the tones you are judging in Develop. Keep ChairPhoto opaque by
@@ -64,17 +61,21 @@ degrade one feature; they never crash the app** — but you'll want them.
 | **ONNX Runtime** *(1.24 or newer)* | Face tagging and Smart Tagging inference | Those two modules report the runtime is missing; everything else is unaffected |
 | **LibRaw** (vendored) | Full-resolution RAW decode — a pinned git submodule compiled into the binary (`git submodule update --init`) | Build fails unless you disable the `raw` feature |
 
-Building additionally needs a Rust toolchain, Node.js, and the usual Tauri Linux
-dependencies (`webkit2gtk-4.1`, `gtk3`, `librsvg`), plus `clang`/`libclang` for the LibRaw
-bindings.
+At build time ChairPhoto additionally needs a Rust toolchain and `clang`/`libclang` (for the
+LibRaw bindings, plus zlib). At run time the GPUI front end needs a Vulkan driver, Wayland or
+X11 client libraries, `libxkbcommon`, and fontconfig/freetype for text layout — no browser
+engine of any kind.
 
 ### Arch Linux
 
 ```bash
 sudo pacman -S --needed \
   perl-image-exiftool exiv2 ffmpeg imagemagick libheif \
-  clang pkgconf webkit2gtk-4.1 gtk3 librsvg \
-  rust nodejs npm
+  clang pkgconf zlib \
+  vulkan-icd-loader libxkbcommon libxkbcommon-x11 libxcb wayland fontconfig freetype2 \
+  rust
+
+# Install your GPU's Vulkan driver too, e.g. nvidia-utils or vulkan-radeon.
 
 # Only for face tagging / Smart Tagging. onnxruntime-cuda substitutes for the CPU build
 # on an NVIDIA GPU, but the GPU is only used in a `faces-cuda`/`smarttags-cuda` build.
@@ -86,8 +87,9 @@ sudo pacman -S --needed onnxruntime-cpu
 ```bash
 sudo apt install \
   libimage-exiftool-perl exiv2 ffmpeg imagemagick libheif1 zlib1g-dev \
-  clang pkg-config libwebkit2gtk-4.1-dev libgtk-3-dev librsvg2-dev \
-  nodejs npm
+  clang pkg-config \
+  libvulkan-dev libxkbcommon-dev libxkbcommon-x11-dev libxcb1-dev libxcb-xkb-dev \
+  libwayland-dev libfontconfig-dev libfreetype-dev
 # Rust via https://rustup.rs
 # ONNX Runtime (face tagging / Smart Tagging) is not packaged by Debian; install a
 # 1.24+ build from https://github.com/microsoft/onnxruntime/releases and point
@@ -95,22 +97,31 @@ sudo apt install \
 ```
 
 *(Arch package names verified on the development machine; Debian names are the
-equivalents and may differ by release.)*
+equivalents — also used by CI, `.github/workflows/ci.yml` — and may differ by release.)*
 
 ## Build & run
 
 ```bash
-npm install
-npm run tauri dev      # development, hot reload
-npm run tauri build    # production build
+cargo build --release -p chairphoto-app --bin chairphoto-gpui
+cargo run --release -p chairphoto-app --bin chairphoto-gpui
 ```
+
+It opens your real catalog by default (`~/Pictures/Raw`, changeable in Preferences). To try
+it without touching your own library, point it at throwaway data directories instead:
+
+```bash
+XDG_DATA_HOME=/tmp/cp-data XDG_CACHE_HOME=/tmp/cp-cache \
+  cargo run --release -p chairphoto-app --bin chairphoto-gpui
+```
+
+That isolates the catalog database and caches ChairPhoto keeps under
+`$XDG_DATA_HOME`/`$XDG_CACHE_HOME` (both default to `~/.local/share` / `~/.local/cache`),
+which is the same mechanism this project's own agents use to avoid ever touching the real
+library during development.
 
 Checks:
 
 ```bash
-npm test                                    # frontend tests (vitest)
-npx tsc --noEmit                            # frontend typecheck
-npm run build
 cargo test --workspace                      # all Rust crates
 cargo check --workspace --all-features --all-targets
 cargo check --workspace --no-default-features   # verifies feature gating still holds
@@ -124,10 +135,9 @@ The Rust side is a Cargo workspace at the repository root, with build output in 
 
 | Crate | Package | Role |
 |---|---|---|
-| `crates/core` | `chairphoto-core` | Catalog, import, decode, XMP, jobs and module backends. No UI or Tauri dependency. |
+| `crates/core` | `chairphoto-core` | Catalog, import, decode, XMP, jobs and module backends. No UI dependency. |
 | `crates/model` | `chairphoto-model` | UI logic with no I/O (library session, editing, presets, tag graph layout, deep links, …), shared by the GPUI views and tested on its own. |
-| `crates/app` | `chairphoto-app` | The GPUI front end (binary `chairphoto-gpui`). |
-| `src-tauri` | `chairphoto` | The Tauri shell: commands, media protocols and plugins over the core. |
+| `crates/app` | `chairphoto-app` | The GPUI front end — the only front end (binary `chairphoto-gpui`). |
 
 Feature names are the same in every crate that forwards them.
 
@@ -135,77 +145,47 @@ The tree is warning-clean under every feature combination. Please keep it that w
 
 ## Modules
 
-Optional features are Cargo features on the backend and modules on the frontend, so you
-can build only what you want:
+Optional features are Cargo features, compiled into the binary, with a runtime on/off toggle
+in the Modules preferences panel — so you can build only what you want:
 
 ```bash
 # a lean build with no RAW, no local AI, no browser automation
-cargo build -p chairphoto --no-default-features --features edit,collage,slideshow
+cargo build -p chairphoto-app --no-default-features --features edit,collage,slideshow
 ```
 
 | Feature | What it adds | Extra cost |
 |---|---|---|
 | `raw` | Full-res RAW decode | the vendored LibRaw submodule, a C++ compiler, zlib and libclang at build time |
-| `edit` | Crop/tone render engine | none |
+| `edit` | Crop/tone render engine (the Darkroom) | none |
 | `faces` | Local face detect + recognise | ONNX Runtime at runtime + model download |
 | `smarttags` | Local CLIP tag suggestions | ONNX Runtime at runtime + ~350 MB model |
 | `ai` | Vision-model tag suggestions (Ollama or cloud) | network for cloud providers |
 | `map` | Geofences + reverse geocoding | network for the geocoder |
+| `tag-graph` | Visual tag graph (Communities view) | none (bundles tiny-skia for the edge raster) |
 | `flickr`, `smugmug` | Publishing via official APIs | — |
 | `instagram` | Posts an export by driving Chrome | Chrome/Chromium at runtime |
 | `localsend` | Send to a LAN device | — |
 | `collage`, `slideshow` | Mosaic render; slideshow video | ffmpeg for slideshow |
 
+`raw`, `edit`, `ai`, `instagram`, `collage`, `slideshow`, `localsend`, `map`, `faces`,
+`smarttags` and `tag-graph` are on by default; `flickr` and `smugmug` are opt-in.
+
 `faces-cuda` and `smarttags-cuda` additionally run inference on an NVIDIA GPU; both fall
 back to CPU rather than failing.
 
-## The GPUI front end
-
-`crates/app` is a native Rust front end on GPUI that calls the core directly: no webview,
-no IPC, and image pixels go straight from the decoder to the GPU. It is being built to
-parity with the React app, view by view and module by module. Progress is tracked row by
-row in [`docs/plans/gpui/parity.md`](docs/plans/gpui/parity.md). When it reaches parity
-it replaces the Tauri shell and `src/`.
-
-```bash
-cargo run --release -p chairphoto-app --bin chairphoto-gpui
-```
-
-It opens the same catalog as the Tauri app. To try it without touching your own library,
-point it at throwaway data directories:
-
-```bash
-XDG_DATA_HOME=/tmp/cp-data XDG_CACHE_HOME=/tmp/cp-cache \
-  cargo run --release -p chairphoto-app --bin chairphoto-gpui
-```
-
-At run time it needs a Vulkan driver (on Arch, `vulkan-icd-loader` and your GPU's
-driver), plus `libxkbcommon`, `libxkbcommon-x11` and `libxcb`. It does not need
-webkit2gtk.
-
-Known differences from the React app, by design:
-
-- **Modules are compiled in.** First-party modules are Rust and follow the same Cargo
-  features. Third-party JavaScript modules (the API in [Writing a module](#writing-a-module))
-  are not loaded; user extensions are planned after parity.
-- **Video** shows its poster frame with *Play in system player*, instead of playing
-  inline.
-- **The tag graph** shows the Communities view only.
+Known, deliberate limitations: video shows its poster frame with *Play in system player*
+instead of playing inline, and the tag graph has no "Photo ↔ tag" view — Communities only.
 
 ## Writing a module
 
-> The JavaScript module API below belongs to the React/Tauri app. The GPUI front end does
-> not load external modules, so it goes away at the switch-over.
-
-
-Modules load through a small, stable host API (`ChairPhotoAPI` / `ChairPhotoModule`) and
-can add panels and actions without touching core. The API is additive-only within a major
-version, and a module declares the oldest host it supports via `minHostVersion`.
-
-**Licensing for module authors:** a module you distribute must be GPL-3.0, because it runs
-inside ChairPhoto. The **external service** a module talks to does not have to be open
-source, and may cost money — the GPL stops at the network boundary. See
-[`MODULE_LICENSING.md`](MODULE_LICENSING.md).
+All modules are first-party Rust, compiled into the app through the `Module` trait
+(`crates/app/src/modules/mod.rs`) and registered in `modules::bundled()`. There is no
+third-party or externally loaded module today; see `docs/plugin-system.md` § "Why no
+third-party modules" for what that used to look like and why it was dropped at the GPUI
+cutover. Adding a module means contributing Rust to this repository (or carrying a patch on
+your own fork) — see `docs/plugin-system.md` for the trait, and
+[`MODULE_LICENSING.md`](MODULE_LICENSING.md) for what the GPL requires and does not require
+of a module that talks to an external service.
 
 ## License
 

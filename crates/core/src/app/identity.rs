@@ -1,7 +1,6 @@
 //! The sidecar-identity repair pass (#34), conflict resolution (#33) and the bulk resolution of
-//! non-UUID conflicts (#150, [`claim_resolve_foreign_conflicts`], its own job family) — the bodies of the
-//! Tauri `repair_pending_identity`, `identity_repair_cancel`, `identity_repair_status` and
-//! `resolve_identity_conflict` commands, and of the GPUI identity-debt panel.
+//! non-UUID conflicts (#150, [`claim_resolve_foreign_conflicts`], its own job family) — the
+//! bodies the GPUI identity-debt panel runs.
 //!
 //! The pass is a job (`JobRegistry::identity`): [`claim_identity_repair`] takes ownership
 //! (catalog → abort → slot, one transition) and returns an [`IdentityRepairPass`] whose

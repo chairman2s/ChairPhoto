@@ -27,7 +27,7 @@ A **publish target**, "Device (LocalSend)", in the unified **Publish** dialog. I
 current selection of one or more photos.
 
 A send is a core job, `crates/core/src/app/localsend.rs` (`claim_send`, then
-`LocalSendJob::run`), shared by the Tauri `localsend_send` command and the GPUI panel. The claim
+`LocalSendJob::run`), called directly by the GPUI panel. The claim
 checks the catalog the ids were read from, resolves the originals and takes the LocalSend job
 generation under one catalog lock; a newer send, Cancel or a catalog switch trips it, and the
 send stops before its next render or file — mid-upload too — and cancels the receiver's session
@@ -134,14 +134,13 @@ runs only for a form the user is looking at. Tests fake the network at `LocalSen
 core's `app::localsend` tests drive the real send against a loopback stub receiver
 (`localsend/test_receiver.rs`, an ephemeral `127.0.0.1` port).
 
-`SendToDevicePanel.tsx` owns the module's backend surface: the `localsend_discover` and
-`localsend_send` wrappers go through `ChairPhotoAPI.invoke`, and the `localsend:progress`
-stream through `ChairPhotoAPI.onEvent` — not through core `api.ts`, and never through
-Tauri directly. `onEvent` is an optional host-API member, so the panel guards for hosts
-that predate it, in which case progress simply does not display.
+`send::SendToDevicePanel` (`crates/app/src/modules/localsend/send.rs`) calls
+`app::localsend`'s discovery and send functions directly — no command indirection — and
+subscribes to the app model's events to catch `CoreEvent::LocalSendProgress`, filtering to
+its own job id so a stale or another panel's job never moves its counter.
 
 Unit tests cover the discovery-JSON parse, the prepare-upload body and response shapes, the
-device-info builder, the host's `satisfies` semver helper, and the Snapchat aspect helper.
+device-info builder, and the Snapchat aspect helper.
 The discovery-socket tests (issue #39) are the exception: they bind the real well-known UDP
 port, join the real multicast group, and send/receive real datagrams over loopback — see the
 `#[cfg(test)] mod tests` doc comments in `crates/core/src/localsend/mod.rs` for what that costs
@@ -201,31 +200,27 @@ modules.
 
 ## Module dependencies (`requires`)
 
-`ChairPhotoModule` (`src/modules/registry.ts`) carries a version-aware `requires`:
+`ModuleMeta` (`crates/app/src/modules/mod.rs`) carries plain module-id dependencies, with no
+version to match against — a compiled-in module ships with the app, so there is nothing to
+version-range:
 
-```ts
-requires?: { id: string; version?: string }[];   // version = semver range; omit = any
-// e.g. snapchat: requires: [{ id: "localsend", version: "^0.1.0" }]
+```rust
+ModuleMeta::new(SNAPCHAT_ID, "Snapchat")
+    .requires(LOCALSEND_ID)
+    // ...
 ```
 
-Modules already carry a `version` such as "0.1.0", and a dependency's range is matched
-against it. Enforcement is in `src/modules/host.ts`:
+Enforcement is in `ModuleRegistry` (`crates/app/src/modules/registry.rs`):
 
-- `enableModule(id)` first recursively enables each required module, dependencies before
-  dependents so `onLoad` order is correct. It **refuses**, and reports why, if a required
-  module is missing, its `backendFeature` is not compiled, or its version does not satisfy
-  the requested range.
-- `disableModule(id)` cascade-disables any enabled module that requires it, with a toast,
-  so there is never an orphaned dependent.
-- `persistEnabled`/`initHost` enable in dependency order on load.
-- `components/ModulesPanel.tsx` shows "Requires: `<name>` `<range>`" and disables the
-  toggle when a dependency is unavailable or version-incompatible.
+- **Enable** first validates the module's own requirement (the required module must exist
+  and its backend feature, if any, must be compiled in), then enables each required module
+  first — dependencies before dependents, so `load` order is correct. It refuses, with the
+  reason on the status line, if a requirement can't be met.
+- **Disable** cascade-disables any enabled module that requires it, so there is never an
+  orphaned dependent.
+- The enabled set is persisted and restored in dependency order.
 
-Version matching uses a small in-repo `satisfies(version, range)` — no new dependency —
-covering what simple `MAJOR.MINOR.PATCH` module versions need: omitted or `*` for any,
-exact `X.Y.Z`, `>=X.Y.Z`, and npm-style caret `^X.Y.Z`. For `X > 0` the caret means same
-major and greater-or-equal; `^0.Y.Z` means same major **and minor** and greater-or-equal,
-since a 0.x bump is treated as breaking. See [plugin-system.md](plugin-system.md).
+See [plugin-system.md](plugin-system.md).
 
 ## Limits
 

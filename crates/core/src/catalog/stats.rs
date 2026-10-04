@@ -18,9 +18,8 @@ use std::collections::{BTreeMap, HashMap};
 /// Excluded photos are surfaced separately via `invalid_dates`.
 const SANE_DATE_FLOOR: &str = "1950";
 
-/// Raw statistics gathered from the catalog in one lock acquisition. The Tauri shell
-/// serialises it (`commands/graph.rs`); the GPUI Statistics module reads it as is.
-/// `Default` is the zeroed result of an empty scope.
+/// Raw statistics gathered from the catalog in one lock acquisition. The GPUI Statistics
+/// module reads it as is. `Default` is the zeroed result of an empty scope.
 #[derive(Debug, Clone)]
 pub struct CatalogStatsRaw {
     pub total_photos: i64,

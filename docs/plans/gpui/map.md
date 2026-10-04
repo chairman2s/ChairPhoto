@@ -15,6 +15,11 @@ setting `map.tileHosts`, since the #119 review in this machine's preferences) in
 in the port". What was built, and how to measure it: `docs/map-and-geotagging.md` § "The
 GPUI map".
 
+**GPUI rewrite: done.** React and the Tauri shell were removed at the cutover (#165); this
+research and the module it describes answer only to the GPUI app from here on. The
+`src-tauri`/webview references below are this document's research record of the pre-cutover
+tree and are left as written.
+
 ## Recommendation
 
 **Write our own map widget; use no map crate.** Split it in two:

@@ -22,7 +22,7 @@
 //! signal needs its own model (backlog C2), and an empty row promising it would be worse
 //! than its absence.
 //!
-//! Shared by the Tauri `explain_photo_signals` command and the GPUI inspector (gpui #108).
+//! Used by the GPUI inspector (gpui #108).
 
 use crate::burst::{flag_cluster, group_into_clusters, BurstConfig, BurstPhoto};
 use crate::burst_analysis::{BURST_SOFT_THRESHOLD_DEFAULT, BURST_SOFT_THRESHOLD_KEY};

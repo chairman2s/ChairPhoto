@@ -1,5 +1,5 @@
 //! Signing in to an OAuth 1.0a service — Flickr or SmugMug (docs/flickr.md, docs/smugmug.md):
-//! the out-of-band flow the Tauri commands and the GPUI modules share.
+//! the out-of-band flow the GPUI modules use.
 //!
 //! 1. [`begin_auth`] asks the service for a request token (callback `oob`), keeps the token and
 //!    its secret in the service's settings, and returns the authorize URL the user opens.

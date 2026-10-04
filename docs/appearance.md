@@ -22,8 +22,8 @@ ChairPhoto's UI is painted from one set of semantic color tokens. Two modes fill
   theme switches live.
 
 Only the Omarchy half has a Rust side, and that is what this document describes: parser
-and watcher in `crates/core/src/appearance/`, the command surface in
-`src-tauri/src/commands/appearance.rs`.
+and watcher in `crates/core/src/appearance/`, called directly by the GPUI app (no command
+wrapper) through `read_current_theme()`.
 
 ## The Omarchy 4 contract
 
@@ -53,23 +53,25 @@ then rewriting `theme.name`. There is a window in which either file — or the w
 directory — is absent. That mid-swap state is normal and transient, never treated as an
 error by itself: readers ride it out (below) and only report the settled outcome.
 
-## Reading the theme: `get_system_theme`
+## Reading the theme: `read_current_theme`
 
-The `get_system_theme` command returns:
+`read_current_theme()` returns a `SystemThemeResult`:
 
-```json
-{ "available": true, "themeName": "tokyo-night", "palette": { "mode": "dark", "accent": "#7aa2f7", "...": "..." } }
+```rust
+SystemThemeResult { available: true, theme_name: Some("tokyo-night".into()), palette: Some(palette) }
 ```
 
 Failure of *any* kind — no Omarchy on this machine, missing files, malformed TOML, an
-invalid color — is `{ "available": false, "themeName": null, "palette": null }`, never a
-rejected promise. A broken theme and an absent theme demand the same frontend reaction,
-so they get the same shape. The palette's optional fields are `null` when the theme omits
-them; keys are camelCase on the wire (`darkBackground`), snake_case only in the TOML.
+invalid color — is `SystemThemeResult { available: false, theme_name: None, palette: None }`,
+never an `Err`. A broken theme and an absent theme demand the same caller reaction, so they
+get the same shape. The palette's optional fields are `None` when the theme omits them;
+`colors.toml`'s keys stay snake_case, matched one to one by the struct's own fields (the
+`camelCase` serialization on [`SystemThemeResult`] and [`OmarchyPalette`] is for the handful
+of tests that round-trip it through JSON, not for a wire this struct crosses at runtime).
 
 ## Watching for switches
 
-At startup (`app::boot`, which every front end runs) the backend starts a singleton
+At startup (`app::boot_with`, which the GPUI app calls) the backend starts a singleton
 watcher thread — **only if the Omarchy state root exists**. It polls every 2 seconds with
 a cheap fingerprint (mtime + length of both files, absence included as a value). On a
 fingerprint change it settle-reads: both files re-read every 100 ms until two consecutive
@@ -77,7 +79,7 @@ reads agree byte-for-byte *and* parse cleanly, up to ~20 tries (~2 s), riding ou
 atomic swap above. The settled outcome is broadcast as:
 
 - **Event**: `appearance:theme_changed`
-- **Payload**: the same `SystemThemeResult` shape as `get_system_theme` — the new theme,
+- **Payload**: the same `SystemThemeResult` shape as `read_current_theme` — the new theme,
   or `available: false` when the theme vanished or never settled on something valid.
 
 The watcher emits only when the settled outcome *differs* from the last known one, so the
@@ -85,11 +87,11 @@ The watcher emits only when the settled outcome *differs* from the last known on
 
 ## Fallback semantics
 
-`available: false` — from the command or the event — means **switch to ChairPhoto
-Standard now**. The frontend must never keep painting a stale Omarchy palette while the
-state on disk is broken or gone; the next valid settled theme arrives as a fresh
+`available: false` — from `read_current_theme` or the event — means **switch to ChairPhoto
+Standard now**. GPUI must never keep painting a stale Omarchy palette while the state on
+disk is broken or gone; the next valid settled theme arrives as a fresh
 `appearance:theme_changed` and re-enables following.
 
-Absence of Omarchy is a supported, non-degraded state, not an error: `get_system_theme`
+Absence of Omarchy is a supported, non-degraded state, not an error: `read_current_theme`
 answers `available: false`, no watcher thread starts, and nothing polls. ChairPhoto
 Standard is simply the only mode with something to show.

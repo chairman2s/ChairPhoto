@@ -8,14 +8,14 @@
 //!   photo's export keywords until edited. A publish records a `flickr` publication with the
 //!   photo's page URL.
 //!
-//! The bodies are core's (`chairphoto_core::app::{oauth, flickr, uploads}`), shared with the
-//! Tauri commands; the network is a [`FlickrApi`], which tests fake — they never reach Flickr.
+//! The bodies are core's (`chairphoto_core::app::{oauth, flickr, uploads}`); the network is a
+//! [`FlickrApi`], which tests fake — they never reach Flickr.
 //!
 //! **Privacy.** Enabling the module and connecting are the opt-in; a photo leaves only on the
 //! user's Publish. The importer only reads the user's own photostream, on Preview, and never
 //! writes to Flickr.
 //!
-//! The `flickr` backend is not in the default build (as in the Tauri shell): without it the
+//! The `flickr` backend is not in the default build: without it the
 //! module still registers, so the Modules panel says "backend "flickr" not included in this
 //! build" and refuses to enable it.
 

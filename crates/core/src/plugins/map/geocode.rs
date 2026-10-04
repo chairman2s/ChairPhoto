@@ -48,7 +48,7 @@ const MIN_INTERVAL: Duration = Duration::from_millis(1100); // 10% headroom over
 /// request, then record the new request time.
 ///
 /// The `tokio::sync::Mutex` guard is **held across the sleep**, so two concurrent
-/// `reverse_geocode_photo` Tauri commands cannot both read `LAST_REQUEST` at the same
+/// `geocode_photo_to_iptc` calls cannot both read `LAST_REQUEST` at the same
 /// instant and compute the same wait: the second caller blocks on `lock().await` until
 /// the first has finished sleeping and updated the timestamp.  This guarantees that at
 /// most one Nominatim request is in flight per `MIN_INTERVAL` window.
@@ -353,7 +353,7 @@ pub async fn reverse_geocode_ll(
     Ok(result)
 }
 
-// ── Filling IPTC location fields (the Tauri commands and the GPUI Map module) ────────
+// ── Filling IPTC location fields (the GPUI Map module) ────────
 
 /// Run `f` against the open catalog and return its identity: only while that catalog is
 /// still `expected` (failing closed with `CATALOG_CHANGED` otherwise), or — with no
@@ -585,8 +585,8 @@ pub struct GeocodeAllSummary {
 /// [`geocode_photo_to_iptc`] is: once another catalog is open, the next step fails closed
 /// with `CATALOG_CHANGED` and the run stops, having written nothing to the new catalog.
 ///
-/// The Tauri command's entry point: it cannot be cancelled. The GPUI module runs
-/// [`geocode_all_to_iptc_with`], which can.
+/// Was the Tauri command's entry point; it has no current caller besides its own tests,
+/// since it cannot be cancelled. The GPUI module runs [`geocode_all_to_iptc_with`], which can.
 pub async fn geocode_all_to_iptc(
     state: &crate::app::AppState,
     expected: Option<CatalogIdentity>,
@@ -678,7 +678,7 @@ pub async fn geocode_all_to_iptc_with(
 // MutexGuard cross an await point and block the catalog for the full duration of
 // the HTTP call (potentially several seconds).
 //
-// The Tauri command `commands::reverse_geocode_photo` implements the correct
+// `geocode_photo_to_iptc` implements the correct
 // three-step pattern instead: (1) lock catalog, read GPS + cache, drop lock;
 // (2) async HTTP call without any lock held; (3) lock catalog again, store result.
 // Follow that pattern if you need to add batch geocoding.
@@ -1033,7 +1033,7 @@ mod tests {
         (dir, state, id, progress)
     }
 
-    /// The core entry points the Tauri commands and the GPUI module share: fill the empty
+    /// The core entry points the single-photo and bulk geocode calls share: fill the empty
     /// location fields, report progress per photo, and never overwrite a value.
     #[tokio::test]
     async fn geocode_all_fills_empty_fields_reports_progress_and_keeps_values() {

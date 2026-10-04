@@ -6,7 +6,11 @@ pkgrel=1
 pkgdesc="Catalog-first photo organizer for large RAW collections"
 arch=('x86_64')
 url="https://github.com/chairman2s/ChairPhoto"
-license=('GPL-3.0-only' 'LGPL-2.1-only')
+# GPL-3.0-only: the project itself. LGPL-2.1-only: vendored LibRaw. MIT: the lens-correction
+# reader ported from RAWmakase, and a Feather-derived subset of the embedded Lucide icons.
+# ISC: the rest of the embedded Lucide icons. Apache-2.0: gpui-kit-assets' own 6 non-Lucide
+# icon SVGs. OFL-1.1: the embedded Instrument Sans/Serif fonts. See MODULE_LICENSING.md.
+license=('GPL-3.0-only' 'LGPL-2.1-only' 'MIT' 'ISC' 'Apache-2.0' 'OFL-1.1')
 
 # Every direct library dependency is listed, per the packaging guidelines: relying on a
 # transitive edge (another depends pulling one of these in) breaks the moment that
@@ -231,6 +235,14 @@ package() {
     "$pkgdir/usr/share/licenses/$pkgname/OFL-InstrumentSans.txt"
   install -Dm644 crates/app/assets/fonts/OFL-InstrumentSerif.txt \
     "$pkgdir/usr/share/licenses/$pkgname/OFL-InstrumentSerif.txt"
+  # gpui-kit-assets' own 6 non-Lucide SVGs (github, the 4 window-control glyphs,
+  # resize-corner) are the crate's own Apache-2.0 work, not Lucide's (MODULE_LICENSING.md).
+  # The crate ships no LICENSE-APACHE of its own, unlike LICENSE-LUCIDE above, so this is the
+  # plain upstream Apache License 2.0 text, kept at a fixed path for the same reason
+  # LICENSE-RAWmakase/LICENSE-LUCIDE are: no reliable path into a Cargo registry cache from a
+  # release tarball.
+  install -Dm644 crates/app/assets/icons/LICENSE-APACHE-GPUI-KIT-ASSETS \
+    "$pkgdir/usr/share/licenses/$pkgname/LICENSE-APACHE-GPUI-KIT-ASSETS"
 
   install -Dm644 "packaging/icons/32x32.png" \
     "$pkgdir/usr/share/icons/hicolor/32x32/apps/$pkgname.png"

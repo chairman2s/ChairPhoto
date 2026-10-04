@@ -267,7 +267,24 @@ impl Resolved {
 /// Also returns the resolved catalog's identity (even when `expected` was `None`), captured
 /// under that same lock hold, so the in-flight registry entry is always scoped to the actual
 /// catalog this round-trip runs against (#188).
-fn resolve(state: &AppState, expected: Option<CatalogIdentity>, photo_id: i64) -> Result<(Resolved, CatalogIdentity), String> {
+///
+/// Also claims the round-trip's registry entry ([`register_cancel`]) **before releasing the
+/// catalog lock** (#188 M3): a catalog switch or re-root trips every round-trip registered for
+/// the catalog it is leaving from inside its own catalog-lock hold
+/// (`detach_catalog_and_trip_jobs_with`'s `before_drop`, see the lock-order table in
+/// `app::jobs`). Registering on a separate, later lock acquisition left a window where that
+/// trip could run — finding nothing yet, a no-op — strictly between this function reading the
+/// identity and the caller actually inserting the registry entry; the entry then existed,
+/// untripped, for a catalog that had already gone. Holding one lock across both halves closes
+/// that window: whichever of this call and the switch/re-root acquires the catalog lock first
+/// runs its whole critical section before the other starts.
+fn resolve(
+    state: &AppState,
+    expected: Option<CatalogIdentity>,
+    photo_id: i64,
+    job_id: u64,
+    flag: Arc<AtomicBool>,
+) -> Result<(Resolved, CatalogIdentity, Arc<AtomicBool>), String> {
     let guard = state.catalog.lock().map_err(|e| e.to_string())?;
     let catalog = guard.as_ref().ok_or("No catalog is open")?;
     if expected.is_some_and(|e| !e.is(catalog)) {
@@ -277,17 +294,17 @@ fn resolve(state: &AppState, expected: Option<CatalogIdentity>, photo_id: i64) -
     let source = catalog.require_photo_path(photo_id).map_err(|e| e.to_string())?;
     let bin = resolved_bin(catalog)
         .ok_or("RapidRAW is not configured — set its path in Preferences → Editors")?;
-    Ok((
-        Resolved {
-            db_path: catalog.db_path().to_path_buf(),
-            root: catalog.root().to_path_buf(),
-            source,
-            source_photo_id: photo_id,
-            bin,
-            format: resolved_format(catalog),
-        },
-        identity,
-    ))
+    let resolved = Resolved {
+        db_path: catalog.db_path().to_path_buf(),
+        root: catalog.root().to_path_buf(),
+        source,
+        source_photo_id: photo_id,
+        bin,
+        format: resolved_format(catalog),
+    };
+    let cancel = register_cancel(identity, photo_id, job_id, flag)
+        .ok_or("This photo is already being edited in RapidRAW — finish or cancel that edit first")?;
+    Ok((resolved, identity, cancel))
 }
 
 /// `<parent>/<stem>-rapidraw.<ext>`, bumping ` (2)`, ` (3)`… on collision (never overwrite).
@@ -496,9 +513,7 @@ async fn edit(
         emit(&state, photo_id, job_id, "cancelled", "");
         return Ok(None);
     }
-    let (r, identity) = resolve(&state, expected, photo_id)?;
-    let cancel = register_cancel(identity, photo_id, job_id, job.flag.clone())
-        .ok_or("This photo is already being edited in RapidRAW — finish or cancel that edit first")?;
+    let (r, identity, cancel) = resolve(&state, expected, photo_id, job_id, job.flag.clone())?;
     // In flight now (same flag), so it leaves the queue: a cancel finds it either way.
     drop(job);
     let state2 = state.clone();
@@ -768,6 +783,147 @@ mod tests {
             .expect("switch to a fresh catalog");
 
         assert!(flag.load(Ordering::Relaxed), "switching away from A must trip its waiting round-trip");
+        clear_cancel(a_identity, pid);
+    }
+
+    /// #188 M3, functional: `resolve` itself — not `register_cancel` called separately — ends
+    /// up registering the round-trip, and a real, later `switch_catalog` still finds and trips
+    /// exactly that entry. Sequential (no race needed for this part: the switch runs strictly
+    /// after `resolve` has already returned), so it exercises `resolve`'s wiring — that the
+    /// flag it returns really is the one `register_cancel` stored — without depending on any
+    /// timing.
+    /// (Mutation-checked: skipping the `register_cancel` call and returning a fresh, untracked
+    /// flag instead — nothing registered — leaves the switch's `trip_catalog` with no entry to
+    /// find, and this fails: `flag` stays untripped.)
+    #[test]
+    fn resolve_registers_the_round_trip_and_a_later_switch_trips_it() {
+        let dir = crate::test_support::TestTmpDir::new("rapidraw-resolve-then-switch");
+        let a_root = dir.join("a");
+        std::fs::create_dir_all(&a_root).unwrap();
+        let a = Catalog::open(&dir.join("a.chairphoto"), &a_root).unwrap();
+        let original = a_root.join("p.ARW");
+        std::fs::write(&original, b"raw").unwrap();
+        let pid = a.upsert_photo(&original, None, 0, 1).unwrap().id;
+        let state = AppState::default();
+        *state.catalog.lock().unwrap() = Some(a);
+        let a_identity = crate::app::catalog_identity(&state).unwrap();
+        clear_cancel(a_identity, pid);
+
+        let (_resolved, identity, flag) =
+            resolve(&state, Some(a_identity), pid, 1, Arc::new(AtomicBool::new(false))).expect("A is open; nothing else holds this slot");
+        assert_eq!(identity, a_identity);
+        assert!(!flag.load(Ordering::Relaxed), "not tripped yet — no switch has happened");
+
+        crate::app::catalogs::switch_catalog(&state, &dir.join("b.chairphoto"), &dir.join("b"), true, None)
+            .expect("switch to a fresh catalog");
+        assert!(flag.load(Ordering::Relaxed), "switching away from A must trip the round-trip resolve just registered");
+        clear_cancel(a_identity, pid);
+    }
+
+    /// #188 M3, the hazard this fix closes: before it, `resolve` read the identity, released
+    /// the catalog lock, and `edit` called `register_cancel` as its own, later, separate
+    /// statement. That left a window in which a catalog switch's own catalog-lock hold could
+    /// run `trip_catalog` strictly in between — finding no entry yet (a no-op) — after which
+    /// the late `register_cancel` call inserted one, untripped, for a catalog that had already
+    /// gone (review `agent-notes/reviews/claude-fixes-r4.log`, probe P6: "the entry registers
+    /// AFTER trip_catalog ran, flag untripped").
+    ///
+    /// This reconstructs that exact sequence deterministically — not through `resolve` itself
+    /// (its current shape, read below, makes the sequence unreachable through the real call
+    /// path: there is no longer any way to call it and then separately call `register_cancel`
+    /// afterwards, because `resolve` now does both, under one lock hold, before returning) —
+    /// but through the same primitives `resolve`/`edit` used before this fix
+    /// (`identity_of` read under the catalog lock, then `register_cancel` as its own call),
+    /// channel-synchronized against a *real* `switch_catalog` so the switch's `trip_catalog` is
+    /// guaranteed to land in the gap, with no timing luck involved. It pins the hazard's
+    /// mechanism and would catch a regression that reintroduces a separate, unsynchronized
+    /// `register_cancel` call anywhere in `edit`'s neighbourhood.
+    ///
+    /// Why not force this through `resolve` with a race instead: the actual gap a reverted fix
+    /// would reopen is a couple of machine instructions wide (a lock `drop` immediately
+    /// followed by a non-blocking `HashMap` insert) — far narrower than realistic OS thread
+    /// scheduling reliably lands in, even with deliberate contention (measured: 50 iterations
+    /// of racing a real `resolve` against a real `switch_catalog`, with both threads already
+    /// parked on the shared catalog mutex before release, did not reproduce it once). Treat
+    /// `resolve`'s atomicity itself as verified by inspection — the function below never drops
+    /// its `guard` before calling `register_cancel` — backed by this deterministic
+    /// reconstruction of what happens when that is not true.
+    #[test]
+    fn registering_after_a_switch_already_tripped_leaves_a_stale_untripped_entry() {
+        let dir = crate::test_support::TestTmpDir::new("rapidraw-resolve-switch-sequence");
+        let a_root = dir.join("a");
+        std::fs::create_dir_all(&a_root).unwrap();
+        let a = Catalog::open(&dir.join("a.chairphoto"), &a_root).unwrap();
+        let state = AppState::default();
+        *state.catalog.lock().unwrap() = Some(a);
+        let a_identity = crate::app::catalog_identity(&state).unwrap();
+        let pid = 987_654_335;
+        clear_cancel(a_identity, pid);
+
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel::<()>();
+        let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
+        let state_for_thread = state.clone();
+        let late_register = std::thread::spawn(move || {
+            // Step 1: read the identity under the catalog lock, then drop it — `resolve`'s
+            // pre-#188-M3 shape.
+            let identity = {
+                let guard = state_for_thread.catalog.lock().unwrap();
+                let catalog = guard.as_ref().unwrap();
+                identity_of(catalog)
+            };
+            // Step 2: let the real switch run to completion, and wait for it to finish.
+            ready_tx.send(()).unwrap();
+            go_rx.recv().unwrap();
+            // Step 3: register only now — `edit`'s pre-fix, separate, later call.
+            register_cancel(identity, pid, 1, Arc::new(AtomicBool::new(false)))
+        });
+
+        ready_rx.recv().unwrap();
+        crate::app::catalogs::switch_catalog(&state, &dir.join("b.chairphoto"), &dir.join("b"), true, None)
+            .expect("switch to a fresh catalog");
+        go_tx.send(()).unwrap();
+
+        let flag = late_register.join().unwrap().expect("nothing else holds this (catalog, photo) slot");
+        assert!(
+            !flag.load(Ordering::Relaxed),
+            "the switch's trip ran before this entry existed, so a register call made strictly after it can never be \
+             reached by that trip — exactly the hazard #188 M3 closes by keeping resolve's identity read and its \
+             registration under one uninterrupted catalog-lock hold"
+        );
+        clear_cancel(a_identity, pid);
+    }
+
+    /// #188 L2: a re-root that trips RapidRAW's round-trips *before* persisting the new root
+    /// leaves them cancelled even when the persist then fails and the whole re-root aborts
+    /// with the catalog still open (`before_drop`'s `?` skips `job_guards.trip_and_clear_all()`
+    /// and `*cat_guard = None` on that path, per `reroot`'s own "A failed persist leaves the
+    /// catalog open and nothing tripped" comment) — RapidRAW was the one exception to that
+    /// comment being true. Forces the failure by dropping the `settings` table out from under
+    /// the open connection (mirrors the identity-repair tests' `DROP TRIGGER` technique) so
+    /// `set_setting` fails; a round-trip registered beforehand must still be untripped
+    /// afterwards, and the catalog must still be open.
+    /// (Mutation-checked: moving `crate::rapidraw::trip_catalog` back before `set_setting` in
+    /// `catalogs::reroot` — the pre-fix order — trips the flag even though the re-root as a
+    /// whole failed; this test then fails.)
+    #[test]
+    fn a_reroot_whose_persist_fails_does_not_trip_rapidraws_round_trips() {
+        let dir = crate::test_support::TestTmpDir::new("rapidraw-reroot-persist-fails");
+        let a_root = dir.join("a");
+        std::fs::create_dir_all(&a_root).unwrap();
+        let a = Catalog::open(&dir.join("a.chairphoto"), &a_root).unwrap();
+        a.conn().execute_batch("DROP TABLE settings;").unwrap();
+        let state = AppState::default();
+        *state.catalog.lock().unwrap() = Some(a);
+        let a_identity = crate::app::catalog_identity(&state).unwrap();
+        let pid = 987_654_336;
+        clear_cancel(a_identity, pid);
+        let flag = register_cancel(a_identity, pid, 1, Arc::default()).expect("registers");
+
+        let err = crate::app::catalogs::reroot_open_catalog(&state, dir.join("new")).unwrap_err();
+        assert!(err.contains("settings"), "expected the forced set_setting failure: {err}");
+
+        assert!(!flag.load(Ordering::Relaxed), "a re-root that failed to persist must not trip RapidRAW's round-trips");
+        assert!(state.catalog.lock().unwrap().is_some(), "the catalog stays open on a failed persist");
         clear_cancel(a_identity, pid);
     }
 

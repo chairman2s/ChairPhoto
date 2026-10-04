@@ -49,8 +49,10 @@ pub async fn edit_in_rapidraw(state: State<'_, AppState>, photo_id: i64) -> Resu
 
 /// Cancel an in-flight RapidRAW wait for `photo_id`, scoped to whichever catalog is open now
 /// (React carries no catalog identity for this command): a wait belonging to a catalog this
-/// session has since switched away from is left alone (#188).
-#[tauri::command]
+/// session has since switched away from is left alone (#188). `(async)`, like
+/// `rapidraw_available` above: it takes the catalog mutex (`catalog_identity`), which must not
+/// block the main thread (#188 follow-up).
+#[tauri::command(async)]
 pub fn cancel_rapidraw(state: State<'_, AppState>, photo_id: i64) -> Result<(), String> {
     crate::rapidraw::cancel_rapidraw(&state, photo_id)
 }

@@ -42,6 +42,8 @@
 //! | a develop open's claim or close's trip (`editing::DevelopOrder::apply`, #225) | the develop order → catalog → the develop abort → the develop slot → the resident set: the order lock is taken first, with no other lock held, and nothing takes it under another lock |
 //! | [`JobRegistry::lock_for_detach`] (switch phase one) | every abort, then every slot |
 //! | [`JobRegistry::lock_for_publish`] (switch phase two) | every abort |
+//! | `detach_catalog_and_trip_jobs_with`'s `before_drop` hook calling `rapidraw::trip_catalog` (switch phase one's own hook, `catalogs::switch_catalog_in`; reroot's own hook, `catalogs::reroot`) | catalog → every abort → every slot → the RapidRAW registry mutex, nested inside `before_drop`, itself called after `lock_for_detach` |
+//! | `rapidraw::resolve`'s claim of the round-trip's registry entry (`register_cancel`, #188 M3) | catalog → the RapidRAW registry mutex, held through registering the entry — the same two locks `trip_catalog` takes in the same order, so a switch's trip can never land in the gap between reading this round-trip's identity and its entry actually existing in the registry (resolve and switch each hold the catalog lock for their whole critical section, so they cannot interleave) |
 //! | [`AbortGeneration::install_fresh`] (sharpness / pHash starts), `scans::claim_import` | one abort, released before the catalog is read |
 //! | a scan start (`scans::scan_two_phase`), `storage::empty_trash_as`, `storage::restore_trashed_as` | catalog → that family's abort (the catalog identity checked before the abort is touched) |
 //! | `storage::claim_reconcile` (a back-up drain or offload-policy start) | catalog → the reconcile abort |

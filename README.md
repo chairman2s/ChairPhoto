@@ -61,10 +61,14 @@ degrade one feature; they never crash the app** — but you'll want them.
 | **ONNX Runtime** *(1.24 or newer)* | Face tagging and Smart Tagging inference | Those two modules report the runtime is missing; everything else is unaffected |
 | **LibRaw** (vendored) | Full-resolution RAW decode — a pinned git submodule compiled into the binary (`git submodule update --init`) | Build fails unless you disable the `raw` feature |
 
-At build time ChairPhoto additionally needs a Rust toolchain and `clang`/`libclang` (for the
-LibRaw bindings, plus zlib). At run time the GPUI front end needs a Vulkan driver, Wayland or
-X11 client libraries, `libxkbcommon`, and fontconfig/freetype for text layout — no browser
-engine of any kind.
+At build time ChairPhoto additionally needs a Rust toolchain, `clang`/`libclang` (for the
+LibRaw bindings, plus zlib), and the fontconfig/freetype headers — `zed-font-kit` (gpui's
+font matcher) probes for them while building, but neither library is linked or loaded at run
+time (confirmed on the release binary with `readelf`/`strings`; see `packaging/PKGBUILD`). At
+run time the GPUI front end needs a Vulkan driver, `libxkbcommon`, and `libxcb` — linked
+unconditionally, so it's needed whether you run Wayland or X11. A Wayland session additionally
+dlopens the Wayland client libraries; X11/XWayland alone needs nothing more. No browser engine
+of any kind.
 
 ### Arch Linux
 

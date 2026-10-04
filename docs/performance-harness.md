@@ -199,3 +199,16 @@ XDG_DATA_HOME=$S/data XDG_CACHE_HOME=$S/empty-cache \
   cargo run --release -p chairphoto-app --example loupe_bench -- \
   --synthetic 160 --size 6000x4000 --dir $S/loupe --steps 20 --stride 8
 ```
+
+### Cold preview stages
+
+`thumbnails::bench::cold_preview_stage_timings` (core, ignored) times what a cold loupe
+preview pays in `preview_bytes`: the read (or a RAW's embedded-preview extraction through
+exiv2), the decode, the colour-space probe (an `exiftool` run), the downscale (`image`'s and
+`thumbnails::downscale`'s) and encode, the thumbnail derived on the way, and the app's decode
+of the cached preview. `CHAIRPHOTO_PREVIEW_BENCH_FILE` names the original (default a generated
+6000×4000 JPEG).
+
+```bash
+cargo test --release -p chairphoto-core --lib thumbnails::bench -- --ignored --nocapture
+```

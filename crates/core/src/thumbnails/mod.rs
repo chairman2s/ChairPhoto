@@ -367,7 +367,9 @@ fn generate_from_decode(path: &Path, img: &DynamicImage, size: Size) -> Result<V
 /// source file is Adobe RGB). Pure — no disk writes.
 fn encode_size(path: &Path, img: &DynamicImage, size: Size) -> Result<Vec<u8>, String> {
     // thumbnail() only downscales, so a max larger than the image leaves it native.
-    let resized = img.thumbnail(size.max, size.max);
+    // `downscale::thumbnail` is `image`'s `thumbnail`, byte for byte, without its per-pixel
+    // overhead (#168).
+    let resized = downscale::thumbnail(img, size.max);
     let mut out = Cursor::new(Vec::new());
     // The webview shows untagged JPEGs as sRGB. Sony shoots Adobe RGB (wider gamut), so
     // an Adobe RGB preview displayed as-is looks dull/desaturated. Convert it to sRGB for
@@ -723,6 +725,11 @@ fn fnv1a(s: &str) -> u64 {
     }
     hash
 }
+
+mod downscale;
+
+#[cfg(test)]
+mod bench;
 
 #[cfg(test)]
 pub(crate) mod tests {

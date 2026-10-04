@@ -581,37 +581,22 @@ pub fn list_card_photos(source: &Path, dest_base: &Path) -> Result<Vec<CardPhoto
         .filter(|p| p.is_file() && is_supported_image(p))
         .collect();
     let meta = extract_batch(&sources);
-    // Each photo's capture time and its date-tree destination, and the same-size library
-    // files there it may already be (#246), each folder listed once.
-    let mut listings = same_photo::FolderListings::default();
-    let planned: Vec<(Option<String>, i64, Vec<PathBuf>)> = sources
-        .iter()
-        .map(|src| {
-            let capture = meta.get(src).and_then(|m| m.promoted.capture_time.clone());
-            let md = std::fs::metadata(src).ok();
-            let size = md.as_ref().map(|m| m.len() as i64).unwrap_or(0);
-            let mtime_secs = mtime_secs(md.as_ref());
-            let candidates = src
-                .file_name()
-                .map(|f| dest_base.join(date_subdir(capture.as_deref(), mtime_secs)).join(f))
-                .map(|d| listings.same_size_candidates(&d, size as u64))
-                .unwrap_or_default();
-            (capture, size, candidates)
-        })
-        .collect();
-    let duplicates = already_imported(&sources, planned.iter().map(|p| &p.2), &AtomicBool::new(false))
+    // The copy's own plan, earlier files of the listing included: a file the copy would skip
+    // as the same photo as one it copies first is flagged too (#246 review, N-a).
+    let planned = plan_card(&sources, &meta, dest_base);
+    let duplicates = already_imported(&sources, planned.iter().map(|p| &p.candidates), &AtomicBool::new(false))
         .unwrap_or_default();
     let mut out: Vec<CardPhoto> = sources
         .iter()
         .zip(planned)
         .enumerate()
-        .map(|(i, (src, (capture, size, _)))| CardPhoto {
+        .map(|(i, (src, CardPlan { capture, size, .. }))| CardPhoto {
             path: src.to_string_lossy().into_owned(),
             name: src
                 .file_name()
                 .map(|f| f.to_string_lossy().into_owned())
                 .unwrap_or_default(),
-            size,
+            size: size as i64,
             capture_time: capture,
             is_duplicate: duplicates.get(i).is_some_and(|found| !found.is_empty()),
         })
@@ -667,30 +652,10 @@ pub fn copy_from_card_abortable(
     // One metadata pass on the source files — reused for the capture date AND indexing.
     let mut meta = extract_batch(&sources);
 
-    // Where each file goes, and the files it may already be (#246): the same-size library
-    // files of its name, then the earlier files of this run bound for the same name at that
-    // size — one photo met twice on the card (two folders holding the same file) is copied
-    // once. Which of those collisions are the same photo is read in one batched pass before
-    // anything is copied.
-    // Nothing is copied while planning, so each folder is listed once for the whole plan.
-    let mut listings = same_photo::FolderListings::default();
-    let mut bound_for: HashMap<(PathBuf, u64), Vec<PathBuf>> = HashMap::new();
-    let planned: Vec<(PathBuf, Vec<PathBuf>)> = sources
-        .iter()
-        .map(|src| {
-            let capture = meta.get(src).and_then(|m| m.promoted.capture_time.clone());
-            let md = std::fs::metadata(src).ok();
-            let dir = dest_base.join(date_subdir(capture.as_deref(), mtime_secs(md.as_ref())));
-            let size = md.map(|m| m.len()).unwrap_or(0);
-            let Some(dest) = src.file_name().map(|f| dir.join(f)) else { return (dir, Vec::new()) };
-            let mut candidates = listings.same_size_candidates(&dest, size);
-            let earlier = bound_for.entry((dest, size)).or_default();
-            candidates.extend(earlier.iter().cloned());
-            earlier.push(src.clone());
-            (dir, candidates)
-        })
-        .collect();
-    let Some(imported_before) = already_imported(&sources, planned.iter().map(|p| &p.1), abort) else {
+    // Which collisions are the same photo is read in one batched pass before anything is
+    // copied.
+    let planned = plan_card(&sources, &meta, dest_base);
+    let Some(imported_before) = already_imported(&sources, planned.iter().map(|p| &p.candidates), abort) else {
         return Ok((ScanResult::default(), Vec::new(), true));
     };
 
@@ -699,7 +664,7 @@ pub fn copy_from_card_abortable(
     // The files of this run that are in the library now: copied, or found there already.
     let mut in_library: HashSet<&PathBuf> = HashSet::new();
     let this_run: HashSet<&PathBuf> = sources.iter().collect();
-    for ((src, (dir, _)), before) in sources.iter().zip(planned).zip(imported_before) {
+    for ((src, CardPlan { dir, .. }), before) in sources.iter().zip(planned).zip(imported_before) {
         if abort.load(Ordering::Relaxed) {
             return Ok((result, copied, true));
         }
@@ -741,6 +706,48 @@ pub fn copy_from_card_abortable(
         copied.push(CopiedItem { dest, meta: m });
     }
     Ok((result, copied, false))
+}
+
+/// Where a card's file goes, and the files it may already be (#246).
+struct CardPlan {
+    /// The date folder under the destination.
+    dir: PathBuf,
+    capture: Option<String>,
+    size: u64,
+    /// The same-size library files of its name there, then the earlier files of this run
+    /// bound for the same name at that size — one photo met twice on the card (two folders
+    /// holding the same file) is copied once.
+    candidates: Vec<PathBuf>,
+}
+
+/// [`CardPlan`] for each of `sources`, in order: the one plan both the copy
+/// ([`copy_from_card_abortable`]) and the import dialog's listing ([`list_card_photos`])
+/// decide by, so the dialog's "already imported" agrees with what the copy skips. Nothing is
+/// copied while planning, so each folder is listed once for the whole plan.
+fn plan_card(
+    sources: &[PathBuf],
+    meta: &HashMap<PathBuf, crate::metadata::PhotoMetadata>,
+    dest_base: &Path,
+) -> Vec<CardPlan> {
+    let mut listings = same_photo::FolderListings::default();
+    let mut bound_for: HashMap<(PathBuf, u64), Vec<PathBuf>> = HashMap::new();
+    sources
+        .iter()
+        .map(|src| {
+            let capture = meta.get(src).and_then(|m| m.promoted.capture_time.clone());
+            let md = std::fs::metadata(src).ok();
+            let dir = dest_base.join(date_subdir(capture.as_deref(), mtime_secs(md.as_ref())));
+            let size = md.map(|m| m.len()).unwrap_or(0);
+            let Some(dest) = src.file_name().map(|f| dir.join(f)) else {
+                return CardPlan { dir, capture, size, candidates: Vec::new() };
+            };
+            let mut candidates = listings.same_size_candidates(&dest, size);
+            let earlier = bound_for.entry((dest, size)).or_default();
+            candidates.extend(earlier.iter().cloned());
+            earlier.push(src.clone());
+            CardPlan { dir, capture, size, candidates }
+        })
+        .collect()
 }
 
 /// What an abortable indexing pass ([`index_ingested_abortable`],
@@ -1270,6 +1277,23 @@ mod tests {
             .collect();
         assert_eq!(copies.len(), 1, "{copies:?}");
         assert!(copies[0].ends_with("IMG.jpg"));
+    }
+
+    /// N-a of the second #246 review: the import dialog's listing flags the second meeting of
+    /// one photo in a card as already imported, as the copy skips it (both decide by one plan,
+    /// `plan_card`).
+    #[test]
+    fn the_listing_flags_what_the_copy_skips() {
+        let (_catalog, _dir, root, card) = ingest_rig("listing");
+        for folder in ["A", "B"] {
+            std::fs::create_dir_all(card.join(folder)).unwrap();
+            std::fs::write(card.join(folder).join("IMG.jpg"), b"\xff\xd8one").unwrap();
+        }
+        let flagged: Vec<String> =
+            list_card_photos(&card, &root).unwrap().into_iter().filter(|p| p.is_duplicate).map(|p| p.path).collect();
+        assert_eq!(flagged.len(), 1, "{flagged:?}");
+        let (result, copied) = copy_from_card(&card, &root, None, |_, _| {}).unwrap();
+        assert_eq!((result.skipped, copied.len()), (1, 1));
     }
 
     /// An abort while the collisions are being read copies nothing.

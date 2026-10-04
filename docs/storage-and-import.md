@@ -696,7 +696,8 @@ Two modes over the same core location model:
   failed to copy. The metadata comes from one exiftool pass per 150 colliding
   files (`scanner::same_photo`), over both sides of each pair, so a re-import reads a few KB
   per file rather than hashing the card. The import dialog's "already imported" flag uses
-  the same rule. Owner decisions: Year/Month/Day tree, keep filenames. UI: topbar "Import card" dialog with an
+  the same rule and the same plan, so a second meeting of one photo on the card is flagged
+  as the copy will skip it. Owner decisions: Year/Month/Day tree, keep filenames. UI: topbar "Import card" dialog with an
   optional **Import name** that labels the batch (defaults to the source folder); the batch
   keeps its stable UUID underneath. (Cross-volume "import once" by UUID is handled by bundle merge.)
 

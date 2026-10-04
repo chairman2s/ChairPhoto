@@ -87,8 +87,9 @@ Adobe DNG SDK license, and none of its tables measured from Adobe Camera Raw.
 > CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR
 > THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
-The GPUI app (`crates/app`) embeds two more sets of third-party assets, both found while
-fixing #173 (#177):
+The GPUI app (`crates/app`) embeds three more sets of third-party assets: two found while
+fixing #173 (#177), and the third (gpui-kit-assets' own 6 non-Lucide SVGs) found by a
+post-merge review of #177 itself:
 
 - **Lucide** icon SVGs (<https://lucide.dev>), ISC License, Copyright (c) 2026 Lucide Icons
   and Contributors — the icons the app's own code names (`IconName::…`) that gpui-kit's
@@ -106,8 +107,21 @@ fixing #173 (#177):
   (`crates/app/assets/fonts/`, `crates/app/src/assets.rs`). The licence texts sit beside the
   font files (`OFL-InstrumentSans.txt`, `OFL-InstrumentSerif.txt`) and the package installs
   both next to ChairPhoto's own license (`packaging/PKGBUILD`).
+- **gpui-kit-assets' own icons.** That crate's default icon bundle (`default-icons.txt`,
+  what every icon gpui-component itself draws from unless `ExtraIcons` above overrides it)
+  embeds 104 SVGs in total; 98 are the Lucide set just covered. The other 6 — `github.svg`
+  (the GitHub mark), `window-close.svg`, `window-maximize.svg`, `window-minimize.svg`,
+  `window-restore.svg`, and `resize-corner.svg` — are **not** Lucide icons. They're the
+  crate's own original work, under its own **Apache License 2.0** (its `Cargo.toml`:
+  `license = "Apache-2.0"`). The crate ships no `LICENSE-APACHE` file of its own (unlike
+  `LICENSE-LUCIDE`), so this repo keeps a verbatim copy of the plain upstream Apache License
+  2.0 text at `crates/app/assets/icons/LICENSE-APACHE-GPUI-KIT-ASSETS`, and the package
+  installs it next to ChairPhoto's own license (`packaging/PKGBUILD`). An earlier version of
+  this note (#177) said gpui-kit and friends "ship no assets of their own" — wrong: these 6
+  SVGs are exactly that, just not Lucide's.
 
 Everything else `crates/app/assets` and the gpui-component/gpui-base/gpui-kit crates bring in
 is Rust source code pulled in as an ordinary Cargo dependency (Apache-2.0, per their own
 `LICENSE-APACHE`), not a bundled asset — the same category as the project's other Rust
-dependencies, which this note does not enumerate individually.
+dependencies, which this note does not enumerate individually. (Those ~800 MIT/Apache-2.0
+Rust crates' own notices are a broader, separate gap — tracked as #244.)

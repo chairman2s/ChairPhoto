@@ -356,8 +356,14 @@ pub fn run() {
     // A dev build is not installed, so nothing else registers the scheme for it.
     #[cfg(debug_assertions)]
     std::thread::spawn(|| {
-        let (Some(home), Ok(exe)) = (desktop::data_home(), std::env::current_exe()) else { return };
-        if let Err(e) = desktop::register_dev_handler(&home, &exe, desktop::opted_in(), desktop::claim_default) {
+        let (Some(home), Some(config), Ok(exe)) =
+            (desktop::data_home(), desktop::config_home(), std::env::current_exe())
+        else {
+            return;
+        };
+        if let Err(e) =
+            desktop::register_dev_handler(&home, &config, &exe, desktop::opted_in(), desktop::claim_default)
+        {
             eprintln!("deep-link dev registration failed: {e}");
         }
     });

@@ -38,8 +38,11 @@ instagram = ["dep:chromiumoxide", "dep:futures-util", "dep:reqwest"]
 # a core dependency — so this is purely a compile gate. See docs/editing.md.
 edit = []
 # The map & geo-tagging module's backend (polygon geofences + Nominatim reverse-geocoder
-# with an SQLite cache). Uses `reqwest` for the geocoder HTTP client; Leaflet is a
-# frontend-only dep. See docs/map-and-geotagging.md.
+# with an SQLite cache, plus OSM raster tile fetch). Uses `reqwest` for both HTTP clients.
+# No Leaflet dependency exists any more (it left with the React front end at #165); the
+# GPUI map module (crates/app/src/modules/map/) renders tiles itself, with Leaflet's
+# behaviour ported into its own math/logic (comments there cite it for provenance only).
+# See docs/map-and-geotagging.md.
 map = ["dep:reqwest"]
 # The collage compositor (justified-mosaic layout + render). No extra deps — `image`
 # is already a core dependency — so this is purely a compile gate. See docs/collage.md.
@@ -137,8 +140,10 @@ zip = { version = "2", default-features = false, features = ["deflate"] }
 # Parses the Omarchy runtime theme's `colors.toml` for the "Follow Omarchy" appearance
 # mode (src/appearance, docs/appearance.md), at 1.1.2 (`cargo tree -i toml@1`). Before
 # #165 removed Tauri, this was already resolved in Cargo.lock via `tauri-utils`'
-# dependency tree, so promoting it to a direct dependency cost nothing new; now
-# `chairphoto-core` is the only thing pulling it in, unlike `socket2` and `libc` below.
+# dependency tree, so promoting it to a direct dependency cost nothing new. `tauri-utils`
+# is gone now, but `chairphoto-core` is still not the only thing pulling toml@1 in:
+# `embed-resource` (a build-dependency of `gpui-pre`, `cargo tree -i toml@1`) resolves
+# the same version, unlike `socket2` and `libc` below.
 toml = "1"
 # Only compiled when the `ai`/`instagram`/`flickr`/`smugmug` feature is on (see [features]).
 # Flickr's upload is multipart/form-data, but we build that body by hand (avoids reqwest's

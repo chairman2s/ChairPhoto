@@ -70,7 +70,8 @@ order is the current grid order.
   off the UI thread; progress is cosmetic, the job's return value is the terminal result.
 
   ```
-  claim_slideshow(photoIds, opts, destDir) -> outputPath
+  claim_slideshow(state, expected: Option<CatalogIdentity>, photoIds, opts, destDir, ffmpeg)
+    -> Result<SlideshowJob, String>
   event CoreEvent::SlideshowProgress { done, total, job }
   ```
 

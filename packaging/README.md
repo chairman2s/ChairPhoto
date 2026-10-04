@@ -203,6 +203,16 @@ verification on new releases starts failing.
    namcap chairphoto-*.pkg.tar.zst
    ```
 
+**The tag is created at step 2 — not before.** Step 1 (bump `Cargo.toml`) and the `pkgver`
+half of step 4 can land in their own commit ahead of steps 2–3, to prepare this recipe for a
+release that has not been cut yet (its tag does not exist, so its GitHub release tarball does
+not either). In that gap, `sha256sums`' first entry is necessarily still the *previous*
+release's hash — there is nothing real to hash for the new `pkgver` until step 2 creates the
+tag and step 3 publishes the tarball it names. Leave it as a visible, known-wrong placeholder
+(commented as such) rather than guessing; a plain `makepkg` correctly fails integrity on it
+until step 4's `updpkgsums` replaces it with the real hash, which needs the tag and the
+release to already exist.
+
 ## Testing without a release
 
 To exercise the recipe against the working tree, build a tarball shaped like GitHub's and

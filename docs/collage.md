@@ -111,8 +111,9 @@ because it has no alpha, and the dialog nudges you toward PNG when that matters.
 
 ## Implementation
 
-Backend `collage::{compose_freeform, resize_cover_offset}` (pure composition,
-`crates/core/src/collage/`), under the job/catalog-binding layer `app::collage::{auto_arrange,
+Backend `collage::compose_freeform` (pure composition, `crates/core/src/collage/`; its
+per-photo `resize_cover_offset` helper is private), under the job/catalog-binding layer
+`app::collage::{auto_arrange,
 make_freeform, save_to_catalog}` (`crates/core/src/app/collage.rs`) that the GPUI Collage
 module (`crates/app/src/modules/collage/`) calls directly, binding them to the
 `CatalogIdentity` its dialog opened with. `chairphoto_model::collage` holds the templates and

@@ -20,6 +20,11 @@ run_backend_checks() {
     done
   done
 
+  # tag-graph is app-only (crates/app/Cargo.toml has no matching chairphoto-core feature),
+  # so it checks against chairphoto-app alone rather than joining the loop above.
+  RUSTFLAGS="-D warnings" \
+    cargo check -p chairphoto-app --no-default-features --features tag-graph --all-targets
+
   RUSTFLAGS="-D warnings" cargo check --workspace --all-targets
   cargo check --workspace --all-features --all-targets
 }

@@ -27,7 +27,18 @@ pub async fn open_default_catalog(state: &AppState) -> Result<PathBuf, String> {
     let catalog_path = default_catalog_path()?;
     // Default library root for a *fresh* catalog (an existing catalog keeps its stored
     // root; change it via set_library_root). The catalog DB lives elsewhere.
-    let default_root = expand_home("~/Pictures/Raw");
+    //
+    // `CHAIRPHOTO_LIBRARY_ROOT`, when set, overrides the `~/Pictures/Raw` default — but
+    // only for a catalog that has never stored a root: `Catalog::open`'s
+    // `INSERT ... ON CONFLICT(key) DO NOTHING` (catalog/mod.rs) means this value is simply
+    // ignored once a `catalog_root` row already exists, so it can never redirect an
+    // existing catalog away from its real root. Meant for development/trial runs (see
+    // README.md "Try it without touching your own library"); change the root of a real
+    // catalog through Preferences / `set_library_root` instead.
+    let default_root = std::env::var_os("CHAIRPHOTO_LIBRARY_ROOT")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| expand_home("~/Pictures/Raw"));
 
     // Create the default root directory off the UI thread.
     let _ = spawn_blocking({
@@ -711,6 +722,78 @@ mod catalog_registry_tests {
         // No file written — fresh install simulation.
         let list = load_recent_catalogs().unwrap();
         assert!(list.is_empty(), "no registry file → empty list");
+    }
+
+    // -----------------------------------------------------------------
+    // CHAIRPHOTO_LIBRARY_ROOT (README.md "try it without touching your own library"):
+    // honoured for a fresh catalog's default root, ignored once a root is already stored.
+    // -----------------------------------------------------------------
+    #[test]
+    fn library_root_env_var_roots_a_fresh_catalog() {
+        let xdg = temp_xdg("library-root-fresh");
+        let lib = xdg.join("scratch-photos");
+        let _g = EnvGuard::set_all(&[
+            ("XDG_DATA_HOME", xdg.to_str().unwrap()),
+            ("CHAIRPHOTO_LIBRARY_ROOT", lib.to_str().unwrap()),
+        ]);
+
+        let state = AppState::default();
+        crate::app::runtime().block_on(open_default_catalog(&state)).unwrap();
+
+        let guard = state.catalog.lock().unwrap();
+        let catalog = guard.as_ref().expect("open_default_catalog must have opened one");
+        assert_eq!(catalog.root(), lib.as_path(), "a fresh catalog adopts CHAIRPHOTO_LIBRARY_ROOT");
+    }
+
+    /// Reopening an existing catalog must never move its already-stored root, even if
+    /// `CHAIRPHOTO_LIBRARY_ROOT` now names something else: `Catalog::open`'s
+    /// `INSERT ... ON CONFLICT(key) DO NOTHING` (catalog/mod.rs) means the env var is read
+    /// only the first time a catalog is created, never on a later reopen.
+    #[test]
+    fn library_root_env_var_does_not_move_an_existing_catalogs_root() {
+        let xdg = temp_xdg("library-root-existing");
+        let first_lib = xdg.join("first-photos");
+        let _g = EnvGuard::set_all(&[
+            ("XDG_DATA_HOME", xdg.to_str().unwrap()),
+            ("CHAIRPHOTO_LIBRARY_ROOT", first_lib.to_str().unwrap()),
+        ]);
+
+        let state = AppState::default();
+        crate::app::runtime().block_on(open_default_catalog(&state)).unwrap();
+        assert_eq!(state.catalog.lock().unwrap().as_ref().unwrap().root(), first_lib.as_path());
+        // Drop the open handle so the next open_default_catalog re-reads the DB file
+        // instead of finding one already open.
+        *state.catalog.lock().unwrap() = None;
+
+        let other_lib = xdg.join("someone-elses-photos");
+        std::env::set_var("CHAIRPHOTO_LIBRARY_ROOT", other_lib.to_str().unwrap());
+        crate::app::runtime().block_on(open_default_catalog(&state)).unwrap();
+
+        let guard = state.catalog.lock().unwrap();
+        let catalog = guard.as_ref().unwrap();
+        assert_eq!(catalog.root(), first_lib.as_path(), "an existing catalog keeps its stored root");
+    }
+
+    /// Without the env var, a fresh catalog still roots at `~/Pictures/Raw` — the override
+    /// is additive, not a replacement for the real default. `HOME` is also overridden to a
+    /// scratch directory here: this must never resolve `~` against the real home and create
+    /// a `Pictures/Raw` there.
+    #[test]
+    fn without_the_env_var_a_fresh_catalog_keeps_the_real_default() {
+        let xdg = temp_xdg("library-root-unset");
+        let scratch_home = xdg.join("home");
+        let _g = EnvGuard::set_all(&[
+            ("XDG_DATA_HOME", xdg.to_str().unwrap()),
+            ("HOME", scratch_home.to_str().unwrap()),
+        ]);
+        std::env::remove_var("CHAIRPHOTO_LIBRARY_ROOT");
+
+        let state = AppState::default();
+        crate::app::runtime().block_on(open_default_catalog(&state)).unwrap();
+
+        let guard = state.catalog.lock().unwrap();
+        let catalog = guard.as_ref().unwrap();
+        assert_eq!(catalog.root(), scratch_home.join("Pictures/Raw").as_path());
     }
 }
 

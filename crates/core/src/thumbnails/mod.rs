@@ -34,19 +34,33 @@ const ZOOM_MAX: u32 = 10000;
 /// derives (and caches) the smaller sizes from the one in-hand decode. Thumbnails
 /// derived from a larger decode differ pixel-for-pixel from an independently
 /// extracted small embedded preview, so old caches must not be reused.
+///
+/// Shared by thumb and preview only — see [`ZOOM_VERSION`] for why zoom keeps its own.
 const CACHE_VERSION: u32 = 5;
 
-/// One cache size: its longest-edge cap, on-disk tag, and JPEG quality.
+/// Zoom's own cache-directory version, independent of [`CACHE_VERSION`]. The fix making a
+/// tier never upscale changed zoom's output for every original smaller than `ZOOM_MAX` (it
+/// used to be blown up to 10 000 px; now it stays native), but left thumb/preview output
+/// unchanged. Bumping `CACHE_VERSION` would have regenerated all three tiers for no reason;
+/// bumping only this orphans the old `z10000v5` directory (cleaned up best-effort by
+/// [`cleanup_stale_zoom_cache`]) and regenerates zoom alone, at the right size. The next
+/// change that affects zoom specifically bumps this again, independently of
+/// `CACHE_VERSION`.
+const ZOOM_VERSION: u32 = 6;
+
+/// One cache size: its longest-edge cap, on-disk tag, cache-directory version, and JPEG
+/// quality.
 #[derive(Clone, Copy)]
 struct Size {
     max: u32,
     tag: &'static str,
+    version: u32,
     quality: u8,
 }
 
-const THUMB: Size = Size { max: THUMB_MAX, tag: "t", quality: 80 };
-const PREVIEW: Size = Size { max: PREVIEW_MAX, tag: "p", quality: 85 };
-const ZOOM: Size = Size { max: ZOOM_MAX, tag: "z", quality: 92 };
+const THUMB: Size = Size { max: THUMB_MAX, tag: "t", version: CACHE_VERSION, quality: 80 };
+const PREVIEW: Size = Size { max: PREVIEW_MAX, tag: "p", version: CACHE_VERSION, quality: 85 };
+const ZOOM: Size = Size { max: ZOOM_MAX, tag: "z", version: ZOOM_VERSION, quality: 92 };
 
 // --- analyzer hook ----------------------------------------------------------
 // A tiny registry of callbacks invoked once, with the freshly decoded (full,
@@ -185,7 +199,7 @@ pub fn preview_bytes(path: &Path) -> Result<Vec<u8>, String> {
 /// cached — nothing is generated — or its header cannot be read. The face-region writer
 /// cross-checks the recorded frame against it (#154).
 pub fn cached_preview_size(path: &Path) -> Option<(u32, u32)> {
-    let cache_path = cache_path_for(path, PREVIEW.max, PREVIEW.tag).ok()?;
+    let cache_path = cache_path_for(path, PREVIEW).ok()?;
     ImageReader::open(cache_path).ok()?.with_guessed_format().ok()?.into_dimensions().ok()
 }
 
@@ -240,7 +254,7 @@ pub fn zoom_bytes(path: &Path) -> Result<Vec<u8>, String> {
 /// derive and cache the smaller tiers too (see `generate_from_decode`). The next
 /// smaller-size request is then a cache hit — free.
 fn cached(path: &Path, size: Size) -> Result<Vec<u8>, String> {
-    let cache_path = cache_path_for(path, size.max, size.tag)?;
+    let cache_path = cache_path_for(path, size)?;
     if let Ok(bytes) = std::fs::read(&cache_path) {
         return Ok(bytes);
     }
@@ -256,7 +270,7 @@ fn cached(path: &Path, size: Size) -> Result<Vec<u8>, String> {
     run_analyzers(&img, path, size.max);
     let bytes = generate_from_decode(path, &img, size)?;
     for smaller in smaller_sizes(size.max) {
-        let cp = cache_path_for(path, smaller.max, smaller.tag)?;
+        let cp = cache_path_for(path, smaller)?;
         if !cp.exists() {
             // Best-effort: an opportunistic derive must never fail the request it rode in on.
             let _ = generate_from_decode(path, &img, smaller);
@@ -285,7 +299,7 @@ pub fn warm_all_sizes(path: &Path) -> Result<(), String> {
     // If every size is already cached, there is nothing to decode (and no hook to fire).
     let mut missing = Vec::new();
     for s in sizes {
-        let cp = cache_path_for(path, s.max, s.tag)?;
+        let cp = cache_path_for(path, s)?;
         if !cp.exists() {
             missing.push(s);
         }
@@ -350,7 +364,7 @@ fn extract_and_decode(path: &Path, max: u32) -> Result<DynamicImage, String> {
 /// warm-all chain so both derive identically from one decode.
 fn generate_from_decode(path: &Path, img: &DynamicImage, size: Size) -> Result<Vec<u8>, String> {
     let bytes = encode_size(path, img, size)?;
-    let cache_path = cache_path_for(path, size.max, size.tag)?;
+    let cache_path = cache_path_for(path, size)?;
     if let Some(parent) = cache_path.parent() {
         std::fs::create_dir_all(parent).ok();
     }
@@ -689,8 +703,10 @@ pub(crate) fn exif_orientation(path: &Path) -> Orientation {
 }
 
 /// Cache file path: <cache_dir>/chairphoto/<tag><max>v<version>/<hash>.jpg, where
-/// the hash covers path + mtime + size so edits invalidate the cache.
-fn cache_path_for(path: &Path, max: u32, tag: &str) -> Result<PathBuf, String> {
+/// the hash covers path + mtime + size so edits invalidate the cache, and `version` is
+/// `size`'s own cache-directory version (shared [`CACHE_VERSION`] for thumb/preview,
+/// [`ZOOM_VERSION`] for zoom).
+fn cache_path_for(path: &Path, size: Size) -> Result<PathBuf, String> {
     let meta = std::fs::metadata(path).map_err(|e| e.to_string())?;
     let mtime = meta
         .modified()
@@ -703,8 +719,35 @@ fn cache_path_for(path: &Path, max: u32, tag: &str) -> Result<PathBuf, String> {
 
     let base = cache_dir()
         .join("chairphoto")
-        .join(format!("{tag}{max}v{CACHE_VERSION}"));
+        .join(format!("{}{}v{}", size.tag, size.max, size.version));
     Ok(base.join(format!("{hash:016x}.jpg")))
+}
+
+/// Old zoom cache directory name, before `ZOOM_VERSION` split off from `CACHE_VERSION` —
+/// kept only so [`cleanup_stale_zoom_cache`] can find and remove it.
+const STALE_ZOOM_DIR: &str = "z10000v5";
+
+/// One-time, best-effort removal of the zoom tier's pre-no-upscale-fix cache directory
+/// (`<cache_dir>/chairphoto/z10000v5`). Those cached JPEGs are upscaled for any original
+/// under `ZOOM_MAX`; nothing reads that directory any more now that zoom writes under its
+/// own [`ZOOM_VERSION`], so removing it only reclaims disk space.
+///
+/// Safe by construction: the path is always this process's own `cache_dir()` joined with a
+/// fixed literal, never anything caller-supplied, and the removal refuses unless that exact
+/// path is a real directory — in particular never a symlink (checked with
+/// [`std::fs::symlink_metadata`], which does not follow it), so a symlink planted at that
+/// name is left untouched rather than followed. `fs::remove_dir_all` itself does not follow
+/// symlinks it finds inside the tree either, so no entry under the directory can redirect
+/// the removal elsewhere. A missing directory or any I/O error is silently a no-op: this is
+/// disk-space cleanup, not correctness-critical, so it never panics or reports a failure.
+///
+/// Call off the UI thread — it is disk I/O and nothing waits on it (`app::boot_with` spawns
+/// it on its own thread).
+pub fn cleanup_stale_zoom_cache() {
+    let dir = cache_dir().join("chairphoto").join(STALE_ZOOM_DIR);
+    if matches!(std::fs::symlink_metadata(&dir), Ok(meta) if meta.file_type().is_dir()) {
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
 
 /// A unique temp dir for one extraction, avoiding collisions between concurrent
@@ -789,6 +832,28 @@ pub(crate) mod tests {
         assert_eq!(dims(&tall, PREVIEW), (205, 2048), "a long edge over the box still shrinks");
     }
 
+    /// Zoom caches under its own version ([`ZOOM_VERSION`]), independent of thumb/preview's
+    /// shared [`CACHE_VERSION`]: the no-upscale fix changed only zoom's output, so only
+    /// zoom's directory name should change — old `z10000v5` zooms must never be read back as
+    /// current, while thumb/preview keep the directories they already had.
+    #[test]
+    fn zoom_caches_under_its_own_version_directory() {
+        let _guard = test_lock();
+        let tmp_dir = TestTmpDir::new("zoom-version");
+        let tmp = tmp_dir.path().to_path_buf();
+        std::env::set_var("XDG_CACHE_HOME", tmp.join("cache"));
+        let img = write_test_jpeg(&tmp, "zoomversion.jpg", 64, 64);
+
+        let zoom_dir = cache_path_for(&img, ZOOM).unwrap().parent().unwrap().file_name().unwrap().to_owned();
+        let preview_dir = cache_path_for(&img, PREVIEW).unwrap().parent().unwrap().file_name().unwrap().to_owned();
+        let thumb_dir = cache_path_for(&img, THUMB).unwrap().parent().unwrap().file_name().unwrap().to_owned();
+
+        assert_eq!(zoom_dir, format!("z{ZOOM_MAX}v{ZOOM_VERSION}").as_str());
+        assert_eq!(preview_dir, format!("p{PREVIEW_MAX}v{CACHE_VERSION}").as_str());
+        assert_eq!(thumb_dir, format!("t{THUMB_MAX}v{CACHE_VERSION}").as_str());
+        assert_ne!(ZOOM_VERSION, CACHE_VERSION, "zoom's version must differ to orphan z10000v5");
+    }
+
     // --- decode-once chain + analyzer hook -----------------------------------
     // These tests touch the global on-disk cache (via XDG_CACHE_HOME) and the global
     // analyzer registry, both process-wide. Serialize them behind one mutex so the env
@@ -870,6 +935,67 @@ pub(crate) mod tests {
         path
     }
 
+    // --- stale zoom cache cleanup (#168 review) ------------------------------
+    // Shares the env-var lock with the tests above: XDG_CACHE_HOME is process-global.
+
+    #[test]
+    fn cleanup_stale_zoom_cache_removes_only_the_old_directory() {
+        let _guard = test_lock();
+        let tmp_dir = TestTmpDir::new("stale-zoom");
+        let cache = tmp_dir.path().join("cache");
+        std::env::set_var("XDG_CACHE_HOME", &cache);
+
+        let stale = cache.join("chairphoto").join(STALE_ZOOM_DIR);
+        std::fs::create_dir_all(&stale).unwrap();
+        std::fs::write(stale.join("deadbeefdeadbeef.jpg"), b"old upscaled zoom").unwrap();
+
+        // A sibling tier directory (current preview cache, say) must survive untouched.
+        let sibling = cache.join("chairphoto").join("p2048v5");
+        std::fs::create_dir_all(&sibling).unwrap();
+        std::fs::write(sibling.join("keep.jpg"), b"current preview").unwrap();
+
+        cleanup_stale_zoom_cache();
+
+        assert!(!stale.exists(), "the old z10000v5 directory should be gone");
+        assert!(sibling.join("keep.jpg").exists(), "an unrelated tier must be untouched");
+    }
+
+    #[test]
+    fn cleanup_stale_zoom_cache_is_a_silent_no_op_when_absent() {
+        let _guard = test_lock();
+        let tmp_dir = TestTmpDir::new("stale-zoom-absent");
+        std::env::set_var("XDG_CACHE_HOME", tmp_dir.path().join("cache"));
+        // Nothing to remove; must not panic.
+        cleanup_stale_zoom_cache();
+    }
+
+    /// A symlink planted at the exact stale name is never followed: neither it nor whatever
+    /// it points at is touched. `symlink_metadata` sees the link, not a directory, so the
+    /// removal refuses outright.
+    #[test]
+    #[cfg(unix)]
+    fn cleanup_stale_zoom_cache_never_follows_a_symlink() {
+        let _guard = test_lock();
+        let tmp_dir = TestTmpDir::new("stale-zoom-symlink");
+        let cache = tmp_dir.path().join("cache");
+        std::env::set_var("XDG_CACHE_HOME", &cache);
+
+        let elsewhere = tmp_dir.path().join("elsewhere");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        std::fs::write(elsewhere.join("precious.txt"), b"not ours to delete").unwrap();
+
+        let chairphoto_dir = cache.join("chairphoto");
+        std::fs::create_dir_all(&chairphoto_dir).unwrap();
+        let link = chairphoto_dir.join(STALE_ZOOM_DIR);
+        std::os::unix::fs::symlink(&elsewhere, &link).unwrap();
+
+        cleanup_stale_zoom_cache();
+
+        let meta = std::fs::symlink_metadata(&link).expect("the symlink itself must still exist");
+        assert!(meta.file_type().is_symlink(), "must remain a symlink, not be removed or replaced");
+        assert!(elsewhere.join("precious.txt").exists(), "the symlink's target must be untouched");
+    }
+
     #[test]
     fn analyzer_hook_fires_once_per_decode() {
         let _guard = test_lock();
@@ -912,7 +1038,7 @@ pub(crate) mod tests {
         let img = write_test_jpeg(&tmp, "cachedsize.jpg", 1200, 900);
 
         assert_eq!(cached_preview_size(&img), None, "not cached yet");
-        assert!(!cache_path_for(&img, PREVIEW.max, PREVIEW.tag).unwrap().exists(), "asking generated it");
+        assert!(!cache_path_for(&img, PREVIEW).unwrap().exists(), "asking generated it");
         let preview = image::load_from_memory(&preview_bytes(&img).unwrap()).unwrap();
         assert_eq!(cached_preview_size(&img), Some((preview.width(), preview.height())));
     }

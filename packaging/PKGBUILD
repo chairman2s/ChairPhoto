@@ -1,12 +1,16 @@
 # Maintainer: Andreas Henden <chairman2s.ah+github@gmail.com>
 
 pkgname=chairphoto
-pkgver=2026.8.0
-pkgrel=3
+pkgver=2026.10.0
+pkgrel=1
 pkgdesc="Catalog-first photo organizer for large RAW collections"
 arch=('x86_64')
 url="https://github.com/chairman2s/ChairPhoto"
-license=('GPL-3.0-only' 'LGPL-2.1-only')
+# GPL-3.0-only: the project itself. LGPL-2.1-only: vendored LibRaw. MIT: the lens-correction
+# reader ported from RAWmakase, and a Feather-derived subset of the embedded Lucide icons.
+# ISC: the rest of the embedded Lucide icons. Apache-2.0: gpui-kit-assets' own 6 non-Lucide
+# icon SVGs. OFL-1.1: the embedded Instrument Sans/Serif fonts. See MODULE_LICENSING.md.
+license=('GPL-3.0-only' 'LGPL-2.1-only' 'MIT' 'ISC' 'Apache-2.0' 'OFL-1.1')
 
 # Every direct library dependency is listed, per the packaging guidelines: relying on a
 # transitive edge (another depends pulling one of these in) breaks the moment that
@@ -25,6 +29,14 @@ license=('GPL-3.0-only' 'LGPL-2.1-only')
 #     load ..." messages, so it is dlopen'd, not link-time NEEDED — but the app cannot open a
 #     window without it, so it belongs here regardless. An actual GPU driver's Vulkan ICD
 #     (mesa-vulkan-*, nvidia-utils, …) is hardware-specific and left to the user/metapackage.
+#   wayland  gpui-pre-linux builds a WaylandClient unconditionally whenever WAYLAND_DISPLAY is
+#     set, with no X11 fallback in that case (linux.rs): on a Wayland session without it, the
+#     app panics rather than falling back to X11/XWayland. Same shape as vulkan-icd-loader
+#     above: not in NEEDED, but `strings` shows `libwayland-client.so.0`/`libwayland-egl.so.1`
+#     as dlopen targets with their own "could not be loaded" error strings. A Wayland
+#     compositor always pulls this in anyway, so in practice it's rarely the missing piece —
+#     listed regardless, per the same "every direct dependency is listed" rule as everything
+#     else here.
 #
 # Tauri/webkit2gtk's dependents (cairo, dbus, gdk-pixbuf2, glib2, gtk3, libsoup3,
 # webkit2gtk-4.1) are gone along with Tauri (#165): none of them appear in NEEDED any more.
@@ -48,6 +60,7 @@ depends=(
   'libxkbcommon'
   'libxkbcommon-x11'
   'vulkan-icd-loader'
+  'wayland'
   'zlib'
 )
 
@@ -93,9 +106,17 @@ source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz"
         "libraw-$_libraw_commit.tar.gz::https://github.com/LibRaw/LibRaw/archive/$_libraw_commit.tar.gz"
         "$pkgname.desktop")
 # Regenerate with `updpkgsums` after every pkgver bump; see README.md in this directory.
+#
+# Index 0 is still v2026.8.0's hash: this recipe targets the *next* tag (v2026.10.0, not yet
+# created — see README.md "Cutting a release" and its note on preparing a recipe ahead of the
+# tag it names), so there is no real v2026.10.0 tarball to hash yet. Left as a visible,
+# known-wrong placeholder rather than a guess; a plain `makepkg` will fail integrity on it
+# until the actual release's `updpkgsums` run replaces it. Index 2 (chairphoto.desktop) is
+# current — that file lives in this repo, not behind a tag, so `sha256sum
+# packaging/chairphoto.desktop` could be computed for real, offline, right now.
 sha256sums=('9243bce8e428bf534228c598f0b5e78cb932684adf4fa91965d583bd1ebb2ebf'
             'SKIP'
-            'f886deeefb89b0ac96497bf02e6307539175fbb99a498ba3f40ed8ff14e10f00')
+            '1472df45baa14daafd92f4bfda8796fecdb0d8f938742fe19484a816bb14702e')
 
 prepare() {
   cd "ChairPhoto-$pkgver"
@@ -214,6 +235,14 @@ package() {
     "$pkgdir/usr/share/licenses/$pkgname/OFL-InstrumentSans.txt"
   install -Dm644 crates/app/assets/fonts/OFL-InstrumentSerif.txt \
     "$pkgdir/usr/share/licenses/$pkgname/OFL-InstrumentSerif.txt"
+  # gpui-kit-assets' own 6 non-Lucide SVGs (github, the 4 window-control glyphs,
+  # resize-corner) are the crate's own Apache-2.0 work, not Lucide's (MODULE_LICENSING.md).
+  # The crate ships no LICENSE-APACHE of its own, unlike LICENSE-LUCIDE above, so this is the
+  # plain upstream Apache License 2.0 text, kept at a fixed path for the same reason
+  # LICENSE-RAWmakase/LICENSE-LUCIDE are: no reliable path into a Cargo registry cache from a
+  # release tarball.
+  install -Dm644 crates/app/assets/icons/LICENSE-APACHE-GPUI-KIT-ASSETS \
+    "$pkgdir/usr/share/licenses/$pkgname/LICENSE-APACHE-GPUI-KIT-ASSETS"
 
   install -Dm644 "packaging/icons/32x32.png" \
     "$pkgdir/usr/share/icons/hicolor/32x32/apps/$pkgname.png"

@@ -61,10 +61,14 @@ degrade one feature; they never crash the app** — but you'll want them.
 | **ONNX Runtime** *(1.24 or newer)* | Face tagging and Smart Tagging inference | Those two modules report the runtime is missing; everything else is unaffected |
 | **LibRaw** (vendored) | Full-resolution RAW decode — a pinned git submodule compiled into the binary (`git submodule update --init`) | Build fails unless you disable the `raw` feature |
 
-At build time ChairPhoto additionally needs a Rust toolchain and `clang`/`libclang` (for the
-LibRaw bindings, plus zlib). At run time the GPUI front end needs a Vulkan driver, Wayland or
-X11 client libraries, `libxkbcommon`, and fontconfig/freetype for text layout — no browser
-engine of any kind.
+At build time ChairPhoto additionally needs a Rust toolchain, `clang`/`libclang` (for the
+LibRaw bindings, plus zlib), and the fontconfig/freetype headers — `zed-font-kit` (gpui's
+font matcher) probes for them while building, but neither library is linked or loaded at run
+time (confirmed on the release binary with `readelf`/`strings`; see `packaging/PKGBUILD`). At
+run time the GPUI front end needs a Vulkan driver, `libxkbcommon`, and `libxcb` — linked
+unconditionally, so it's needed whether you run Wayland or X11. A Wayland session additionally
+dlopens the Wayland client libraries; X11/XWayland alone needs nothing more. No browser engine
+of any kind.
 
 ### Arch Linux
 
@@ -107,17 +111,23 @@ cargo run --release -p chairphoto-app --bin chairphoto
 ```
 
 It opens your real catalog by default (`~/Pictures/Raw`, changeable in Preferences). To try
-it without touching your own library, point it at throwaway data directories instead:
+it without touching your own library, point it at throwaway directories instead — all three
+variables, not just the first two:
 
 ```bash
-XDG_DATA_HOME=/tmp/cp-data XDG_CACHE_HOME=/tmp/cp-cache \
+XDG_DATA_HOME=/tmp/cp-data XDG_CACHE_HOME=/tmp/cp-cache CHAIRPHOTO_LIBRARY_ROOT=/tmp/cp-photos \
   cargo run --release -p chairphoto-app --bin chairphoto
 ```
 
-That isolates the catalog database and caches ChairPhoto keeps under
-`$XDG_DATA_HOME`/`$XDG_CACHE_HOME` (both default to `~/.local/share` / `~/.local/cache`),
-which is the same mechanism this project's own agents use to avoid ever touching the real
-library during development.
+`XDG_DATA_HOME`/`XDG_CACHE_HOME` (both default to `~/.local/share`/`~/.cache`) isolate the
+catalog database and the image caches. On their own, though, a brand new catalog still roots
+itself at the real `~/Pictures/Raw` (`crates/core/src/app/catalogs.rs`) — the scratch database
+would browse, scan and write XMP sidecars into your actual library. `CHAIRPHOTO_LIBRARY_ROOT`
+closes that gap: a development-only override, honoured only while the catalog has no stored
+root yet, so it can set where a *fresh* catalog starts but can never redirect one that already
+exists. (This project's own agent-driving skill, `.claude/skills/chairphoto-app/app.sh`, takes
+the same idea further — seeding `catalog_root` straight into the database so a scratch
+instance opens already pointed at its pre-populated agent library.)
 
 Checks:
 

@@ -344,7 +344,9 @@ mod tests {
         });
 
         let earlier = save_iptc(&state, id, &first).unwrap();
-        let (later, title_inside_the_window) = rx.recv().unwrap();
+        let (later, title_inside_the_window) = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("BEFORE_SETTLE never fired: write_and_settle did not call before_settle for this write");
         assert_eq!(title_inside_the_window, "t1", "the later save stored before the earlier one settled");
         assert_eq!(earlier.sidecar, crate::catalog::IptcSidecarState::Written, "{earlier:?}");
         let later = later.join().unwrap().unwrap();

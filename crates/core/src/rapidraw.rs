@@ -261,8 +261,8 @@ impl Resolved {
     }
 }
 
-/// `expected`: the catalog the photo id was read from (`None` = whichever is open, the Tauri
-/// command's unbound form), checked under the same lock hold as the path lookup — once
+/// `expected`: the catalog the photo id was read from (`None` = whichever is open, the
+/// unbound form the former Tauri command used), checked under the same lock hold as the path lookup — once
 /// another catalog is open this fails closed with [`CATALOG_CHANGED`] and nothing launches.
 /// Also returns the resolved catalog's identity (even when `expected` was `None`), captured
 /// under that same lock hold, so the in-flight registry entry is always scoped to the actual
@@ -410,7 +410,7 @@ fn copy_exif_if_missing(source: &Path, out: &Path) {
     }
 }
 
-/// The blocking core of the round-trip, decoupled from Tauri so it's directly testable with a
+/// The blocking core of the round-trip, decoupled from any front end so it's directly testable with a
 /// mock binary (see `tests/rapidraw_roundtrip.rs`). Launches RapidRAW with the request/response
 /// protocol, then runs the completion state machine:
 ///   - nonzero exit / spawn failure → `Err`;
@@ -537,7 +537,7 @@ async fn edit(
 }
 
 /// Cancel an in-flight RapidRAW wait for `photo_id`, scoped to the catalog open right now (the
-/// Tauri/React command has no identity of its own to pass — #188): trips the watcher's cancel
+/// former Tauri/React command had no identity of its own to pass — #188): trips the watcher's cancel
 /// flag so it abandons the wait (used both to give up on a forwarded session and to resolve
 /// the "closed without Done" case, which the app can't distinguish from forwarding). A switch
 /// since the round-trip started means this call's identity no longer matches that entry's, so

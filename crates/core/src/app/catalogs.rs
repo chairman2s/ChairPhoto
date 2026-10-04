@@ -95,9 +95,8 @@ pub fn spawn_detached_phase_b(
 /// `scan:progress {phase:"metadata"|"finalizing"}` and ends with the terminal
 /// `scan:progress {phase:"done"}` whether it finishes, fails or is aborted.
 ///
-/// A value rather than a spawned thread so each front end runs it on its own worker: the
-/// Tauri shell on the core runtime's blocking pool, the GPUI app on its job runner.
-/// [`run`](Self::run) blocks for the whole pass — never call it on a UI thread.
+/// A value rather than a spawned thread, so the GPUI app runs it on its own worker (its job
+/// runner). [`run`](Self::run) blocks for the whole pass — never call it on a UI thread.
 pub struct EnrichJob {
     events: AppState,
     path: PathBuf,
@@ -171,8 +170,8 @@ pub(crate) fn send_scan_done(events: &AppState) {
 
 // ── Catalog switching ────────────────────────────────────────────────────────
 
-/// Switch the active catalog with a safe teardown → reinit lifecycle (I4b). The body of the
-/// Tauri `switch_catalog` command and of the GPUI catalog switcher. **Blocking** (it opens
+/// Switch the active catalog with a safe teardown → reinit lifecycle (I4b). The body the
+/// GPUI catalog switcher calls. **Blocking** (it opens
 /// and may migrate a SQLite file): run it on a worker, never the UI thread.
 ///
 /// 1. Checks the target exists (or, with `create`, does not) before anything is mutated, so
@@ -183,11 +182,11 @@ pub(crate) fn send_scan_done(events: &AppState) {
 /// 3. Opens (or creates, with its folders) the new catalog.
 /// 4. Publishes it with fresh un-tripped generations ([`publish_catalog_and_reset_jobs`]),
 ///    drops stale volume health and records it in the recent-catalogs registry.
-/// 5. Emits `catalog:switched`, so every front end resets and re-reads.
+/// 5. Emits `catalog:switched`, so the GPUI app resets and re-reads.
 ///
 /// Returns the Phase B auto-resume (I6d) when the new catalog has pending enrichment rows;
 /// the caller runs it on a worker. A failed open after step 2 leaves **no** catalog open —
-/// the old handle is gone by then, as it always was in the Tauri command.
+/// the old handle is gone by then.
 pub fn switch_catalog(
     state: &AppState,
     catalog_path: &Path,
@@ -379,7 +378,7 @@ fn publish(state: &AppState, catalog: Catalog, only_if_vacant: bool) -> Result<A
 /// lands between them, with its phase two still to come, publishes over the re-root — the
 /// later request wins, and it announces itself with `catalog:switched`.
 ///
-/// Emits no `catalog:switched` (the Tauri command never did); the caller refreshes what it
+/// Emits no `catalog:switched`; the caller refreshes what it
 /// shows.
 pub fn reroot_library(state: &AppState, new_root: PathBuf, catalog_path: &Path) -> Result<(), String> {
     reroot(state, new_root, Some(catalog_path), None, || ())
@@ -392,10 +391,10 @@ pub fn reroot_library(state: &AppState, new_root: PathBuf, catalog_path: &Path) 
 /// handles (see [`reroot_library`]); one that lands before phase one is refused only by
 /// [`reroot_open_catalog_as`], which the GPUI app's Preferences uses.
 ///
-/// The Tauri command reopens the *default* catalog (`default_catalog_path`), which is only
-/// the same thing while the default catalog is the open one: with another catalog open it
-/// writes the root into that catalog and then reopens the default one at its own stored
-/// root. The GPUI app's Preferences uses this instead.
+/// Unlike the removed Tauri command, which always reopened the *default* catalog
+/// (`default_catalog_path`) regardless of which one was open — writing the root into
+/// whatever catalog was open, then reopening the default one at its own stored root — this
+/// reopens whichever catalog actually is open. The GPUI app's Preferences uses this.
 pub fn reroot_open_catalog(state: &AppState, new_root: PathBuf) -> Result<(), String> {
     reroot(state, new_root, None, None, || ())
 }

@@ -392,7 +392,7 @@ previous ChairPhoto run are therefore ingested for free.
   a matching run is going, as UX only: a run regroups the clusters the view shows. The guarantee
   is in the core — every seed, suggestion and cluster write of the matcher re-checks in its own
   `UPDATE` that the face is still undecided, so a confirm, naming, assignment or ignore made
-  during a run (from any view, or the Tauri UI) is never overwritten; and every seed and
+  during a run (from any view) is never overwritten; and every seed and
   suggestion write re-checks that the pair is not rejected, so a rejection made during a run
   stands too.
 - **Settings** — people root, model download status, similarity threshold, and index actions

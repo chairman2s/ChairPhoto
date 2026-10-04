@@ -8,7 +8,7 @@
 //! frame at a time.
 //!
 //! Moved here from the Tauri shell's `commands/culling.rs` (gpui #106), so the GPUI app's
-//! "Stack bursts" dialog and the Tauri commands run the same code.
+//! "Stack bursts" dialog runs the same code.
 
 use crate::burst::{group_into_clusters, BurstConfig, BurstPhoto};
 use crate::catalog::Catalog;
@@ -103,7 +103,7 @@ fn setting_i64(c: &Catalog, key: &str, default: i64) -> i64 {
 /// Cluster the candidates and turn every multi-frame cluster into a proposal.
 ///
 /// Split from the command so the grouping decisions — which clusters become proposals, how
-/// many are returned, and why each keeper won — are testable without a Tauri `State`.
+/// many are returned, and why each keeper won — are testable without constructing a full app state.
 fn build_proposals(
     candidates: &[crate::catalog::culling::StackCandidate],
     skipped_stacked: usize,
@@ -145,8 +145,8 @@ fn build_proposals(
 
 /// Turn one cluster into a reviewable proposal.
 ///
-/// Split from the command so the reason text and the disclosures are testable without a
-/// Tauri `State` — the reason is a claim about why a frame won, and a claim that drifts
+/// Split from the command so the reason text and the disclosures are testable without
+/// constructing a full app state — the reason is a claim about why a frame won, and a claim that drifts
 /// from the rule is worse than no claim.
 fn build_proposal(
     cluster: &crate::burst::Cluster,

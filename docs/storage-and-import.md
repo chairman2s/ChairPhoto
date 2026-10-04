@@ -224,8 +224,7 @@ The debt is therefore a **set of fields per photo**, in `pending_sidecar_iptc`
   IPTC, and the panel's Start is enabled by either.
 - **Listed, dismissed, retried one at a time (#153).** The identity-debt panel lists the
   photos owing IPTC (`list_owed_iptc_page`: id, UUID, path, owed fields, last error,
-  generation; paged) with **Retry** and **Dismiss** per row (`app::iptc_owed`; the Tauri
-  `list_owed_iptc` / `retry_owed_iptc` / `dismiss_owed_iptc` commands). Retry writes the
+  generation; paged) with **Retry** and **Dismiss** per row (`app::iptc_owed`). Retry writes the
   photo's owed fields as a save does: it takes the sidecar's write turn, reads what is owed
   now with the turn held, and writes and settles through the save's compare-and-set; an
   unreachable original is recorded on the row and stays owed. Dismiss clears the owed set
@@ -234,14 +233,13 @@ The debt is therefore a **set of fields per photo**, in `pending_sidecar_iptc`
   or another photo that took the id is never dismissed. The catalog keeps its values; a later
   save owes only what it changes. Both are bound to the photo's UUID and to the catalog
   their row was read from (`with_catalog_as`): the GPUI panel binds them to the catalog of
-  the page it drew, and the React panel (#164) captures the open catalog's identity
-  (`get_catalog_identity`) when it opens and passes it as `catalog` to every read and
-  action — the identity queue's `list_pending_identity` / `summarize_pending_identity` /
-  `resolve_identity_conflict` too — and closes on `catalog:switched`. A byte copy of the
-  catalog has the same ids, UUIDs and generations; only the catalog identity tells them
-  apart. Each re-reads the panel's and the title bar's counts.
+  the page it drew, and the identity queue's `list_pending_identity` /
+  `summarize_pending_identity` / `resolve_identity_conflict` are bound the same way,
+  closing on `catalog:switched`. A byte copy of the catalog has the same ids, UUIDs and
+  generations; only the catalog identity tells them apart. Each re-reads the panel's and
+  the title bar's counts.
 - **Reported honestly.** A save that reached only the catalog answers `pending` with the
-  reason (`IptcSaveOutcome`, returned by the Tauri `set_iptc` command and shown by both
+  reason (`IptcSaveOutcome`, returned by `Catalog::set_iptc` and shown by both
   inspectors as "Saved to catalog; sidecar pending (…)"); `unchanged` when nothing was owed.
 - **Bundle import** stores each new photo's manifest IPTC through `set_iptc_carried`, which
   owes only the fields the sidecar beside the extracted file has no value for. A value that
@@ -890,7 +888,7 @@ root setting rather than silently using whatever the caller passed.
    releases the WAL write lock and flushes pending writes before the new catalog is opened.
 3. **Open (or create) the new catalog** — off the async executor, so the UI thread is
    never stalled.
-4. **Emit `catalog:switched`** — the frontend resets all React state (selection, filters,
+4. **Emit `catalog:switched`** — the GPUI app resets all session state (selection, filters,
    albums, scan progress) and re-queries the new catalog.
 
 A *fresh* abort generation is installed for each family after the new catalog is open, so

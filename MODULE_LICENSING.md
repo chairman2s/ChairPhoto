@@ -6,8 +6,9 @@ writing a module, and in particular what it does *not* restrict.
 ## The short version
 
 - **Your module must be GPL-3.0** (or a GPL-compatible license) if you distribute it.
-  Modules load through the host API and run inside ChairPhoto, so a distributed module
-  is a derivative work.
+  Modules are Rust compiled into the ChairPhoto binary through the `Module` trait, so
+  distributing one means distributing a fork or patch of ChairPhoto itself — a
+  derivative work.
 - **The external service your module talks to does not have to be open-source.**
   A module may call any web API — free, paid, proprietary, closed. The service runs on
   someone else's machine as a separate program; the GPL does not reach across a network
@@ -39,11 +40,11 @@ third-party services (the Flickr API, the Claude API) that nobody expects to be 
 
 ## Practical checklist
 
-1. Ship a `LICENSE` (GPL-3.0) with your module.
-2. State clearly in your README which external service the module requires, and whether
-   it costs money — users should know before installing.
-3. Set `minHostVersion` to the oldest ChairPhoto release whose host API you use
-   (see the host-API stability contract in the plugin system docs).
+1. Ship a `LICENSE` (GPL-3.0) with your fork or patch.
+2. State clearly which external service the module requires, and whether it costs
+   money — users should know before building or installing it.
+3. There is no separate module version to track: a compiled-in module ships at
+   whatever ChairPhoto version it was built into (see `docs/plugin-system.md`).
 4. Never bundle credentials. Take API keys from the user at runtime, the way the
    built-in publishing modules do.
 

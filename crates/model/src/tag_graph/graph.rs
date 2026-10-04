@@ -60,7 +60,7 @@ pub struct Link {
     pub kind: LinkKind,
 }
 
-/// `library_graph`'s answer (`LibraryGraphData`), as the Tauri command shaped it.
+/// `library_graph`'s answer (`LibraryGraphData`), mirrored field for field.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct LibraryGraph {
     /// `(tag id, full path, photos)`: tags with at least one visible photo.

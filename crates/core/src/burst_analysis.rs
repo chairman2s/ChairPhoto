@@ -5,7 +5,7 @@
 //! is advisory only — nothing is ever auto-rejected (see `docs/sharpness-culling.md`).
 //!
 //! Moved here from the Tauri shell's `commands/burst.rs` (gpui #106), so the GPUI app's
-//! "Analyse burst sharpness" and the Tauri command run the same code.
+//! "Analyse burst sharpness" runs the same code the removed Tauri command did.
 
 use crate::app::{with_catalog_as, with_catalog_identified, AppState, CatalogIdentity};
 use crate::burst::{group_into_clusters, BurstConfig, BurstPhoto, BurstVerdict};
@@ -69,9 +69,10 @@ pub fn next_burst_job(state: &AppState) -> u64 {
 /// Re-running is idempotent: flags are overwritten on every call.
 ///
 /// Bound to the catalog open when step 1 runs: a switch between the read and the write makes
-/// step 4 fail closed (`CATALOG_CHANGED`) rather than flag the new catalog's same ids. The
-/// Tauri command calls this; a front end that read `photo_ids` itself passes the identity it
-/// read them with ([`analyze_burst_sharpness_as`]).
+/// step 4 fail closed (`CATALOG_CHANGED`) rather than flag the new catalog's same ids. No
+/// current production caller (the GPUI app reads `photo_ids` itself and passes the identity
+/// it read them with, [`analyze_burst_sharpness_as`]) — exercised directly only by this
+/// module's own tests.
 pub fn analyze_burst_sharpness(state: &AppState, photo_ids: &[i64]) -> Result<BurstAnalysisResult, String> {
     analyze(state, None, photo_ids, next_burst_job(state), || {})
 }

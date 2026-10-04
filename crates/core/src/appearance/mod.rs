@@ -5,7 +5,8 @@
 //! same semantic tokens from the palette Omarchy keeps under its XDG state directory. This
 //! module is the whole Rust side of the latter — the palette parser, the current-theme
 //! reader, and a polling watcher that broadcasts [`THEME_CHANGED_EVENT`] when the user
-//! switches themes. The thin command surface is `commands::appearance`.
+//! switches themes. GPUI calls [`read_current_theme`] directly at startup and listens for
+//! the event; there is no command wrapper.
 //!
 //! Absent Omarchy is a normal, non-degraded state: [`read_current_theme`] answers
 //! `available: false` (never `Err`) and [`start_watcher`] starts nothing, so a machine
@@ -112,7 +113,7 @@ impl OmarchyPalette {
     }
 }
 
-/// What `get_system_theme` returns and [`THEME_CHANGED_EVENT`] carries. Failure of any
+/// What [`read_current_theme`] returns and [`THEME_CHANGED_EVENT`] carries. Failure of any
 /// kind — no Omarchy on this machine, missing files, malformed TOML, an invalid color —
 /// is `available: false` with both fields `None`, never an `Err`: a broken or absent theme
 /// is a normal answer, and the frontend's reaction (fall back to ChairPhoto Standard) is
@@ -302,7 +303,7 @@ fn settle_read(root: &Path) -> (SystemThemeResult, Fingerprint) {
 }
 
 /// The watcher's memory between ticks: the last stat fingerprint, and the last outcome
-/// the frontend knows (emitted here, or fetched itself via `get_system_theme` at startup).
+/// GPUI knows (emitted here, or read itself via [`read_current_theme`] at startup).
 struct WatchState {
     fingerprint: Fingerprint,
     last: SystemThemeResult,
@@ -318,7 +319,7 @@ impl WatchState {
 }
 
 /// One poll tick, factored out of the thread loop so the whole transition is testable
-/// without a Tauri app. Compares the cheap fingerprint against the last one; on change,
+/// without starting a real app. Compares the cheap fingerprint against the last one; on change,
 /// settle-reads the new state and returns the outcome to broadcast — `Some` only when the
 /// settled outcome differs from the last known one, so a 2-second tick never spams events.
 fn poll_tick(root: &Path, state: &mut WatchState) -> Option<SystemThemeResult> {

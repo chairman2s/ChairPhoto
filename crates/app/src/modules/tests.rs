@@ -317,7 +317,7 @@ fn enabling_loads_requirements_first_and_persists_in_dependency_order(cx: &mut T
 }
 
 /// Instagram, Flickr and SmugMug register in every build (Flickr's and SmugMug's backends are
-/// opt-in, as in the Tauri shell): without the feature the Modules panel lists them with the
+/// opt-in): without the feature the Modules panel lists them with the
 /// reason and an enable is refused; with it they enable and contribute a publish target (and
 /// the OAuth services a settings tab).
 #[gpui_kit::test]

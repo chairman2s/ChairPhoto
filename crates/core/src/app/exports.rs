@@ -1,5 +1,5 @@
-//! Exports as owned jobs — the bodies of the Tauri `export_photos` and `export_bundle`
-//! commands, and of the GPUI Export and bundle-export dialogs. Both **block** (file copies,
+//! Exports as owned jobs — the bodies the GPUI Export and bundle-export dialogs call.
+//! Both **block** (file copies,
 //! JPEG renders, a zip of possibly gigabytes of RAW files): run them on a worker.
 //!
 //! Export is one-way (docs/storage-and-import.md): it reads originals through the resolver
@@ -65,7 +65,7 @@ pub fn cancel_bundle_export(state: &AppState) -> Result<(), String> {
     state.jobs.bundle_export.trip()
 }
 
-/// What the Export dialog asks for (the Tauri `export_photos` arguments).
+/// What the Export dialog asks for.
 #[derive(Debug, Clone)]
 pub struct ExportRequest {
     pub photo_ids: Vec<i64>,
@@ -79,7 +79,7 @@ pub struct ExportRequest {
     pub version_id: Option<i64>,
 }
 
-/// Export photos under a fresh claim, against whatever catalog is open (the Tauri command).
+/// Export photos under a fresh claim, against whatever catalog is open.
 pub fn export_photos(state: &AppState, request: &ExportRequest) -> Result<ExportResult, String> {
     let claim = claim_export(state)?;
     export_photos_claimed(state, &claim, None, request)
@@ -178,8 +178,8 @@ pub fn export_bundle_claimed(
     })
 }
 
-/// [`export_bundle_claimed`] with the progress sink supplied — the Tauri command keeps
-/// React's `import:progress` shape through it.
+/// [`export_bundle_claimed`] with the progress sink supplied — reuses the `import:progress`
+/// event shape rather than inventing a new one.
 pub fn export_bundle_claimed_with(
     state: &AppState,
     claim: &ExportClaim,

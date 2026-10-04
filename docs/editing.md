@@ -269,20 +269,23 @@ implemented — the crop fixes shape, resize would fix pixels.
   slider frame therefore pays the look and the encode and nothing else; a geometry change
   is a miss and re-frames. Both caches are byte-identical to the uncached path (locked by
   tests in `plugins/edit`).
-- **Transport — the Darkroom stage is a native URL.** The stage `<img>` loads
-  `edit://<photoId>?r=<base64url(record)>&m=<maxEdge>[&b=1][&hi=1][&v=bust]`
-  (`editRenderUrl` in `src/modules/api.ts`; `protocol::handle_edit_request` and
-  `commands::editing::render_edit_bytes` in Rust), served through the same bounded LIFO
-  image pool as `thumb://`/`preview://`/`zoom://`: the newest URL renders first and
-  identical URLs coalesce into one render, which is what makes slider spam safe. Responses
-  are `Cache-Control: no-store` — rendering, not fetching, is the cost, and a regenerated
-  proxy or re-imported LUT must never show stale pixels. `s=<token>` names the working
-  image, `k=1` asks for the sensor-clipping overlay instead of the render, and `b=1`
-  renders the geometry only (perspective → straighten, no crop, no look) as lossless PNG.
-  The proof sheet, the duels, the preset browser and every engine-2 loupe render use these
-  URLs too. The `render_edit` command still returns a base64 data URL for its one remaining
-  caller — an engine-1 version on the loupe — and `render_edit_batch` has no caller in the
-  app (it stays a core command for modules); neither serves an engine-2 render.
+- **Transport — in-process, no encode, no protocol.** Every render — the Darkroom stage, the
+  loupe's active version, the Duel's two variants, the Proof sheet and the preset browser —
+  is an `EditJob { photo_id, edit_json, max_edge, hi_res, base_only, source, clip,
+  catalog_epoch }` (`crates/core/src/image_pool.rs`) submitted to the same bounded LIFO image
+  pool as thumbnails/previews/zoom, under `JobKey::Edit`: the newest job renders first and
+  identical jobs coalesce into one render, which is what makes slider spam safe.
+  `media::render_edit_image` runs it and hands GPUI the result directly as a BGRA
+  `RenderImage` texture — no JPEG/PNG encode, no URL, no IPC, so there is nothing to cache or
+  bust: a regenerated proxy or re-imported LUT is simply a new job. `source` names the working
+  image to render from (the camera preview, or a resident RAW by token), `clip: true` asks for
+  the sensor-clipping overlay instead of the render, and `base_only: true` renders the
+  geometry only (perspective → straighten, no crop, no look). `hi_res: true` renders from the
+  native-size zoom tier instead of the 2048 px proxy. Every job carries the `catalog_epoch` it
+  was asked under, so a request from before a catalog switch can never merge into, or be
+  handed to, one made after. One render path (`media::render_edit_image`) serves every
+  caller, engine-1 and engine-2 alike: it branches internally on the record's engine and on
+  whether a resident RAW working image exists for the job's source token.
 - **Loupe:** shows the active version's render when the module is enabled (`renderForLoupe`):
   an engine-2 version is the RAW through its pipeline at 2560 px, full size to zoom — from
   the Darkroom's own working image while it prints there, else from an offline load — and
@@ -379,9 +382,9 @@ engine**, which forks "<name> (RAW)" with the framing copied and tone and look r
 
 Every stage of a render can be timed without a profiler: `CHAIRPHOTO_EDIT_TIMING=1` makes
 the backend print one `[edit-timing]` line per render (stages, total, and the build profile —
-`tauri dev` runs the engine unoptimized, so its numbers are not release numbers), and the
-Darkroom's Preferences toggle "Log render timings to the console" adds the frontend half:
-IPC round trip, resolve-to-paint, and drag cadence per frame, summarized every 2 s and
+a debug `cargo run` without `--release` runs the engine unoptimized, so its numbers are not
+release numbers), and the Darkroom's Preferences toggle "Log render timings to the console"
+adds the GPUI half: submit-to-paint and drag cadence per frame, summarized every 2 s and
 persisted under `editor.renderTiming.lastSummary`. The ignored bench
 `plugins::edit::bench::render_stage_timings` gives the same stages in isolation; see
 `docs/performance-harness.md` § Edit render bench.

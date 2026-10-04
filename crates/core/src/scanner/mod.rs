@@ -537,9 +537,8 @@ pub struct CopiedItem {
 /// size is treated as already-imported (skipped); a different size gets a " (n)" name.
 ///
 /// This is a convenience wrapper over the two phases [`copy_from_card`] (heavy, no
-/// catalog) and [`index_ingested`] (brief catalog work). The Tauri command calls the
-/// phases separately so the long copy never holds the catalog lock — see
-/// `ingest_from_card_cmd`.
+/// catalog) and [`index_ingested`] (brief catalog work). `app::scans::ingest_from_card_claimed`
+/// calls the phases separately so the long copy never holds the catalog lock.
 pub fn ingest_from_card(
     catalog: &Catalog,
     source: &Path,

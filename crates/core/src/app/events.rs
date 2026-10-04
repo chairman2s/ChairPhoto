@@ -142,8 +142,8 @@ pub struct LocalSendProgress {
 #[serde(rename_all = "camelCase")]
 pub struct ImportProgress {
     /// The import job this progress belongs to (`scans::claim_import`), so a front end can
-    /// drop a superseded or switched-away import's stragglers. Ids start at 1; `0` is the
-    /// Tauri bundle export, which reuses this event and is no import job.
+    /// drop a superseded or switched-away import's stragglers. Ids start at 1; `0` is
+    /// bundle export, which reuses this event and is no import job.
     pub job: u64,
     pub done: usize,
     pub total: usize,

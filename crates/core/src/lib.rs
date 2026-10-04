@@ -2,8 +2,8 @@
 //! backends — everything the app does, with no UI toolkit.
 //!
 //! The front end is the GPUI app (`crates/app`), which links this crate directly. (Until #165
-//! a Tauri shell wrapped it too.) Anything a front end needs from here is `pub`; front ends reach it through [`app::AppState`]
-//! and the domain modules, and hear from it through [`app::events`].
+//! a Tauri shell wrapped it too.) Anything the front end needs from here is `pub`; it reaches it through [`app::AppState`]
+//! and the domain modules, and hears from it through [`app::events`].
 
 pub mod app;
 pub mod appearance;

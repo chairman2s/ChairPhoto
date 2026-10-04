@@ -5,6 +5,12 @@ keymaps, the second window, pickers and confirms, the clipboard, window options 
 on `gpui-kit =0.7.0`. That crate pins `gpui-pre =0.3.7`, not upstream `gpui` 0.2.2. See the Phase 0
 spike, `3e13e1b` on `feature/gpui-spike`.
 
+**GPUI rewrite: done.** This research shaped the shipped shell (`crates/app/src/shell/`,
+`keymap.rs`, `theme/`); React and the Tauri shell were removed at the cutover (#165), and the
+GPUI app has been the only front end since. Recommendations below that read as proposals are
+implemented; the pre-cutover comparisons are this document's research record and are left as
+written.
+
 **Citations** use the form `crate@version:path:line`, with the path relative to that crate's root in
 `~/.cargo/registry/src/index.crates.io-*/`. Once a section has named a crate, later citations in it
 are shortened to `path:line`. Paths without a crate prefix are in this repository.

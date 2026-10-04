@@ -1,6 +1,4 @@
-//! Folder scans and card import — the bodies of the Tauri `rescan_library`,
-//! `scan_folder_cmd`, `scan_nas_folder_cmd`, `ingest_from_card_cmd` and
-//! `list_card_photos_cmd` commands, and what the GPUI app runs for Import ▾.
+//! Folder scans and card import — the bodies the GPUI app runs for Import ▾.
 //!
 //! Every function here **blocks** (walks, copies, SQLite on a secondary connection): run it
 //! on a worker, never a UI thread. Progress goes out through `state`'s event sink —

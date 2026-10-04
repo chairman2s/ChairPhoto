@@ -2,7 +2,7 @@
 //!
 //! Imports, scans, catalog switches, identity repair, reconcile and emptying the trash are
 //! long and lock-holding (file copies, a SQLite open, sidecar IO per copy on a NAS). In the
-//! app they run on the core runtime's blocking pool, as the Tauri commands do, never on the
+//! app they run on the core runtime's blocking pool, never on the
 //! UI thread or GPUI's background executor (whose threads a long job would park).
 //!
 //! GPUI's deterministic test scheduler rejects wakeups from foreign threads, so a job on the

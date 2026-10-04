@@ -1,14 +1,14 @@
 //! The identity-debt panel's per-photo owed IPTC (#153): list, Dismiss, Retry one.
 //!
-//! Shared by the Tauri `list_owed_iptc` / `dismiss_owed_iptc` / `retry_owed_iptc` commands
-//! and the GPUI identity-debt panel. The record and its compare-and-set are the catalog's
+//! Used by the GPUI identity-debt panel. The record and its compare-and-set are the catalog's
 //! (`catalog/iptc_owed.rs`); this module binds each action to the catalog its row was read
 //! from and runs Retry through the save's write turn and write+settle path.
 //!
 //! A row names its photo by id *and* UUID. GPUI also passes the [`CatalogIdentity`] its page
 //! was read with, so an action after a catalog switch fails closed with
-//! [`CATALOG_CHANGED`](super::CATALOG_CHANGED). The Tauri shell carries no identity (`None`);
-//! there the UUID check is the guard against an id that names another photo now.
+//! [`CATALOG_CHANGED`](super::CATALOG_CHANGED). The removed Tauri shell carried no identity
+//! (`None`); there the UUID check was the guard against an id that names another photo now,
+//! and it still applies whenever no identity is passed.
 
 use super::iptc::{run_in_turn, write_and_settle, InTurn, IptcSaveOutcome};
 use super::{AppState, CatalogIdentity};

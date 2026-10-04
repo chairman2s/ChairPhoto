@@ -307,8 +307,7 @@ pub enum Mark {
 }
 
 impl Mark {
-    /// Write the mark on one photo: the Tauri `set_rating` / `set_pick_state` /
-    /// `set_label` commands' body (`Catalog::set_culling`).
+    /// Write the mark on one photo (`Catalog::set_culling`).
     fn write(&self, c: &Catalog, photo_id: i64) -> chairphoto_core::catalog::Result<Photo> {
         match self {
             Mark::Rating(r) => c.set_culling(photo_id, Some(*r), None, None),

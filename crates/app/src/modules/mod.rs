@@ -454,7 +454,7 @@ impl chairphoto_core::app::uploads::ServiceSettings for ModuleSettings {
 
 /// The first-party modules this build ships, in registration order: the order of
 /// `BUNDLED_MODULES` in `src/modules/bundled.ts` as each is ported (#123–#129), each behind
-/// its backend's cargo feature like the Tauri shell's features. A module whose backend is
+/// its own backend cargo feature. A module whose backend is
 /// compiled out may still register (metadata only) so the Modules panel can say so.
 pub fn bundled() -> Vec<Rc<dyn Module>> {
     #[allow(unused_mut)]
@@ -490,8 +490,8 @@ pub fn bundled() -> Vec<Rc<dyn Module>> {
     modules
 }
 
-/// The backend features compiled into this build (`plugin_features` in the Tauri shell):
-/// what [`ModuleMeta::backend_feature`] is checked against.
+/// The backend features compiled into this build: what [`ModuleMeta::backend_feature`] is
+/// checked against.
 pub fn compiled_features() -> Vec<SharedString> {
     #[allow(unused_mut)]
     let mut features: Vec<SharedString> = Vec::new();

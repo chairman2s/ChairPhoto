@@ -111,24 +111,17 @@ because it has no alpha, and the dialog nudges you toward PNG when that matters.
 
 ## Implementation
 
-Backend `collage::{compose_freeform, resize_cover_offset}` with commands
-`collage_auto_arrange` (async, upright-aspect layout), `make_collage_freeform`, and
-`save_collage_to_catalog`, whose bodies live in core `app::collage` (shared with the GPUI
-Collage module, which binds them to the `CatalogIdentity` its dialog opened with). A library
-save indexes only into the catalog its photos were resolved in: if another catalog opened
-while the collage rendered, it fails closed and removes the rendered file. Frontend
-`CollageDialog` plus `collageTemplates.ts`; in the GPUI app,
-`crates/app/src/modules/collage/` plus `chairphoto_model::collage` (templates and canvas
-gestures).
-
-`CollageDialog.tsx` owns the module's backend surface: private
-`CollageFormat`/`CollageOptions`/`Placement`/`FreeformOptions` DTOs and wrappers over
-`ChairPhotoAPI.invoke`, not core `api.ts` wrappers, per the module isolation rule.
+Backend `collage::{compose_freeform, resize_cover_offset}` (pure composition,
+`crates/core/src/collage/`), under the job/catalog-binding layer `app::collage::{auto_arrange,
+make_freeform, save_to_catalog}` (`crates/core/src/app/collage.rs`) that the GPUI Collage
+module (`crates/app/src/modules/collage/`) calls directly, binding them to the
+`CatalogIdentity` its dialog opened with. `chairphoto_model::collage` holds the templates and
+canvas gestures. A library save indexes only into the catalog its photos were resolved in: if
+another catalog opened while the collage rendered, it fails closed and removes the rendered
+file.
 
 An earlier iteration of the dialog showed a static server-rendered preview; the canvas
-replaced it. Its `make_collage` and `collage_preview` Rust commands remain defined and
-registered, but the frontend no longer calls them, and their `api.ts` wrappers are gone.
-The justified `layout()` underneath still backs Auto-arrange.
+replaced it. The justified `layout()` underneath still backs Auto-arrange.
 
 ## Limits
 

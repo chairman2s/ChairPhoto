@@ -1,5 +1,5 @@
-//! Sending photos to a LocalSend device — the body of the Tauri `localsend_send` command and of
-//! the GPUI LocalSend/Snapchat publish targets (docs/localsend.md).
+//! Sending photos to a LocalSend device — the body the GPUI LocalSend/Snapchat publish
+//! targets run (docs/localsend.md).
 //!
 //! A send is a job (`JobRegistry::localsend`): [`claim_send`] resolves the photos' originals
 //! and takes ownership (catalog → the LocalSend abort, one transition), and

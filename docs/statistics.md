@@ -70,11 +70,9 @@ re-filtering the grid.
 ## Where it lives
 
 ```
-src/modules/plugins/statistics.tsx      the view, registered via registerMainView
-src-tauri/src/commands/graph.rs         catalog_stats command (serialises CatalogStatsRaw)
 crates/core/src/catalog/stats.rs        the queries (Catalog::catalog_stats)
-crates/model/src/statistics.rs          GPUI port: fetch session, cache, derived dashboard
-crates/app/src/modules/statistics/      GPUI port: the module, its state entity, the view
+crates/model/src/statistics.rs          fetch session, cache, derived dashboard
+crates/app/src/modules/statistics/      the module, its state entity, the view
 ```
 
 In the GPUI app the view is cached while the module is enabled, so instead of fetching on

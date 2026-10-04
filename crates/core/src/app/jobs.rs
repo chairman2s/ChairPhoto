@@ -368,8 +368,8 @@ impl<S: JobStatus> JobFamily<S> {
     ///
     /// All three locks are held across the whole claim, and each of them is load-bearing:
     ///
-    /// * **abort + slot together.** Two starts can run concurrently, since Tauri dispatches
-    ///   commands onto its runtime. If the abort lock were released before the slot write
+    /// * **abort + slot together.** Two starts can run concurrently (a background task
+    ///   racing a UI action, say). If the abort lock were released before the slot write
     ///   they could interleave: A installs its flag, B trips A and claims the slot, then A —
     ///   already aborted — overwrites the slot with itself and the panel tracks a dead job.
     ///   Job ids cannot arbitrate that, because they are allocated after the flag is

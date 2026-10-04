@@ -7,7 +7,7 @@
 //! 3. Drains the queue with bounded parallelism via rayon, resolving photo paths via
 //!    the catalog resolver (never `photos.path`), loading the 2048 px preview, and
 //!    calling the detection/embedding closure.
-//! 4. Emits `faces:progress {done, total}` Tauri events after each photo that was
+//! 4. Emits `faces:progress {done, total}` events after each photo that was
 //!    *actually processed* (indexed or already-indexed sentinel). Offline and error
 //!    cases do NOT advance `done` — they are left in the queue for retry.
 //! 5. Checks the `abort` flag after each photo and stops cleanly when tripped.
@@ -68,7 +68,7 @@ pub fn load_force_cpu(conn: &Connection) -> bool {
 
 // ── Progress event ─────────────────────────────────────────────────────────────
 
-/// Payload for the `faces:progress` Tauri event.
+/// Payload for the `faces:progress` event.
 #[derive(Debug, Clone, Serialize)]
 pub struct FacesProgress {
     pub done: usize,

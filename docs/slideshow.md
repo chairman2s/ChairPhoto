@@ -66,20 +66,19 @@ order is the current grid order.
   tmpfs) and encodes. A newer render, Cancel (the job's own abort
   handle) or a catalog switch kills ffmpeg, removes the partial movie and answers
   "Slideshow cancelled". Missing ffmpeg is refused before anything is claimed.
-- The `make_slideshow` async command (Tauri) and the GPUI Slideshow module both run that job
+- The GPUI Slideshow module (`crates/app/src/modules/slideshow/`) calls that job directly,
   off the UI thread; progress is cosmetic, the job's return value is the terminal result.
 
   ```
-  make_slideshow(photoIds, opts, destDir) -> outputPath
-  event "slideshow:progress" { done, total, job }
+  claim_slideshow(photoIds, opts, destDir) -> outputPath
+  event CoreEvent::SlideshowProgress { done, total, job }
   ```
 
-- `SlideshowDialog.tsx` owns the module's backend surface: private `SlideshowOptions` and
-  `SlideshowProgress` DTOs, a `ChairPhotoAPI.invoke` wrapper for `make_slideshow`, and the
-  `slideshow:progress` subscription through the **optional** `ChairPhotoAPI.onEvent` — not
-  core `api.ts` wrappers, and never Tauri directly. Progress is nonessential: if `onEvent`
-  is absent or the subscription fails, the encode still runs and the UI shows an
-  indeterminate "Rendering…" instead of a determinate bar.
+- The dialog subscribes to the app model's events and matches
+  `CoreEvent::SlideshowProgress`, filtering to its own job id so a stale or another
+  dialog's job never moves its bar. Progress is nonessential: a lost or missed event still
+  lets the encode finish, and the UI simply shows an indeterminate "Rendering…" instead of a
+  determinate bar.
 
 ## Limits
 

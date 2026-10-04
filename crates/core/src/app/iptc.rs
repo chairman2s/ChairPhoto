@@ -1,6 +1,6 @@
 //! Saving a photo's authored IPTC fields: the catalog, then the photo's XMP sidecar.
 //!
-//! Shared by the Tauri `set_iptc` command and the GPUI inspector (gpui #108).
+//! Used by the GPUI inspector (gpui #108).
 
 use super::{AppState, CatalogIdentity};
 use crate::catalog::{IptcFields, IptcSettled, IptcSidecarState, IptcSidecarWrite};
@@ -9,8 +9,8 @@ use crate::xmp::lock::WriteOrder;
 /// What an IPTC save did. The catalog half always succeeded (a failure there is the save's
 /// `Err`); `sidecar` says whether the sidecar has caught up.
 ///
-/// The Tauri `set_iptc` command returns this where it used to return nothing, so a caller
-/// that ignored the result still works.
+/// `save_iptc` returns this where an earlier version returned nothing, so a caller that
+/// ignores the result still works.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct IptcSaveOutcome {
@@ -686,7 +686,8 @@ mod tests {
         assert_eq!(read(&crate::xmp::sidecar_path(&nas_file)), crate::xmp::test_fixtures::LIGHTROOM);
     }
 
-    /// #155 R2: the unbound save (the Tauri `set_iptc`, which names no catalog) is bound to
+    /// #155 R2: the unbound save (`catalog: None`, naming no catalog — the removed Tauri
+    /// `set_iptc`'s form, now only exercised here) is bound to
     /// the catalog it reserved its turn in. A switch while it waits — the window #149 opened
     /// between the reserve and the store — fails it closed with `CATALOG_CHANGED`: the new
     /// catalog's row with the same id is not stored into, and neither catalog's sidecar is

@@ -46,8 +46,9 @@ Ollama server is treated like a cloud provider: photos go to it only after the u
 exact URL (Preferences → AI Tagging → "Send photos to this Ollama server", stored as
 `ai.ollama_remote_url`; pointing the URL at another host needs a new opt-in), and private tags
 are withheld from it. The core enforces the opt-in (`plugins::ai::opt_in`, checked by
-`app::ai::admit` before any preview is read) for every front end; the React settings panel has
-no control for it, so the Tauri shell refuses a remote Ollama until the setting is saved.
+`app::ai::admit` before any preview is read) regardless of what any settings panel shows —
+the checkbox above is convenience, not the only gate: a remote Ollama is refused until
+`ai.ollama_remote_url` is saved, whatever UI (or lack of one) got it there.
 
 A tag can be marked **private** (`tags.private`) — typically every name under `People`. Private
 tags are stripped from the vocabulary sent to remote engines (cloud providers, or Ollama not on

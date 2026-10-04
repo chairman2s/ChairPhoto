@@ -1,7 +1,6 @@
-//! Flickr publishing (docs/flickr.md) — the bodies of the Tauri `flickr_*` / `post_to_flickr`
-//! commands and of the GPUI Flickr module: sign-in ([`super::oauth`]), the tags prefill, the
-//! upload of a rendered publish job ([`super::uploads`]), and importing the photostream as
-//! publications.
+//! Flickr publishing (docs/flickr.md) — the bodies the GPUI Flickr module runs: sign-in
+//! ([`super::oauth`]), the tags prefill, the upload of a rendered publish job
+//! ([`super::uploads`]), and importing the photostream as publications.
 //!
 //! The network is a [`FlickrApi`]: [`LiveFlickr`] calls `crate::flickr`; tests hand in a fake.
 //! Every function is **blocking**: run it on a worker.
@@ -103,9 +102,9 @@ pub fn upload(
 }
 
 /// The whole publish of `photo_id` from whichever catalog is open, for a caller with no steps
-/// to show (the Tauri command): check the connection, then claim, render, upload — so a call
-/// that cannot publish claims nothing. The caller records the publication. Another publish
-/// running meanwhile is neither stopped nor stops this one.
+/// to show: check the connection, then claim, render, upload — so a call that cannot
+/// publish claims nothing. The caller records the publication. Another publish running
+/// meanwhile is neither stopped nor stops this one.
 #[allow(clippy::too_many_arguments)]
 pub fn post(
     api: &dyn FlickrApi,
@@ -458,7 +457,7 @@ mod tests {
         assert!(api.uploads.lock().unwrap().is_empty());
     }
 
-    /// The Tauri command's path checks the connection before it claims anything: a call that
+    /// `post()`'s path checks the connection before it claims anything: a call that
     /// cannot publish takes no job id and leaves a publish already running untouched.
     #[test]
     fn a_post_that_cannot_publish_claims_nothing() {

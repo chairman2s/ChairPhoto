@@ -5,10 +5,11 @@
 //! to be spelled identically in TypeScript, in the Tauri command, and in
 //! `Catalog::list_photos` — three places that could drift silently, because a positional
 //! argument list carries no names across the IPC boundary. [`PhotoQuery`] is that tuple
-//! given a name and a type on both sides (issue #10): the TypeScript `PhotoQuery` in
-//! `src/modules/api.ts` is the same object, field for field.
-//!
-//! Two things keep the two sides honest rather than merely parallel:
+//! given a name and a type (issue #10), originally on both sides of that boundary (the
+//! TypeScript `PhotoQuery` in `src/modules/api.ts` was the same object, field for field).
+//! The GPUI app builds it as a plain Rust value with no such boundary to cross, but the
+//! same two guards below still hold for anything that does deserialize one (a persisted or
+//! hand-built query):
 //!
 //! - `deny_unknown_fields` — a field TypeScript sends that Rust does not know is a
 //!   deserialization *error*, not a silently dropped filter. A dropped filter shows up as

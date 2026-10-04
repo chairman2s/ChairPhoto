@@ -43,8 +43,7 @@ as owned by the module.
   Re-applying is idempotent. A fence whose tag path is an auto-tag's can't tag by hand
   (#181): `apply_fence` refuses it before writing anything, the import hook skips it, and
   `apply_all_fences` skips it, applies every other fence, and reports the applied and
-  skipped fences (the GPUI status line names them; the frozen React command still returns
-  only the count).
+  skipped fences by name on the GPUI status line.
 - Assignments are **editable and never auto-removed**. You can hand-correct drift, or add
   the tag to a photo that has no GPS at all.
 
@@ -80,7 +79,7 @@ headless half lives in the core under `plugins::map`: `tiles::math` (Web Mercato
 zoom, the visible tile grid, fit-to-points), `tiles::source` (the tile URL), `tiles::cache`
 and `tiles::fetch` (below), and `cluster` (grid clustering, 60 px). The module paints tiles,
 fences and markers on one canvas, with the fence list, filmstrip, status bar and fence editor
-as overlays, and contributes the same settings and inspector "Geocode" panels as React.
+as overlays, and contributes a settings panel and an inspector "Geocode" panel.
 
 **Tiles need the user's yes, per host** (decision #118). The first time the map opens with a
 tile host it has no answer for, a card asks whether to load tiles from that host and says
@@ -122,8 +121,10 @@ restart before any write succeeds reads the old answer. A failed write is shown 
 Reverse geocoding stays user-initiated per click, as before.
 
 **OSM tile policy.** The default URL is the policy's exact
-`https://tile.openstreetmap.org/{z}/{x}/{y}.png`; React's stored `{s}.` default reads as it,
-and `{s}` is never used (dropped on OSM's host, `a` elsewhere). Every request carries
+`https://tile.openstreetmap.org/{z}/{x}/{y}.png`; a `map.tileUrl` stored before the GPUI
+cutover (#165), whose default carried a `{s}.` subdomain placeholder, still reads as the
+same URL, because `{s}` is never used (dropped on OSM's host, `a` elsewhere). Every request
+carries
 `plugins::map::USER_AGENT`. Tiles are cached on disk under
 `$XDG_CACHE_HOME/chairphoto/tiles/` (512 MiB cap, least recently used evicted), fresh for
 `max(max-age, 7 days)`, then revalidated with `If-None-Match`/`If-Modified-Since`; a stale

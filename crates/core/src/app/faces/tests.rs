@@ -894,7 +894,7 @@ fn a_concurrent_writer_cannot_land_between_accepts_read_and_write() {
     assert!(has_tag(&c, p, alice));
 }
 
-/// The Tauri `faces_accept` on a face with no person says why, not "no assigned person".
+/// `accept()` on a face with no suggestion says why, not "no assigned person".
 #[test]
 fn accepting_a_face_with_no_suggestion_says_it_changed() {
     let (c, root) = temp_catalog("accept-none");
@@ -1126,8 +1126,8 @@ type Decision = Box<dyn FnOnce(&Catalog) -> CatalogResult<()> + Send>;
 /// A sink that makes the user's decisions in the middle of a real run: `at_seed` when the
 /// seed phase starts (its candidates already read), `after_load` at the first progress of a
 /// later phase (the pending faces already read by `load_pending_faces`). The worker is on
-/// its own connection, so this is the interleaving the inspector, overlay or Tauri UI can
-/// produce at any time (#137).
+/// its own connection, so this is the interleaving the inspector or overlay can produce at
+/// any time (#137).
 struct DecideMidRun {
     state: AppState,
     at_seed: std::sync::Mutex<Option<Decision>>,

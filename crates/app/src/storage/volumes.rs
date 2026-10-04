@@ -6,7 +6,7 @@
 //! A view entity Preferences mounts in its Storage tab ([`crate::preferences`], #113), the
 //! one way in (the rail's gear and More ⋯ → Preferences… both open it), as in React.
 //! Reachability is stated off the catalog lock through the volume-health cache, which add
-//! and remove invalidate, as the Tauri commands do.
+//! and remove invalidate.
 //!
 //! The panel is bound to the catalog the tab was built for (its [`Scope`]): the list, Add
 //! and Remove all go through `with_catalog_as`, so one queued before a switch and run after

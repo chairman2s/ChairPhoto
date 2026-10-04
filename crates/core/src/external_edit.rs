@@ -262,7 +262,7 @@ struct Resolved {
 }
 
 /// `expected`: the catalog the photo id was read from (`None` = whichever is open, the
-/// Tauri commands' unbound form). Checked under the same lock hold as the path lookup, so
+/// unbound form the former Tauri commands used). Checked under the same lock hold as the path lookup, so
 /// once another catalog is open this fails closed with [`CATALOG_CHANGED`] before anything
 /// is launched or imported — photo ids are per catalog.
 fn resolve(state: &AppState, expected: Option<CatalogIdentity>, photo_id: i64, ed: &Editor) -> Result<Resolved, String> {

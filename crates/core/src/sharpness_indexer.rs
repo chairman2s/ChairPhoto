@@ -10,7 +10,7 @@
 //! 4. Decodes the JPEG, scores it with [`crate::sharpness::score_image`] (`method='tile'`).
 //! 5. Writes `(sharpness, sharpness_method)` back to the catalog via
 //!    `Catalog::set_sharpness`.
-//! 6. Emits `sharpness:progress {done, total}` Tauri events after each processed photo.
+//! 6. Emits `sharpness:progress {done, total}` events after each processed photo.
 //! 7. Checks the `abort` flag after each photo — stops cleanly when tripped, leaving
 //!    unscored rows for the next run (resume-safe because `sharpness IS NULL` is the queue).
 //!

@@ -40,8 +40,8 @@ impl VolumeHealth {
         }
     }
 
-    /// A cache with an explicit TTL (used by tests — this crate's and the Tauri shell's,
-    /// which is why it is not `#[cfg(test)]`: that would hide it from the other crate).
+    /// A cache with an explicit TTL (used by tests across this crate's modules, which is
+    /// why it is not `#[cfg(test)]`).
     pub fn with_ttl(ttl: Duration) -> Self {
         Self {
             inner: RwLock::new(HashMap::new()),

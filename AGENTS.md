@@ -1,6 +1,6 @@
 # ChairPhoto Agent Guide
 
-ChairPhoto is a native photo organizer built with Tauri (Rust) and React/TypeScript.
+ChairPhoto is a native photo organizer built with Rust and GPUI.
 It is catalog-first, non-destructive, local-first, and optimized for culling large RAW
 collections.
 
@@ -128,9 +128,8 @@ Read only the documents triggered by the task:
 ### Performance
 
 - Thumbnail/grid work never decodes on the UI thread.
-- GPUI: pixels reach the screen through `ImageStore` (`crates/app/src/image_store.rs`) as GPU
-  textures, decoded on the image pool. React (until #165): through the native media
-  protocols, never as base64 IPC payloads.
+- Pixels reach the screen through `ImageStore` (`crates/app/src/image_store.rs`) as GPU
+  textures, decoded on the image pool.
 - Navigation loads the requested photo first, then preloads N-1 and N+1. Target display latency
   is under 50 ms when preloaded and under 500 ms cold.
 - Scans, indexing, export, and model work expose progress without making progress events a
@@ -144,9 +143,6 @@ Read only the documents triggered by the task:
   `crates/app/src/modules/` and registers in `modules/registry.rs`, behind the same Cargo
   feature as its backend. Module logic that needs no UI goes in `crates/model`; backend bodies
   in `crates/core/src/app/` or `plugins/`.
-- React (until #165): modules reach host/backend services through `ChairPhotoAPI`, declared
-  core wrappers, and host hooks, never through `window.__TAURI__` or app internals; core
-  command wrappers stay in `modules/api.ts`.
 - Missing optional host capabilities degrade only the cosmetic/optional behavior. A required
   terminal signal must fail closed with an explicit state.
 
@@ -154,47 +150,38 @@ Read only the documents triggered by the task:
 
 ```
 crates/core/src/        Rust I/O, catalog, image processing, jobs (`chairphoto-core`, no UI)
-crates/app/src/         GPUI front end, the primary UI (`chairphoto-app`, bin `chairphoto-gpui`)
+crates/app/src/         GPUI front end, the only UI (`chairphoto-app`, bin `chairphoto-gpui`)
 crates/model/src/       UI logic with no I/O, unit-tested on its own (`chairphoto-model`)
-src/                    React/TypeScript UI — frozen, removed at the cutover (#165)
-src-tauri/src/          Tauri shell over the core (`chairphoto`) — frozen, removed at #165
 ```
 
-The GPUI app is where new UI work goes. The React app still builds and ships from this
-branch until the cutover, so a changed Tauri command must keep React working.
+The GPUI app is the only front end; all UI work goes here.
 
-The Rust side is a Cargo workspace rooted at the repository root. The core crate must build
-with no `tauri` dependency; the shell re-exports it at its crate root and forwards every
-feature under the same name.
+The Rust side is a Cargo workspace rooted at the repository root, of the three crates above.
+The core crate has no UI dependency, GPUI included; `crates/app` links the core directly and
+forwards each of its features to the core's feature of the same name.
 
 The core owns file access, catalog queries, image decoding, XMP, and external processes.
 The GPUI app calls the core directly (`crates/core/src/app/` services, through `AppState`)
 and never reads photo files itself; blocking calls run on a worker or the storage `Runner`.
-React reaches the same services through Tauri commands.
 
 ### Backend map
 
-Paths are under `crates/core/src/`, except `commands/` and `protocol.rs`, which are the
-shell's (`src-tauri/src/`).
+Paths are under `crates/core/src/`.
 
 | Path | Responsibility |
 |---|---|
-| `app/` | The service layer every front end shares: `AppState`, `with_catalog*` and `CatalogIdentity` (`mod.rs`), job families and the documented lock order (`jobs.rs`), events (`events.rs`), and one file per domain (`iptc.rs`, `faces.rs`, `scans.rs`, `uploads.rs`, …). Tauri commands are thin wrappers over these. |
-| `commands/` | (shell) Flat Tauri command surface; one submodule per domain. |
+| `app/` | The service layer GPUI calls: `AppState`, `with_catalog*` and `CatalogIdentity` (`mod.rs`), job families and the documented lock order (`jobs.rs`), events (`events.rs`), and one file per domain (`iptc.rs`, `faces.rs`, `scans.rs`, `uploads.rs`, …). |
 | `catalog/` | SQLite schema, migrations, lifecycle, locations/resolver, vocabulary (incl. tag maintenance), albums, and merge. |
-| `scanner/`, `thumbnails/`, `image_pool/`, `protocol/` | Import/index, preview generation/cache, bounded decode work, and native media protocols. |
+| `scanner/`, `thumbnails/`, `image_pool/` | Import/index, preview generation/cache, and bounded decode work. |
 | `xmp/` | Merge-safe sidecar reads/writes. |
 | `raw/`, `export/`, `bundle/` | Full RAW decode, one-way export, and portable catalogs. |
 | `burst*`, `phash*`, `sharpness*` | Derived culling signals and grouping. |
 | `plugins/*` | Feature-gated module backends and their prefixed tables. |
 | `flickr/`, `smugmug/`, `instagram/`, `localsend/`, `oauth1/` | Publishing, web automation, LAN send, and shared OAuth. |
 
-Add commands to their domain submodule, not `commands/mod.rs`.
-
 ### GPUI front-end map
 
-Paths are under `crates/app/src/`. Each top-level module's `//!` doc names its ticket and the
-React component it ports; `docs/plans/gpui/parity.md` maps every React file to its port.
+Paths are under `crates/app/src/`.
 
 | Path | Responsibility |
 |---|---|
@@ -212,18 +199,6 @@ React component it ports; `docs/plans/gpui/parity.md` maps every React file to i
 editing, presets, tag tree/graph, statistics, deep links, theme), ported from the TypeScript
 with its vitest cases.
 
-### React front-end map (frozen; removed at #165)
-
-| Path | Responsibility |
-|---|---|
-| `App.tsx` | Shell state and panel wiring. |
-| `components/CatalogGrid*`, `Thumbnail*` | Virtualized library/culling hot path. |
-| `components/PhotoInspector*`, `Tag*`, `Editor*`, `Preferences*` | Core user workflows. |
-| `modules/registry.ts` | Pure module and `ChairPhotoAPI` types. |
-| `modules/host.ts` | Capability adaptation, enablement, requirements, and slots. |
-| `modules/api.ts` | Typed wrappers for core commands only. |
-| `modules/plugins/*` | First-party modules; each owns its DTOs and command/event wrappers. |
-
 ## Working Agreements
 
 ### Understand before changing
@@ -238,17 +213,12 @@ with its vitest cases.
 
 Run the full suite for every package touched, not a scoped test that can hide breakage.
 `.claude/skills/merge-verify/verify.sh <label> [--root DIR] [--features a,b]` runs all of the
-below (frontend only when `src/` changed), counts distinct SKIPPED tests, and prints a
-summary; use it rather than filtering cargo output by hand. It puts test temp files under
-`/home`, because `/tmp` is a quota-limited tmpfs and one test copies the 8 GB real catalog.
+below, counts distinct SKIPPED tests, and prints a summary; use it rather than filtering
+cargo output by hand. It puts test temp files under `/home`, because `/tmp` is a
+quota-limited tmpfs and one test copies the 8 GB real catalog.
 
 ```bash
-# frontend, from repository root
-npx tsc --noEmit
-npm test
-npm run build
-
-# backend, from repository root (the Cargo workspace: crates/core + src-tauri)
+# from repository root (the Cargo workspace: crates/core, crates/model, crates/app)
 cargo test --workspace
 cargo check --workspace --all-features --all-targets
 cargo check --workspace --no-default-features
@@ -329,9 +299,10 @@ restarts at `0`, so it is not a patch/minor distinction and carries no compatibi
 
 - **Never zero-pad the month.** `2026.08.0` is not valid semver ("invalid leading zero in
   minor version number") and Cargo refuses to build. Write `2026.8.0`.
-- One version, three files, always in step: `package.json`, `src-tauri/Cargo.toml`, and
-  `src-tauri/tauri.conf.json`. Bumping one alone ships a build that disagrees with itself.
-- Tag a release `v2026.8.0`, matching the manifests exactly.
+- No Cargo manifest currently carries the version; `packaging/PKGBUILD`'s `pkgver` is the
+  only record (#165 removed the other two files it used to track against). #167 (packaging)
+  sets the single source of truth for the Rust workspace.
+- Tag a release `v2026.8.0`, matching the manifest(s) exactly.
 
 ## Runtime Notes
 
@@ -352,10 +323,6 @@ runs under a crash marker (`crates/core/src/crash_marker.rs`): `enter(kind, subj
 before the call, `blocked(kind, subject)` checked first. A subject that took the process down
 twice is skipped and the caller takes its fallback; a clean quit is not a crash. Choose the
 subject so a change (decoder version, file size/mtime, driver) earns a fresh chance.
-
-On NVIDIA/Wayland, WebKitGTK may crash without
-`WEBKIT_DISABLE_DMABUF_RENDERER=1`. `src-tauri/src/lib.rs::run` sets it on Linux while
-respecting an existing value. Do not remove it without a tested replacement.
 
 Optional `faces-cuda` accelerates face inference and must fall back to CPU without crashing.
 See `docs/face-tagging.md` before changing model execution or `indexing.speed`.

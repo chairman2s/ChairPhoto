@@ -42,7 +42,7 @@ pub use crate::plugins::smarttags::store;
 
 // ── Progress / outcome types ──────────────────────────────────────────────────
 
-/// Payload for the `smarttags:progress` Tauri event.
+/// Payload for the `smarttags:progress` event.
 #[derive(Debug, Clone, Serialize)]
 pub struct SmarttagsProgress {
     pub done: usize,

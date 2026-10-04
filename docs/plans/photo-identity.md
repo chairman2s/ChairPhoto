@@ -63,3 +63,25 @@ normally lands beside `DSC01234.ARW` and is stacked under it.
   existing RAW" in the dialog and pair by capture + serial; (b) record it as a companion /
   alternate rendition of the RAW's photo instead of a separate photo; (c) offer to skip
   JPEGs whose RAW is already imported.
+
+## 3. The camera JPEG as the preview source (undecided idea)
+
+**Idea (owner, not decided):** when the camera's own JPEG of a RAW has been imported, use it
+for that photo's thumbnail and preview instead of the small JPEG embedded in the RAW.
+
+**Why:** it is full resolution with the camera's own colours and picture style (closer to what
+was seen on the camera), it already exists, and it decodes fast — a cold loupe open would
+not wait for RAW work.
+
+**Conditions it would need:**
+- **Edits win.** Only for photos with no Develop edit; an edited photo shows its render.
+- **Same framing.** Only when the JPEG's aspect matches the RAW's (an in-camera 16:9 crop of
+  a 3:2 RAW must not be used). Face boxes are stored in the preview's frame and the #154
+  cross-check compares aspects, so a different shape would refuse or misplace face regions.
+  Matching capture time and serial is not enough on its own.
+- **A different look.** In-camera DRO/HDR/creative styles can make the JPEG differ from the
+  RAW; possibly a preference ("use camera JPEG for previews when available").
+- **Offline.** A JPEG only on an unmounted NAS falls back to the RAW's embedded preview.
+- **Reliable pairing first.** Depends on §2's pairing by capture time + serial, and fits its
+  option (b): the JPEG as another rendition of the RAW's photo, preferred for previews while
+  the photo is unedited.

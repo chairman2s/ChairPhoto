@@ -661,6 +661,34 @@ fn a_save_landing_on_a_reshown_photo_does_not_leave_the_form_stale(cx: &mut Test
     insp.read_with(cx, |i, cx| assert!(!i.iptc.dirty(cx), "a fresh read leaves nothing dirty"));
 }
 
+/// **Typing after reshow survives a late save** (#201 M1). Same setup as the test above —
+/// Save "First", then "Second" while "First" is still queued, navigate to photo 1 and back to
+/// photo 0 before either lands (the generation bumps twice and the return re-reads, landing
+/// "" with nothing dirty). This time the user types "Typed but not saved" into Headline before
+/// either queued save lands. Both saves still commit to the catalog, in order, but the
+/// completion must not refill the inputs over the user's typing: the shown Headline must still
+/// read what they typed, not the save's value or a fresh "" re-read.
+/// (Mutation-checked: reverting the gate to `if shown` alone — the pre-fix code — re-reads the
+/// catalog once "Second" lands and this fails: shown == "Second", not the typed text.)
+#[gpui_kit::test]
+fn r4_typing_after_reshow_survives_a_late_save(cx: &mut TestAppContext) {
+    let dir = TempDir::new("insp-iptc-typing-after-reshow");
+    let app = start(cx);
+    let ids = open_catalog_with_photos(&app, &dir, 2, cx);
+    let insp = two_iptc_saves(&app, &dir, &ids, cx);
+    select(&app, ids[1], SelectMods::default(), cx);
+    select(&app, ids[0], SelectMods::default(), cx);
+    render(&app, cx);
+    let headline = insp.read_with(cx, |i, _| i.iptc.fields[0].clone());
+    set_input(&app, &headline, "Typed but not saved", cx);
+    work(cx);
+    render(&app, cx);
+    let stored = catalog(&app, |c| c.get_iptc(ids[0]).unwrap().headline);
+    assert_eq!(stored, "Second", "both queued saves still land, in order, on the catalog");
+    let shown = insp.read_with(cx, |i, cx| i.iptc.values(cx).headline);
+    assert_eq!(shown, "Typed but not saved", "a late save landing must not wipe unsaved typing");
+}
+
 /// **Forced interleaving.** The two saves are pending when the core switches to a catalog
 /// whose photo 0 has the same id (and its own original), with `catalog:switched` withheld or
 /// delivered: neither save writes the new catalog's row or sidecar.

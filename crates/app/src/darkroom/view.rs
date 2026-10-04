@@ -17,7 +17,7 @@ use super::session::Darkroom;
 use super::stage::FrameTier;
 use crate::image_store::ImageState;
 use crate::shell::style::Colors;
-use crate::storage::ui::{chip, clickable, truncating_chip};
+use crate::storage::ui::{chip, clickable, icon_label_chip, truncating_chip};
 use crate::loupe::zoom::fitted;
 use chairphoto_core::catalog::Photo;
 use chairphoto_core::image_pool::ImageKind;
@@ -29,6 +29,7 @@ use chairphoto_model::darkroom::filmstrip::{step_target, KeyTarget, STRIP_LAYOUT
 use chairphoto_model::darkroom::kelvin::{kelvin_to_slider, KelvinContext, WbShown, KELVIN_TINT_RANGE, SLIDER_STEPS};
 use chairphoto_model::darkroom::tone_strip::{self, ZONE_COUNT, ZONE_FILLS, ZONE_LABELS};
 use chairphoto_model::editing::{bw_filters, VersionEdit};
+use gpui_kit::assets::IconName;
 use gpui_kit::component::slider::{Slider, SliderEvent, SliderState};
 use gpui_kit::prelude::*;
 use gpui_kit::{
@@ -530,12 +531,18 @@ impl DarkroomView {
             .px(px(12.))
             .border_b_1()
             .border_color(colors.line)
-            .child(clickable(chip("dk-back", "← Library", true, colors), true, move |_, _, cx| {
-                // DarkroomView.tsx's `markShellLeave("develop")` before `onBack()`.
-                let rows_from = shell.read(cx).rows_from();
-                crate::shell::timing::ShellTimer::leave("develop", rows_from, cx);
-                shell.update(cx, |s, cx| s.show_library(cx))
-            }))
+            .child(clickable(
+                // The UI font has no U+2190; the fallback font it reaches for draws it tiny
+                // (#197 L5) — Lucide's arrow instead, as the other back chips already do.
+                icon_label_chip("dk-back", IconName::ArrowLeft, false, "Library", true, colors).aria_label("← Library"),
+                true,
+                move |_, _, cx| {
+                    // DarkroomView.tsx's `markShellLeave("develop")` before `onBack()`.
+                    let rows_from = shell.read(cx).rows_from();
+                    crate::shell::timing::ShellTimer::leave("develop", rows_from, cx);
+                    shell.update(cx, |s, cx| s.show_library(cx))
+                },
+            ))
             .child(div().text_size(px(13.)).font_weight(FontWeight::SEMIBOLD).child("Darkroom"))
             .children(self.render_shelf(d, colors))
             .child(div().id("dk-hint").text_size(px(11.)).text_color(colors.mute).child(hint).test_support());

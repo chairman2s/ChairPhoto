@@ -1634,6 +1634,74 @@ fn a_switch_resets_the_debt_panels_scroll_to_the_top(cx: &mut TestAppContext) {
     assert!(after.contains(&0), "the re-read page must open at the top, not the old scroll offset: {after:?}");
 }
 
+/// **#200 follow-up.** `RepairEnded` had the identical scroll-reset gap `CatalogSwitched` had
+/// before #200: repaired copies leave the queue and every later offset shifts, but resetting
+/// `page`/`owed_page` to 0 without also resetting the scroll handles left the re-read page
+/// open at whatever offset the pass found it scrolled to. Claims the pass directly (as
+/// `the_debt_panel_reattaches_to_a_running_pass` does) and never calls `pass.run()`, so the
+/// panel re-attaches to a real job id but nothing actually repairs the fixture rows; the
+/// terminal event is then sent directly (`on_core_event(IdentityRepairDone)`, as
+/// `a_terminal_event_that_beats_the_job_id_is_replayed` does) — the row count stays exactly
+/// `N` throughout, so the scroll offset is the only variable.
+/// (Mutation-checked: dropping the two `scroll_to_item(0, Top)` calls this adds to the
+/// `RepairEnded` branch reproduces the bug — row 0 stays off screen after the pass ends; this
+/// fails.)
+#[gpui_kit::test]
+fn a_finished_repair_pass_resets_the_debt_panels_scroll_to_the_top(cx: &mut TestAppContext) {
+    const N: usize = 60;
+    let dir = TempDir::new("debt-repair-scroll");
+    let app = start(cx);
+    catalog_with_debt(&app, &dir, N, cx);
+    let pass = chairphoto_core::app::identity::claim_identity_repair(&app.state).unwrap();
+    let job = pass.job;
+    let panel = open_debt_panel(&app, cx);
+    app.wired.storage.read_with(cx, |s, _| assert_eq!(s.repair.job, Some(job), "re-attached to the claimed pass"));
+    panel.read_with(cx, |p, _| assert_eq!(p.rows.as_ref().map(Vec::len), Some(N), "nothing repaired yet"));
+
+    panel.read_with(cx, |p, _| p.debt_scroll.scroll_to_item(N - 1, gpui_kit::ScrollStrategy::Bottom));
+    let scrolled = drawn(&app, "debt-row", N, cx);
+    assert!(!scrolled.contains(&0), "the precondition: scrolled away from row 0: {scrolled:?}");
+
+    app.wired.storage.update(cx, |s, cx| {
+        s.on_core_event(
+            &CoreEvent::IdentityRepairDone(chairphoto_core::app::IdentityRepairDone {
+                ok: true,
+                job,
+                summary: Default::default(),
+                error: None,
+            }),
+            cx,
+        )
+    });
+    work(cx);
+
+    let after = drawn(&app, "debt-row", N, cx);
+    assert!(after.contains(&0), "the re-read page must open at the top, not the old scroll offset: {after:?}");
+}
+
+/// #197 L5 follow-up: `debt-prev`/`debt-next` draw an icon beside "Prev"/"Next" (no literal
+/// "←"/"→" character in the visible text since #197), but without an explicit `aria_label`
+/// their accessible name was not implicitly "Prev"/"Next" either — `icon_label_chip`'s
+/// icon+text composite derives no accessible name of its own, so it read as nothing at all.
+/// Both now set `aria_label` explicitly, restoring the arrow semantic the pre-#197 literal
+/// "← Prev" text carried (the owed-IPTC list's `owed-prev`/`owed-next` share the exact same
+/// fix, in the same file, but are a separate tab this test does not open).
+/// (Mutation-checked: dropping either `.aria_label(...)` call leaves that chip's accessible
+/// name `None`, not "← Prev"/"Next →"; this fails.)
+#[gpui_kit::test]
+fn the_debt_paging_chips_have_explicit_accessible_names(cx: &mut TestAppContext) {
+    const N: usize = 2;
+    let dir = TempDir::new("debt-paging-aria");
+    let app = start(cx);
+    catalog_with_debt(&app, &dir, N, cx);
+    open_debt_panel(&app, cx);
+    let mut label = |id: &'static str| {
+        cx.update_window(app.window(), |_, window, _| window.find(id).label().map(str::to_string)).unwrap()
+    };
+    assert_eq!(label("debt-prev").as_deref(), Some("← Prev"));
+    assert_eq!(label("debt-next").as_deref(), Some("Next →"));
+}
+
 /// The panel re-attaches to a pass already running when it opens (claimed elsewhere — by an
 /// earlier panel), follows its job id, and ends with its terminal event.
 #[gpui_kit::test]

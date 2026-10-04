@@ -63,6 +63,13 @@ pub struct LibraryQuery {
     statuses: BTreeMap<i64, StorageStatus>,
     /// Bumped by every refresh and by `clear`; a response carrying another value is stale.
     generation: u64,
+    /// Bumped only when a refresh's rows actually land (`apply_page`, landed) or are disowned
+    /// (`clear`) — unlike `generation`, which bumps as soon as a refresh is *requested*, before
+    /// its answer arrives. A caller that must redo work keyed off the rows themselves (#191 M2)
+    /// wants this counter, not `generation`: keying off `generation` caches a window built from
+    /// the still-old `photos()` under the number the *next* refresh's answer will also carry,
+    /// so that stale window survives the real landing.
+    rows_landed: u64,
     /// Ids already requested under the current generation, so scrolling back over rows does
     /// not re-ask for them. Cleared with each applied refresh: a new query means new answers.
     requested: HashSet<i64>,
@@ -137,6 +144,12 @@ impl LibraryQuery {
         self.generation
     }
 
+    /// Bumped each time `photos()` actually changed under a landed refresh or a `clear` —
+    /// never merely because one was requested (#191 M2; see the field doc).
+    pub fn rows_landed(&self) -> u64 {
+        self.rows_landed
+    }
+
     /// Hand back a refresh's answer.
     ///
     /// - `Err`: returned unchanged, nothing touched — an empty grid would read as "no photos
@@ -154,6 +167,7 @@ impl LibraryQuery {
         if request.generation != self.generation {
             return Ok(None);
         }
+        self.rows_landed += 1;
         self.photos = page.photos;
         self.total = page.total;
         self.requested.clear();
@@ -186,6 +200,7 @@ impl LibraryQuery {
     pub fn clear(&mut self) {
         // Bumping the generation is the disowning.
         self.generation += 1;
+        self.rows_landed += 1;
         self.photos.clear();
         self.requested.clear();
         self.pinned.clear();

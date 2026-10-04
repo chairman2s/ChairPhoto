@@ -1356,6 +1356,13 @@ impl Darkroom {
         self.strip_rebuild_count
     }
 
+    /// Tests: the ids in the strip's cached wanted list, in the order it last asked the image
+    /// store for them (#191 M2).
+    #[cfg(test)]
+    pub(crate) fn strip_wanted_ids(&self) -> Vec<i64> {
+        self.strip_wanted.iter().map(|(id, _)| *id).collect()
+    }
+
     /// Move to `photo_id` (a strip click, ← / →): the shell's active photo changes, and
     /// [`sync`](Self::sync) saves this photo and opens that one.
     pub fn step_to(&mut self, photo_id: i64, cx: &mut Context<Self>) {

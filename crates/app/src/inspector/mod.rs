@@ -927,7 +927,10 @@ impl PhotoInspector {
                     // already reset and may have re-read the catalog before this save landed,
                     // so its captured values must not be adopted as the new baseline (#201).
                     // The outcome goes to the status line either way; if the photo is shown
-                    // again, a fresh read replaces whatever the reset left on screen.
+                    // again and the form has no unsaved edits, a fresh read replaces whatever
+                    // the reset left on screen. If the user has since typed into the form
+                    // (#201 M1), a re-read here would refill the inputs over that typing — skip
+                    // it and leave the baseline as the reshow's own read left it.
                     let line = match result {
                         Ok(outcome) if outcome.sidecar == chairphoto_core::catalog::IptcSidecarState::Written => {
                             format!("IPTC saved to sidecar for {name}")
@@ -936,7 +939,7 @@ impl PhotoInspector {
                         Err(e) => format!("IPTC save for {name} failed: {e}"),
                     };
                     this.status(line, cx);
-                    if shown {
+                    if shown && !this.iptc.dirty(cx) {
                         this.read_iptc(id, cx);
                     }
                 }

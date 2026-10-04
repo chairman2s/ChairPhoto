@@ -78,10 +78,21 @@ fn which(bin: &str) -> Option<String> {
 /// environment — so a test can check the lookup without mutating process-wide state. Walks
 /// the entries in order and returns the first one that is a regular, executable file.
 fn which_in(bin: &str, path_var: impl AsRef<std::ffi::OsStr>) -> Option<String> {
-    std::env::split_paths(&path_var).find_map(|dir| {
+    std::env::split_paths(&path_var).filter(|dir| is_searchable_path_entry(dir)).find_map(|dir| {
         let candidate = dir.join(bin);
         is_executable_file(&candidate).then(|| candidate.to_string_lossy().into_owned())
     })
+}
+
+/// Whether a `PATH` entry (as [`std::env::split_paths`] yields it) is one [`which_in`]
+/// searches (#211 L3): only an absolute directory. An empty entry, `.`, or any other relative
+/// entry resolves against the process's current working directory — shells and `exec*(3)`
+/// treat a relative/empty `PATH` component that way, so without this gate `which_in` could
+/// "find" ffmpeg/ffprobe as whatever same-named file happens to sit in the CWD, which for a
+/// GUI app launched from an arbitrary directory is attacker-influenceable and never what a
+/// `PATH` lookup is supposed to mean.
+fn is_searchable_path_entry(dir: &Path) -> bool {
+    dir.is_absolute()
 }
 
 #[cfg(unix)]
@@ -452,6 +463,43 @@ mod tests {
         let search = format!("{}:{}", decoy_dir.display(), real_dir.display());
         assert_eq!(which_in("myffmpeg", &search), Some(real.to_string_lossy().into_owned()));
         assert_eq!(which_in("nonexistent-binary-xyz", &search), None);
+    }
+
+    /// #211 L3 (review probe P2): an empty `PATH` entry, `.`, and any other relative entry
+    /// all mean "resolve against the CWD" — `which_in` must never search any of them, only
+    /// absolute directories. Pure and CWD-independent: it checks the gate `which_in` filters
+    /// through, not the filesystem, so it cannot pass by accident of wherever the test runner's
+    /// working directory happens to be.
+    /// (Mutation-checked: `is_searchable_path_entry` returning `true` unconditionally — the
+    /// pre-fix behavior, equivalent to no filter at all — fails every assertion but the last.)
+    #[test]
+    fn which_in_only_searches_absolute_path_entries() {
+        assert!(!is_searchable_path_entry(Path::new("")), "an empty PATH entry means the CWD");
+        assert!(!is_searchable_path_entry(Path::new(".")), "\".\" means the CWD");
+        assert!(!is_searchable_path_entry(Path::new("src/..")), "any relative entry resolves against the CWD");
+        assert!(is_searchable_path_entry(Path::new("/usr/bin")), "an absolute directory is searched");
+    }
+
+    /// #211 L3, end-to-end: a `PATH` string carrying an empty entry and `.` ahead of the real
+    /// absolute one must not error or short-circuit — `which_in` skips the bad entries and
+    /// still finds the real binary.
+    /// (Mutation-checked: dropping the `.filter(...)` in `which_in` still passes this
+    /// particular case — on most machines the real `myffmpeg` isn't sitting in the CWD either
+    /// — which is exactly why `which_in_only_searches_absolute_path_entries` above is the test
+    /// that actually pins the gate; this one just confirms the gate doesn't break the good
+    /// path.)
+    #[test]
+    #[cfg(unix)]
+    fn which_in_skips_empty_and_dot_entries_and_still_finds_the_real_binary() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = crate::test_support::TestTmpDir::new("slideshow-which-relative");
+        let real_dir = dir.join("real");
+        std::fs::create_dir_all(&real_dir).unwrap();
+        let real = real_dir.join("myffmpeg2");
+        std::fs::write(&real, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let search = format!(".::{}", real_dir.display());
+        assert_eq!(which_in("myffmpeg2", &search), Some(real.to_string_lossy().into_owned()));
     }
 
     #[test]

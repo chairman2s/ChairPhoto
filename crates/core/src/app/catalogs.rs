@@ -429,10 +429,14 @@ fn reroot(
         if expected.is_some_and(|e| !e.is(catalog)) {
             return Err(CATALOG_CHANGED.into());
         }
-        // Re-root reopens the same file under a fresh instance id, so this handle's identity
-        // never comes back either — same reasoning as a switch (#188).
-        crate::rapidraw::trip_catalog(identity_of(catalog));
         catalog.set_setting("catalog_root", &new_root.to_string_lossy()).map_err(|e| e.to_string())?;
+        // Re-root reopens the same file under a fresh instance id, so this handle's identity
+        // never comes back either — same reasoning as a switch (#188). Trip only now, after
+        // the setting actually landed (#188 L2): a failed `set_setting` returns `Err` here,
+        // which `before_drop`'s `?` propagates without tripping any job generation or
+        // clearing the catalog — RapidRAW's round-trips must not be cancelled on that path
+        // either, matching this closure's own "nothing tripped" comment above.
+        crate::rapidraw::trip_catalog(identity_of(catalog));
         reopen.get_or_insert_with(|| catalog.db_path().to_path_buf());
         Ok(())
     })?;

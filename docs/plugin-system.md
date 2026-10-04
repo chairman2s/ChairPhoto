@@ -101,11 +101,14 @@ Each backend-bearing module's Rust lives in its own module under
 feature to compile the backend out entirely; [`modules::compiled_features()`] lists what this
 build has. Most modules are themselves gated behind the matching app feature
 (`crates/app/src/modules/mod.rs::bundled()`), so omitting it drops the module from the registry
-entirely — it never registers, metadata or otherwise. Instagram, Flickr and SmugMug are the
-exception: they always register (their publishing feature is opt-in upstream), and when their
-`backend_feature` is absent they register metadata-only — the Modules panel shows "backend not
-included in this build" and refuses to enable it. Default feature set decides what ships.
-Runtime toggle is independent: even compiled in, a module does nothing until enabled.
+entirely — it never registers, metadata or otherwise. Five modules are the exception and always
+register: Statistics and Obsidian declare no `backend_feature` at all, so they're simply always
+available. Instagram, Flickr and SmugMug each declare one (`instagram`/`flickr`/`smugmug`) and
+register even when it's compiled out — the Modules panel then shows "backend not included in
+this build" and refuses to enable it. Of those three, only Flickr's and SmugMug's features are
+opt-in upstream; Instagram's is in `crates/app/Cargo.toml`'s default feature set like most
+others. Default feature set decides what ships. Runtime toggle is independent: even compiled
+in, a module does nothing until enabled.
 
 ## A module's settings
 

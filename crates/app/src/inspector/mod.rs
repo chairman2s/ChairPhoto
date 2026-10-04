@@ -227,6 +227,9 @@ pub struct IptcForm {
     pub saved: IptcFields,
     pub status: String,
     fill: Option<IptcFields>,
+    /// A landed save's committed values, applied field by field at the next render
+    /// (`merge_landed`) instead of overwriting the whole form (#227).
+    merge: Option<IptcFields>,
 }
 
 impl IptcForm {
@@ -245,13 +248,38 @@ impl IptcForm {
 
     /// Put loaded values into the inputs (render time, where the window is at hand).
     pub(crate) fn apply_fill(&mut self, window: &mut Window, cx: &mut gpui_kit::App) {
-        let Some(f) = self.fill.take() else { return };
-        let description = f.description.clone();
-        self.description.update(cx, |i, cx| i.set_value(description, window, cx));
-        for ((key, _), input) in IPTC_FIELDS.iter().zip(&self.fields) {
-            let v = iptc_get(&f, key);
-            input.update(cx, |i, cx| i.set_value(v, window, cx));
+        if let Some(f) = self.fill.take() {
+            let description = f.description.clone();
+            self.description.update(cx, |i, cx| i.set_value(description, window, cx));
+            for ((key, _), input) in IPTC_FIELDS.iter().zip(&self.fields) {
+                let v = iptc_get(&f, key);
+                input.update(cx, |i, cx| i.set_value(v, window, cx));
+            }
         }
+        if let Some(landed) = self.merge.take() {
+            self.merge_landed(landed, window, cx);
+        }
+    }
+
+    /// A save landed on this photo while it was shown, but after the live form had already
+    /// been reset and re-read by a navigate-away-and-back (#227): refill only the fields
+    /// whose input still matches `saved` as it stood before this call (the user hasn't typed
+    /// into them since) with what the save actually committed, and move `saved` to the same
+    /// true value either way. A field the user has since edited keeps the typing; `saved`
+    /// still moves to the committed value for it, so the next dirty check (and the next Save)
+    /// judges it against what the catalog really holds, not the reshow's earlier read.
+    fn merge_landed(&mut self, landed: IptcFields, window: &mut Window, cx: &mut gpui_kit::App) {
+        if self.description.read(cx).value().to_string() == self.saved.description {
+            let d = landed.description.clone();
+            self.description.update(cx, |i, cx| i.set_value(d, window, cx));
+        }
+        for ((key, _), input) in IPTC_FIELDS.iter().zip(&self.fields) {
+            if input.read(cx).value().to_string() == iptc_get(&self.saved, key) {
+                let v = iptc_get(&landed, key);
+                input.update(cx, |i, cx| i.set_value(v, window, cx));
+            }
+        }
+        self.saved = landed;
     }
 }
 
@@ -427,7 +455,7 @@ impl PhotoInspector {
                 .filter(|s| crate::machine_prefs::MachinePrefs::read(cx, &s.pref_key()).as_deref() == Some("1"))
                 .collect(),
             data: PhotoData::default(),
-            iptc: IptcForm { description, fields, saved: IptcFields::default(), status: String::new(), fill: None },
+            iptc: IptcForm { description, fields, saved: IptcFields::default(), status: String::new(), fill: None, merge: None },
             meta_open: META_DEFAULT_OPEN.iter().map(|s| s.to_string()).collect(),
             version_name,
             renaming: None,
@@ -499,6 +527,9 @@ impl PhotoInspector {
             self.iptc.saved = IptcFields::default();
             self.iptc.status.clear();
             self.iptc.fill = Some(IptcFields::default());
+            // A save for the previous photo that lands after this reset must not apply its
+            // merge to this one's fields (#227).
+            self.iptc.merge = None;
             cx.notify();
         } else if let Some(p) = photo {
             if self.stack_key != Some((p.1, p.2)) {
@@ -925,12 +956,14 @@ impl PhotoInspector {
                     // The inspector moved on, or this photo was navigated away from and back
                     // (the generation changed) since Save was clicked: the live form was
                     // already reset and may have re-read the catalog before this save landed,
-                    // so its captured values must not be adopted as the new baseline (#201).
-                    // The outcome goes to the status line either way; if the photo is shown
-                    // again and the form has no unsaved edits, a fresh read replaces whatever
-                    // the reset left on screen. If the user has since typed into the form
-                    // (#201 M1), a re-read here would refill the inputs over that typing — skip
-                    // it and leave the baseline as the reshow's own read left it.
+                    // so its captured values must not be adopted as the new baseline outright
+                    // (#201). The outcome goes to the status line either way. A successful
+                    // write's committed values are merged in field by field at the next render
+                    // (`IptcForm::merge_landed`, #227): a field the user hasn't typed into
+                    // since the reshow is refilled with them; a field they have since edited
+                    // (#201 M1) keeps the typing. A failed write changed nothing, so there is
+                    // nothing to merge.
+                    let ok = result.is_ok();
                     let line = match result {
                         Ok(outcome) if outcome.sidecar == chairphoto_core::catalog::IptcSidecarState::Written => {
                             format!("IPTC saved to sidecar for {name}")
@@ -939,8 +972,9 @@ impl PhotoInspector {
                         Err(e) => format!("IPTC save for {name} failed: {e}"),
                     };
                     this.status(line, cx);
-                    if shown && !this.iptc.dirty(cx) {
-                        this.read_iptc(id, cx);
+                    if shown && ok {
+                        this.iptc.merge = Some(saved);
+                        cx.notify();
                     }
                 }
             },

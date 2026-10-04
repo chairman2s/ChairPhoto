@@ -207,6 +207,13 @@ package() {
   install -Dm644 crates/core/vendor/LibRaw/LICENSE.LGPL "$pkgdir/usr/share/licenses/$pkgname/LibRaw-LICENSE.LGPL"
   # The lens-correction reader is ported from RAWmakase, MIT (MODULE_LICENSING.md).
   install -Dm644 crates/core/src/lens/LICENSE-RAWmakase "$pkgdir/usr/share/licenses/$pkgname/RAWmakase-LICENSE"
+  # Lucide icons (ISC; a Feather-derived subset MIT) and the Instrument Sans/Serif fonts
+  # (SIL OFL 1.1) the GPUI app embeds (#177; MODULE_LICENSING.md).
+  install -Dm644 crates/app/assets/icons/LICENSE-LUCIDE "$pkgdir/usr/share/licenses/$pkgname/LICENSE-LUCIDE"
+  install -Dm644 crates/app/assets/fonts/OFL-InstrumentSans.txt \
+    "$pkgdir/usr/share/licenses/$pkgname/OFL-InstrumentSans.txt"
+  install -Dm644 crates/app/assets/fonts/OFL-InstrumentSerif.txt \
+    "$pkgdir/usr/share/licenses/$pkgname/OFL-InstrumentSerif.txt"
 
   install -Dm644 "packaging/icons/32x32.png" \
     "$pkgdir/usr/share/icons/hicolor/32x32/apps/$pkgname.png"

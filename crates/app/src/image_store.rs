@@ -80,7 +80,11 @@
 //!   thumbnail (`Loaded::cover` false) of a row that names no cover and was rendered in that
 //!   row's catalog — or, still rendering, when the row names no cover: it is adopted, not
 //!   rendered twice. The identity is read after the render, so a switch during it counts
-//!   against the pixels: it errs towards rendering again.
+//!   against the pixels: it errs towards rendering again. Avatar crops (#223 F1) are stamped
+//!   the same way (#223 L5): the grid applies [`ImageStore::foreign`] itself before painting
+//!   a Thumb; the People view applies it to both the Thumb and the avatar crop it draws from
+//!   ([`crate::modules::faces::people_view`]), so a crop rendered in a catalog a row no
+//!   longer belongs to is never painted under it either.
 //!
 //! The pool is behind [`Submit`] so tests can hold responders and deliver them in any order.
 
@@ -394,6 +398,10 @@ struct Done {
 /// An avatar crop's answer (#223 F1) — much simpler than [`Done`]: a crop is never
 /// catalog-bound (like any plain, unlooked request, rv134 M1), so there is no refusal and
 /// no look to track; only cached, pending and failed, dropped by generation like any tier.
+/// `result` still carries `Loaded::rendered_in` (#223 L5), stamped the same way a plain
+/// Thumb's is: not to refuse anything here, but so a painter (the People view) can run the
+/// same foreign-render check the grid does before drawing it under a row that may since have
+/// switched catalogs.
 #[cfg(feature = "faces")]
 struct AvatarDone {
     key: AvatarKey,
@@ -850,9 +858,20 @@ impl ImageStore {
             self.avatar_pending.insert(key, (generation, job.clone()));
             self.stats.submitted += 1;
             let done = self.avatar_done.clone();
+            let probe = self.probe.clone();
             batch.push((
                 JobKey::Avatar(job),
                 Box::new(move |result| {
+                    // Stamped with the catalog open when it rendered, exactly like a Thumb
+                    // (#223 L5): a crop is still never catalog-bound (no refusal, no look to
+                    // track, as the type's own doc says), but a painter needs `rendered_in`
+                    // to tell a crop rendered under a since-replaced catalog from this
+                    // catalog's own, the same foreign-render check the grid already applies.
+                    let seen = match (&probe, &result) {
+                        (Some(probe), Ok(_)) => probe(),
+                        _ => None,
+                    };
+                    let result = result.map(|loaded| Loaded { rendered_in: seen, ..loaded });
                     let _ = done.unbounded_send(AvatarDone { key, generation, result });
                 }),
             ));

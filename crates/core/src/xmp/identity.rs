@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use xmltree::XMLNode;
 use super::document::SidecarDocument;
 use super::dom::{first_text, plain, rdf_of};
-use super::ns::{NS_CHAIRPHOTO, NS_XMP, NS_XMPIDQ};
+use super::ns::{NS_CHAIRPHOTO, NS_RDF, NS_XMP, NS_XMPIDQ};
 use super::parse::ns_attr;
 use super::repair::parse_for_read;
 use super::sidecar_path;
@@ -52,7 +52,16 @@ pub fn read_identifier(photo_path: &Path) -> Option<String> {
 /// the identifier, because it is simply the first text node depth-first. `read_identifiers`
 /// already skipped it; this is what makes the singular reader agree with it rather than
 /// minting `legacy_photo_identity` from a scheme name shared by every sidecar in that layout.
+///
+/// Also reads the qualified struct's attribute shorthand — `rdf:li xmpidq:Scheme="DAM"
+/// rdf:value="dam:3"`, with the value and its qualifier both attributes on the `li` itself and
+/// no text children to find by walking further — the same way [`identifiers_in_rdf`]'s own
+/// walk does (nit). Before this, such an `rdf:li` had nothing for either reader to recurse
+/// into, so it read as no identifier at all and a scan replaced it as if the sidecar had none.
 fn first_identifier_text(e: &xmltree::Element) -> Option<String> {
+    if let Some(v) = ns_attr(e, NS_RDF, "value").filter(|v| !v.trim().is_empty()) {
+        return Some(v.trim().to_string());
+    }
     for node in &e.children {
         match node {
             XMLNode::Text(t) if !t.trim().is_empty() => return Some(t.trim().to_string()),
@@ -93,7 +102,15 @@ pub fn read_identifiers(photo_path: &Path) -> Vec<String> {
 /// with [`overwrite_identifier_checked`], which reads from a [`SidecarDocument`] already open
 /// under the sidecar's file lock rather than a fresh, unlocked parse (#222 N3).
 fn identifiers_in_rdf(rdf: &xmltree::Element) -> Vec<String> {
+    // `e`'s value: its own `rdf:value` attribute, if XML represents it that way (the
+    // qualified struct's attribute shorthand — `rdf:li xmpidq:Scheme="DAM"
+    // rdf:value="dam:3"`, with no text children to find by walking further); otherwise
+    // every text node among its children, skipping an `xmpidq:*` qualifier the same way.
     fn texts(e: &xmltree::Element, out: &mut Vec<String>) {
+        if let Some(v) = ns_attr(e, NS_RDF, "value").filter(|v| !v.trim().is_empty()) {
+            out.push(v.trim().to_string());
+            return;
+        }
         for node in &e.children {
             match node {
                 XMLNode::Text(t) if !t.trim().is_empty() => out.push(t.trim().to_string()),
@@ -466,6 +483,67 @@ mod tests {
         std::fs::write(sidecar_path(&photo), existing).unwrap();
 
         assert_eq!(read_identifiers(&photo), vec!["dam:asset/2".to_string(), "another-photos-uuid".to_string()]);
+    }
+
+    /// r6 review nit: the qualified struct's attribute shorthand — `rdf:li xmpidq:Scheme="DAM"
+    /// rdf:value="dam:3"`, value and qualifier both attributes on the `li` itself, nothing
+    /// in its children to walk into. Before this, both readers found no text anywhere under
+    /// such an `rdf:li` and read the sidecar as carrying no identifier at all, which would
+    /// have let a scan mint a fresh UUID for a photo that already had one.
+    /// Independently checked against Python's `xml.etree.ElementTree`: this exact document's
+    /// `rdf:li` has no element or text children, and its `{http://www.w3.org/1999/02/22-rdf-syntax-ns#}value`
+    /// attribute is `dam:3` — the one and only value this sidecar expresses.
+    #[test]
+    fn read_identifier_and_read_identifiers_read_the_attribute_shorthand_form() {
+        let dir = crate::test_support::TestTmpDir::new("xmp-identifier-attr-shorthand");
+        let photo = dir.join("DSC33.ARW");
+        std::fs::write(&photo, b"raw").unwrap();
+        let existing = r#"<?xml version="1.0" encoding="UTF-8"?>
+<x:xmpmeta xmlns:x="adobe:ns:meta/">
+ <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
+  <rdf:Description rdf:about=""
+    xmlns:xmp="http://ns.adobe.com/xap/1.0/"
+    xmlns:xmpidq="http://ns.adobe.com/xmp/Identifier/qual/1.0/">
+   <xmp:Identifier>
+    <rdf:Bag>
+     <rdf:li xmpidq:Scheme="DAM" rdf:value="dam:3"/>
+    </rdf:Bag>
+   </xmp:Identifier>
+  </rdf:Description>
+ </rdf:RDF>
+</x:xmpmeta>"#;
+        std::fs::write(sidecar_path(&photo), existing).unwrap();
+
+        assert_eq!(read_identifiers(&photo), vec!["dam:3".to_string()], "not empty: the sidecar does have an identifier");
+        assert_eq!(read_identifier(&photo).as_deref(), Some("dam:3"), "not None, and not the scheme name \"DAM\"");
+    }
+
+    /// The attribute-shorthand qualifier (`xmpidq:Scheme="DAM"`) is still just a qualifier,
+    /// never counted as a value of its own — the attribute-form counterpart of
+    /// `read_identifiers_reads_a_qualified_bag_item_as_one_value`.
+    #[test]
+    fn read_identifiers_still_sees_a_second_item_beside_an_attribute_shorthand_one() {
+        let dir = crate::test_support::TestTmpDir::new("xmp-identifiers-attr-shorthand-plus-one");
+        let photo = dir.join("DSC34.ARW");
+        std::fs::write(&photo, b"raw").unwrap();
+        let existing = r#"<?xml version="1.0" encoding="UTF-8"?>
+<x:xmpmeta xmlns:x="adobe:ns:meta/">
+ <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
+  <rdf:Description rdf:about=""
+    xmlns:xmp="http://ns.adobe.com/xap/1.0/"
+    xmlns:xmpidq="http://ns.adobe.com/xmp/Identifier/qual/1.0/">
+   <xmp:Identifier>
+    <rdf:Bag>
+     <rdf:li xmpidq:Scheme="DAM" rdf:value="dam:3"/>
+     <rdf:li>another-photos-uuid</rdf:li>
+    </rdf:Bag>
+   </xmp:Identifier>
+  </rdf:Description>
+ </rdf:RDF>
+</x:xmpmeta>"#;
+        std::fs::write(sidecar_path(&photo), existing).unwrap();
+
+        assert_eq!(read_identifiers(&photo), vec!["dam:3".to_string(), "another-photos-uuid".to_string()]);
     }
 
     // --- overwrite_identifier_checked reads under the write's own lock (#222 N3) -------

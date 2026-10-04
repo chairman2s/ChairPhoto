@@ -689,6 +689,39 @@ fn r4_typing_after_reshow_survives_a_late_save(cx: &mut TestAppContext) {
     assert_eq!(shown, "Typed but not saved", "a late save landing must not wipe unsaved typing");
 }
 
+/// **P201a: a late save refills only the fields the user didn't touch** (#227). Same setup
+/// as the two tests above — Save "First", then "Second" while "First" is still queued,
+/// navigate to photo 1 and back to photo 0 before either lands (the generation bumps twice
+/// and the return re-reads, landing "" with nothing dirty). This time the user types into
+/// Title — a field neither queued save touched — instead of Headline. Both saves still
+/// commit, in order: Headline must show the committed "Second" (the field is clean relative
+/// to the reshow's own baseline, so the landed value refills it), while Title must keep the
+/// typing the whole-form gate used to protect by skipping the refill outright.
+/// (Mutation-checked: reverting to the whole-form dirty gate — `if shown &&
+/// !this.iptc.dirty(cx) { this.read_iptc(id, cx) }`, the pre-#227 code — treats the whole
+/// form as dirty because of the Title edit and skips the refill entirely, leaving Headline
+/// "" instead of "Second": `left: "", right: "Second"`.)
+#[gpui_kit::test]
+fn p201a_a_late_save_refills_only_the_fields_the_user_did_not_touch(cx: &mut TestAppContext) {
+    let dir = TempDir::new("insp-iptc-field-dirty");
+    let app = start(cx);
+    let ids = open_catalog_with_photos(&app, &dir, 2, cx);
+    let insp = two_iptc_saves(&app, &dir, &ids, cx);
+    select(&app, ids[1], SelectMods::default(), cx);
+    select(&app, ids[0], SelectMods::default(), cx);
+    render(&app, cx);
+    let title = insp.read_with(cx, |i, _| i.iptc.fields[1].clone());
+    set_input(&app, &title, "Typed but not saved", cx);
+    work(cx);
+    render(&app, cx);
+    let stored = catalog(&app, |c| c.get_iptc(ids[0]).unwrap().headline);
+    assert_eq!(stored, "Second", "both queued saves still land, in order, on the catalog");
+    let values = insp.read_with(cx, |i, cx| i.iptc.values(cx));
+    assert_eq!(values.headline, "Second", "an untouched field refills with what the save committed");
+    assert_eq!(values.title, "Typed but not saved", "a touched field keeps the user's typing");
+    insp.read_with(cx, |i, cx| assert!(i.iptc.dirty(cx), "Title is still unsaved"));
+}
+
 /// **Forced interleaving.** The two saves are pending when the core switches to a catalog
 /// whose photo 0 has the same id (and its own original), with `catalog:switched` withheld or
 /// delivered: neither save writes the new catalog's row or sidecar.

@@ -4195,6 +4195,51 @@ mod tests {
         assert_eq!(catalog.get_photo(id).unwrap().path, "b/IMG.ARW");
     }
 
+    /// A nit from the r6 review: the qualified Bag item's attribute shorthand —
+    /// `rdf:li xmpidq:Scheme="DAM" rdf:value="…"`, value and qualifier both attributes on
+    /// the `li` itself, no text children to find — used to read as no identifier at all in
+    /// `read_identifier`, the function this scan's own `sidecar_uuid` lookup goes through.
+    /// Moving the file (so only the UUID, never the path, can match it back to its row)
+    /// proves the scan still reads it: before the identity.rs fix this would re-home nothing
+    /// and mint a second row at the new path instead, silently splitting the photo in two.
+    #[test]
+    fn a_scan_recognizes_the_qualified_attribute_shorthand_identifier() {
+        let (catalog, root, _dir) = temp_catalog("rehome-shorthand-identifier");
+        let path = root.join("a/IMG.ARW");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, b"raw-bytes").unwrap();
+        let up = catalog.upsert_photo(&path, None, 1, 9).unwrap();
+        let sidecar = format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<x:xmpmeta xmlns:x="adobe:ns:meta/">
+ <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
+  <rdf:Description rdf:about=""
+    xmlns:xmp="http://ns.adobe.com/xap/1.0/"
+    xmlns:xmpidq="http://ns.adobe.com/xmp/Identifier/qual/1.0/">
+   <xmp:Identifier>
+    <rdf:Bag>
+     <rdf:li xmpidq:Scheme="DAM" rdf:value="{}"/>
+    </rdf:Bag>
+   </xmp:Identifier>
+  </rdf:Description>
+ </rdf:RDF>
+</x:xmpmeta>"#,
+            up.uuid
+        );
+        std::fs::write(crate::xmp::sidecar_path(&path), &sidecar).unwrap();
+        assert_eq!(crate::xmp::read_identifier(&path).as_deref(), Some(up.uuid.as_str()), "precondition: the fix reads it");
+
+        let moved = root.join("b/IMG.ARW");
+        std::fs::create_dir_all(moved.parent().unwrap()).unwrap();
+        rename_with_sidecar(&path, &moved);
+
+        let again = scan(&catalog, &moved);
+
+        assert_eq!((again.id, again.created, again.uuid.as_str()), (up.id, false, up.uuid.as_str()), "re-homed, not minted anew");
+        assert_eq!(photo_count(&catalog), 1, "no duplicate row from a sidecar misread as having no identifier");
+        assert_eq!(catalog.get_photo(up.id).unwrap().path, "b/IMG.ARW");
+    }
+
     /// The guard on a real case-insensitive filesystem: a casefold tmpfs, mounted in a private
     /// user and mount namespace (`unshare -rm`), where this test binary runs
     /// [`case_only_renames_on_a_casefold_mount`]. Skipped where unprivileged namespaces, tmpfs

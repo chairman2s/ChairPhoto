@@ -78,3 +78,41 @@ pub fn probe_source(path: &std::path::Path) -> DevelopSource {
 pub fn probe_source(_path: &std::path::Path) -> DevelopSource {
     DevelopSource::NoDecoder
 }
+
+// Moved from the Tauri shell's `commands/develop.rs` when it was removed (#165).
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_non_raw_path_is_jpeg_and_the_source_tag_serializes() {
+        let json = serde_json::to_string(&DevelopSource::Jpeg).unwrap();
+        assert_eq!(json, r#"{"source":"jpeg"}"#);
+        let json = serde_json::to_string(&DevelopSource::Unsupported {
+            camera: Some("ILCE-7RM6".into()),
+            reason: "Unsupported file format or not RAW file".into(),
+        })
+        .unwrap();
+        assert!(json.starts_with(r#"{"source":"unsupported","camera":"ILCE-7RM6""#), "{json}");
+    }
+
+    /// Runs only with a real RAW at `CHAIRPHOTO_RAW_FIXTURE`: prints the exact payload the
+    /// Darkroom badge receives, and pins its shape.
+    #[cfg(feature = "raw")]
+    #[test]
+    fn a_real_fixture_probes_as_raw_with_its_picture_size() {
+        let Ok(fixture) = std::env::var("CHAIRPHOTO_RAW_FIXTURE") else {
+            println!("SKIPPED: a_real_fixture_probes_as_raw_with_its_picture_size — set CHAIRPHOTO_RAW_FIXTURE");
+            return;
+        };
+        let src = probe_source(std::path::Path::new(&fixture));
+        println!("develop source: {}", serde_json::to_string(&src).unwrap());
+        assert!(matches!(src, DevelopSource::Raw { bits: 16, .. }), "{src:?}");
+    }
+
+    #[cfg(not(feature = "raw"))]
+    #[test]
+    fn without_the_raw_feature_a_raw_probes_as_nodecoder() {
+        assert_eq!(probe_source(std::path::Path::new("x.ARW")), DevelopSource::NoDecoder);
+    }
+}

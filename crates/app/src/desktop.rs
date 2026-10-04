@@ -182,10 +182,13 @@ fn clean_stale_handler(data_home: &Path, config_home: &Path) {
     }
 }
 
-/// Whether a desktop-entry's content is recognisably ChairPhoto's own dev handler (the shape
-/// [`handler_entry`] writes), not merely a file that happens to share a name.
+/// Whether a desktop-entry's content is recognisably ChairPhoto's own dev handler: either the
+/// shape [`handler_entry`] writes today, or the pre-#167 shape (`Name=ChairPhoto (GPUI dev
+/// build)`, before the `chairphoto-gpui` → `chairphoto` rename) that [`STALE_HANDLER_FILE`]
+/// is the only file this module can ever name. Not merely a file that happens to share a name.
 fn is_own_entry(content: &str) -> bool {
-    content.contains("\nName=ChairPhoto (dev build)\n") && content.contains(SCHEME_MIME)
+    (content.contains("\nName=ChairPhoto (dev build)\n") || content.contains("\nName=ChairPhoto (GPUI dev build)\n"))
+        && content.contains(SCHEME_MIME)
 }
 
 /// Remove `x-scheme-handler/chairphoto=chairphoto-gpui-handler.desktop` from
@@ -328,6 +331,20 @@ mod tests {
 
     // --- stale pre-#167 handler + mimeapps default cleanup (L6) --------------------------
 
+    /// The literal pre-#167 handler entry text, copied from `handler_entry` as it read at
+    /// `aa9438f^:crates/app/src/desktop.rs` (before the `chairphoto-gpui` → `chairphoto`
+    /// rename changed the `Name=` line this module writes). Built from the literal text, not
+    /// by calling the *current* `handler_entry()`, so this fixture still matches what a real
+    /// pre-rename dev build actually wrote even if `handler_entry`'s shape changes again later.
+    const STALE_PRE_RENAME_ENTRY: &str = "[Desktop Entry]\n\
+         Type=Application\n\
+         Name=ChairPhoto (GPUI dev build)\n\
+         Exec=/old/chairphoto-gpui %u\n\
+         Terminal=false\n\
+         NoDisplay=true\n\
+         MimeType=x-scheme-handler/chairphoto;\n\
+         StartupWMClass=chairphoto\n";
+
     /// A ChairPhoto-shaped stale entry, and a `mimeapps.list` default pointing at it, are
     /// both removed when the current handler registers — and the new entry still gets
     /// written and claimed, same as any other registration.
@@ -337,7 +354,7 @@ mod tests {
         let apps = home.0.join("applications");
         std::fs::create_dir_all(&apps).unwrap();
         let stale = apps.join(STALE_HANDLER_FILE);
-        std::fs::write(&stale, handler_entry(Path::new("/old/chairphoto-gpui")).unwrap()).unwrap();
+        std::fs::write(&stale, STALE_PRE_RENAME_ENTRY).unwrap();
         let config = home.0.join("config");
         std::fs::create_dir_all(&config).unwrap();
         let mimeapps = config.join("mimeapps.list");

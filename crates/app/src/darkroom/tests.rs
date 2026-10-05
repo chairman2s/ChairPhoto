@@ -1802,10 +1802,14 @@ fn rails_writes_fail_closed_across_a_switch(cx: &mut TestAppContext) {
 }
 
 /// The Darkroom's keys stand down while the proof sheet or the duel is up (React's
-/// filmstrip `keysDisabled`): under the proof sheet — which binds only Esc — ← / → do not
-/// step the filmstrip, Enter does not zoom to the crop, and Ctrl+Z / Ctrl+Shift+Z / Ctrl+Y
-/// do not move the history; under the duel — which binds the arrows, ↓ and Esc — Ctrl+Z,
-/// Ctrl+Y and Enter do nothing either. Each key is first shown to act with no overlay up.
+/// filmstrip `keysDisabled`): under the proof sheet — which now binds its own ← / → / ↑ / ↓
+/// to move its own cell focus (#250 follow-up) — none of that steps the filmstrip, zooms to
+/// the crop, or moves the history, and Ctrl+Z / Ctrl+Shift+Z / Ctrl+Y do nothing either;
+/// under the duel — which binds the arrows, ↓ and Esc — Ctrl+Z, Ctrl+Y and Enter do nothing
+/// either. Each key is first shown to act with no overlay up. Enter's own "no-op from the
+/// backdrop" is checked once the arrows' focus moves are backed out, since a focused cell's
+/// Enter now adopts it by design — that is the sheet's own business, covered in
+/// `loupe::tests::overlays`, not this test's.
 #[gpui_kit::test]
 fn the_darkroom_keys_stand_down_under_the_proof_sheet_and_the_duel(cx: &mut TestAppContext) {
     use super::view::Overlay;
@@ -1844,18 +1848,31 @@ fn the_darkroom_keys_stand_down_under_the_proof_sheet_and_the_duel(cx: &mut Test
     work(cx);
     assert_eq!(rig.labels(v).1, head, "Ctrl+Y redoes");
 
-    // Under the proof sheet: nothing.
+    // Under the proof sheet: nothing Darkroom's own — including ← / → / ↑ / ↓, which now
+    // move the sheet's own cell focus (#250 follow-up) instead of doing nothing at all, but
+    // still never reach the filmstrip, the crop zoom or the history.
     rig.with_view(cx, |v, window, cx| v.open_proof_sheet(window, cx));
     assert_eq!(overlay(cx), "proof");
-    for key in ["right", "left", "ctrl-z", "ctrl-shift-z", "ctrl-y", "enter"] {
+    for key in ["right", "left", "up", "down", "ctrl-z", "ctrl-shift-z", "ctrl-y"] {
         rig.press(key, cx);
         work(cx);
         assert_eq!(rig.open_photo(cx), photo, "{key} under the proof sheet does not step the filmstrip");
         assert!(stage_view(cx).is_fit(), "{key} under the proof sheet does not zoom");
         assert_eq!(rig.labels(v).1, head, "{key} under the proof sheet does not move the history");
-        // Enter with no proof focused is a no-op of the sheet's own (`loupe::proof_sheet`).
         assert_eq!(overlay(cx), "proof", "{key}: the sheet stays up");
     }
+    // The arrows above focused a cell of the sheet's own; refocus the backdrop so Enter's
+    // own no-op (nothing of the sheet's is focused) is what this checks, not an adopt.
+    rig.with_view(cx, |v, window, cx| match v.overlay() {
+        Some(Overlay::Proof(p)) => p.read(cx).focus_handle().clone().focus(window, cx),
+        _ => panic!("the proof sheet is still up"),
+    });
+    rig.press("enter", cx);
+    work(cx);
+    assert_eq!(rig.open_photo(cx), photo, "Enter from the backdrop does not step the filmstrip");
+    assert!(stage_view(cx).is_fit(), "Enter from the backdrop does not zoom");
+    assert_eq!(rig.labels(v).1, head, "Enter from the backdrop does not move the history");
+    assert_eq!(overlay(cx), "proof", "Enter with no proof focused is a no-op of the sheet's own");
     rig.press("escape", cx);
     assert_eq!(overlay(cx), "none");
 

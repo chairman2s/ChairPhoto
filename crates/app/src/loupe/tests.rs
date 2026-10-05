@@ -1400,6 +1400,187 @@ mod overlays {
         assert!(shell.read_with(cx, |s, _| s.loupe_proof_preview().is_some()), "one of the two sheets' hovered candidate is shown");
     }
 
+    // --- arrow keys over the proof sheet (#250 follow-up) ---------------------------------
+
+    /// ← / → cycle focus the same way Tab / Shift+Tab do — wrapping, and from the backdrop
+    /// landing on the first/last cell — and each move's preview follows; Enter adopts
+    /// whichever cell an arrow press focused, not only a Tab-focused or clicked one.
+    #[gpui_kit::test]
+    fn left_and_right_cycle_focus_like_tab_and_enter_adopts_it(cx: &mut TestAppContext) {
+        let (app, _pool, _dir, ids) = app_with(1, "proof-preview-left-right", cx);
+        let images = app.wired.images.clone();
+        let shell = app.wired.shell.clone();
+        let candidates = proof_spread(&VersionEdit::default(), &VersionEdit::default(), &[], None);
+        let n = candidates.len();
+        let source = VariantSource::new(ids[0], 0, SourceToken::Preview);
+        let events: Rc<RefCell<Vec<ProofEvent>>> = Rc::default();
+        let (handle, sheet) = cx
+            .update(|cx| {
+                let candidates = candidates.clone();
+                let shell = shell.clone();
+                gpui_kit::open_window(Default::default(), cx, |window, cx| {
+                    cx.new(|cx| ProofSheet::new(&images, shell, source, candidates, window, cx))
+                })
+            })
+            .unwrap();
+        cx.update(|cx| {
+            let events = events.clone();
+            cx.subscribe(&sheet, move |_, e: &ProofEvent, _| events.borrow_mut().push(e.clone())).detach()
+        });
+        let focused = |cx: &mut TestAppContext| cx.update_window(handle, |_, window, cx| sheet.read(cx).focused(window)).unwrap();
+        let preview = |cx: &mut TestAppContext| shell.read_with(cx, |s, _| s.loupe_proof_preview().map(|p| p.candidate.clone()));
+        let press = |key: &str, cx: &mut TestAppContext| {
+            cx.update_window(handle, |_, window, cx| {
+                window.render_frame(cx);
+                window.press(key, cx);
+            })
+            .unwrap();
+            cx.run_until_parked();
+        };
+
+        cx.update_window(handle, |_, window, cx| {
+            sheet.read(cx).focus_handle().clone().focus(window, cx);
+        })
+        .unwrap();
+        press("right", cx); // from the backdrop: the first cell, like Tab
+        assert_eq!(focused(cx), Some(0));
+        assert_eq!(preview(cx), Some(candidates[0].clone()));
+
+        press("right", cx);
+        assert_eq!(focused(cx), Some(1), "→ moves to the next cell");
+        assert_eq!(preview(cx), Some(candidates[1].clone()));
+
+        press("left", cx);
+        assert_eq!(focused(cx), Some(0), "← moves back");
+
+        press("left", cx);
+        assert_eq!(focused(cx), Some(n - 1), "← from the first cell wraps to the last, like Shift+Tab");
+
+        press("right", cx);
+        assert_eq!(focused(cx), Some(0), "→ from the last cell wraps to the first, like Tab");
+
+        press("right", cx);
+        assert_eq!(focused(cx), Some(1));
+        press("enter", cx);
+        assert_eq!(events.borrow().as_slice(), &[ProofEvent::Adopt(candidates[1].clone())], "Enter adopts the arrow-focused cell");
+    }
+
+    /// ↑ / ↓ move focus by row in the grid as it actually renders ([`ProofSheet::columns`]),
+    /// clamped to the nearest cell in a shorter row and staying put at the top/bottom edge
+    /// rather than wrapping. [`row_target`] is the same pure arithmetic `ProofSheet::move_row`
+    /// calls, exhaustively unit-tested on its own (next to it in `proof_sheet.rs`, with no
+    /// GPUI involved) for the clamping and the edges; used here as the oracle, this proves the
+    /// real dispatch, GPUI focus and the published preview actually follow it, at whatever
+    /// column count the sheet's default window really measures — not a pixel count guessed in
+    /// the test.
+    #[gpui_kit::test]
+    fn up_and_down_move_focus_by_row_and_preview_follows(cx: &mut TestAppContext) {
+        use crate::loupe::proof_sheet::row_target;
+
+        let (app, _pool, _dir, ids) = app_with(1, "proof-preview-rows", cx);
+        let images = app.wired.images.clone();
+        let shell = app.wired.shell.clone();
+        let candidates = proof_spread(&VersionEdit::default(), &VersionEdit::default(), &[], None);
+        let n = candidates.len();
+        let source = VariantSource::new(ids[0], 0, SourceToken::Preview);
+        let (handle, sheet) = cx
+            .update(|cx| {
+                let candidates = candidates.clone();
+                let shell = shell.clone();
+                gpui_kit::open_window(Default::default(), cx, |window, cx| {
+                    cx.new(|cx| ProofSheet::new(&images, shell, source, candidates, window, cx))
+                })
+            })
+            .unwrap();
+        // Narrow enough that the panel's own flex-wrap actually wraps this fixture's 4 cells
+        // (the default test window fits them all on one row): `columns()` is asserted below,
+        // so a future layout change that stops wrapping here fails loudly, not silently.
+        cx.simulate_window_resize(handle, gpui_kit::size(gpui_kit::px(500.), gpui_kit::px(900.)));
+        cx.run_until_parked();
+        let focused = |cx: &mut TestAppContext| cx.update_window(handle, |_, window, cx| sheet.read(cx).focused(window)).unwrap();
+        let preview = |cx: &mut TestAppContext| shell.read_with(cx, |s, _| s.loupe_proof_preview().map(|p| p.candidate.clone()));
+        let press = |key: &str, cx: &mut TestAppContext| {
+            cx.update_window(handle, |_, window, cx| {
+                window.render_frame(cx);
+                window.press(key, cx);
+            })
+            .unwrap();
+            cx.run_until_parked();
+        };
+
+        cx.update_window(handle, |_, window, cx| {
+            sheet.read(cx).focus_handle().clone().focus(window, cx);
+            window.render_frame(cx);
+        })
+        .unwrap();
+        press("down", cx); // from the backdrop: the first cell
+        let cols = sheet.read_with(cx, |s, _| s.columns());
+        assert!(cols < n, "this fixture's {n} cells must wrap past one row at the narrowed window: {cols} columns");
+        assert_eq!(focused(cx), Some(0));
+        assert_eq!(preview(cx), Some(candidates[0].clone()));
+
+        // Three downs (reaching, then stuck at, the bottom edge) and four ups (back to the
+        // first cell, then stuck at the top edge): every step checked against the oracle.
+        for key in ["down", "down", "down", "up", "up", "up", "up"] {
+            let before = focused(cx).unwrap();
+            press(key, cx);
+            let delta = if key == "down" { 1 } else { -1 };
+            let want = row_target(before, n, cols, delta).unwrap_or(before);
+            assert_eq!(focused(cx), Some(want), "{key} from {before} with {cols} columns");
+            assert_eq!(preview(cx), Some(candidates[want].clone()));
+        }
+    }
+
+    /// Last input wins (#250 follow-up): a pointer resting on a cell would otherwise block
+    /// arrow navigation's own preview, since hover always won before. An arrow press must
+    /// outrank the still-hovered cell, repeatedly, until the pointer itself actually moves —
+    /// only then does hover take the preview back. Checked synchronously, right after each
+    /// key — not after `run_until_parked`, which (in this test harness only, not the real
+    /// windowed app) lets GPUI's own deferred hover re-evaluation settle on `None` for a
+    /// pointer this test never actually moves, which would quietly agree with the focused
+    /// cell either way and hide a broken precedence.
+    #[gpui_kit::test]
+    fn an_arrow_press_outranks_a_resting_pointer_until_it_moves_again(cx: &mut TestAppContext) {
+        let (app, _pool, _dir, ids) = app_with(1, "proof-preview-keyboard-wins", cx);
+        let images = app.wired.images.clone();
+        let shell = app.wired.shell.clone();
+        let candidates = proof_spread(&VersionEdit::default(), &VersionEdit::default(), &[], None);
+        let source = VariantSource::new(ids[0], 0, SourceToken::Preview);
+        let (handle, sheet) = cx
+            .update(|cx| {
+                let candidates = candidates.clone();
+                let shell = shell.clone();
+                gpui_kit::open_window(Default::default(), cx, |window, cx| {
+                    cx.new(|cx| ProofSheet::new(&images, shell, source, candidates, window, cx))
+                })
+            })
+            .unwrap();
+
+        cx.update_window(handle, |_, window, cx| {
+            sheet.read(cx).focus_handle().clone().focus(window, cx);
+            window.render_frame(cx);
+
+            // The pointer rests on cell 2 — today, hover alone would own the preview.
+            window.hover(("proof-cell", 2u64), cx);
+            let preview = |cx: &mut gpui_kit::App| shell.read(cx).loupe_proof_preview().map(|p| p.candidate.clone());
+            assert_eq!(preview(cx), Some(candidates[2].clone()), "hovered, nothing focused yet");
+
+            // An arrow press focuses cell 0 and must win the preview despite the resting
+            // pointer, which this test never moves.
+            window.press("right", cx);
+            assert_eq!(preview(cx), Some(candidates[0].clone()), "the keyboard move wins over the still-hovered cell");
+
+            // A second arrow press keeps winning — the pointer still has not moved.
+            window.press("right", cx);
+            assert_eq!(preview(cx), Some(candidates[1].clone()), "still the keyboard's cell, not the hovered one");
+
+            // The pointer actually moves, onto a different cell: hover hands the preview back.
+            window.hover(("proof-cell", 3u64), cx);
+            assert_eq!(preview(cx), Some(candidates[3].clone()), "a real hover change is back in charge");
+        })
+        .unwrap();
+    }
+
     /// An edit render that was no longer wanted when it finished is dropped, never shown.
     #[gpui_kit::test]
     fn an_unwanted_edit_render_is_dropped(cx: &mut TestAppContext) {

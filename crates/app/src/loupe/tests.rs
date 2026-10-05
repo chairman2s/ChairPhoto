@@ -1305,6 +1305,49 @@ mod overlays {
         assert_eq!(previewed(cx), Some(b_candidate), "A's release did not clear B's preview");
     }
 
+    /// A sole sheet's own window closing (#250 second review, F1) must still release the
+    /// entity and clear both its preview and its pop-out routing handle
+    /// (`ShellState::loupe_proof_sheet`). `LoupeProofSheetHandle.sheet` is a `WeakEntity`, not
+    /// a strong one: before that fix, the route held the sheet alive — a reference cycle,
+    /// since `ProofSheet` itself holds an `Entity<ShellState>` — so `on_release` never ran
+    /// for a sole sheet whose only other owner was the window being closed here, and both the
+    /// preview and the route leaked past it.
+    #[gpui_kit::test]
+    fn a_sole_sheets_window_closing_releases_it_and_clears_its_route(cx: &mut TestAppContext) {
+        let (app, _pool, _dir, ids) = app_with(1, "proof-route-release", cx);
+        let images = app.wired.images.clone();
+        let shell = app.wired.shell.clone();
+        let candidates = proof_spread(&VersionEdit::default(), &VersionEdit::default(), &[], None);
+        let (handle, sheet) = cx
+            .update(|cx| {
+                let shell = shell.clone();
+                let source = VariantSource::new(ids[0], 0, SourceToken::Preview);
+                gpui_kit::open_window(Default::default(), cx, |window, cx| {
+                    cx.new(|cx| ProofSheet::new(&images, shell, source, candidates, window, cx))
+                })
+            })
+            .unwrap();
+        // Only the window's own root-view reference keeps it alive from here, as the
+        // Darkroom's own `rails.overlay` would be the only one in the app
+        // (`releasing_a_sheet_clears_only_its_own_preview`'s own comment).
+        let weak = sheet.downgrade();
+        drop(sheet);
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            window.hover(("proof-cell", 1u64), cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        assert!(shell.read_with(cx, |s, _| s.loupe_proof_preview().is_some()), "previewing");
+        assert!(shell.read_with(cx, |s, _| s.loupe_proof_sheet().is_some()), "routed");
+
+        cx.update_window(handle, |_, window, _| window.remove_window()).unwrap();
+        cx.run_until_parked();
+        assert!(weak.upgrade().is_none(), "the sheet is actually released, not held alive by its own route");
+        assert!(shell.read_with(cx, |s, _| s.loupe_proof_preview().is_none()), "its preview is cleared");
+        assert!(shell.read_with(cx, |s, _| s.loupe_proof_sheet().is_none()), "its routing handle is cleared too");
+    }
+
     /// A sheet's own `renders` observer calling `sync_preview` with nothing of its own hovered
     /// or focused — its own 320 px render landing, say — must not clear another live sheet's
     /// preview, the same per-sheet token `clear_preview` already used (#250 review, probe

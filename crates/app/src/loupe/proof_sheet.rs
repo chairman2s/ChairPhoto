@@ -213,7 +213,7 @@ impl ProofSheet {
         // The pop-out's own window, while it has focus, routes its arrow/Enter/Esc keys here
         // instead of stepping the library selection (#250 follow-up) — it needs this window
         // (not its own) to move this sheet's real focus (`LoupeProofSheetHandle`'s own docs).
-        let handle = LoupeProofSheetHandle { window: window.window_handle(), sheet: cx.entity() };
+        let handle = LoupeProofSheetHandle { window: window.window_handle(), sheet: cx.entity().downgrade() };
         this.shell.update(cx, |s, cx| s.set_loupe_proof_sheet(Some(handle), cx));
         // Whatever ends this entity's life without going through `close`/`adopt` — the
         // overlay dropped from under it, the window it was mounted in closing — still takes

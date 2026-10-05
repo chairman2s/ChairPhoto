@@ -388,11 +388,21 @@ pub struct LoupeProofPreview {
 /// cleared on adopt, decline, or the sheet's own release — never by a hover/focus change, which
 /// would otherwise flicker it on every cell the pointer leaves with nothing else hovered or
 /// focused (`ProofSheet::clear_preview`'s much shorter-lived job).
+///
+/// `sheet` is a [`gpui_kit::WeakEntity`], not a strong one (#250 second review): `ProofSheet`
+/// itself holds an `Entity<ShellState>`, so a strong handle here closed a reference cycle —
+/// any path that drops the sheet without going through `ProofSheet::end` (`DarkroomView::
+/// open_duel` replacing `rails.overlay` without closing a live proof sheet first, confirmed;
+/// a window torn down some other way) leaked it, left this route pointing at an orphan, and
+/// regressed `ProofSheet`'s own `on_release` cleanup (its preview, and this route, both meant
+/// to clear when the entity is dropped — unreachable while the drop itself never happens).
+/// Callers upgrade before use ([`crate::loupe::view::LoupeView::proof_sheet_route`] filters out
+/// a handle whose sheet no longer upgrades) and `.update(..)` through `Result::ok()`.
 #[cfg(feature = "edit")]
 #[derive(Clone)]
 pub struct LoupeProofSheetHandle {
     pub window: gpui_kit::AnyWindowHandle,
-    pub sheet: Entity<crate::loupe::proof_sheet::ProofSheet>,
+    pub sheet: gpui_kit::WeakEntity<crate::loupe::proof_sheet::ProofSheet>,
 }
 
 /// Whether two previews would render, label and placeholder the same thing: used to skip a

@@ -2274,6 +2274,117 @@ fn the_pop_out_routes_arrows_and_enter_to_a_live_proof_sheet(cx: &mut TestAppCon
     );
 }
 
+/// `DarkroomView::open_duel` replaces `rails.overlay` without closing a live proof sheet
+/// first (#250 second review, F2): the sheet must still be released and its pop-out routing
+/// handle cleared with it, so the pop-out's own arrows step the library selection again
+/// instead of being silently swallowed by a route that now points at an orphan.
+#[gpui_kit::test]
+fn opening_the_duel_over_a_live_proof_sheet_releases_its_popout_route(cx: &mut TestAppContext) {
+    use super::view::Overlay;
+    use crate::loupe::window;
+    let rig = rig("dk-duel-over-proof-route", 3, cx);
+    work(cx);
+    advance(cx, SETTLE);
+    cx.update(window::open);
+    cx.run_until_parked();
+    let h = cx.update(|cx| window::handle(cx)).expect("the pop-out opened");
+    let active = |cx: &mut TestAppContext| rig.app.wired.shell.read_with(cx, |s, _| s.library.selection().active_id);
+
+    rig.with_view(cx, |v, window, cx| v.open_proof_sheet(window, cx));
+    let sheet = rig.view(cx).read_with(cx, |v, _| match v.overlay() {
+        Some(Overlay::Proof(s)) => s.clone(),
+        _ => panic!("the proof sheet is mounted"),
+    });
+    let weak = sheet.downgrade();
+    drop(sheet);
+    assert!(rig.app.wired.shell.read_with(cx, |s, _| s.loupe_proof_sheet().is_some()), "routed");
+
+    rig.with_view(cx, |v, window, cx| v.open_duel(window, cx));
+    cx.run_until_parked();
+    assert!(rig.view(cx).read_with(cx, |v, _| matches!(v.overlay(), Some(Overlay::Duel(_)))), "the duel replaced it");
+    assert!(weak.upgrade().is_none(), "the replaced proof sheet is actually released");
+    assert!(rig.app.wired.shell.read_with(cx, |s, _| s.loupe_proof_sheet().is_none()), "its stale route is cleared");
+
+    let before = active(cx);
+    cx.update_window(h, |_, window, cx| {
+        window.render_frame(cx);
+        window.press("right", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    assert_ne!(active(cx), before, "the pop-out's own → steps the selection again, not swallowed by a stale route");
+}
+
+/// Up/Down in the pop-out move the proof sheet's own real row (#250 second review, item 2) —
+/// `ProofSheet::row_target`'s own arithmetic, oracle-checked the same way `loupe::tests::
+/// overlays::up_and_down_move_focus_by_row_and_preview_follows` checks it on the main window
+/// directly — not `ProofNext`/`ProofPrevious`'s cycle the way Left/Right still do. While the
+/// sheet is up, `contexts::POPOUT_PROOF_SHEET` replaces `LOUPE` on the pop-out's own root, so
+/// Shift+→ (`ExtendNext`), Ctrl+A (`SelectAll`) and C (`CompareSelection`) — bound only in
+/// `LOUPE` — are inert there instead of silently moving the active photo or opening Compare
+/// out from under a dealt sheet; Esc declines it.
+#[gpui_kit::test]
+fn the_pop_out_gives_up_down_real_rows_and_swallows_extend_select_all_and_compare_while_a_sheet_is_up(cx: &mut TestAppContext) {
+    use super::view::Overlay;
+    use crate::loupe::proof_sheet::row_target;
+    use crate::loupe::window;
+    let rig = rig("dk-popout-rows", 3, cx);
+    work(cx);
+    advance(cx, SETTLE);
+    cx.update(window::open);
+    cx.run_until_parked();
+    let h = cx.update(|cx| window::handle(cx)).expect("the pop-out opened");
+    let active = |cx: &mut TestAppContext| rig.app.wired.shell.read_with(cx, |s, _| s.library.selection().active_id);
+    let press_in_popout = |key: &str, cx: &mut TestAppContext| {
+        cx.update_window(h, |_, window, cx| {
+            window.render_frame(cx);
+            window.press(key, cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+    };
+
+    rig.with_view(cx, |v, window, cx| v.open_proof_sheet(window, cx));
+    let sheet = rig.view(cx).read_with(cx, |v, _| match v.overlay() {
+        Some(Overlay::Proof(s)) => s.clone(),
+        _ => panic!("the proof sheet is mounted"),
+    });
+    let focused_in_main = |cx: &mut TestAppContext| cx.update_window(rig.app.window(), |_, window, cx| sheet.read(cx).focused(window)).unwrap();
+    let n = sheet.read_with(cx, |s, _| s.candidates().len());
+    let cols = cx.update_window(rig.app.window(), |_, window, cx| { window.render_frame(cx); sheet.read(cx).columns() }).unwrap();
+    assert!(cols < n, "this rig's own candidates ({n}) must wrap past one row at the Darkroom's own width: {cols} columns");
+
+    // ↓ from the backdrop starts at cell 0, the same convention as the main window's own ↓.
+    press_in_popout("down", cx);
+    assert_eq!(focused_in_main(cx), Some(0));
+
+    // A second ↓ is a real row move — `row_target`, not a plain +1 cycle.
+    press_in_popout("down", cx);
+    let want = row_target(0, n, cols, 1);
+    assert_ne!(want, Some(1), "this rig's own layout must actually exercise a row move, not coincide with +1");
+    assert_eq!(focused_in_main(cx), want, "the pop-out's ↓ moved by row, not by cycling to cell 1");
+
+    // ↑ moves back by row the same way.
+    let before_up = focused_in_main(cx).unwrap();
+    press_in_popout("up", cx);
+    assert_eq!(focused_in_main(cx), row_target(before_up, n, cols, -1));
+
+    // Shift+→, Ctrl+A and C are inert while the sheet is up: neither the selection nor the
+    // sheet's own focus changes, and the sheet stays up.
+    let a = active(cx);
+    let focus_before = focused_in_main(cx);
+    for key in ["shift-right", "ctrl-a", "c"] {
+        press_in_popout(key, cx);
+        assert_eq!(active(cx), a, "{key}: the selection does not move while a sheet is up");
+        assert_eq!(focused_in_main(cx), focus_before, "{key}: the sheet's own focus is untouched");
+        assert!(rig.view(cx).read_with(cx, |v, _| v.overlay().is_some()), "{key}: the sheet stays up");
+    }
+
+    // Esc declines it.
+    press_in_popout("escape", cx);
+    assert!(rig.view(cx).read_with(cx, |v, _| v.overlay().is_none()), "Esc from the pop-out declined the sheet");
+}
+
 /// The proof sheet's keys, as React's proof cells were buttons: Enter on the sheet as dealt
 /// (the backdrop focused, no proof) neither declines nor adopts; Tab / Shift+Tab move focus
 /// through the proofs, wrapping; Enter adopts the focused proof. A pointer click on the

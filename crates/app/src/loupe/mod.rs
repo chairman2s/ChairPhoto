@@ -108,6 +108,12 @@ actions!(
         /// top/bottom edge rather than wrapping (#250 follow-up).
         ProofDown,
         ProofUp,
+        /// Enter over the pop-out loupe while a Darkroom proof sheet is up (#250 second
+        /// review, [`crate::keymap::contexts::POPOUT_PROOF_SHEET`]): adopts the sheet's own
+        /// currently previewed candidate. The main window's own Enter is a framework-level
+        /// keyboard click on the focused cell (no action of its own); the pop-out has no such
+        /// cell to focus, so this names its request explicitly instead.
+        ProofAdopt,
     ]
 );
 
@@ -140,6 +146,7 @@ pub fn bindings() -> Vec<KeyBinding> {
     let cull = Some(contexts::CULL);
     let duel = Some(contexts::DUEL);
     let proof = Some(contexts::PROOF_SHEET);
+    let popout_proof = Some(contexts::POPOUT_PROOF_SHEET);
     let mut b = vec![
         // The loupe: App.tsx's grid branch, which also ran while the loupe was inline.
         KeyBinding::new("right", SelectNext, loupe),
@@ -187,6 +194,18 @@ pub fn bindings() -> Vec<KeyBinding> {
         KeyBinding::new("left", ProofPrevious, proof),
         KeyBinding::new("down", ProofDown, proof),
         KeyBinding::new("up", ProofUp, proof),
+        // The pop-out loupe, only while a proof sheet is up there (#250 second review):
+        // `LoupeView` reuses the Proof sheet's own action types, dispatching each into the
+        // Darkroom's own window rather than handling it directly (`LoupeView::
+        // proof_sheet_route`'s own docs) — so ↑/↓ move by row there too, not the library
+        // grid's own ⇄ conflation, and Shift+arrows/Ctrl+A/C (bound only in `LOUPE`, absent
+        // here) are unreachable for as long as this context replaces it.
+        KeyBinding::new("right", ProofNext, popout_proof),
+        KeyBinding::new("left", ProofPrevious, popout_proof),
+        KeyBinding::new("down", ProofDown, popout_proof),
+        KeyBinding::new("up", ProofUp, popout_proof),
+        KeyBinding::new("enter", ProofAdopt, popout_proof),
+        KeyBinding::new("escape", ProofClose, popout_proof),
         // A module card's full-size photo in the pop-out (#110).
         KeyBinding::new("escape", card::BackToWall, Some(contexts::LOUPE_CARD)),
     ];

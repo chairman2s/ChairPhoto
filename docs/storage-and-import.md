@@ -602,10 +602,13 @@ drained when the NAS volume is detected:
 - `offload(photo)` — only after verified backup; frees local space
 - `restore(photo)` — pull an archived original back to local (e.g. to edit it)
 
-**The ops and verification**: `catalog/lifecycle.rs` + async `backup_photo` /
-`offload_photo` / `restore_photo` commands. SHA-256 (`photo_locations.verified_hash`,
-schema v10); each op is plan-under-lock → pure file IO off-thread → record-under-lock,
-so a NAS copy never blocks the UI. The backup target is the single backup volume and
+**The ops and verification**: `catalog/lifecycle.rs` + the `app/storage.rs` service bodies
+(`backup_photo_as` / `offload_photo_as` / `restore_photo_as`, run on a worker). SHA-256 (`photo_locations.verified_hash`,
+schema v10); each op is plan → pure file IO off-thread → record-under-lock, and the plan
+itself is split like the path resolver (#85): candidate rows are gathered in pure SQL
+under the catalog lock and their existence is statted off it, so a NAS copy never blocks
+the UI — and a slow or unmounted NAS never holds the catalog lock while a plan checks it.
+The backup target is the single backup volume and
 restore lands on the single local volume (multi-volume selection is future). The `pending_operations`
 queue and automatic draining on NAS reappearance are not implemented; the ops are
 invoked directly per photo.

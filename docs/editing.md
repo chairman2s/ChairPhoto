@@ -133,9 +133,11 @@ offline fallback. The photo row carries a face token, `"<version>:<rev>"` (none 
 original), which the views ask for the thumbnail under; `rev` rises on every change of the
 face — it moving to another version, the face version's settings changing, a pin or unpin, a
 deletion — so no view shows a cached stale face. Only settled writes count, so a slider drag
-renders no faces; the Library's rows (and so the faces) are re-read when Develop is left,
-after a pin or a version operation, and when the filmstrip steps on from a photo whose
-changes were saved.
+renders no faces; the Library's rows (and so the faces) are re-read when Develop is left
+and after a pin or a version operation. When the filmstrip steps on from a photo whose
+changes were saved, only that photo's face is read again (`ShellState::refresh_face`), not
+the whole library. The original's offline fallback thumbnail is refreshed on the face path
+as on the plain one, so a rotation change does not leave it stale.
 
 Stored in the core table `photo_cover` (one row per photo): `version_id` is the face itself,
 kept current in the transaction of every write that can move it (`catalog::edits`,

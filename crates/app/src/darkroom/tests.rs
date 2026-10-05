@@ -2868,9 +2868,10 @@ fn refresh_rows(rig: &Rig, cx: &mut TestAppContext) {
     cx.run_until_parked();
 }
 
-/// #252: a saved change moves the photo's face to its version. Stepping on re-reads the rows,
-/// so the strip's frame for the photo left asks for its new face without leaving Develop —
-/// whether the save had landed before the step or was still on the worker.
+/// #252: a saved change moves the photo's face to its version. Stepping on reads that one
+/// row's face again — never the whole library (review M1) — so the strip's frame for the
+/// photo left asks for its new face without leaving Develop, whether the save had landed
+/// before the step or was still on the worker. The other rows are left as they were.
 #[gpui_kit::test]
 fn a_frame_shows_the_new_face_of_the_photo_just_edited(cx: &mut TestAppContext) {
     let rig = rig("dk-face-strip", 3, cx);
@@ -2879,6 +2880,10 @@ fn a_frame_shows_the_new_face_of_the_photo_just_edited(cx: &mut TestAppContext) 
     draw(&rig, cx);
     let first = rig.open_photo(cx).unwrap();
     assert_eq!(look(&rig, first, cx), Some(Look { from, cover: None }), "unedited: the original");
+    let row_reads = |cx: &mut TestAppContext| rig.app.wired.shell.read_with(cx, |s, _| s.row_reads);
+    let rows = |cx: &mut TestAppContext| rig.app.wired.shell.read_with(cx, |s, _| s.library.photos().to_vec());
+    let reads_before = row_reads(cx);
+    let rows_before = rows(cx);
 
     // Saved, then a step.
     rig.slide(Control::Tone(ToneKey::Ev), 0.5, cx);
@@ -2900,6 +2905,16 @@ fn a_frame_shows_the_new_face_of_the_photo_just_edited(cx: &mut TestAppContext) 
     let want = face_look(&rig, second);
     assert!(want.is_some(), "the change on the second photo was saved");
     assert_eq!(look(&rig, second, cx), Some(Look { from, cover: want }));
+
+    assert_eq!(row_reads(cx), reads_before, "no whole-library row read on a step");
+    let after = rows(cx);
+    assert_eq!(after.len(), rows_before.len());
+    for (b, a) in rows_before.iter().zip(&after) {
+        assert_eq!(a.id, b.id);
+        if a.id != first && a.id != second {
+            assert_eq!(a.cover_token, b.cover_token, "photo {}: untouched", a.id);
+        }
+    }
 }
 
 /// A frame shows its photo's cover look, asked for under the row's cover token — (photo,

@@ -161,10 +161,11 @@ impl Catalog {
         let mut stmt = self.conn.prepare(&format!(
             "-- includes-hidden: the trash is the one surface whose whole job is to show
              -- photos the rest of the app hides.
-             SELECT {cols} FROM photos
+             SELECT {cols} FROM photos {face}
              WHERE trashed_at IS NOT NULL
              ORDER BY trashed_at DESC, id",
             cols = super::query::photo_columns("photos"),
+            face = super::query::face_join("photos"),
         ))?;
         let rows = stmt.query_map([], super::row_to_photo)?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)

@@ -1115,8 +1115,9 @@ impl Catalog {
         self.conn
             .query_row(
                 &format!(
-                    "SELECT {cols} FROM photos WHERE id = ?1",
-                    cols = query::photo_columns("photos")
+                    "SELECT {cols} FROM photos {face} WHERE photos.id = ?1",
+                    cols = query::photo_columns("photos"),
+                    face = query::face_join("photos")
                 ),
                 params![photo_id],
                 row_to_photo,
@@ -1134,8 +1135,9 @@ impl Catalog {
         self.conn
             .query_row(
                 &format!(
-                    "SELECT {cols} FROM photos WHERE uuid = ?1",
-                    cols = query::photo_columns("photos")
+                    "SELECT {cols} FROM photos {face} WHERE photos.uuid = ?1",
+                    cols = query::photo_columns("photos"),
+                    face = query::face_join("photos")
                 ),
                 params![identity],
                 row_to_photo,
@@ -1319,8 +1321,9 @@ impl Catalog {
     /// The photos stacked under `parent_id` (e.g. the camera JPEG under a RAW).
     pub fn list_stack_children(&self, parent_id: i64) -> Result<Vec<Photo>> {
         let mut stmt = self.conn.prepare(&format!(
-            "SELECT {cols} FROM photos WHERE stack_parent_id = ?1 ORDER BY path COLLATE NOCASE",
-            cols = query::photo_columns("photos")
+            "SELECT {cols} FROM photos {face} WHERE photos.stack_parent_id = ?1 ORDER BY photos.path COLLATE NOCASE",
+            cols = query::photo_columns("photos"),
+            face = query::face_join("photos")
         ))?;
         let rows = stmt.query_map(params![parent_id], row_to_photo)?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)

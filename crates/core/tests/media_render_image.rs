@@ -229,6 +229,35 @@ fn the_thumbnail_is_the_render_of_the_last_changed_version() {
     assert_eq!(kept, cached_tier(&abs, ImageKind::Thumb), "the original's own thumbnail kept for offline");
 }
 
+/// #252 review L3: a photo showing its face keeps its offline fallback current — a user
+/// rotation after the fallback was kept rewrites it, as the plain path would.
+#[cfg(feature = "edit")]
+#[test]
+fn the_face_path_keeps_the_offline_fallback_current_after_a_rotation() {
+    let dir = Fixture::new("media-face-rotated-fallback");
+    let (state, ids) = catalog_with(&dir, &["g.jpg"], |root, n| {
+        write_jpeg(root, n, 1600, 1000);
+    });
+    let id = ids[0];
+    let abs = dir.join("photos").join("g.jpg");
+    {
+        let guard = state.catalog.lock().unwrap();
+        let c = guard.as_ref().unwrap();
+        let v = c.create_version(id, "Bright").unwrap();
+        c.set_version_edit(v, r#"{"tone": {"ev": 1.0}}"#).unwrap();
+    }
+    let kept = || std::fs::read(chairphoto_core::thumbnails::persistent_thumb_path(id)).unwrap();
+    assert!(render_image(&state, JobKey::photo(id, ImageKind::Thumb)).unwrap().cover);
+    assert_eq!(kept(), cached_tier(&abs, ImageKind::Thumb), "unrotated: the cached thumbnail itself");
+
+    state.catalog.lock().unwrap().as_ref().unwrap().set_photo_rotation(id, 90).unwrap();
+    assert!(render_image(&state, JobKey::photo(id, ImageKind::Thumb)).unwrap().cover);
+    let rotated = image::load_from_memory(&cached_tier(&abs, ImageKind::Thumb)).unwrap().rotate90();
+    let mut q90 = std::io::Cursor::new(Vec::new());
+    rotated.write_with_encoder(JpegEncoder::new_with_quality(&mut q90, 90)).unwrap();
+    assert_eq!(kept(), q90.into_inner(), "rewritten for the new rotation");
+}
+
 /// Original gone: the thumbnail tier falls back to the persistent copy; preview has no
 /// fallback and errors.
 #[test]

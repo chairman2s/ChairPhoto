@@ -230,8 +230,8 @@ pub struct OpenPhoto {
     commit_again: bool,
     pub saving: bool,
     /// A commit of this open saved: the photo's face may have moved to the version (#252),
-    /// so the Library's rows are re-read once the photo is left, even within Develop — the
-    /// filmstrip shows the face its row names.
+    /// so its row's face is read again once the photo is left within Develop — the filmstrip
+    /// shows the face its row names.
     saved: bool,
     _stage_observer: Subscription,
 }
@@ -1216,9 +1216,11 @@ impl Darkroom {
             let shell = self.shell.read(cx);
             shell.surface == Surface::Develop && shell.rows_from() == Some(open.from)
         } {
-            // A step to another photo: the strip's frame for this one shows its new face.
+            // A step to another photo: the strip's frame for this one shows its new face —
+            // its row's face read again, not the whole library (review of #252, M1).
             // (Leaving Develop re-reads the rows itself, in `leave`.)
-            self.shell.update(cx, |s, cx| s.refresh_rows(cx));
+            let (photo, from) = (open.photo.id, open.from);
+            self.shell.update(cx, |s, cx| s.refresh_face(photo, from, cx));
         }
         cx.notify();
     }
@@ -1230,8 +1232,14 @@ impl Darkroom {
         let Some(i) = self.leaving.iter().position(|o| o.seq == seq && !o.committing) else { return };
         let left = self.leaving.remove(i);
         let shell = self.shell.read(cx);
-        if !left.dirty() && (shell.surface != Surface::Develop || left.saved) && shell.rows_from() == Some(left.from) {
-            self.shell.update(cx, |s, cx| s.refresh_rows(cx));
+        if !left.dirty() && shell.rows_from() == Some(left.from) {
+            if shell.surface != Surface::Develop {
+                self.shell.update(cx, |s, cx| s.refresh_rows(cx));
+            } else if left.saved {
+                // Stepped on within Develop: only this photo's face can have moved.
+                let (photo, from) = (left.photo.id, left.from);
+                self.shell.update(cx, |s, cx| s.refresh_face(photo, from, cx));
+            }
         }
         // The photo was opened again meanwhile: its versions are read now that nothing of its
         // earlier open is left on the worker (#189).

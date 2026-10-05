@@ -491,10 +491,19 @@ impl Catalog {
 /// import calls these writes inside its own transaction (`bundle::importer`).
 fn atomically<T>(conn: &Connection, write: impl FnOnce() -> Result<T>) -> Result<T> {
     conn.execute_batch("SAVEPOINT version_write")?;
-    let out = write();
-    let end = if out.is_ok() { "RELEASE version_write" } else { "ROLLBACK TO version_write; RELEASE version_write" };
-    conn.execute_batch(end)?;
-    out
+    match write() {
+        Ok(value) => {
+            conn.execute_batch("RELEASE version_write")?;
+            Ok(value)
+        }
+        Err(e) => {
+            // After some errors (SQLITE_FULL, an I/O error) SQLite has already rolled the
+            // whole transaction back and the savepoint is gone, so this fails too: the
+            // write's own error is the one to report, not that.
+            let _ = conn.execute_batch("ROLLBACK TO version_write; RELEASE version_write");
+            Err(e)
+        }
+    }
 }
 
 const PIN_AUTO: i64 = 0;

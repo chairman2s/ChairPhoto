@@ -65,8 +65,16 @@ pub const IN_PROGRESS: &str = crate::catalog::IN_PROGRESS_REASON;
 /// pending); a drain whose op's photo is claimed leaves the op pending, untouched
 /// (`DrainSummary::busy`). So a claim cannot deadlock against anything.
 ///
+/// An IPTC sidecar write claims its photo too (`iptc::write_and_settle`, #256), so a save
+/// never writes a sidecar an offload of that photo is confirming and deleting: whichever
+/// claims first goes ahead, and the other is refused — the write stays owed for the next
+/// save or the repair pass, the offload fails with [`IN_PROGRESS`] (a drain leaves it
+/// pending). The identity-repair pass, face-region and GPS writes do not claim; offload's
+/// move-aside check (`catalog::lifecycle`) still keeps what they write.
+///
 /// **Lock order** (`app::jobs`): the set's mutex is a leaf — nothing is acquired while it
-/// is held, and it is taken with no lock held but, at most, the catalog lock. The claim it
+/// is held, and it is taken with no lock held but, at most, the catalog lock or a sidecar's
+/// write turn. The claim it
 /// grants is taken *before* the op's plan and held across the op's catalog-lock
 /// acquisitions; since nothing ever blocks on a claim, holding one there cannot invert the
 /// order.

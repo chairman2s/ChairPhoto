@@ -746,6 +746,19 @@ leaf in the `app::jobs` lock order. The inspector also disables its storage butt
 photo while one of them runs, so a double-click starts one run. The `Catalog::*_photo` sync
 wrappers do not claim; they are for tests and single-threaded callers.
 
+An IPTC sidecar write — a save, the debt panel's Retry, a geocode fill — claims its photo
+too, from before it opens the sidecar until it has settled (#256): an offload deletes the
+local sidecar once it has confirmed it at home, and a write landing after that check would
+leave a newer sidecar beside a freed image, untracked, with the debt settled. Whichever
+claims first goes ahead. A save that meets a claimed photo stores in the catalog and leaves
+the fields owed, reported "sidecar pending (a storage operation on this photo is already in
+progress)"; the next save or the repair pass writes them, to wherever the photo then
+resolves. An offload that meets a write is refused as in progress. The identity-repair pass,
+face-region and GPS writes do not claim; what they write is still never deleted by an
+offload (each sidecar write replaces the file by a rename, so it either lands before the
+offload moves the sidecar aside — and fails its re-hash — or makes a new file at its name,
+which the offload keeps).
+
 Two guards do not depend on the claim. Offload's commit drops exactly the local location
 rows it planned from, by id, so a row added after the plan (a restore) is never dropped with
 them. And every lifecycle copy (`copy_and_verify`, used for images and companions) writes its

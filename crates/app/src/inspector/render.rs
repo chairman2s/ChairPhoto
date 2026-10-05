@@ -397,15 +397,17 @@ impl PhotoInspector {
             summary,
             || {
                 let mut r = row();
+                // Disabled while one of them runs for this photo (#254).
+                let idle = !self.storage_running.contains(&photo);
                 match status {
                     Some(StorageStatus::LocalOnly) => {
-                        r = r.child(self.chip("storage-backup", "Back up", true, colors, cx, |t, _, cx| t.back_up(cx)))
+                        r = r.child(self.chip("storage-backup", "Back up", idle, colors, cx, |t, _, cx| t.back_up(cx)))
                     }
                     Some(StorageStatus::BackedUp) => {
-                        r = r.child(self.chip("storage-offload", "Offload local", true, colors, cx, |t, _, cx| t.offload(cx)))
+                        r = r.child(self.chip("storage-offload", "Offload local", idle, colors, cx, |t, _, cx| t.offload(cx)))
                     }
                     Some(StorageStatus::Archived | StorageStatus::Offline) => {
-                        r = r.child(self.chip("storage-restore", "Restore local", true, colors, cx, |t, _, cx| t.restore(cx)))
+                        r = r.child(self.chip("storage-restore", "Restore local", idle, colors, cx, |t, _, cx| t.restore(cx)))
                     }
                     _ => {}
                 }

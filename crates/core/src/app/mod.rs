@@ -110,6 +110,10 @@ pub struct AppState {
     /// left as loose fields so a catalog switch cannot reach some families and miss others.
     /// **Declare new job families in [`JobRegistry`], never directly here.**
     pub jobs: Arc<JobRegistry>,
+    /// The photos a storage operation (backup, offload, restore — a user's verb or a drain)
+    /// is working on right now, so two never work one photo at once (#254). See
+    /// [`storage::StorageClaims`].
+    pub storage_claims: Arc<storage::StorageClaims>,
     /// The frontend's event sink, installed once at startup ([`AppState::set_events`]).
     /// Until then — and in tests that install none — events are dropped.
     events: Arc<OnceLock<Arc<dyn EventSink>>>,

@@ -466,7 +466,7 @@ impl StorageState {
                 }
                 match result {
                     Ok(Ok((summary, offloaded))) => {
-                        if !summary.skipped_offline && summary.ran + summary.failed + summary.partial > 0 {
+                        if !summary.skipped_offline && summary.ran + summary.failed + summary.partial + summary.busy > 0 {
                             s.status(drain_status(&summary), cx);
                         }
                         if offloaded > 0 {
@@ -697,6 +697,10 @@ pub fn drain_status(s: &chairphoto_core::catalog::DrainSummary) -> String {
             line += &format!(" ({} failed)", frames(s.frames_failed));
         }
     }
+    if s.busy > 0 {
+        // Their photos were in use by another storage operation; still queued (#254).
+        line += &format!(", {} waiting (photo in use)", s.busy);
+    }
     line
 }
 
@@ -764,6 +768,9 @@ mod tests {
         );
         let failed_only = DrainSummary { partial: 1, frames_failed: 2, ..Default::default() };
         assert_eq!(drain_status(&failed_only), "Storage queue: 0 done, 1 part-done (2 frames failed)");
+        // #254: an op whose photo another storage operation held is still queued.
+        let busy = DrainSummary { ran: 1, busy: 2, ..Default::default() };
+        assert_eq!(drain_status(&busy), "Storage queue: 1 done, 2 waiting (photo in use)");
     }
 
     /// #185: the bundle line says what an import filled in on photos already in the catalog,

@@ -499,6 +499,19 @@ Three rules govern carrying:
 - **Offload carries before it deletes.** Invariant 1 covers edit state too: freeing the
   local image must not strand the history beside it. Companions go home first, then the
   local ones are freed with the image, and `restore` brings them back.
+- **Offload deletes only what home holds byte for byte (#255).** Re-hashing the backup
+  proves home is intact, not that it holds what is here. Just before deleting, offload
+  re-hashes every local copy of the image against the verified backup hash, and every
+  companion against the hash the carry confirmed at home; it deletes exactly those
+  companions, never a fresh listing. A local JPEG or DNG rewritten in place after its
+  backup, a sidecar edited after the carry, or a companion that appeared after it refuses
+  the photo — nothing is deleted, and a queued offload is kept `failed` with the reason
+  ("changed since its backup — refusing to offload; the copy at home is the earlier
+  version"). The cost is one sequential read of each local copy, on a local disk, beside the
+  NAS read of the backup offload already made; size or mtime would be cheaper and are not
+  content checks (an in-place rewrite can keep the size, and `exiftool -P` keeps the mtime).
+  Back up does not replace a verified backup that is present, so such a photo stays local
+  until the owner decides how a changed original reaches home.
 - **Divergence refuses; it never resolves.** A companion present on both sides with
   different contents is two unreconciled edits. Backup leaves it untouched and does not
   claim it as carried; offload refuses outright. Choosing a side would silently destroy
@@ -704,6 +717,33 @@ reported skipped and requeued as above — and no further queued op. Offload, th
 deletes, re-checks the flag before every member's delete, the named photo's included. A copy
 or delete already under way is indivisible and is recorded on that claimed connection.
 
+**One storage operation per photo at a time (#254).** User verbs run on the blocking pool
+beside each other and beside a drain or the offload-policy sweep. Every backup, offload and
+restore the service layer runs therefore claims, in `AppState::storage_claims`
+(`storage::StorageClaims`, keyed by catalog file and photo id), the photo it was named on
+**and the frames it will take** before it plans, and holds the claim until it has recorded.
+Nothing waits on a claim: a verb whose named photo is held fails with "a storage operation
+on this photo is already in progress"; a held frame is left and reported with that reason;
+a drain whose op's photo is held leaves the op `pending` and untouched (`DrainSummary::busy`),
+and a held frame of a stack op is requeued `pending`, not failed — both are retried by the
+next drain. The claim is per photo rather than one global gate because a drain can run for
+hours, and a user's Offload of an unrelated photo must not wait behind it. Its mutex is a
+leaf in the `app::jobs` lock order. The inspector also disables its storage buttons for a
+photo while one of them runs, so a double-click starts one run. The `Catalog::*_photo` sync
+wrappers do not claim; they are for tests and single-threaded callers.
+
+Two guards do not depend on the claim. Offload's commit drops exactly the local location
+rows it planned from, by id, so a row added after the plan (a restore) is never dropped with
+them. And every lifecycle copy (`copy_and_verify`, used for images and companions) writes its
+own temp file (`.<name>.chairphoto-part-<pid>-<n>`, created exclusively) and places it
+**without replacing** whatever is at the destination — `renameat2(RENAME_NOREPLACE)`, else a
+hard link, else an exclusive create, the import's own placement. Two writers can never
+write into one file. A destination that already exists is accepted only when it hashes to
+the source (another writer placed the same bytes); otherwise the copy fails and that file is
+left untouched. This also means a Restore no longer overwrites a local file that differs
+from the backup: it fails and names the file instead. A crash can leave a hidden temp file
+behind; scans skip it.
+
 Restore is the same rule pointing the other way: a stack that leaves as seven frames comes
 back as seven. It brings home only the frames that are *away* — a frame already local is
 left alone, because copying the backup over it would replace a file the user may have
@@ -729,7 +769,8 @@ where nothing can be recovered afterwards.
 1. **Never delete the last verified copy** of a photo — including the companions that
    carry its edit state.
 2. **Never offload** anything not verified-backed-up.
-3. **Hash-verify** the NAS copy before marking safe or deleting anything local.
+3. **Hash-verify** the NAS copy before marking safe or deleting anything local — and the
+   local copy against it: a local file that no longer matches its backup is never deleted.
 4. On a NAS-less machine, offload of un-backed-up photos is **unavailable**; they
    stay local and flagged at-risk.
 5. If local fills up with **no NAS**, chairphoto may auto-evict only the

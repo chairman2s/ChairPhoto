@@ -384,6 +384,11 @@ pub struct PhotoInspector {
     pub publish_version: Option<i64>,
     /// The Storage section's last action message for the photo shown.
     pub storage_msg: Option<String>,
+    /// Photos with a Back up, Offload or Restore in flight from this inspector: their
+    /// buttons are disabled and a second press is ignored until the first one ends (#254).
+    /// The core refuses a second operation on a photo anyway (`StorageClaims`); this keeps a
+    /// double-click from starting one and overwriting the first one's message.
+    pub storage_running: HashSet<i64>,
     pub editors: Option<Editors>,
     editors_reading: bool,
     /// Bumped by every editors read started; only the newest one's result lands.
@@ -462,6 +467,7 @@ impl PhotoInspector {
             platform,
             publish_version: None,
             storage_msg: None,
+            storage_running: HashSet::new(),
             editors: None,
             editors_reading: false,
             editors_seq: 0,
@@ -672,6 +678,9 @@ impl PhotoInspector {
                 self.from = None;
                 self.iptc_saving.clear();
                 self.iptc_queued.clear();
+                // The old catalog's runs are bound to it; this catalog's photo ids are other
+                // photos, so none of them is in flight here.
+                self.storage_running.clear();
                 self.data = PhotoData::default();
                 self.editors = None;
                 self.editors_reading = false;
@@ -831,13 +840,19 @@ impl PhotoInspector {
     /// Back up now if the NAS is reachable, else queue a backup (React's `onBackup`).
     pub fn back_up(&mut self, cx: &mut Context<Self>) {
         let (Some(id), Some(from)) = (self.photo_id, self.from) else { return };
+        if self.storage_running.contains(&id) {
+            return;
+        }
         self.storage_msg = Some("Backing up…".into());
         cx.notify();
         self.storage_action(
             id,
             move |state| match chairphoto_core::app::storage::backup_photo_as(state, from, id) {
                 Ok(report) => Ok(chairphoto_model::storage_outcome::backup_message(&report)),
-                Err(e) if e == chairphoto_core::app::CATALOG_CHANGED => Err(e),
+                // Refusals, not an offline NAS: queueing would report "NAS offline".
+                Err(e) if e == chairphoto_core::app::CATALOG_CHANGED || e == chairphoto_core::app::storage::IN_PROGRESS => {
+                    Err(e)
+                }
                 Err(_) => {
                     chairphoto_core::app::storage::enqueue_backup_as(state, from, id)?;
                     Ok("Queued (NAS offline)".to_string())
@@ -849,6 +864,9 @@ impl PhotoInspector {
 
     pub fn offload(&mut self, cx: &mut Context<Self>) {
         let (Some(id), Some(from)) = (self.photo_id, self.from) else { return };
+        if self.storage_running.contains(&id) {
+            return;
+        }
         self.storage_msg = Some("Offloading…".into());
         cx.notify();
         self.storage_action(
@@ -863,6 +881,9 @@ impl PhotoInspector {
 
     pub fn restore(&mut self, cx: &mut Context<Self>) {
         let (Some(id), Some(from)) = (self.photo_id, self.from) else { return };
+        if self.storage_running.contains(&id) {
+            return;
+        }
         self.storage_msg = Some("Restoring…".into());
         cx.notify();
         self.storage_action(
@@ -875,6 +896,8 @@ impl PhotoInspector {
         );
     }
 
+    /// Run one storage verb for `id`, marked in flight ([`Self::storage_running`]) until it
+    /// ends — whatever the inspector shows by then, so the mark is always cleared.
     fn storage_action(
         &mut self,
         id: i64,
@@ -882,9 +905,16 @@ impl PhotoInspector {
         cx: &mut Context<Self>,
     ) {
         let generation = self.generation;
-        self.run_blocking(
+        let epoch = self.epoch;
+        self.storage_running.insert(id);
+        self.run_blocking_always(
             work,
             move |this, result, cx| {
+                if this.epoch != epoch {
+                    return; // a switch cleared the marks; this run was bound to the old catalog
+                }
+                this.storage_running.remove(&id);
+                cx.notify();
                 if this.generation == generation && this.photo_id == Some(id) {
                     this.storage_msg = Some(result.unwrap_or_else(|e| e));
                     cx.notify();

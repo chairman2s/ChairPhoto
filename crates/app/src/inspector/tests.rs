@@ -879,6 +879,72 @@ fn offload_of_a_stack_says_what_it_freed_and_what_it_left(cx: &mut TestAppContex
     assert!(dir.0.join("photos/2026/p1.ARW").exists(), "the frame, with no backup of its own, stayed");
 }
 
+/// Storage, #254: a double-clicked Offload starts one run. The button is disabled while it
+/// runs (a second click reaches no handler), a second press through the method is ignored
+/// too, and the first run's own message is what the section shows when it ends.
+#[gpui_kit::test]
+fn a_double_clicked_offload_runs_once(cx: &mut TestAppContext) {
+    let dir = TempDir::new("insp-storage-double");
+    let app = start(cx);
+    let ids = open_catalog_with_photos(&app, &dir, 1, cx);
+    let nas = dir.0.join("nas");
+    std::fs::create_dir_all(dir.0.join("photos/2026")).unwrap();
+    std::fs::create_dir_all(&nas).unwrap();
+    let raw = dir.0.join("photos/2026/p0.ARW");
+    std::fs::write(&raw, b"raw-0").unwrap();
+    catalog(&app, |c| {
+        let nas = c.add_volume("NAS", &nas, chairphoto_core::catalog::VolumeKind::Backup).unwrap();
+        c.backup_photo(ids[0], nas).unwrap();
+    });
+    // Re-read the catalog so the Library knows the photo is backed up (the Offload button).
+    app.state.send(CoreEvent::CatalogSwitched(dir.0.join("photos.chairphoto").to_string_lossy().to_string()));
+    cx.run_until_parked();
+    select(&app, ids[0], SelectMods::default(), cx);
+    if !present(&app, "storage-msg", cx) {
+        click(&app, "section-storage", cx);
+    }
+    assert!(present(&app, "storage-offload", cx), "the backed-up photo offers Offload");
+    work(cx); // the reads selecting the photo started
+    assert_eq!(cx.update(|cx| Runner::get(cx).pending()), 0);
+
+    click(&app, "storage-offload", cx);
+    click(&app, "storage-offload", cx);
+    let insp = inspector(&app, cx);
+    insp.update(cx, |i, cx| i.offload(cx));
+    assert_eq!(cx.update(|cx| Runner::get(cx).pending()), 1, "one offload was started");
+    insp.read_with(cx, |i, _| assert!(i.storage_running.contains(&ids[0])));
+
+    work(cx);
+    insp.read_with(cx, |i, _| {
+        assert_eq!(i.storage_msg.as_deref(), Some("Local copy freed"));
+        assert!(i.storage_running.is_empty(), "the mark ends with the run");
+    });
+    assert!(!raw.exists());
+}
+
+/// Storage, #254: Back up on a photo another storage operation holds (a drain, say) says
+/// so, rather than queueing a backup and reporting the NAS offline.
+#[gpui_kit::test]
+fn back_up_of_a_photo_in_use_says_so_and_queues_nothing(cx: &mut TestAppContext) {
+    let dir = TempDir::new("insp-storage-in-use");
+    let app = start(cx);
+    let ids = open_catalog_with_photos(&app, &dir, 1, cx);
+    let nas = dir.0.join("nas");
+    std::fs::create_dir_all(&nas).unwrap();
+    let db = catalog(&app, |c| {
+        c.add_volume("NAS", &nas, chairphoto_core::catalog::VolumeKind::Backup).unwrap();
+        c.db_path().to_path_buf()
+    });
+    let held = app.state.storage_claims.claim(&db, ids[0], &[]).unwrap();
+    select(&app, ids[0], SelectMods::default(), cx);
+    let insp = inspector(&app, cx);
+    insp.update(cx, |i, cx| i.back_up(cx));
+    work(cx);
+    insp.read_with(cx, |i, _| assert_eq!(i.storage_msg.as_deref(), Some(chairphoto_core::app::storage::IN_PROGRESS)));
+    assert!(catalog(&app, |c| c.list_pending_operations().unwrap()).is_empty(), "nothing was queued");
+    drop(held);
+}
+
 // --- versions ------------------------------------------------------------------------
 
 /// Add (typed name, else "Version N"), choose, rename, duplicate, delete; the chosen version

@@ -16,9 +16,9 @@ use crate::catalog::{
     SkippedPhoto, VolumeKind,
 };
 use std::collections::HashSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 /// Where a lifecycle step plans and records: the shared handle (`AppState` — whichever
 /// catalog is open at each step) or one bound connection (a drain, which must never apply
@@ -37,6 +37,123 @@ impl CatalogAccess for Catalog {
     fn with<T>(&self, f: impl FnOnce(&Catalog) -> crate::catalog::Result<T>) -> Result<T, String> {
         f(self).map_err(|e| e.to_string())
     }
+}
+
+// ── One storage operation per photo at a time (#254) ─────────────────────────
+
+/// Why a verb refused, or a stack step left a member: another storage operation is working
+/// on that photo right now. A user's second click gets this as its error; a drain leaves the
+/// op (or requeues the frame) pending for its next run.
+pub const IN_PROGRESS: &str = crate::catalog::IN_PROGRESS_REASON;
+
+/// The photos storage operations are working on right now, per catalog file (#254).
+///
+/// User verbs run on the blocking pool alongside each other and alongside a drain or the
+/// offload-policy sweep, and nothing else serialised them: a double-clicked Offload ran
+/// twice, an offload's commit could drop the location row a concurrent restore had just
+/// added, and two copies to one destination could write one file. Every backup, offload
+/// and restore the service layer runs now claims the photo it was named on **and the stack
+/// frames it will take** before it plans, and holds the claim until it has recorded.
+///
+/// Keyed per photo rather than one global lock, because a drain can run for hours: a global
+/// gate would make the user's Offload wait behind the whole back-up queue, or refuse it,
+/// for the sake of photos it never touches. Two different photos still copy side by side,
+/// as before.
+///
+/// Never waited on. A verb whose named photo is claimed fails with [`IN_PROGRESS`]; a stack
+/// frame that is claimed is left and reported with that reason (a drain requeues it as
+/// pending); a drain whose op's photo is claimed leaves the op pending, untouched
+/// (`DrainSummary::busy`). So a claim cannot deadlock against anything.
+///
+/// **Lock order** (`app::jobs`): the set's mutex is a leaf — nothing is acquired while it
+/// is held, and it is taken with no lock held but, at most, the catalog lock. The claim it
+/// grants is taken *before* the op's plan and held across the op's catalog-lock
+/// acquisitions; since nothing ever blocks on a claim, holding one there cannot invert the
+/// order.
+///
+/// Keyed by the catalog's database path as well as the id: a verb bound to catalog A (its
+/// own connection) can still be finishing after a switch, and photo 7 in catalog B is a
+/// different photo.
+#[derive(Default)]
+pub struct StorageClaims {
+    held: Mutex<HashSet<(PathBuf, i64)>>,
+}
+
+impl StorageClaims {
+    /// The set. A panic while it was held cannot leave it half-changed (each change is one
+    /// insert or remove), so a poisoned lock is still usable — and must be, or one panicked
+    /// worker would refuse every storage op for the rest of the session.
+    fn held(&self) -> MutexGuard<'_, HashSet<(PathBuf, i64)>> {
+        self.held.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Claim `named` and whichever of `frames` are free, in catalog `db`. `None` — claiming
+    /// nothing — when `named` itself is held by another operation. A frame held elsewhere is
+    /// simply not part of the claim; the op leaves it ([`StorageClaim::holds`]).
+    pub fn claim(self: &Arc<Self>, db: &Path, named: i64, frames: &[i64]) -> Option<StorageClaim> {
+        let mut held = self.held();
+        if held.contains(&(db.to_path_buf(), named)) {
+            return None;
+        }
+        let mut ids = vec![named];
+        held.insert((db.to_path_buf(), named));
+        for &frame in frames {
+            if held.insert((db.to_path_buf(), frame)) {
+                ids.push(frame);
+            }
+        }
+        Some(StorageClaim { claims: Arc::clone(self), db: db.to_path_buf(), ids })
+    }
+
+    /// Whether some operation holds photo `id` of catalog `db`.
+    pub fn is_claimed(&self, db: &Path, id: i64) -> bool {
+        self.held().contains(&(db.to_path_buf(), id))
+    }
+}
+
+/// One storage operation's hold on its photos; released when dropped.
+pub struct StorageClaim {
+    claims: Arc<StorageClaims>,
+    db: PathBuf,
+    ids: Vec<i64>,
+}
+
+impl StorageClaim {
+    /// Whether this claim holds photo `id`.
+    pub fn holds(&self, id: i64) -> bool {
+        self.ids.contains(&id)
+    }
+}
+
+impl Drop for StorageClaim {
+    fn drop(&mut self) {
+        let mut held = self.claims.held();
+        for &id in &self.ids {
+            held.remove(&(self.db.clone(), id));
+        }
+    }
+}
+
+/// Claim `photo_id` and the frames stacked under it in the catalog `cat` reaches, before
+/// anything is planned — so the plan is made, and the work done, with every member it can
+/// take held. The stack is read under the catalog lock and the claim taken after it is
+/// released.
+fn claim_moment(cat: &impl CatalogAccess, claims: &Arc<StorageClaims>, photo_id: i64) -> Result<StorageClaim, String> {
+    let (db, frames) = cat.with(|c| Ok((c.db_path().to_path_buf(), c.stack_frame_ids(photo_id)?)))?;
+    claims.claim(&db, photo_id, &frames).ok_or_else(|| IN_PROGRESS.to_string())
+}
+
+/// Leave each planned frame the claim does not hold — held by another operation, or stacked
+/// in the instant between the claim and the plan — reported with [`IN_PROGRESS`], so a
+/// drain requeues it as pending.
+fn leave_unclaimed<T>(frames: &mut Vec<T>, skipped: &mut Vec<SkippedPhoto>, claim: &StorageClaim, id: impl Fn(&T) -> i64) {
+    frames.retain(|frame| {
+        let held = claim.holds(id(frame));
+        if !held {
+            skipped.push(SkippedPhoto { photo_id: id(frame), reason: IN_PROGRESS.to_string() });
+        }
+        held
+    });
 }
 
 // ── Backup, offload, restore ─────────────────────────────────────────────────
@@ -61,22 +178,28 @@ fn superseded(abort: Option<&AtomicBool>) -> bool {
 /// The named photo's failure is the call's failure; a frame that fails is reported and the
 /// rest continue, because the master is already at home by then.
 pub fn backup_to(state: &AppState, photo_id: i64, backup_id: i64) -> Result<BackupReport, String> {
-    backup_in(state, photo_id, backup_id, None)
+    backup_in(state, &state.storage_claims, photo_id, backup_id, None)
 }
 
 /// `abort`: the reconcile claim a drain runs this under. The named photo — the op in flight,
 /// started while the drain still owned it — runs to the end; once the claim is tripped no
 /// further frame is started, and each is reported skipped with [`SUPERSEDED`].
+///
+/// `claims`: the photo and its frames are claimed before planning ([`StorageClaims`]); a
+/// named photo another operation holds fails with [`IN_PROGRESS`].
 fn backup_in(
     cat: &impl CatalogAccess,
+    claims: &Arc<StorageClaims>,
     photo_id: i64,
     backup_id: i64,
     abort: Option<&AtomicBool>,
 ) -> Result<BackupReport, String> {
+    let claim = claim_moment(cat, claims, photo_id)?;
     // Candidate rows under the lock; which copies are actually on disk is decided off it
     // (#85), so a slow NAS stalls this plan but no other catalog reader.
     let candidates = cat.with(|c| c.plan_backup_candidates(photo_id, backup_id))?;
-    let plan = crate::catalog::resolve_backup_plan(candidates).map_err(|e| e.to_string())?;
+    let mut plan = crate::catalog::resolve_backup_plan(candidates).map_err(|e| e.to_string())?;
+    leave_unclaimed(&mut plan.frames, &mut plan.skipped, &claim, |f| f.photo_id);
     let mut report = BackupReport { skipped: plan.skipped, total: plan.total, ..Default::default() };
     backup_one(cat, plan.named)?;
     report.backed_up.push(photo_id);
@@ -131,7 +254,7 @@ pub fn backup_photo_as(
 ) -> Result<BackupReport, String> {
     let cat = bound(state, expected)?;
     let backup_id = cat.with(|c| single_volume_of_kind(c, VolumeKind::Backup, "backup"))?;
-    backup_in(&cat, photo_id, backup_id, None)
+    backup_in(&cat, &state.storage_claims, photo_id, backup_id, None)
 }
 
 /// Queue a backup of a photo read from the catalog `expected` names; `CATALOG_CHANGED` once
@@ -146,7 +269,7 @@ pub fn offload_photo_as(
     expected: super::CatalogIdentity,
     photo_id: i64,
 ) -> Result<OffloadReport, String> {
-    offload_in(&bound(state, expected)?, photo_id, None)
+    offload_in(&bound(state, expected)?, &state.storage_claims, photo_id, None)
 }
 
 /// [`restore_photo`] of a photo read from the catalog `expected` names (see [`bound`]).
@@ -157,7 +280,7 @@ pub fn restore_photo_as(
 ) -> Result<RestoreReport, String> {
     let cat = bound(state, expected)?;
     let local_id = cat.with(|c| single_volume_of_kind(c, VolumeKind::Local, "local"))?;
-    restore_in(&cat, photo_id, local_id, None)
+    restore_in(&cat, &state.storage_claims, photo_id, local_id, None)
 }
 
 /// Free a photo's local copies **and its stack frames'** (#82), each only after re-verifying
@@ -166,7 +289,7 @@ pub fn restore_photo_as(
 /// id-keyed thumbnail from a local copy of every member first, so each stays visible once
 /// only the NAS copy remains (frames are what the inspector's Stack section shows).
 pub fn offload_photo(state: &AppState, photo_id: i64) -> Result<OffloadReport, String> {
-    offload_in(state, photo_id, None)
+    offload_in(state, &state.storage_claims, photo_id, None)
 }
 
 /// `abort`: as [`backup_in`]'s, but stricter, because this is the verb that deletes: the
@@ -174,25 +297,45 @@ pub fn offload_photo(state: &AppState, photo_id: i64) -> Result<OffloadReport, S
 /// named photo's included — a tripped claim before the named photo frees nothing and fails,
 /// keeping the queue row; a frame it reaches tripped is reported skipped. Whatever was
 /// already freed is recorded either way: a deleted local file must never keep its row.
-fn offload_in(cat: &impl CatalogAccess, photo_id: i64, abort: Option<&AtomicBool>) -> Result<OffloadReport, String> {
+fn offload_in(
+    cat: &impl CatalogAccess,
+    claims: &Arc<StorageClaims>,
+    photo_id: i64,
+    abort: Option<&AtomicBool>,
+) -> Result<OffloadReport, String> {
+    let stopped = || superseded(abort);
+    offload_until(cat, claims, photo_id, &stopped)
+}
+
+/// [`offload_in`] with the ownership check as a closure, consulted before each member's
+/// delete (`verify_and_delete_locals_until`) — where a test starts another operation on the
+/// same photo while this one holds it.
+fn offload_until(
+    cat: &impl CatalogAccess,
+    claims: &Arc<StorageClaims>,
+    photo_id: i64,
+    stopped: &dyn Fn() -> bool,
+) -> Result<OffloadReport, String> {
+    // Held from before the plan until the commit: a restore of the same photo cannot add a
+    // row between this plan and its commit, nor a second offload delete under it (#254).
+    let claim = claim_moment(cat, claims, photo_id)?;
     // Candidate rows under the lock; the per-frame backup gate stats off it (#85). The stat
     // can go stale by the delete, but never destructively: `free_local_copies` re-hashes the
     // backup before anything is removed.
     let candidates = cat.with(|c| c.plan_offload_candidates(photo_id))?;
-    let plan = crate::catalog::resolve_offload_plan(candidates).map_err(|e| e.to_string())?;
+    let mut plan = crate::catalog::resolve_offload_plan(candidates).map_err(|e| e.to_string())?;
+    leave_unclaimed(&mut plan.frames, &mut plan.skipped, &claim, |f| f.photo_id);
     for member in std::iter::once(&plan.named).chain(plan.frames.iter()) {
         if let Some(local) = member.local_files.first() {
             let _ = crate::thumbnails::ensure_persistent_thumb(member.photo_id, local);
         }
     }
-    let carry = match abort {
-        Some(abort) => crate::catalog::verify_and_delete_locals_abortable(&plan, abort),
-        None => crate::catalog::verify_and_delete_locals(&plan),
-    }
-    .map_err(|e| e.to_string())?;
+    let carry = crate::catalog::verify_and_delete_locals_until(&plan, stopped).map_err(|e| e.to_string())?;
     // Companions are recorded before the local rows go away, per freed photo — see
     // `commit_offload_carry`.
-    cat.with(|c| c.commit_offload_carry(carry))
+    let report = cat.with(|c| c.commit_offload_carry(carry));
+    drop(claim);
+    report
 }
 
 /// Pull a photo's backup copy back to local volume `local_id`, hash-verified, companions
@@ -200,20 +343,23 @@ fn offload_in(cat: &impl CatalogAccess, photo_id: i64, abort: Option<&AtomicBool
 /// frames stacked under it that are away** (#82): offload frees the moment, so restore brings
 /// it back. A frame already local is left alone rather than overwritten.
 pub fn restore_to(state: &AppState, photo_id: i64, local_id: i64) -> Result<RestoreReport, String> {
-    restore_in(state, photo_id, local_id, None)
+    restore_in(state, &state.storage_claims, photo_id, local_id, None)
 }
 
-/// `abort`: as [`backup_in`]'s.
+/// `abort` and `claims`: as [`backup_in`]'s.
 fn restore_in(
     cat: &impl CatalogAccess,
+    claims: &Arc<StorageClaims>,
     photo_id: i64,
     local_id: i64,
     abort: Option<&AtomicBool>,
 ) -> Result<RestoreReport, String> {
+    let claim = claim_moment(cat, claims, photo_id)?;
     // Candidate rows under the lock; which frames are already home and which backup is
     // reachable are statted off it (#85).
     let candidates = cat.with(|c| c.plan_restore_candidates(photo_id, local_id))?;
-    let plan = crate::catalog::resolve_restore_plan(candidates).map_err(|e| e.to_string())?;
+    let mut plan = crate::catalog::resolve_restore_plan(candidates).map_err(|e| e.to_string())?;
+    leave_unclaimed(&mut plan.frames, &mut plan.skipped, &claim, |f| f.photo_id);
     let mut report = RestoreReport { skipped: plan.skipped, total: plan.total, ..Default::default() };
     restore_one(cat, plan.named)?;
     report.restored.push(photo_id);
@@ -369,11 +515,12 @@ mod stack_tests {
         let nas = held.with(|c| single_volume_of_kind(c, VolumeKind::Backup, "backup")).unwrap();
         let local = held.with(|c| single_volume_of_kind(c, VolumeKind::Local, "local")).unwrap();
 
-        assert_eq!(backup_in(&held, master, nas, None).unwrap().backed_up, vec![master, frame]);
-        assert_eq!(backup_in(&held, master, nas, None).unwrap().backed_up, vec![master, frame], "idempotent");
-        assert_eq!(offload_in(&held, master, None).unwrap().freed, vec![master, frame]);
+        let claims = &state.storage_claims;
+        assert_eq!(backup_in(&held, claims, master, nas, None).unwrap().backed_up, vec![master, frame]);
+        assert_eq!(backup_in(&held, claims, master, nas, None).unwrap().backed_up, vec![master, frame], "idempotent");
+        assert_eq!(offload_in(&held, claims, master, None).unwrap().freed, vec![master, frame]);
         assert!(!jpg.exists());
-        assert_eq!(restore_in(&held, master, local, None).unwrap().restored, vec![master, frame]);
+        assert_eq!(restore_in(&held, claims, master, local, None).unwrap().restored, vec![master, frame]);
         assert!(jpg.exists());
     }
 
@@ -384,7 +531,7 @@ mod stack_tests {
         let (_dir, state, master, _frame, raw, jpg) = stacked("tripped");
         backup_photo(&state, master).unwrap();
         let tripped = AtomicBool::new(true);
-        let err = offload_in(&state, master, Some(&tripped)).unwrap_err();
+        let err = offload_in(&state, &state.storage_claims, master, Some(&tripped)).unwrap_err();
         assert!(err.contains("catalog switched"), "{err}");
         assert!(raw.exists() && jpg.exists(), "nothing was freed");
     }
@@ -468,6 +615,27 @@ mod stack_tests {
         assert_eq!(reconcile_due(&state).unwrap().0, 0);
     }
 
+    /// #255 through the drain: a queued offload whose local master was rewritten after its
+    /// backup is a refusal of that photo, not an interruption — the op is kept `failed` with
+    /// the reason, and the newer local bytes stay.
+    #[test]
+    fn a_drained_offload_of_a_changed_local_copy_fails_with_the_reason() {
+        let (_dir, state, master, _frame, raw, jpg) = stacked("drain-local-changed");
+        backup_photo(&state, master).unwrap();
+        std::fs::write(&raw, b"raw-bytes rewritten by another tool").unwrap();
+        with_catalog(&state, |c| c.enqueue_operation("offload", master).map(drop)).unwrap();
+
+        let summary = reconcile_now(&state).unwrap();
+
+        assert_eq!((summary.ran, summary.failed, summary.partial), (0, 1, 0), "{summary:?}");
+        let ops = with_catalog(&state, |c| c.list_pending_operations()).unwrap();
+        assert_eq!(ops.len(), 1, "{ops:?}");
+        assert_eq!((ops[0].photo_id, ops[0].status.as_str()), (master, "failed"));
+        assert!(ops[0].error.contains(crate::catalog::LOCAL_CHANGED_REASON), "{}", ops[0].error);
+        assert_eq!(std::fs::read(&raw).unwrap(), b"raw-bytes rewritten by another tool");
+        assert!(jpg.exists(), "the named photo's refusal is the call's: the frame stays too");
+    }
+
     /// A claimed backup tripped mid-stack: the named photo — the op in flight — finishes,
     /// and no further frame is started; the frame is reported with why, which is what the
     /// drain requeues.
@@ -476,12 +644,105 @@ mod stack_tests {
         let (_dir, state, master, frame, _raw, _jpg) = stacked("tripped-backup");
         let nas = with_catalog(&state, |c| single_volume_of_kind(c, VolumeKind::Backup, "backup")).unwrap();
         let tripped = AtomicBool::new(true);
-        let report = backup_in(&state, master, nas, Some(&tripped)).unwrap();
+        let report = backup_in(&state, &state.storage_claims, master, nas, Some(&tripped)).unwrap();
         assert_eq!(report.backed_up, vec![master]);
         assert_eq!(report.skipped.len(), 1);
         assert_eq!((report.skipped[0].photo_id, report.skipped[0].reason.as_str()), (frame, SUPERSEDED));
         assert_eq!(report.total, 2);
         assert!(!with_catalog(&state, |c| c.has_verified_backup(frame)).unwrap(), "the frame was not copied");
+    }
+
+    // --- one storage operation per photo at a time (#254) ---------------------------------
+
+    fn db_of(state: &AppState) -> PathBuf {
+        with_catalog(state, |c| Ok(c.db_path().to_path_buf())).unwrap()
+    }
+
+    #[test]
+    fn a_claim_refuses_a_held_photo_skips_held_frames_and_releases_on_drop() {
+        let claims = Arc::new(StorageClaims::default());
+        let (a, b) = (Path::new("/a.chairphoto"), Path::new("/b.chairphoto"));
+        let first = claims.claim(a, 1, &[2, 3]).unwrap();
+        assert!(claims.claim(a, 1, &[]).is_none(), "the named photo is held");
+        assert!(claims.claim(a, 3, &[]).is_none(), "a frame of a held moment is held");
+        let other = claims.claim(a, 4, &[3, 5]).unwrap();
+        assert!(!other.holds(3) && other.holds(5), "a held frame is left out, a free one taken");
+        assert!(claims.claim(b, 1, &[2]).is_some(), "photo 1 of another catalog is another photo");
+        drop(first);
+        assert!(!claims.is_claimed(a, 1) && !claims.is_claimed(a, 2) && claims.is_claimed(a, 5));
+        drop(other);
+        assert!(!claims.is_claimed(a, 5));
+    }
+
+    /// **Forced interleaving.** While an offload of a stack is part-way through (its first
+    /// ownership check, before anything is deleted), a second offload, a restore and a
+    /// backup — of the master, or of its frame directly — are each refused with
+    /// [`IN_PROGRESS`], touching nothing; the offload then finishes, and a restore after it
+    /// runs. Without the claim the restore would add a row the offload's commit could drop,
+    /// and a second offload would race the first's deletes.
+    #[test]
+    fn a_second_verb_on_a_moment_in_flight_is_refused() {
+        let (_dir, state, master, frame, raw, jpg) = stacked("claim-verbs");
+        backup_photo(&state, master).unwrap();
+        let (from, ()) = super::super::with_catalog_identified(&state, |_| Ok(())).unwrap();
+        let tried = std::cell::RefCell::new(Vec::new());
+        let during = || {
+            if tried.borrow().is_empty() {
+                let mut t = tried.borrow_mut();
+                for id in [master, frame] {
+                    t.push(offload_photo_as(&state, from, id).map(drop));
+                    t.push(restore_photo_as(&state, from, id).map(drop));
+                    t.push(backup_photo_as(&state, from, id).map(drop));
+                }
+            }
+            false
+        };
+
+        let report = offload_until(&state, &state.storage_claims, master, &during).unwrap();
+
+        let tried = tried.into_inner();
+        assert_eq!(tried.len(), 6, "the second verbs ran while the offload held the moment");
+        for result in &tried {
+            assert_eq!(result.as_ref().unwrap_err(), IN_PROGRESS);
+        }
+        assert_eq!(report.freed, vec![master, frame]);
+        assert!(!raw.exists() && !jpg.exists());
+        assert!(!state.storage_claims.is_claimed(&db_of(&state), master), "released when done");
+        assert_eq!(restore_photo_as(&state, from, master).unwrap().restored, vec![master, frame]);
+        assert!(raw.exists() && jpg.exists());
+    }
+
+    /// A drain meeting a photo a user's verb holds: the op for that photo stays pending and
+    /// untouched (`busy`), and a held frame of another op's stack is requeued pending, not
+    /// failed. Both run on the next drain once the verb is done.
+    #[test]
+    fn a_drain_leaves_held_photos_pending_for_the_next_run() {
+        let (_dir, state, master, frame, _raw, _jpg) = stacked("claim-drain");
+        with_catalog(&state, |c| c.enqueue_operation("backup", master).map(drop)).unwrap();
+        let db = db_of(&state);
+
+        // The named photo held: nothing is done for that op.
+        let held = state.storage_claims.claim(&db, master, &[]).unwrap();
+        let s = reconcile_now(&state).unwrap();
+        assert_eq!((s.ran, s.failed, s.partial, s.busy), (0, 0, 0, 1), "{s:?}");
+        let ops = with_catalog(&state, |c| c.list_pending_operations()).unwrap();
+        assert_eq!((ops.len(), ops[0].status.as_str(), ops[0].error.as_str()), (1, "pending", ""));
+        assert!(!with_catalog(&state, |c| c.has_verified_backup(master)).unwrap());
+        drop(held);
+
+        // Only the frame held: the master is backed up, the frame requeued pending.
+        let held = state.storage_claims.claim(&db, frame, &[]).unwrap();
+        let s = reconcile_now(&state).unwrap();
+        assert_eq!((s.ran, s.partial, s.frames_requeued, s.frames_failed), (0, 1, 1, 0), "{s:?}");
+        let ops = with_catalog(&state, |c| c.list_pending_operations()).unwrap();
+        assert_eq!((ops.len(), ops[0].photo_id, ops[0].status.as_str()), (1, frame, "pending"), "{ops:?}");
+        assert!(with_catalog(&state, |c| c.has_verified_backup(master)).unwrap());
+        assert_eq!(reconcile_due(&state).unwrap().0, 1, "the requeued frame still counts");
+        drop(held);
+
+        let s = reconcile_now(&state).unwrap();
+        assert_eq!((s.ran, s.busy), (1, 0), "{s:?}");
+        assert!(with_catalog(&state, |c| c.has_verified_backup(frame)).unwrap());
     }
 }
 
@@ -660,6 +921,9 @@ pub struct ReconcileClaim {
     db_path: PathBuf,
     root: PathBuf,
     abort: Arc<AtomicBool>,
+    /// Each op claims its photos here as a user's verb does ([`StorageClaims`]), so a drain
+    /// and a verb never work one photo at once.
+    claims: Arc<StorageClaims>,
 }
 
 /// Claim the reconcile generation against the open catalog. Takes the catalog lock and then
@@ -679,7 +943,7 @@ fn claim(state: &AppState, expected: Option<super::CatalogIdentity>) -> Result<R
     }
     let (db_path, root) = (c.db_path().to_path_buf(), c.root().to_path_buf());
     let abort = state.jobs.reconcile.install_fresh()?;
-    Ok(ReconcileClaim { db_path, root, abort })
+    Ok(ReconcileClaim { db_path, root, abort, claims: state.storage_claims.clone() })
 }
 
 impl ReconcileClaim {
@@ -735,11 +999,12 @@ impl ReconcileClaim {
             // some members is replaced by one row per skipped frame, so a retry does not
             // replay the members that already finished.
             let abort = Some(self.abort.as_ref());
+            let claims = &self.claims;
             let result = match op.kind.as_str() {
-                "backup" => backup_in(&cat, op.photo_id, backup_id, abort).map(|r| r.skipped),
-                "offload" => offload_in(&cat, op.photo_id, abort).map(|r| r.skipped),
+                "backup" => backup_in(&cat, claims, op.photo_id, backup_id, abort).map(|r| r.skipped),
+                "offload" => offload_in(&cat, claims, op.photo_id, abort).map(|r| r.skipped),
                 "restore" => match local_id {
-                    Some(l) => restore_in(&cat, op.photo_id, l, abort).map(|r| r.skipped),
+                    Some(l) => restore_in(&cat, claims, op.photo_id, l, abort).map(|r| r.skipped),
                     None => Err("no local volume".into()),
                 },
                 other => Err(format!("unknown operation: {other}")),
@@ -750,14 +1015,19 @@ impl ReconcileClaim {
                     summary.ran += 1;
                 }
                 Ok(skipped) => {
-                    // A frame left because the claim was tripped goes back as pending; one
-                    // that refused on its own account is failed (`replace_operation_with_skipped`).
+                    // A frame left because the claim was tripped, or because another storage
+                    // operation held it, goes back as pending; one that refused on its own
+                    // account is failed (`replace_operation_with_skipped`).
                     cat.with(|c| c.replace_operation_with_skipped(op.id, &op.kind, &skipped))?;
-                    let requeued = skipped.iter().filter(|s| s.superseded()).count();
+                    let requeued = skipped.iter().filter(|s| s.retry_later()).count();
                     summary.frames_requeued += requeued;
                     summary.frames_failed += skipped.len() - requeued;
                     summary.partial += 1;
                 }
+                // Another storage operation (a user's verb) is working on this photo: not
+                // this op's failure, and nothing was done. Its row stays pending, untouched,
+                // for the next drain (#254).
+                Err(e) if e == IN_PROGRESS => summary.busy += 1,
                 // Tripped mid-op (an offload stopped before its named photo, or any failure
                 // while the claim was being taken over): an interruption, not this op's
                 // failure. Its row stays pending, untouched, for the next drain.
@@ -807,7 +1077,8 @@ impl ReconcileClaim {
             if already_freed.contains(&id) {
                 continue;
             }
-            if let Ok(report) = offload_in(&cat, id, Some(self.abort.as_ref())) {
+            // A photo another operation holds is left for the next sweep.
+            if let Ok(report) = offload_in(&cat, &self.claims, id, Some(self.abort.as_ref())) {
                 offloaded += report.freed.len();
                 already_freed.extend(report.freed);
             }

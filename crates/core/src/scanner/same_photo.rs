@@ -519,16 +519,26 @@ fn create_new_with(
     Err(Error::new(ErrorKind::AlreadyExists, format!("no free name beside {}", wanted.display())))
 }
 
+/// The tag in a copy's temporary name: `.<name>.chairphoto-part-<pid>-<n>`.
+pub(crate) const PART_TAG: &str = "chairphoto-part";
+
 /// A new hidden temporary file beside `wanted`, created exclusively under a name unique to
 /// this process and call.
 pub(crate) fn create_part(wanted: &Path) -> std::io::Result<(PathBuf, std::fs::File)> {
+    create_hidden(wanted, PART_TAG)
+}
+
+/// A new hidden file beside `wanted`, `.<name>.<tag>-<pid>-<n>`, created exclusively under a
+/// name unique to this process and call — a copy's temporary file ([`PART_TAG`]) or the name
+/// an offload moves a local file to while it checks it (`catalog::working_files`).
+pub(crate) fn create_hidden(wanted: &Path, tag: &str) -> std::io::Result<(PathBuf, std::fs::File)> {
     use std::sync::atomic::AtomicU64;
     static NEXT: AtomicU64 = AtomicU64::new(0);
     let dir = wanted.parent().unwrap_or_else(|| Path::new("."));
     let name = wanted.file_name().and_then(|s| s.to_str()).unwrap_or("file");
     loop {
         let n = NEXT.fetch_add(1, Ordering::Relaxed);
-        let part = dir.join(format!(".{name}.chairphoto-part-{}-{n}", std::process::id()));
+        let part = dir.join(format!(".{name}.{tag}-{}-{n}", std::process::id()));
         match std::fs::OpenOptions::new().write(true).create_new(true).open(&part) {
             Ok(file) => return Ok((part, file)),
             // Left by a crashed run of a process that had this id: take the next number.
@@ -542,6 +552,18 @@ pub(crate) fn create_part(wanted: &Path) -> std::io::Result<(PathBuf, std::fs::F
 /// when one is), in one step where the filesystem allows ([`create_new_file`]). On success
 /// `part` is gone.
 pub(crate) fn place_no_replace(part: &Path, to: &Path) -> std::io::Result<()> {
+    place(part, to, true)
+}
+
+/// [`place_no_replace`] without the copy fallback: only a no-replace rename or a hard link,
+/// which never leave `to` partly written; `Unsupported` on a filesystem with neither. For
+/// putting back a file whose bytes exist nowhere else (`catalog::working_files::put_back`),
+/// where a copy that a crash cut short would be the only copy left.
+pub(crate) fn place_no_replace_without_copy(part: &Path, to: &Path) -> std::io::Result<()> {
+    place(part, to, false)
+}
+
+fn place(part: &Path, to: &Path, may_copy: bool) -> std::io::Result<()> {
     #[cfg(any(target_os = "linux", target_os = "android"))]
     {
         use rustix::fs::{renameat_with, RenameFlags, CWD};
@@ -553,12 +575,13 @@ pub(crate) fn place_no_replace(part: &Path, to: &Path) -> std::io::Result<()> {
             Err(e) => return Err(e.into()),
         }
     }
-    place_by_link(part, to)
+    place_by_link(part, to, may_copy)
 }
 
 /// [`place_no_replace`] by a hard link (which fails with "exists" rather than replace) and
-/// the removal of `part`; on a filesystem without hard links, [`place_by_copy`].
-fn place_by_link(part: &Path, to: &Path) -> std::io::Result<()> {
+/// the removal of `part`; on a filesystem without hard links, [`place_by_copy`] when
+/// `may_copy`, else `Unsupported`.
+fn place_by_link(part: &Path, to: &Path, may_copy: bool) -> std::io::Result<()> {
     match std::fs::hard_link(part, to) {
         Ok(()) => {
             // The file is placed; a temporary name that will not go is only litter.
@@ -566,7 +589,10 @@ fn place_by_link(part: &Path, to: &Path) -> std::io::Result<()> {
             Ok(())
         }
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Err(e),
-        Err(e) if links_unsupported(&e) => place_by_copy(part, to),
+        Err(e) if links_unsupported(&e) && may_copy => place_by_copy(part, to),
+        Err(e) if links_unsupported(&e) => {
+            Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "no no-replace rename or hard links here"))
+        }
         Err(e) => Err(e),
     }
 }
@@ -885,7 +911,9 @@ mod tests {
         let taken = dir.join("taken");
         std::fs::write(&taken, b"theirs").unwrap();
         type Place = fn(&Path, &Path) -> std::io::Result<()>;
-        for (how, place) in [("no-replace", place_no_replace as Place), ("link", place_by_link), ("copy", place_by_copy)] {
+        let link: Place = |part, to| place_by_link(part, to, true);
+        let without_copy: Place = place_no_replace_without_copy;
+        for (how, place) in [("no-replace", place_no_replace as Place), ("link", link), ("copy", place_by_copy), ("without-copy", without_copy)] {
             let part = dir.join(format!(".part-{how}"));
             std::fs::write(&part, b"ours").unwrap();
             let err = place(&part, &taken).unwrap_err();

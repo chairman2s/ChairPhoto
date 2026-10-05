@@ -908,11 +908,19 @@ fn first_present(copies: Vec<Copy>) -> Option<Copy> {
         .find(|c| crate::volume_health::candidate_exists(&c.abs))
 }
 
+/// Recover what a crashed offload left beside the local copies a plan is about to look at
+/// (`working_files::sweep_once`): a local file it had moved to a hidden name is put back
+/// first, so the plan finds it where the catalog says it is. Once per folder per run.
+fn sweep_local_folders<'a>(locals: impl Iterator<Item = &'a Vec<Copy>>) {
+    super::working_files::sweep_beside(locals.flatten().map(|c| c.abs.as_path()));
+}
+
 /// The "which of these exists?" half of [`Catalog::plan_backup_candidates`]. Stats the
 /// filesystem — call it from a blocking context with NO catalog lock held; everything it
 /// needs travels inside the candidates.
 pub fn resolve_backup_plan(candidates: BackupCandidates) -> Result<BackupPlan> {
     let BackupCandidates { named, frames: members, total, base, volume_id } = candidates;
+    sweep_local_folders(std::iter::once(&named).chain(&members).map(|m| &m.locals));
     let named = resolve_backup_member(named, &base, volume_id)?;
     let mut frames = Vec::new();
     let mut skipped = Vec::new();
@@ -955,6 +963,7 @@ fn resolve_backup_member(member: BackupMember, base: &str, volume_id: i64) -> Re
 /// refuse an offload — never make one wrong.
 pub fn resolve_offload_plan(candidates: OffloadCandidates) -> Result<OffloadPlan> {
     let OffloadCandidates { named, frames: members, total } = candidates;
+    sweep_local_folders(std::iter::once(&named).chain(&members).map(|m| &m.locals));
     let named = resolve_offload_member(named)?;
     let mut frames = Vec::new();
     let mut skipped = Vec::new();
@@ -991,6 +1000,7 @@ fn resolve_offload_member(member: OffloadMember) -> Result<PhotoOffload> {
 /// with NO catalog lock held.
 pub fn resolve_restore_plan(candidates: RestoreCandidates) -> Result<RestorePlan> {
     let RestoreCandidates { named, frames: members, total, base, volume_id } = candidates;
+    sweep_local_folders(std::iter::once(&named).chain(&members).map(|m| &m.locals));
     let named = resolve_restore_member(named, &base, volume_id)?;
     let mut frames = Vec::new();
     let mut skipped = Vec::new();
@@ -1309,8 +1319,8 @@ pub(crate) fn verify_and_delete_locals_until(plan: &OffloadPlan, stopped: &dyn F
     Ok(out)
 }
 
-/// Re-verify one photo's backup hash, carry its local companions home, confirm every local
-/// file still matches what is at home, then delete its local files. Invariant 3: never delete
+/// Re-verify one photo's backup hash, carry its local companions home, then free its local
+/// files — each only once it is confirmed to hold what home holds. Invariant 3: never delete
 /// a local copy unless the backup is present and still hashes to the recorded value.
 ///
 /// Returns what is now confirmed at home — for the caller to record *before*
@@ -1343,34 +1353,31 @@ fn free_local_copies(photo: &PhotoOffload, stopped: &dyn Fn() -> bool) -> Result
         }
         carried.extend(carry.carried);
     }
-    // The carry can take a while over a NAS; a run taken over meanwhile stops before the
-    // content check below — which is also where a test lands a write "just after the carry".
+    // The carry can take a while over a NAS; a run taken over meanwhile stops before
+    // anything is moved.
     if stopped() {
         return Err(CatalogError::Validation(SUPERSEDED_REASON.into()));
     }
-    let to_free = confirm_locals_match_home(photo, &carried)?;
+    let to_free = companions_to_free(photo, &carried)?;
 
-    let mut sidecar_backups_left = 0usize;
-    for (file, companions) in photo.local_files.iter().zip(&to_free) {
-        if stopped() {
-            return Err(CatalogError::Validation(SUPERSEDED_REASON.into()));
-        }
-        // Companions first: if this fails part-way, the image is still local, so the
-        // photo is never left with its edit state gone and its bytes freed. Exactly the
-        // ones confirmed above — never a fresh look, which could take one that appeared
-        // after the check and was never carried.
-        for companion in companions {
-            std::fs::remove_file(companion).map_err(io)?;
-        }
-        // Counted, never carried and never deleted — see
-        // `companions::sidecar_backups_beside`. Counting is what turns "the one file
-        // offload left behind" from a bug report into something the verb says (#82).
-        sidecar_backups_left += crate::companions::sidecar_backups_beside(file).len();
-        // Best-effort: an already-absent local file is fine (goal is "not local").
-        if file.exists() {
-            std::fs::remove_file(file).map_err(io)?;
-        }
+    let mut aside = Aside::default();
+    if let Err(e) = move_aside_confirmed(photo, &to_free, &carried, stopped, &mut aside) {
+        return Err(aside.put_back(e));
     }
+    // Every file is now confirmed and under a hidden name; nothing has been deleted. Unlink
+    // them. A failure here puts back whatever is left.
+    if let Err(e) = aside.unlink() {
+        return Err(aside.put_back(e));
+    }
+
+    // Counted, never carried and never deleted — see `companions::sidecar_backups_beside`.
+    // Counting is what turns "the one file offload left behind" from a bug report into
+    // something the verb says (#82).
+    let sidecar_backups_left = photo
+        .local_files
+        .iter()
+        .map(|file| crate::companions::sidecar_backups_beside(file).len())
+        .sum();
     Ok((
         FreedPhoto {
             photo_id: photo.photo_id,
@@ -1382,45 +1389,154 @@ fn free_local_copies(photo: &PhotoOffload, stopped: &dyn Fn() -> bool) -> Result
     ))
 }
 
-/// The content check offload makes just before it deletes anything (#255): every local
-/// copy of the image must still hash to the verified backup's hash, and every companion
-/// beside it must be one the carry confirmed at home, byte for byte. Returns, per local
-/// file, the companions to delete with it.
+/// The check that makes offload delete only what home holds byte for byte (#255), made on
+/// each file **after** it has been moved to a hidden name (#256): companions first, then the
+/// image, for every local copy. Each is moved aside, re-hashed — the image against the
+/// verified backup's hash, a companion against the hash the carry confirmed at home — and
+/// kept aside only if it matches. Then every name that was emptied is looked at again.
 ///
 /// Re-hashing the backup (invariant 3) proves home is intact, not that home holds what is
 /// here: a JPEG or DNG rewritten in place by another tool after its backup, or a sidecar
 /// edited after the carry, would otherwise be deleted while home kept the older bytes.
 ///
+/// Checking the moved file rather than the named one is what closes the window between the
+/// check and the delete. A write through the photo's name either landed before the move —
+/// the file moved aside holds it, and its hash says so — or comes after it, and then makes a
+/// new file at that name, which the final look finds and keeps. What is deleted afterwards is
+/// the hidden file, which no other writer knows by name. (A writer that already had the file
+/// open can still write into it after the move; ChairPhoto's own sidecar writes never do —
+/// they replace the file by a rename — and a photo's IPTC write holds the photo's storage
+/// claim, `app::storage::StorageClaims`.)
+///
 /// The cost is one sequential read of each local copy — a local disk, usually far faster
 /// than the NAS read of the backup that offload already makes — plus companions of a few KB.
 /// Size or mtime would be cheaper and are not content checks: an in-place rewrite can keep
 /// the size, and a tool may preserve the mtime (`exiftool -P`).
-fn confirm_locals_match_home(photo: &PhotoOffload, carried: &[CarriedCompanion]) -> Result<Vec<Vec<PathBuf>>> {
-    let mut to_free = Vec::with_capacity(photo.local_files.len());
+fn move_aside_confirmed(
+    photo: &PhotoOffload,
+    to_free: &[Vec<PathBuf>],
+    carried: &[CarriedCompanion],
+    stopped: &dyn Fn() -> bool,
+    aside: &mut Aside,
+) -> Result<()> {
+    for (file, companions) in photo.local_files.iter().zip(to_free) {
+        // Companions first: if this stops part-way, the image is still local, so the photo
+        // is never left with its edit state gone and its bytes freed. Exactly the ones
+        // listed before — never a fresh look, which could take one that appeared after the
+        // carry and was never carried.
+        for companion in companions {
+            if stopped() {
+                return Err(CatalogError::Validation(SUPERSEDED_REASON.into()));
+            }
+            let hash = carried.iter().find(|c| &c.source == companion).map(|c| c.hash.as_str()).unwrap_or_default();
+            aside.take(companion, hash, "changed since it was carried home — refusing to offload")?;
+        }
+        if stopped() {
+            return Err(CatalogError::Validation(SUPERSEDED_REASON.into()));
+        }
+        // An already-absent local file is fine: the goal is "not local".
+        aside.take(file, &photo.expected_hash, LOCAL_CHANGED_REASON)?;
+    }
+    // A name emptied above that holds a file again was written after its file was moved: a
+    // newer image, or a companion nobody carried. It is kept, and so is everything else.
     for file in &photo.local_files {
-        if file.exists() && sha256_file(file)? != photo.expected_hash {
+        let appeared = std::iter::once(file.clone())
+            .filter(|f| std::fs::symlink_metadata(f).is_ok())
+            .chain(crate::companions::carried_beside(file).into_iter().map(|c| c.path))
+            .next();
+        if let Some(path) = appeared {
             return Err(CatalogError::Validation(format!(
-                "{} {LOCAL_CHANGED_REASON}",
-                file.display()
+                "{} was written while the photo was being offloaded — refusing to offload",
+                path.display()
             )));
         }
+    }
+    Ok(())
+}
+
+/// The local files an offload has moved to hidden names and confirmed
+/// ([`move_aside_confirmed`]): each one's own name and its hidden one.
+#[derive(Default)]
+struct Aside {
+    moved: Vec<(PathBuf, PathBuf)>,
+}
+
+impl Aside {
+    /// Move `file` aside and confirm it hashes to `expected`; a file that is not there is
+    /// nothing to free. On a mismatch the file is put back and the offload refused with
+    /// `why` — or, if a new file took its name meanwhile, kept under its hidden name, which
+    /// the refusal names: those bytes are not at home.
+    fn take(&mut self, file: &Path, expected: &str, why: &str) -> Result<()> {
+        #[cfg(test)]
+        offload_hook::step(offload_hook::Step::BeforeMove, file);
+        let Some(hidden) = super::working_files::move_aside(file).map_err(io)? else {
+            return Ok(());
+        };
+        #[cfg(test)]
+        offload_hook::step(offload_hook::Step::AfterMove, file);
+        let matches = sha256_file(&hidden).map(|h| h == expected);
+        if matches.as_ref().is_ok_and(|m| *m) {
+            self.moved.push((file.to_path_buf(), hidden));
+            return Ok(());
+        }
+        let refusal = match matches {
+            Ok(_) => format!("{} {why}", file.display()),
+            Err(e) => format!("{} could not be read back ({e}) — refusing to offload", file.display()),
+        };
+        Err(CatalogError::Validation(match super::working_files::put_back(&hidden, file) {
+            Ok(true) => refusal,
+            _ => format!("{refusal}; its bytes were kept as {} because its name was taken", hidden.display()),
+        }))
+    }
+
+    /// Delete every confirmed file. Stops at the first that cannot be deleted.
+    fn unlink(&mut self) -> Result<()> {
+        while let Some((file, hidden)) = self.moved.pop() {
+            if let Err(e) = std::fs::remove_file(&hidden) {
+                self.moved.push((file, hidden));
+                return Err(io(e));
+            }
+        }
+        Ok(())
+    }
+
+    /// Undo [`Self::take`] for everything still moved, newest first, and return `refusal`.
+    /// A confirmed file whose name a new file took is at home byte for byte, so it is
+    /// deleted rather than left hidden; one that cannot be put back for any other reason
+    /// is named in the refusal.
+    fn put_back(&mut self, refusal: CatalogError) -> CatalogError {
+        let mut kept = Vec::new();
+        while let Some((file, hidden)) = self.moved.pop() {
+            match super::working_files::put_back(&hidden, &file) {
+                Ok(true) => {}
+                Ok(false) if std::fs::symlink_metadata(&file).is_ok() => {
+                    let _ = std::fs::remove_file(&hidden);
+                }
+                _ => kept.push(hidden.display().to_string()),
+            }
+        }
+        if kept.is_empty() {
+            return refusal;
+        }
+        CatalogError::Validation(format!("{refusal}; could not put back {}", kept.join(", ")))
+    }
+}
+
+/// Which companions beside each local file an offload frees with it: exactly the ones the
+/// carry confirmed at home. One the carry did not take (it appeared after the carry) refuses
+/// the photo. Content is checked later, on the moved file ([`move_aside_confirmed`]).
+fn companions_to_free(photo: &PhotoOffload, carried: &[CarriedCompanion]) -> Result<Vec<Vec<PathBuf>>> {
+    let mut to_free = Vec::with_capacity(photo.local_files.len());
+    for file in &photo.local_files {
         let mut companions = Vec::new();
         for found in crate::companions::carried_beside(file) {
-            match carried.iter().find(|c| c.source == found.path) {
-                Some(c) if sha256_file(&found.path)? == c.hash => companions.push(found.path),
-                Some(_) => {
-                    return Err(CatalogError::Validation(format!(
-                        "{} changed since it was carried home — refusing to offload",
-                        found.path.display()
-                    )))
-                }
-                None => {
-                    return Err(CatalogError::Validation(format!(
-                        "{} appeared after its companions were carried home — refusing to offload",
-                        found.path.display()
-                    )))
-                }
+            if !carried.iter().any(|c| c.source == found.path) {
+                return Err(CatalogError::Validation(format!(
+                    "{} appeared after its companions were carried home — refusing to offload",
+                    found.path.display()
+                )));
             }
+            companions.push(found.path);
         }
         to_free.push(companions);
     }
@@ -1435,6 +1551,52 @@ pub const LOCAL_CHANGED_REASON: &str =
 
 fn io(e: std::io::Error) -> CatalogError {
     CatalogError::Io(e.to_string())
+}
+
+/// Where a test acts inside an offload's per-file check ([`Aside::take`]): just before a local
+/// file is moved aside, and just after. Per thread, so parallel tests never see each other's.
+#[cfg(test)]
+pub(crate) mod offload_hook {
+    use std::cell::RefCell;
+    use std::path::Path;
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) enum Step {
+        BeforeMove,
+        AfterMove,
+    }
+
+    type Hook = Box<dyn FnMut(Step, &Path)>;
+    thread_local! {
+        static HOOK: RefCell<Option<Hook>> = RefCell::new(None);
+    }
+
+    /// Run `hook` at every step of offloads on this thread until the guard is dropped.
+    pub(crate) fn set(hook: impl FnMut(Step, &Path) + 'static) -> Guard {
+        HOOK.with(|h| *h.borrow_mut() = Some(Box::new(hook)));
+        Guard
+    }
+
+    pub(crate) struct Guard;
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            HOOK.with(|h| h.borrow_mut().take());
+        }
+    }
+
+    pub(super) fn step(step: Step, file: &Path) {
+        let hook = HOOK.with(|h| h.borrow_mut().take());
+        if let Some(mut hook) = hook {
+            hook(step, file);
+            HOOK.with(|h| {
+                let mut slot = h.borrow_mut();
+                if slot.is_none() {
+                    *slot = Some(hook);
+                }
+            });
+        }
+    }
 }
 
 #[cfg(test)]

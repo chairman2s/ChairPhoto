@@ -652,6 +652,158 @@ mod stack_tests {
         assert!(!with_catalog(&state, |c| c.has_verified_backup(frame)).unwrap(), "the frame was not copied");
     }
 
+    // --- offload's check-to-delete window (#256, review probes P1/P2) ----------------------
+
+    /// The hidden names an offload's check left in `dir`.
+    fn hidden_in(dir: &Path) -> Vec<String> {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .filter_map(|e| e.ok()?.file_name().into_string().ok())
+            .filter(|n| n.contains(crate::catalog::working_files::ASIDE_TAG))
+            .collect()
+    }
+
+    /// Run `act` once, at `step` for `file`, inside every offload on this thread while the
+    /// guard lives.
+    fn at_step(
+        step: crate::catalog::offload_hook::Step,
+        file: &Path,
+        act: impl FnOnce() + 'static,
+    ) -> crate::catalog::offload_hook::Guard {
+        let file = file.to_path_buf();
+        let mut act = Some(act);
+        crate::catalog::offload_hook::set(move |at, path| {
+            if at == step && path == file {
+                if let Some(act) = act.take() {
+                    act();
+                }
+            }
+        })
+    }
+
+    /// **Forced interleaving (P1).** The image is rewritten in place just before offload moves
+    /// it aside: the file moved aside holds the new bytes, its re-hash says so, and it is put
+    /// back. Nothing is deleted, the newer bytes stay under the photo's name, nothing hidden
+    /// is left, and the photo is still recorded local.
+    #[test]
+    fn an_image_rewritten_up_to_its_move_is_caught_by_the_rehash() {
+        use crate::catalog::offload_hook::Step;
+        let (_dir, state, master, _frame, raw, jpg) = stacked("p1-before-move");
+        backup_photo(&state, master).unwrap();
+        let target = raw.clone();
+        let _hook = at_step(Step::BeforeMove, &raw, move || std::fs::write(&target, b"NEW BYTES").unwrap());
+
+        let err = offload_photo(&state, master).unwrap_err();
+
+        assert!(err.contains(crate::catalog::LOCAL_CHANGED_REASON), "{err}");
+        assert_eq!(std::fs::read(&raw).unwrap(), b"NEW BYTES");
+        assert!(jpg.exists(), "the named photo's refusal is the call's");
+        assert!(hidden_in(raw.parent().unwrap()).is_empty(), "{:?}", hidden_in(raw.parent().unwrap()));
+        assert_eq!(with_catalog(&state, |c| c.photo_storage_status(master)).unwrap(), StorageStatus::BackedUp);
+    }
+
+    /// **Forced interleaving (P1, the other side).** A new file is written at the image's name
+    /// just after offload moved the image aside. The final look finds it: the offload refuses,
+    /// the new file is kept, and the moved file — confirmed identical to home — is deleted
+    /// rather than left hidden. The photo is still recorded local, pointing at the new file.
+    #[test]
+    fn an_image_written_after_its_move_is_kept() {
+        use crate::catalog::offload_hook::Step;
+        let (dir, state, master, _frame, raw, _jpg) = stacked("p1-after-move");
+        backup_photo(&state, master).unwrap();
+        let target = raw.clone();
+        let _hook = at_step(Step::AfterMove, &raw, move || std::fs::write(&target, b"NEW BYTES").unwrap());
+
+        let err = offload_photo(&state, master).unwrap_err();
+
+        assert!(err.contains("was written while the photo was being offloaded"), "{err}");
+        assert_eq!(std::fs::read(&raw).unwrap(), b"NEW BYTES");
+        assert_eq!(std::fs::read(dir.join("nas/2026/08/DSC1.ARW")).unwrap(), b"raw-bytes", "home untouched");
+        assert!(hidden_in(raw.parent().unwrap()).is_empty(), "{:?}", hidden_in(raw.parent().unwrap()));
+        assert_eq!(with_catalog(&state, |c| c.photo_storage_status(master)).unwrap(), StorageStatus::BackedUp);
+    }
+
+    /// **Forced interleaving (P2).** A companion nobody carried appears after the image was
+    /// moved aside (before #256 it was left local, untracked, with the photo recorded
+    /// archived). The offload refuses and puts the image back; the companion stays beside it.
+    #[test]
+    fn a_companion_written_after_the_move_keeps_the_photo_local() {
+        use crate::catalog::offload_hook::Step;
+        let (dir, state, master, _frame, raw, _jpg) = stacked("p2-companion");
+        backup_photo(&state, master).unwrap();
+        let pp3 = crate::companions::appended_path(&raw, "pp3");
+        let target = pp3.clone();
+        let _hook = at_step(Step::AfterMove, &raw, move || std::fs::write(&target, b"late pp3").unwrap());
+
+        let err = offload_photo(&state, master).unwrap_err();
+
+        assert!(err.contains("DSC1.ARW.pp3 was written while the photo was being offloaded"), "{err}");
+        assert_eq!(std::fs::read(&raw).unwrap(), b"raw-bytes", "the image is back under its name");
+        assert_eq!(std::fs::read(&pp3).unwrap(), b"late pp3");
+        assert!(!dir.join("nas/2026/08/DSC1.ARW.pp3").exists());
+        assert!(hidden_in(raw.parent().unwrap()).is_empty());
+        assert_eq!(with_catalog(&state, |c| c.photo_storage_status(master)).unwrap(), StorageStatus::BackedUp);
+    }
+
+    /// Both writes at once: the image is rewritten just before its move (so the moved file is
+    /// not what home holds) and a new file takes its name just after. Neither is lost: the
+    /// new file keeps the name, and the moved bytes are kept under the hidden name the
+    /// refusal gives.
+    #[test]
+    fn unconfirmed_bytes_whose_name_was_taken_are_kept_and_named() {
+        use crate::catalog::offload_hook::Step;
+        let (_dir, state, master, _frame, raw, _jpg) = stacked("p1-both");
+        backup_photo(&state, master).unwrap();
+        let (before, after) = (raw.clone(), raw.clone());
+        let mut steps = 0;
+        let _hook = crate::catalog::offload_hook::set(move |step, path| {
+            if path != before.as_path() {
+                return;
+            }
+            steps += 1;
+            match (steps, step) {
+                (1, Step::BeforeMove) => std::fs::write(&before, b"REWRITTEN").unwrap(),
+                (2, Step::AfterMove) => std::fs::write(&after, b"NEWEST").unwrap(),
+                _ => {}
+            }
+        });
+
+        let err = offload_photo(&state, master).unwrap_err();
+
+        let hidden = hidden_in(raw.parent().unwrap());
+        assert_eq!(hidden.len(), 1, "{hidden:?}");
+        assert!(err.contains(crate::catalog::LOCAL_CHANGED_REASON) && err.contains(&hidden[0]), "{err}");
+        assert_eq!(std::fs::read(&raw).unwrap(), b"NEWEST");
+        assert_eq!(std::fs::read(raw.parent().unwrap().join(&hidden[0])).unwrap(), b"REWRITTEN");
+    }
+
+    /// A crash between the move and the delete leaves the image under its hidden name. The
+    /// next run's plan puts it back before it looks for the photo's copies, so a restore
+    /// finds it at home (and leaves it), and nothing hidden is left.
+    #[test]
+    fn a_crashed_offloads_hidden_file_is_put_back_by_the_next_plan() {
+        if !cfg!(target_os = "linux") {
+            println!("SKIPPED: a_crashed_offloads_hidden_file_is_put_back_by_the_next_plan — needs /proc");
+            return;
+        }
+        let (_dir, state, master, _frame, raw, _jpg) = stacked("crashed-offload");
+        backup_photo(&state, master).unwrap();
+        let folder = raw.parent().unwrap();
+        let hidden = folder.join(format!(
+            ".DSC1.ARW.{}-{}-0",
+            crate::catalog::working_files::ASIDE_TAG,
+            crate::catalog::working_files::dead_pid()
+        ));
+        std::fs::rename(&raw, &hidden).unwrap();
+        crate::catalog::working_files::forget_swept(folder); // the next run
+
+        let report = restore_photo(&state, master).unwrap();
+
+        assert_eq!(std::fs::read(&raw).unwrap(), b"raw-bytes", "put back under its name");
+        assert!(hidden_in(folder).is_empty());
+        assert_eq!(report.restored, vec![master], "the frame is home, so only the master is named");
+    }
+
     // --- one storage operation per photo at a time (#254) ---------------------------------
 
     fn db_of(state: &AppState) -> PathBuf {

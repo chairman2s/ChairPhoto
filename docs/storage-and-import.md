@@ -500,18 +500,32 @@ Three rules govern carrying:
   local image must not strand the history beside it. Companions go home first, then the
   local ones are freed with the image, and `restore` brings them back.
 - **Offload deletes only what home holds byte for byte (#255).** Re-hashing the backup
-  proves home is intact, not that it holds what is here. Just before deleting, offload
-  re-hashes every local copy of the image against the verified backup hash, and every
-  companion against the hash the carry confirmed at home; it deletes exactly those
-  companions, never a fresh listing. A local JPEG or DNG rewritten in place after its
-  backup, a sidecar edited after the carry, or a companion that appeared after it refuses
-  the photo — nothing is deleted, and a queued offload is kept `failed` with the reason
-  ("changed since its backup — refusing to offload; the copy at home is the earlier
-  version"). The cost is one sequential read of each local copy, on a local disk, beside the
-  NAS read of the backup offload already made; size or mtime would be cheaper and are not
-  content checks (an in-place rewrite can keep the size, and `exiftool -P` keeps the mtime).
-  Back up does not replace a verified backup that is present, so such a photo stays local
-  until the owner decides how a changed original reaches home.
+  proves home is intact, not that it holds what is here. So offload checks each local file
+  **after moving it to a hidden name** in its folder (`.<name>.chairphoto-offload-<pid>-<n>`,
+  #256): companions first, then the image, each re-hashed there — the image against the
+  verified backup hash, a companion against the hash the carry confirmed at home — and
+  freed only with exactly the companions the carry confirmed, never a fresh listing. Then
+  it looks at every name it emptied once more, and only then deletes the hidden files. A
+  write through the photo's name either landed before the move (the moved file holds it and
+  its hash says so) or comes after it and makes a new file at that name (the last look finds
+  it); what is deleted is the hidden file, which no other writer knows by name, so nothing
+  written after its check is deleted. A local JPEG or DNG rewritten in place after its
+  backup, a sidecar edited after the carry, a companion that appeared after it, or any new
+  file at an emptied name refuses the photo: every moved file goes back under its name
+  (never replacing a file there — one that cannot go back because a new file took its name
+  is deleted only if it was confirmed identical to home, and otherwise kept under its hidden
+  name, which the refusal names), nothing is deleted, and a queued offload is kept `failed`
+  with the reason ("changed since its backup — refusing to offload; the copy at home is the
+  earlier version"). A crash between the move and the delete leaves the file under its
+  hidden name; the next backup, offload or restore plan that looks in that folder (once per
+  folder per run, off the catalog lock) puts every such file whose process is no longer
+  running back under its name, again never replacing one — a file left by a crash is never
+  deleted, since it may hold the only copy of a local change. The cost is one sequential
+  read of each local copy, on a local disk, beside the NAS read of the backup offload
+  already made; size or mtime would be cheaper and are not content checks (an in-place
+  rewrite can keep the size, and `exiftool -P` keeps the mtime). Back up does not replace a
+  verified backup that is present, so such a photo stays local until the owner decides how
+  a changed original reaches home.
 - **Divergence refuses; it never resolves.** A companion present on both sides with
   different contents is two unreconciled edits. Backup leaves it untouched and does not
   claim it as carried; offload refuses outright. Choosing a side would silently destroy

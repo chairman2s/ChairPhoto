@@ -23,7 +23,13 @@ const KINDS: &[&str] = &["backup", "offload", "restore"];
 pub struct DrainSummary {
     pub ran: usize,
     pub failed: usize,
+    /// Stack ops that finished only some members; the rest were requeued per frame.
     pub partial: usize,
+    /// Frames of a partial op put back in the queue as `pending` because the drain was
+    /// superseded before reaching them — retried by the next drain.
+    pub frames_requeued: usize,
+    /// Frames of a partial op recorded `failed`, with their own reason.
+    pub frames_failed: usize,
     /// True when nothing was attempted because no backup volume is reachable.
     pub skipped_offline: bool,
     /// True when the drain stopped before its last op because it stopped being the owner —
@@ -114,6 +120,10 @@ impl Catalog {
         Ok(())
     }
 
+    /// Replace a stack op that finished only some members with one row per member it left:
+    /// `failed` with its reason when the member itself refused, `pending` when it was left
+    /// only because the drain was superseded ([`super::SkippedPhoto::superseded`]) — that is
+    /// unfinished work, and only `pending` rows are retried automatically.
     pub fn replace_operation_with_skipped(
         &self,
         operation_id: i64,
@@ -122,12 +132,13 @@ impl Catalog {
     ) -> Result<()> {
         let tx = self.conn.unchecked_transaction()?;
         for item in skipped {
+            let (status, error) = if item.superseded() { ("pending", "") } else { ("failed", item.reason.as_str()) };
             tx.execute(
                 "INSERT INTO pending_operations(kind, photo_id, status, error, created_at)
-                 VALUES(?1, ?2, 'failed', ?3, ?4)
+                 VALUES(?1, ?2, ?3, ?4, ?5)
                  ON CONFLICT(kind, photo_id) DO UPDATE
-                 SET status = 'failed', error = excluded.error",
-                params![kind, item.photo_id, item.reason, now()],
+                 SET status = excluded.status, error = excluded.error",
+                params![kind, item.photo_id, status, error, now()],
             )?;
         }
         tx.execute("DELETE FROM pending_operations WHERE id = ?1", params![operation_id])?;

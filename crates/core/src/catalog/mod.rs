@@ -53,8 +53,10 @@ pub use lifecycle::{
     verify_and_delete_locals_abortable, BackupCandidates, BackupPlan, BackupReport, CarriedCompanion,
     CompanionCarry, CopyOutcome, FreedPhoto, OffloadCandidates, OffloadCarry, OffloadEligibility, OffloadPlan,
     OffloadReport, PhotoBackup, PhotoOffload, PhotoRestore, RestoreCandidates, RestorePlan, RestoreReport,
-    SkippedPhoto,
+    SkippedPhoto, SUPERSEDED_REASON,
 };
+#[cfg(test)]
+pub(crate) use lifecycle::verify_and_delete_locals_until;
 pub use merge::{MergeOutcome, MergeSummary, IMPORTED_EDIT_VERSION};
 pub use models::{
     Album, BurstInput, CoverPin, ExportKeywords, HistoryStep, ImportBatch, IptcFields, LocationRole, MetadataEntry,

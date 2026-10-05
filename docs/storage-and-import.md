@@ -686,8 +686,13 @@ recent work on fast local storage can find yesterday's frame on the NAS, and tha
 behaviour, not a bug (#87).
 
 When reconcile completes only part of a stack, it replaces the completed master's queue
-row with one failed row per skipped frame. Each child row keeps the refusal reason and is
-retried independently, so the completed master is not destructively replayed.
+row with one row per skipped frame, retried independently, so the completed master is not
+destructively replayed. A frame that refused on its own account is `failed` with its reason.
+A frame left only because the drain was superseded (a catalog switch or a newer drain) is
+`pending` again — an interruption is not a failure, and only pending rows are counted by the
+reconcile check and the queue chip, so a failed row would never be retried by itself. For
+the same reason an op the trip stopped before it did anything (an offload before its named
+photo) keeps its pending row untouched.
 
 Ownership is the service layer's (`crates/core/src/app/storage.rs`), not a lock held across
 the work. A verb the user started on ids read from one catalog runs its plan, its file IO and

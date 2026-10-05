@@ -45,7 +45,7 @@ impl CatalogAccess for Catalog {
 /// catalog switch or a newer drain tripped the reconcile generation). The member is reported
 /// skipped with this reason, so a drain requeues it rather than replaying the members that
 /// finished.
-const SUPERSEDED: &str = "storage operation superseded or catalog switched";
+const SUPERSEDED: &str = crate::catalog::SUPERSEDED_REASON;
 
 /// Whether the claim this step runs under (if any) has been taken over. Unclaimed steps — a
 /// verb the user pressed, bound to its catalog by [`bound`] — run to the end.
@@ -389,6 +389,85 @@ mod stack_tests {
         assert!(raw.exists() && jpg.exists(), "nothing was freed");
     }
 
+
+    /// Review P7 (#253 Medium-1): a switch that trips a drain mid-op is an interruption, not
+    /// a failure. The stack backup's frame it never reached is requeued *pending*, the
+    /// offload it tripped before its named photo is left pending and untouched — so
+    /// `reconcile_due` still counts that work, and the next drain finishes it. Nothing is
+    /// recorded `failed`.
+    #[test]
+    fn a_drain_tripped_mid_op_leaves_its_unfinished_work_pending() {
+        let (dir, state, master, frame, _raw, _jpg) = stacked("tripped-drain");
+        let other = dir.join("photos/2026/08/O.ARW");
+        std::fs::write(&other, b"offload-me").unwrap();
+        let o = with_catalog(&state, |c| {
+            let o = c.upsert_photo(&other, None, 1, 10)?.id;
+            let nas = single_volume_of_kind(c, VolumeKind::Backup, "backup")?;
+            c.backup_photo(o, nas)?;
+            c.enqueue_operation("backup", master)?;
+            c.enqueue_operation("offload", o)?;
+            Ok(o)
+        })
+        .unwrap();
+        assert_eq!(reconcile_due(&state).unwrap().0, 2);
+
+        // Drain 1: tripped after the backup op's ownership check — the named master is the
+        // op in flight and finishes; the frame is never reached; the offload op is not run.
+        let claim = claim_reconcile(&state).unwrap();
+        let s1 = claim.drain_with(&state, &mut |i| if i == 0 { claim.abort.store(true, Ordering::SeqCst) }).unwrap();
+        assert_eq!((s1.partial, s1.frames_requeued, s1.frames_failed, s1.aborted), (1, 1, 0, true), "{s1:?}");
+        // Drain 2: tripped before its first op, the offload — before its named photo.
+        let claim2 = claim_reconcile(&state).unwrap();
+        let s2 = claim2.drain_with(&state, &mut |_| claim2.abort.store(true, Ordering::SeqCst)).unwrap();
+        assert!(s2.aborted && s2.failed == 0, "{s2:?}");
+        assert!(other.exists(), "the tripped offload freed nothing");
+
+        let ops = with_catalog(&state, |c| c.list_pending_operations()).unwrap();
+        assert!(ops.iter().all(|o| o.status == "pending" && o.error.is_empty()), "{ops:?}");
+        assert_eq!(reconcile_due(&state).unwrap().0, 2, "the unfinished frame and offload still count");
+
+        let s3 = reconcile_now(&state).unwrap();
+        assert_eq!((s3.ran, s3.failed, s3.partial), (2, 0, 0), "{s3:?}");
+        assert!(with_catalog(&state, |c| c.has_verified_backup(frame)).unwrap(), "the frame was backed up");
+        assert!(!other.exists(), "the offload ran");
+        assert_eq!(reconcile_due(&state).unwrap().0, 0);
+        let _ = o;
+    }
+
+    /// The reviewer's coverage gap: an offload tripped mid-stack — the named photo is freed
+    /// (and must be recorded, its local row dropped), the trip lands before the frame. The
+    /// frame stays local, is reported superseded, and its queue row is pending, not failed.
+    #[test]
+    fn an_offload_tripped_after_its_named_photo_requeues_the_frame() {
+        let (_dir, state, master, frame, raw, jpg) = stacked("tripped-offload-mid");
+        backup_photo(&state, master).unwrap();
+        let op = with_catalog(&state, |c| c.enqueue_operation("offload", master)).unwrap();
+        let plan = with_catalog(&state, |c| c.plan_offload(master)).unwrap();
+        // Trips exactly once the named photo's local file is gone.
+        let carry = crate::catalog::verify_and_delete_locals_until(&plan, &|| !raw.exists()).unwrap();
+        let report = with_catalog(&state, |c| c.commit_offload_carry(carry)).unwrap();
+        assert_eq!(report.freed, vec![master]);
+        assert_eq!(report.skipped.len(), 1);
+        assert!(report.skipped[0].photo_id == frame && report.skipped[0].superseded(), "{:?}", report.skipped);
+        assert!(!raw.exists() && jpg.exists());
+        assert_eq!(
+            with_catalog(&state, |c| c.photo_storage_status(master)).unwrap(),
+            crate::catalog::StorageStatus::Archived,
+            "the freed master's local row was dropped"
+        );
+
+        with_catalog(&state, |c| c.replace_operation_with_skipped(op, "offload", &report.skipped)).unwrap();
+        let ops = with_catalog(&state, |c| c.list_pending_operations()).unwrap();
+        assert_eq!(ops.len(), 1);
+        assert_eq!((ops[0].kind.as_str(), ops[0].photo_id, ops[0].status.as_str()), ("offload", frame, "pending"));
+        assert_eq!(reconcile_due(&state).unwrap().0, 1);
+        // The frame was backed up with its master, so the retry frees it.
+        let s = reconcile_now(&state).unwrap();
+        assert_eq!((s.ran, s.failed), (1, 0), "{s:?}");
+        assert!(!jpg.exists());
+        assert_eq!(reconcile_due(&state).unwrap().0, 0);
+    }
+
     /// A claimed backup tripped mid-stack: the named photo — the op in flight — finishes,
     /// and no further frame is started; the frame is reported with why, which is what the
     /// drain requeues.
@@ -653,8 +732,8 @@ impl ReconcileClaim {
             }
             before_op(i);
             // The drain needs only what each op left undone: a stack op that completed for
-            // some members is replaced by one failed row per skipped frame, so a retry
-            // does not replay the members that already finished.
+            // some members is replaced by one row per skipped frame, so a retry does not
+            // replay the members that already finished.
             let abort = Some(self.abort.as_ref());
             let result = match op.kind.as_str() {
                 "backup" => backup_in(&cat, op.photo_id, backup_id, abort).map(|r| r.skipped),
@@ -671,8 +750,20 @@ impl ReconcileClaim {
                     summary.ran += 1;
                 }
                 Ok(skipped) => {
+                    // A frame left because the claim was tripped goes back as pending; one
+                    // that refused on its own account is failed (`replace_operation_with_skipped`).
                     cat.with(|c| c.replace_operation_with_skipped(op.id, &op.kind, &skipped))?;
+                    let requeued = skipped.iter().filter(|s| s.superseded()).count();
+                    summary.frames_requeued += requeued;
+                    summary.frames_failed += skipped.len() - requeued;
                     summary.partial += 1;
+                }
+                // Tripped mid-op (an offload stopped before its named photo, or any failure
+                // while the claim was being taken over): an interruption, not this op's
+                // failure. Its row stays pending, untouched, for the next drain.
+                Err(_) if self.aborted() => {
+                    summary.aborted = true;
+                    break;
                 }
                 Err(e) => {
                     cat.with(|c| c.set_operation_failed(op.id, &e))?;

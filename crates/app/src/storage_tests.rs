@@ -525,7 +525,7 @@ fn window_focus_backs_up_what_waits_for_a_reachable_nas(cx: &mut TestAppContext)
     app.state.catalog.lock().unwrap().as_ref().unwrap().enqueue_operation("backup", id).unwrap();
     refocus_main_window(&app, cx);
     work(cx);
-    assert_eq!(status(&app, cx), "Backed up 1");
+    assert_eq!(status(&app, cx), "Storage queue: 1 done");
     assert!(dir.0.join("nas/2026/a.jpg").exists(), "the copy is on the NAS");
     app.wired.shell.read_with(cx, |s, _| assert_eq!(s.counts.pending, 0, "the queue count was re-read"));
 }
@@ -542,7 +542,7 @@ fn window_focus_leaves_the_queue_while_the_nas_is_away(cx: &mut TestAppContext) 
     app.state.catalog.lock().unwrap().as_ref().unwrap().enqueue_operation("backup", id).unwrap();
     refocus_main_window(&app, cx);
     work(cx);
-    assert_ne!(status(&app, cx), "Backed up 1");
+    assert_ne!(status(&app, cx), "Storage queue: 1 done");
     let pending = app.state.catalog.lock().unwrap().as_ref().unwrap().list_pending_operations().unwrap();
     assert_eq!(pending.len(), 1);
 }

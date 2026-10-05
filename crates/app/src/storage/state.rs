@@ -467,16 +467,7 @@ impl StorageState {
                 match result {
                     Ok(Ok((summary, offloaded))) => {
                         if !summary.skipped_offline && summary.ran + summary.failed + summary.partial > 0 {
-                            let failed =
-                                if summary.failed > 0 { format!(", {} failed", summary.failed) } else { String::new() };
-                            // A stack op that finished only some members: the rest stay
-                            // queued, one row per frame, with why (#82).
-                            let partial = if summary.partial > 0 {
-                                format!(", {} part-done (frames left queued)", summary.partial)
-                            } else {
-                                String::new()
-                            };
-                            s.status(format!("Backed up {}{failed}{partial}", summary.ran), cx);
+                            s.status(drain_status(&summary), cx);
                         }
                         if offloaded > 0 {
                             s.status(format!("Offloaded {offloaded} older photo(s) to the NAS"), cx);
@@ -687,6 +678,28 @@ pub fn rescan_line(r: &ScanResult) -> String {
     line
 }
 
+/// The status line after a reconcile drain. Neutral about the verb, because the queue holds
+/// offloads and restores as well as backups. A part-done stack op says what became of the
+/// frames it left: queued to retry (pending — the drain was superseded before them) or
+/// failed (they refused on their own account, and wait in the queue with the reason).
+pub fn drain_status(s: &chairphoto_core::catalog::DrainSummary) -> String {
+    let frames = |n: usize| if n == 1 { "1 frame".to_string() } else { format!("{n} frames") };
+    let mut line = format!("Storage queue: {} done", s.ran);
+    if s.failed > 0 {
+        line += &format!(", {} failed", s.failed);
+    }
+    if s.partial > 0 {
+        line += &format!(", {} part-done", s.partial);
+        if s.frames_requeued > 0 {
+            line += &format!(" ({} queued to retry)", frames(s.frames_requeued));
+        }
+        if s.frames_failed > 0 {
+            line += &format!(" ({} failed)", frames(s.frames_failed));
+        }
+    }
+    line
+}
+
 /// BundleImportDialog's result line.
 pub fn bundle_import_line(r: &BundleImportResult) -> String {
     let plural = |n: usize, one: &str, many: &str| if n == 1 { one.to_string() } else { many.to_string() };
@@ -736,6 +749,21 @@ mod tests {
         assert_eq!(rescan_line(&r), "Scanned 5, imported 4 (3 new), 1 errors");
         let clean = ScanResult { scanned: 2, imported: 2, created: 2, errors: 0, skipped: 0 };
         assert_eq!(card_import_line(&clean), "Imported 2 new of 2 on card");
+    }
+
+    /// The drain line names no verb the queue may not have run, and says "queued" only for
+    /// frames that really are pending again.
+    #[test]
+    fn the_drain_line_says_what_is_queued_and_what_failed() {
+        use chairphoto_core::catalog::DrainSummary;
+        assert_eq!(drain_status(&DrainSummary { ran: 1, ..Default::default() }), "Storage queue: 1 done");
+        let s = DrainSummary { ran: 2, failed: 1, partial: 2, frames_requeued: 3, frames_failed: 1, ..Default::default() };
+        assert_eq!(
+            drain_status(&s),
+            "Storage queue: 2 done, 1 failed, 2 part-done (3 frames queued to retry) (1 frame failed)"
+        );
+        let failed_only = DrainSummary { partial: 1, frames_failed: 2, ..Default::default() };
+        assert_eq!(drain_status(&failed_only), "Storage queue: 0 done, 1 part-done (2 frames failed)");
     }
 
     /// #185: the bundle line says what an import filled in on photos already in the catalog,

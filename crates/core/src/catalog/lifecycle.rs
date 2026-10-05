@@ -28,9 +28,21 @@ pub struct SkippedPhoto {
     pub reason: String,
 }
 
+/// Why a member was left because its run stopped being the owner (a catalog switch or a
+/// newer drain tripped its claim) — an interruption, not a failure of that member.
+pub const SUPERSEDED_REASON: &str = "storage operation superseded or catalog switched";
+
 impl SkippedPhoto {
     fn new(photo_id: i64, reason: impl Into<String>) -> Self {
         Self { photo_id, reason: reason.into() }
+    }
+
+    /// Whether this member was left only because the run was superseded. Such a member is
+    /// requeued as pending work, never recorded as failed: nothing about it failed, and a
+    /// failed row is one the reconcile check (`reconcile_due`) and the queue chip do not
+    /// count, so the work would never be retried by itself.
+    pub fn superseded(&self) -> bool {
+        self.reason.ends_with(SUPERSEDED_REASON)
     }
 }
 
@@ -1190,25 +1202,30 @@ pub fn copy_and_verify(src: &Path, dst: &Path, expected: Option<&str>) -> Result
 /// tile. A **frame** that refuses is recorded and left local instead: aborting would not
 /// un-free what is already gone, and it would hide which frame objected.
 pub fn verify_and_delete_locals(plan: &OffloadPlan) -> Result<OffloadCarry> {
-    verify_and_delete_locals_inner(plan, None)
+    verify_and_delete_locals_until(plan, &|| false)
 }
 
+/// [`verify_and_delete_locals`] under a claim: `abort` is re-checked before every member's
+/// delete (and between its files). A tripped claim before the named photo frees nothing and
+/// fails; a frame it reaches tripped is skipped with [`SUPERSEDED_REASON`].
 pub fn verify_and_delete_locals_abortable(plan: &OffloadPlan, abort: &AtomicBool) -> Result<OffloadCarry> {
-    verify_and_delete_locals_inner(plan, Some(abort))
+    verify_and_delete_locals_until(plan, &|| abort.load(Ordering::Relaxed))
 }
 
-fn verify_and_delete_locals_inner(plan: &OffloadPlan, abort: Option<&AtomicBool>) -> Result<OffloadCarry> {
+/// The body of both, with the ownership check as a closure — so a test can trip it at an
+/// exact point (after the named photo is freed, before a frame).
+pub(crate) fn verify_and_delete_locals_until(plan: &OffloadPlan, stopped: &dyn Fn() -> bool) -> Result<OffloadCarry> {
     let mut out = OffloadCarry {
         freed: Vec::new(),
         skipped: plan.skipped.clone(),
         total: plan.total,
         sidecar_backups_left: 0,
     };
-    let (freed, left_behind) = free_local_copies(&plan.named, abort)?;
+    let (freed, left_behind) = free_local_copies(&plan.named, stopped)?;
     out.freed.push(freed);
     out.sidecar_backups_left += left_behind;
     for frame in &plan.frames {
-        match free_local_copies(frame, abort) {
+        match free_local_copies(frame, stopped) {
             Ok((freed, left_behind)) => {
                 out.freed.push(freed);
                 out.sidecar_backups_left += left_behind;
@@ -1226,9 +1243,9 @@ fn verify_and_delete_locals_inner(plan: &OffloadPlan, abort: Option<&AtomicBool>
 /// Returns what is now confirmed at home — for the caller to record *before*
 /// `commit_offload`, since that drops the local location rows and the companion rows
 /// cascade with them — and how many sidecar backups were left beside the freed files.
-fn free_local_copies(photo: &PhotoOffload, abort: Option<&AtomicBool>) -> Result<(FreedPhoto, usize)> {
-    if abort.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
-        return Err(CatalogError::Validation("storage operation superseded or catalog switched".into()));
+fn free_local_copies(photo: &PhotoOffload, stopped: &dyn Fn() -> bool) -> Result<(FreedPhoto, usize)> {
+    if stopped() {
+        return Err(CatalogError::Validation(SUPERSEDED_REASON.into()));
     }
     let current = sha256_file(&photo.backup_abs)?;
     if current != photo.expected_hash {
@@ -1256,8 +1273,8 @@ fn free_local_copies(photo: &PhotoOffload, abort: Option<&AtomicBool>) -> Result
 
     let mut sidecar_backups_left = 0usize;
     for file in &photo.local_files {
-        if abort.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
-            return Err(CatalogError::Validation("storage operation superseded or catalog switched".into()));
+        if stopped() {
+            return Err(CatalogError::Validation(SUPERSEDED_REASON.into()));
         }
         // Companions first: if this fails part-way, the image is still local, so the
         // photo is never left with its edit state gone and its bytes freed.

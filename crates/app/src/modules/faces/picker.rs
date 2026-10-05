@@ -4,8 +4,8 @@
 //! matches no tag. ↑/↓ move the highlight, Enter picks it (or creates), Esc cancels.
 //!
 //! The keys are taken by a keystroke **interceptor** while the field has focus, before any
-//! binding: otherwise Esc would also close the loupe (its `CloseLoupe`) and Enter would toggle
-//! it, since the field sits inside the loupe's key context.
+//! binding: otherwise Esc would also close the loupe (`CloseLoupe`) and Enter would too
+//! (`LoupeConfirm`), since the field sits inside the loupe's key context.
 
 use super::logic::{picker_rows, step_highlight, PickerRow};
 use crate::shell::style::Colors;

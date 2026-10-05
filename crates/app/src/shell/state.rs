@@ -377,6 +377,34 @@ pub struct LoupeProofPreview {
     pub cell: crate::loupe::edit_renders::RenderState,
 }
 
+/// Where to send a key the pop-out loupe's own view would otherwise step the library
+/// selection with, while the Darkroom's proof sheet is up (#250 follow-up): the sheet lives in
+/// the Darkroom's own window, a different one from the pop-out's, and
+/// [`crate::loupe::proof_sheet::ProofSheet`]'s focus/row navigation moves that window's own
+/// `FocusHandle` state, which only means anything there — so the pop-out re-dispatches the
+/// matching `Proof*` action into `window` (`AnyWindowHandle::update`-style,
+/// `AppContext::update_window`) rather than calling the sheet's private methods with its own,
+/// wrong window. Set once when the sheet opens ([`crate::loupe::proof_sheet::ProofSheet::new`]);
+/// cleared on adopt, decline, or the sheet's own release — never by a hover/focus change, which
+/// would otherwise flicker it on every cell the pointer leaves with nothing else hovered or
+/// focused (`ProofSheet::clear_preview`'s much shorter-lived job).
+///
+/// `sheet` is a [`gpui_kit::WeakEntity`], not a strong one (#250 second review): `ProofSheet`
+/// itself holds an `Entity<ShellState>`, so a strong handle here closed a reference cycle —
+/// any path that drops the sheet without going through `ProofSheet::end` (`DarkroomView::
+/// open_duel` replacing `rails.overlay` without closing a live proof sheet first, confirmed;
+/// a window torn down some other way) leaked it, left this route pointing at an orphan, and
+/// regressed `ProofSheet`'s own `on_release` cleanup (its preview, and this route, both meant
+/// to clear when the entity is dropped — unreachable while the drop itself never happens).
+/// Callers upgrade before use ([`crate::loupe::view::LoupeView::proof_sheet_route`] filters out
+/// a handle whose sheet no longer upgrades) and `.update(..)` through `Result::ok()`.
+#[cfg(feature = "edit")]
+#[derive(Clone)]
+pub struct LoupeProofSheetHandle {
+    pub window: gpui_kit::AnyWindowHandle,
+    pub sheet: gpui_kit::WeakEntity<crate::loupe::proof_sheet::ProofSheet>,
+}
+
 /// Whether two previews would render, label and placeholder the same thing: used to skip a
 /// redundant `ShellState` notify (review NIT) when the proof sheet republishes on every render
 /// (`ProofSheet::sync_preview`) but nothing actually changed. Ignores `source.encode`'s
@@ -465,6 +493,10 @@ pub struct ShellState {
     /// The proof sheet's previewed candidate on the pop-out loupe, while one is up (#250).
     #[cfg(feature = "edit")]
     loupe_proof_preview: Option<LoupeProofPreview>,
+    /// Where the pop-out re-routes its own arrow/Enter/Esc keys while a proof sheet is up
+    /// (#250 follow-up, [`LoupeProofSheetHandle`]).
+    #[cfg(feature = "edit")]
+    loupe_proof_sheet: Option<LoupeProofSheetHandle>,
     /// Compare's presentation for the next open (`panel.compareMode`; the root view seeds it
     /// from the per-machine preferences and stores changes back).
     pub compare_mode: CompareMode,
@@ -542,6 +574,8 @@ impl ShellState {
             loupe_print: None,
             #[cfg(feature = "edit")]
             loupe_proof_preview: None,
+            #[cfg(feature = "edit")]
+            loupe_proof_sheet: None,
             compare_mode: CompareMode::Duel,
             last_mark: None,
             catalog_generation: 0,
@@ -859,6 +893,21 @@ impl ShellState {
         }
         self.loupe_proof_preview = preview;
         cx.notify();
+    }
+
+    /// Where the pop-out's own arrow/Enter/Esc keys go instead, while a proof sheet is up
+    /// (#250 follow-up).
+    #[cfg(feature = "edit")]
+    pub fn loupe_proof_sheet(&self) -> Option<&LoupeProofSheetHandle> {
+        self.loupe_proof_sheet.as_ref()
+    }
+
+    /// Set by [`crate::loupe::proof_sheet::ProofSheet::new`] when it opens, cleared by its own
+    /// end (adopt, decline) or release — never by a hover/focus change (`LoupeProofSheetHandle`'s
+    /// own docs). Nothing renders from this directly, so no notify.
+    #[cfg(feature = "edit")]
+    pub fn set_loupe_proof_sheet(&mut self, handle: Option<LoupeProofSheetHandle>, _cx: &mut Context<Self>) {
+        self.loupe_proof_sheet = handle;
     }
 
     /// Open Compare on the selection (two or more; C in the grid, the bench's Compare). The
@@ -1372,6 +1421,7 @@ impl ShellState {
                 {
                     self.loupe_print = None;
                     self.loupe_proof_preview = None;
+                    self.loupe_proof_sheet = None;
                 }
                 self.catalog_generation += 1;
                 self.surface = Surface::Library;

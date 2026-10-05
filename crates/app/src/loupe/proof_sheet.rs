@@ -26,7 +26,12 @@
 //! whatever is merely hovered, until the pointer itself actually moves again (#250 follow-up,
 //! "last input wins"): [`Self::keyboard_wins`] flips on in [`Self::cycle`] and
 //! [`Self::move_row`], and off in [`Self::set_hovered`], which runs on every real hover change
-//! regardless of its direction. Neither clears the preview to "the photo as it is" —
+//! regardless of its direction. It only has to cover the one frame between the key press and
+//! GPUI's own hover-end: a focused, hoverable element's default `on_hover` already ends a
+//! hover after any key press (deferred to the next paint — gpui-pre 0.3.7's
+//! `HoverListenerMode::InputModalityAware`, `elements/div.rs`), real windowed app included,
+//! not only this crate's own headless tests (#250 review). Neither clears the preview to "the
+//! photo as it is" —
 //! [`Self::sync_preview`], run from any click on the backdrop or the panel too (not only
 //! Tab/hover), since the backdrop's own `track_focus` moves focus there on the matching mouse
 //! down, off a focused cell, before any of this entity's own listeners do; and from every
@@ -42,7 +47,7 @@ use crate::keymap::contexts;
 use crate::loupe::duel::{variant_image, VariantSource};
 use crate::loupe::edit_renders::EditRenders;
 use crate::loupe::{ProofClose, ProofDown, ProofNext, ProofPrevious, ProofUp};
-use crate::shell::state::{LoupeProofPreview, ShellState};
+use crate::shell::state::{LoupeProofPreview, LoupeProofSheetHandle, ShellState};
 use crate::shell::style::Colors;
 use chairphoto_core::image_pool::EditJob;
 use chairphoto_model::darkroom::spreads::{ProofCandidate, ProofGroup};
@@ -150,8 +155,11 @@ pub struct ProofSheet {
     hovered: Option<usize>,
     /// An arrow key or Tab/Shift+Tab moved focus more recently than the pointer did: outranks
     /// `hovered` in `Self::sync_preview` until `Self::set_hovered` runs again — a real hover
-    /// change, in either direction (#250 follow-up, "last input wins"). Sticks across renders;
-    /// only a fresh hover event clears it, not time or a click.
+    /// change, in either direction (#250 follow-up, "last input wins"). Only a fresh hover
+    /// event clears it in this struct's own terms, not time or a click — but in practice that
+    /// event is never far off: GPUI's own default `on_hover` already ends a focused cell's
+    /// hover one paint after any key press, real app included (the module docs' own note), so
+    /// this field's real job is bridging that single frame, not holding the line indefinitely.
     keyboard_wins: bool,
     /// The cells' own flex-wrap row, measured after layout the way the Darkroom's own
     /// `stage_bounds` is: `Self::columns` turns its width into the column count `Self::move_row`
@@ -202,10 +210,20 @@ impl ProofSheet {
             closed: false,
             _observers,
         };
+        // The pop-out's own window, while it has focus, routes its arrow/Enter/Esc keys here
+        // instead of stepping the library selection (#250 follow-up) — it needs this window
+        // (not its own) to move this sheet's real focus (`LoupeProofSheetHandle`'s own docs).
+        let handle = LoupeProofSheetHandle { window: window.window_handle(), sheet: cx.entity().downgrade() };
+        this.shell.update(cx, |s, cx| s.set_loupe_proof_sheet(Some(handle), cx));
         // Whatever ends this entity's life without going through `close`/`adopt` — the
         // overlay dropped from under it, the window it was mounted in closing — still takes
-        // the preview down (#250).
-        cx.on_release(|this: &mut Self, cx| this.clear_preview(cx)).detach();
+        // the preview down (#250), and this sheet's own routing handle with it (#250
+        // follow-up).
+        cx.on_release(|this: &mut Self, cx| {
+            this.clear_preview(cx);
+            this.clear_sheet_handle(cx);
+        })
+        .detach();
         this
     }
 
@@ -315,6 +333,19 @@ impl ProofSheet {
         self.closed = true;
         self.renders.update(cx, |r, cx| r.want(&[], cx));
         self.clear_preview(cx);
+        self.clear_sheet_handle(cx);
+    }
+
+    /// Takes down this sheet's own pop-out routing handle (#250 follow-up), but only if it is
+    /// still this sheet's own — the same token guard as [`Self::clear_preview`], for the same
+    /// reason (#250 review).
+    fn clear_sheet_handle(&mut self, cx: &mut App) {
+        let token = self.token;
+        self.shell.update(cx, |s, cx| {
+            if s.loupe_proof_sheet().is_some_and(|h| h.sheet.entity_id() == token) {
+                s.set_loupe_proof_sheet(None, cx);
+            }
+        });
     }
 
     /// The pop-out's preview: the hovered cell, else the focused one, else none (the photo as

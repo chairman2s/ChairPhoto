@@ -26,6 +26,13 @@ pub mod contexts {
     pub const STACK_DIALOG: &str = "StackProposals";
     /// The inline loupe over the grid, and the pop-out loupe window.
     pub const LOUPE: &str = "Loupe";
+    /// The pop-out loupe window, while a Darkroom proof sheet is up there (#250 second
+    /// review): replaces [`LOUPE`] on the same root div for as long as a sheet is dealt, so
+    /// ←/→/↑/↓/Enter/Esc reach it (real row moves for ↑/↓, not `LOUPE`'s own ⇄ step/extend
+    /// conflation) and `LOUPE`'s own keys — Shift+arrows, Ctrl+A, C included — are
+    /// unreachable meanwhile, the same way the Darkroom's own `PROOF_SHEET` already outranks
+    /// `DARKROOM` while the sheet has focus there.
+    pub const POPOUT_PROOF_SHEET: &str = "PopoutProofSheet";
     /// A module's card in the pop-out loupe, while it shows a photo full-size (#110).
     pub const LOUPE_CARD: &str = "LoupeCard";
     /// Compare (duel/grid modes).

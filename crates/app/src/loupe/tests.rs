@@ -1305,6 +1305,49 @@ mod overlays {
         assert_eq!(previewed(cx), Some(b_candidate), "A's release did not clear B's preview");
     }
 
+    /// A sole sheet's own window closing (#250 second review, F1) must still release the
+    /// entity and clear both its preview and its pop-out routing handle
+    /// (`ShellState::loupe_proof_sheet`). `LoupeProofSheetHandle.sheet` is a `WeakEntity`, not
+    /// a strong one: before that fix, the route held the sheet alive — a reference cycle,
+    /// since `ProofSheet` itself holds an `Entity<ShellState>` — so `on_release` never ran
+    /// for a sole sheet whose only other owner was the window being closed here, and both the
+    /// preview and the route leaked past it.
+    #[gpui_kit::test]
+    fn a_sole_sheets_window_closing_releases_it_and_clears_its_route(cx: &mut TestAppContext) {
+        let (app, _pool, _dir, ids) = app_with(1, "proof-route-release", cx);
+        let images = app.wired.images.clone();
+        let shell = app.wired.shell.clone();
+        let candidates = proof_spread(&VersionEdit::default(), &VersionEdit::default(), &[], None);
+        let (handle, sheet) = cx
+            .update(|cx| {
+                let shell = shell.clone();
+                let source = VariantSource::new(ids[0], 0, SourceToken::Preview);
+                gpui_kit::open_window(Default::default(), cx, |window, cx| {
+                    cx.new(|cx| ProofSheet::new(&images, shell, source, candidates, window, cx))
+                })
+            })
+            .unwrap();
+        // Only the window's own root-view reference keeps it alive from here, as the
+        // Darkroom's own `rails.overlay` would be the only one in the app
+        // (`releasing_a_sheet_clears_only_its_own_preview`'s own comment).
+        let weak = sheet.downgrade();
+        drop(sheet);
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            window.hover(("proof-cell", 1u64), cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        assert!(shell.read_with(cx, |s, _| s.loupe_proof_preview().is_some()), "previewing");
+        assert!(shell.read_with(cx, |s, _| s.loupe_proof_sheet().is_some()), "routed");
+
+        cx.update_window(handle, |_, window, _| window.remove_window()).unwrap();
+        cx.run_until_parked();
+        assert!(weak.upgrade().is_none(), "the sheet is actually released, not held alive by its own route");
+        assert!(shell.read_with(cx, |s, _| s.loupe_proof_preview().is_none()), "its preview is cleared");
+        assert!(shell.read_with(cx, |s, _| s.loupe_proof_sheet().is_none()), "its routing handle is cleared too");
+    }
+
     /// A sheet's own `renders` observer calling `sync_preview` with nothing of its own hovered
     /// or focused — its own 320 px render landing, say — must not clear another live sheet's
     /// preview, the same per-sheet token `clear_preview` already used (#250 review, probe
@@ -1515,6 +1558,17 @@ mod overlays {
         .unwrap();
         press("down", cx); // from the backdrop: the first cell
         let cols = sheet.read_with(cx, |s, _| s.columns());
+        // Checked against the cells' own rendered positions (review mutation B: `columns()`
+        // hard-coded to 1 passed this test before, since its oracle below only re-reads the
+        // same value under test) — the first row's actual width, not `columns()`'s opinion of
+        // it.
+        let actual_cols = cx
+            .update_window(handle, |_, window, _| {
+                let ys: Vec<f32> = (0..n).map(|i| f32::from(window.find(("proof-cell", i as u64)).bounds().origin.y)).collect();
+                ys.iter().filter(|y| (**y - ys[0]).abs() < 0.5).count()
+            })
+            .unwrap();
+        assert_eq!(cols, actual_cols, "columns() must match how many cells actually rendered on the first row");
         assert!(cols < n, "this fixture's {n} cells must wrap past one row at the narrowed window: {cols} columns");
         assert_eq!(focused(cx), Some(0));
         assert_eq!(preview(cx), Some(candidates[0].clone()));
@@ -1535,10 +1589,16 @@ mod overlays {
     /// arrow navigation's own preview, since hover always won before. An arrow press must
     /// outrank the still-hovered cell, repeatedly, until the pointer itself actually moves —
     /// only then does hover take the preview back. Checked synchronously, right after each
-    /// key — not after `run_until_parked`, which (in this test harness only, not the real
-    /// windowed app) lets GPUI's own deferred hover re-evaluation settle on `None` for a
-    /// pointer this test never actually moves, which would quietly agree with the focused
-    /// cell either way and hide a broken precedence.
+    /// key — not after `run_until_parked`, which also lets this settle to the right answer
+    /// under a *broken* `keyboard_wins`: GPUI's own on-hover default
+    /// (`HoverListenerMode::InputModalityAware`) ends a hover after any key press too, real
+    /// app included, deferred to the next paint (gpui-pre 0.3.7 `elements/div.rs`
+    /// `default_hover_listener_ends_after_key_press`) — so a pointer this test never moves
+    /// settles to `None` there regardless, and `None.or(focused)` gives the focused cell's
+    /// preview either way, mutated `keyboard_wins` included. `keyboard_wins` only has to
+    /// bridge the one frame between the key press and that deferred end (#250 review); this
+    /// test's synchronous read is what actually exercises it (mutation-checked: removing the
+    /// `keyboard_wins` branch in `sync_preview` fails this specific assertion).
     #[gpui_kit::test]
     fn an_arrow_press_outranks_a_resting_pointer_until_it_moves_again(cx: &mut TestAppContext) {
         let (app, _pool, _dir, ids) = app_with(1, "proof-preview-keyboard-wins", cx);

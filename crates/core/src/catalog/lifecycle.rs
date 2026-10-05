@@ -27,7 +27,24 @@ use std::time::{SystemTime, UNIX_EPOCH};
 #[serde(rename_all = "camelCase")]
 pub struct SkippedPhoto {
     pub photo_id: i64,
+    /// What the user reads: why this member was left.
     pub reason: String,
+    /// What the code acts on (#256): whether the member refused, or was interrupted or busy
+    /// and is retried. Never derived from `reason`'s wording.
+    pub kind: SkipKind,
+}
+
+/// Why a stack member was left, as the code needs to know it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum SkipKind {
+    /// It refused on its own account (no verified backup, a changed local copy, …): a
+    /// queued op records it failed, with the reason.
+    Refused,
+    /// Its run stopped being the owner ([`SUPERSEDED_REASON`]).
+    Superseded,
+    /// Another storage operation held it ([`IN_PROGRESS_REASON`]).
+    InProgress,
 }
 
 /// Why a member was left because its run stopped being the owner (a catalog switch or a
@@ -40,8 +57,19 @@ pub const SUPERSEDED_REASON: &str = "storage operation superseded or catalog swi
 pub const IN_PROGRESS_REASON: &str = "a storage operation on this photo is already in progress";
 
 impl SkippedPhoto {
-    fn new(photo_id: i64, reason: impl Into<String>) -> Self {
-        Self { photo_id, reason: reason.into() }
+    /// A member that refused on its own account, for `reason`.
+    pub fn refused(photo_id: i64, reason: impl Into<String>) -> Self {
+        Self { photo_id, reason: reason.into(), kind: SkipKind::Refused }
+    }
+
+    /// A member left because its run was superseded.
+    pub fn interrupted(photo_id: i64) -> Self {
+        Self { photo_id, reason: SUPERSEDED_REASON.into(), kind: SkipKind::Superseded }
+    }
+
+    /// A member left because another storage operation held it.
+    pub fn busy(photo_id: i64) -> Self {
+        Self { photo_id, reason: IN_PROGRESS_REASON.into(), kind: SkipKind::InProgress }
     }
 
     /// Whether this member was left only because the run was superseded. Such a member is
@@ -49,12 +77,12 @@ impl SkippedPhoto {
     /// failed row is one the reconcile check (`reconcile_due`) and the queue chip do not
     /// count, so the work would never be retried by itself.
     pub fn superseded(&self) -> bool {
-        self.reason.ends_with(SUPERSEDED_REASON)
+        self.kind == SkipKind::Superseded
     }
 
     /// Whether this member was left only because another storage operation held it.
     pub fn in_progress(&self) -> bool {
-        self.reason.ends_with(IN_PROGRESS_REASON)
+        self.kind == SkipKind::InProgress
     }
 
     /// Whether a queued op should retry this member as pending work rather than record it
@@ -63,6 +91,23 @@ impl SkippedPhoto {
     pub fn retry_later(&self) -> bool {
         self.superseded() || self.in_progress()
     }
+}
+
+/// A catalog error as a storage verb's user reads it (#256): a refusal's own words, without
+/// the "invalid input:" every validation error carries in its `Display`. Other errors keep
+/// theirs ("io error: …", "database error: …"), which say what kind of failure it was.
+pub fn user_reason(e: &CatalogError) -> String {
+    match e {
+        CatalogError::Validation(why) => why.clone(),
+        other => other.to_string(),
+    }
+}
+
+/// A path as a refusal names it: its file name. The user knows the photo; the folder is
+/// noise in a status line, and an absolute path in a queued op's error says more about the
+/// machine than about the problem.
+fn name(path: &Path) -> String {
+    path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| path.display().to_string())
 }
 
 /// One photo's share of a backup: where its image is now and where the copy goes.
@@ -388,7 +433,7 @@ impl Catalog {
                     )?;
                     report.backed_up.push(frame.photo_id);
                 }
-                Err(e) => report.skipped.push(SkippedPhoto::new(frame.photo_id, e.to_string())),
+                Err(e) => report.skipped.push(SkippedPhoto::refused(frame.photo_id, user_reason(&e))),
             }
         }
         Ok(report)
@@ -759,7 +804,7 @@ impl Catalog {
                     )?;
                     report.restored.push(frame.photo_id);
                 }
-                Err(e) => report.skipped.push(SkippedPhoto::new(frame.photo_id, e.to_string())),
+                Err(e) => report.skipped.push(SkippedPhoto::refused(frame.photo_id, user_reason(&e))),
             }
         }
         Ok(report)
@@ -931,7 +976,7 @@ pub fn resolve_backup_plan(candidates: BackupCandidates) -> Result<BackupPlan> {
             Ok(plan) => frames.push(plan),
             // A frame's own missing copy is a skip, not the master's failure. Anything
             // else is still an error.
-            Err(CatalogError::Validation(why)) => skipped.push(SkippedPhoto::new(frame_id, why)),
+            Err(CatalogError::Validation(why)) => skipped.push(SkippedPhoto::refused(frame_id, why)),
             Err(e) => return Err(e),
         }
     }
@@ -975,7 +1020,7 @@ pub fn resolve_offload_plan(candidates: OffloadCandidates) -> Result<OffloadPlan
             // Invariant 2 is decided per frame: a frame without its own verified
             // backup stays local and is named, rather than being freed on the strength
             // of the master's backup.
-            Err(CatalogError::Validation(why)) => skipped.push(SkippedPhoto::new(frame_id, why)),
+            Err(CatalogError::Validation(why)) => skipped.push(SkippedPhoto::refused(frame_id, why)),
             Err(e) => return Err(e),
         }
     }
@@ -1019,7 +1064,7 @@ pub fn resolve_restore_plan(candidates: RestoreCandidates) -> Result<RestorePlan
         let frame_id = member.photo_id;
         match resolve_restore_member(member, &base, volume_id) {
             Ok(plan) => frames.push(plan),
-            Err(CatalogError::Validation(why)) => skipped.push(SkippedPhoto::new(frame_id, why)),
+            Err(CatalogError::Validation(why)) => skipped.push(SkippedPhoto::refused(frame_id, why)),
             Err(e) => return Err(e),
         }
     }
@@ -1286,7 +1331,7 @@ pub(crate) fn copy_and_verify_with(
                 } else {
                     Err(CatalogError::Validation(format!(
                         "{} already exists with different contents — left untouched",
-                        dst.display()
+                        name(dst)
                     )))
                 }
             }
@@ -1325,7 +1370,7 @@ pub(crate) fn verify_and_delete_locals_until(plan: &OffloadPlan, stopped: &dyn F
         total: plan.total,
         sidecar_backups_left: 0,
     };
-    let (freed, left_behind) = free_local_copies(&plan.named, stopped)?;
+    let (freed, left_behind) = free_local_copies(&plan.named, stopped).map_err(Stop::into_error)?;
     out.freed.push(freed);
     out.sidecar_backups_left += left_behind;
     for frame in &plan.frames {
@@ -1334,10 +1379,34 @@ pub(crate) fn verify_and_delete_locals_until(plan: &OffloadPlan, stopped: &dyn F
                 out.freed.push(freed);
                 out.sidecar_backups_left += left_behind;
             }
-            Err(e) => out.skipped.push(SkippedPhoto::new(frame.photo_id, e.to_string())),
+            Err(Stop::Superseded) => out.skipped.push(SkippedPhoto::interrupted(frame.photo_id)),
+            Err(Stop::Refused(e)) => out.skipped.push(SkippedPhoto::refused(frame.photo_id, user_reason(&e))),
         }
     }
     Ok(out)
+}
+
+/// Why one member's offload stopped: its run was superseded, or the member refused. Typed so
+/// the caller tells them apart without reading the reason's words (#256).
+enum Stop {
+    Superseded,
+    Refused(CatalogError),
+}
+
+impl From<CatalogError> for Stop {
+    fn from(e: CatalogError) -> Self {
+        Stop::Refused(e)
+    }
+}
+
+impl Stop {
+    /// As the named photo's error: the call's own failure.
+    fn into_error(self) -> CatalogError {
+        match self {
+            Stop::Superseded => CatalogError::Validation(SUPERSEDED_REASON.into()),
+            Stop::Refused(e) => e,
+        }
+    }
 }
 
 /// Re-verify one photo's backup hash, carry its local companions home, then free its local
@@ -1347,15 +1416,16 @@ pub(crate) fn verify_and_delete_locals_until(plan: &OffloadPlan, stopped: &dyn F
 /// Returns what is now confirmed at home — for the caller to record *before*
 /// `commit_offload`, since that drops the local location rows and the companion rows
 /// cascade with them — and how many sidecar backups were left beside the freed files.
-fn free_local_copies(photo: &PhotoOffload, stopped: &dyn Fn() -> bool) -> Result<(FreedPhoto, usize)> {
+fn free_local_copies(photo: &PhotoOffload, stopped: &dyn Fn() -> bool) -> std::result::Result<(FreedPhoto, usize), Stop> {
     if stopped() {
-        return Err(CatalogError::Validation(SUPERSEDED_REASON.into()));
+        return Err(Stop::Superseded);
     }
     let current = sha256_file(&photo.backup_abs)?;
     if current != photo.expected_hash {
         return Err(CatalogError::Validation(
             "backup hash changed — refusing to offload".into(),
-        ));
+        )
+        .into());
     }
 
     // Invariant 1 ("never delete the last copy") applies to companions too: freeing the
@@ -1369,26 +1439,27 @@ fn free_local_copies(photo: &PhotoOffload, stopped: &dyn Fn() -> bool) -> Result
         if let Some(first) = carry.diverged.first() {
             return Err(CatalogError::Validation(format!(
                 "{} differs from the copy at home — refusing to offload",
-                first.display()
-            )));
+                name(first)
+            ))
+            .into());
         }
         carried.extend(carry.carried);
     }
     // The carry can take a while over a NAS; a run taken over meanwhile stops before
     // anything is moved.
     if stopped() {
-        return Err(CatalogError::Validation(SUPERSEDED_REASON.into()));
+        return Err(Stop::Superseded);
     }
     let to_free = companions_to_free(photo, &carried)?;
 
     let mut aside = Aside::default();
     if let Err(e) = move_aside_confirmed(photo, &to_free, &carried, stopped, &mut aside) {
-        return Err(aside.put_back(e));
+        return Err(aside.put_back(e.into()));
     }
     // Every file is now confirmed and under a hidden name; nothing has been deleted. Unlink
     // them. A failure here puts back whatever is left.
     if let Err(e) = aside.unlink() {
-        return Err(aside.put_back(e));
+        return Err(aside.put_back(e.into()));
     }
 
     // Counted, never carried and never deleted — see `companions::sidecar_backups_beside`.
@@ -1439,7 +1510,7 @@ fn move_aside_confirmed(
     carried: &[CarriedCompanion],
     stopped: &dyn Fn() -> bool,
     aside: &mut Aside,
-) -> Result<()> {
+) -> std::result::Result<(), Stop> {
     for (file, companions) in photo.local_files.iter().zip(to_free) {
         // Companions first: if this stops part-way, the image is still local, so the photo
         // is never left with its edit state gone and its bytes freed. Exactly the ones
@@ -1447,13 +1518,13 @@ fn move_aside_confirmed(
         // carry and was never carried.
         for companion in companions {
             if stopped() {
-                return Err(CatalogError::Validation(SUPERSEDED_REASON.into()));
+                return Err(Stop::Superseded);
             }
             let hash = carried.iter().find(|c| &c.source == companion).map(|c| c.hash.as_str()).unwrap_or_default();
             aside.take(companion, hash, "changed since it was carried home — refusing to offload")?;
         }
         if stopped() {
-            return Err(CatalogError::Validation(SUPERSEDED_REASON.into()));
+            return Err(Stop::Superseded);
         }
         // An already-absent local file is fine: the goal is "not local".
         aside.take(file, &photo.expected_hash, LOCAL_CHANGED_REASON)?;
@@ -1468,8 +1539,9 @@ fn move_aside_confirmed(
         if let Some(path) = appeared {
             return Err(CatalogError::Validation(format!(
                 "{} was written while the photo was being offloaded — refusing to offload",
-                path.display()
-            )));
+                name(&path)
+            ))
+            .into());
         }
     }
     Ok(())
@@ -1501,12 +1573,12 @@ impl Aside {
             return Ok(());
         }
         let refusal = match matches {
-            Ok(_) => format!("{} {why}", file.display()),
-            Err(e) => format!("{} could not be read back ({e}) — refusing to offload", file.display()),
+            Ok(_) => format!("{} {why}", name(file)),
+            Err(e) => format!("{} could not be read back ({}) — refusing to offload", name(file), user_reason(&e)),
         };
         Err(CatalogError::Validation(match super::working_files::put_back(&hidden, file) {
             Ok(true) => refusal,
-            _ => format!("{refusal}; its bytes were kept as {} because its name was taken", hidden.display()),
+            _ => format!("{refusal}; its bytes were kept beside it as {} because its name was taken", name(&hidden)),
         }))
     }
 
@@ -1525,7 +1597,7 @@ impl Aside {
     /// A confirmed file whose name a new file took is at home byte for byte, so it is
     /// deleted rather than left hidden; one that cannot be put back for any other reason
     /// is named in the refusal.
-    fn put_back(&mut self, refusal: CatalogError) -> CatalogError {
+    fn put_back(&mut self, refusal: Stop) -> Stop {
         let mut kept = Vec::new();
         while let Some((file, hidden)) = self.moved.pop() {
             match super::working_files::put_back(&hidden, &file) {
@@ -1533,13 +1605,14 @@ impl Aside {
                 Ok(false) if std::fs::symlink_metadata(&file).is_ok() => {
                     let _ = std::fs::remove_file(&hidden);
                 }
-                _ => kept.push(hidden.display().to_string()),
+                _ => kept.push(name(&hidden)),
             }
         }
         if kept.is_empty() {
             return refusal;
         }
-        CatalogError::Validation(format!("{refusal}; could not put back {}", kept.join(", ")))
+        let refusal = user_reason(&refusal.into_error());
+        Stop::Refused(CatalogError::Validation(format!("{refusal}; could not put back {}", kept.join(", "))))
     }
 }
 
@@ -1554,7 +1627,7 @@ fn companions_to_free(photo: &PhotoOffload, carried: &[CarriedCompanion]) -> Res
             if !carried.iter().any(|c| c.source == found.path) {
                 return Err(CatalogError::Validation(format!(
                     "{} appeared after its companions were carried home — refusing to offload",
-                    found.path.display()
+                    name(&found.path)
                 )));
             }
             companions.push(found.path);
@@ -1705,6 +1778,42 @@ mod tests {
         };
         assert!(err.contains("no verified backup"), "refused by the stat half: {err}");
         assert!(raw.exists(), "a refusal never touches the local copy");
+    }
+
+    // --- typed skip reasons (#256) -----------------------------------------------------------
+
+    /// What a queued op does with a member is decided by its kind, never by its words: a
+    /// refusal whose text happens to end like an interruption is still a refusal.
+    #[test]
+    fn a_skipped_members_kind_not_its_words_decides_a_retry() {
+        let lookalike = SkippedPhoto::refused(1, format!("a tool wrote: {SUPERSEDED_REASON}"));
+        assert!(!lookalike.superseded() && !lookalike.retry_later());
+        let lookalike = SkippedPhoto::refused(1, format!("a tool wrote: {IN_PROGRESS_REASON}"));
+        assert!(!lookalike.in_progress() && !lookalike.retry_later());
+        assert!(SkippedPhoto::interrupted(1).superseded() && SkippedPhoto::interrupted(1).retry_later());
+        assert!(SkippedPhoto::busy(1).in_progress() && SkippedPhoto::busy(1).retry_later());
+        assert_eq!(SkippedPhoto::interrupted(1).reason, SUPERSEDED_REASON);
+        assert_eq!(SkippedPhoto::busy(1).reason, IN_PROGRESS_REASON);
+    }
+
+    /// A frame an offload reaches after its run was superseded is skipped as interrupted —
+    /// typed through the offload, not recovered from the error text.
+    #[test]
+    fn an_offload_frame_reached_after_a_trip_is_typed_interrupted() {
+        let (catalog, dir, raw, id, nas) = backed_up_photo("typed-interrupted");
+        let jpg = raw.with_extension("JPG");
+        std::fs::write(&jpg, b"jpeg").unwrap();
+        let frame = catalog.upsert_photo(&jpg, None, 1, 10).unwrap().id;
+        catalog.set_stack_parent(frame, id).unwrap();
+        catalog.backup_photo(id, nas).unwrap();
+        let plan = catalog.plan_offload(id).unwrap();
+
+        let carry = verify_and_delete_locals_until(&plan, &|| !raw.exists()).unwrap();
+
+        assert_eq!(carry.skipped.len(), 1);
+        assert_eq!((carry.skipped[0].photo_id, carry.skipped[0].kind), (frame, SkipKind::Superseded));
+        assert!(jpg.exists());
+        let _ = dir;
     }
 
     // --- two writers, one destination (#254) ----------------------------------------------

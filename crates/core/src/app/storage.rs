@@ -27,15 +27,17 @@ trait CatalogAccess {
     fn with<T>(&self, f: impl FnOnce(&Catalog) -> crate::catalog::Result<T>) -> Result<T, String>;
 }
 
+/// Both report a catalog error as its user reads it ([`crate::catalog::user_reason`]): a
+/// storage verb's refusal reaches the inspector's status line and a queued op's error.
 impl CatalogAccess for AppState {
     fn with<T>(&self, f: impl FnOnce(&Catalog) -> crate::catalog::Result<T>) -> Result<T, String> {
-        with_catalog(self, f)
+        with_catalog(self, |c| Ok(f(c)))?.map_err(|e| crate::catalog::user_reason(&e))
     }
 }
 
 impl CatalogAccess for Catalog {
     fn with<T>(&self, f: impl FnOnce(&Catalog) -> crate::catalog::Result<T>) -> Result<T, String> {
-        f(self).map_err(|e| e.to_string())
+        f(self).map_err(|e| crate::catalog::user_reason(&e))
     }
 }
 
@@ -161,19 +163,13 @@ fn leave_unclaimed<T>(frames: &mut Vec<T>, skipped: &mut Vec<SkippedPhoto>, clai
     frames.retain(|frame| {
         let held = claim.holds(id(frame));
         if !held {
-            skipped.push(SkippedPhoto { photo_id: id(frame), reason: IN_PROGRESS.to_string() });
+            skipped.push(SkippedPhoto::busy(id(frame)));
         }
         held
     });
 }
 
 // ── Backup, offload, restore ─────────────────────────────────────────────────
-
-/// Why a claimed stack step left a member: its drain or sweep is no longer the owner (a
-/// catalog switch or a newer drain tripped the reconcile generation). The member is reported
-/// skipped with this reason, so a drain requeues it rather than replaying the members that
-/// finished.
-const SUPERSEDED: &str = crate::catalog::SUPERSEDED_REASON;
 
 /// Whether the claim this step runs under (if any) has been taken over. Unclaimed steps — a
 /// verb the user pressed, bound to its catalog by [`bound`] — run to the end.
@@ -194,7 +190,9 @@ pub fn backup_to(state: &AppState, photo_id: i64, backup_id: i64) -> Result<Back
 
 /// `abort`: the reconcile claim a drain runs this under. The named photo — the op in flight,
 /// started while the drain still owned it — runs to the end; once the claim is tripped no
-/// further frame is started, and each is reported skipped with [`SUPERSEDED`].
+/// further frame is started, and each is reported skipped as interrupted
+/// ([`SkippedPhoto::interrupted`]), so a drain requeues it rather than replaying the members
+/// that finished.
 ///
 /// `claims`: the photo and its frames are claimed before planning ([`StorageClaims`]); a
 /// named photo another operation holds fails with [`IN_PROGRESS`].
@@ -209,17 +207,20 @@ fn backup_in(
     // Candidate rows under the lock; which copies are actually on disk is decided off it
     // (#85), so a slow NAS stalls this plan but no other catalog reader.
     let candidates = cat.with(|c| c.plan_backup_candidates(photo_id, backup_id))?;
-    let mut plan = crate::catalog::resolve_backup_plan(candidates).map_err(|e| e.to_string())?;
+    let mut plan = crate::catalog::resolve_backup_plan(candidates).map_err(|e| crate::catalog::user_reason(&e))?;
     leave_unclaimed(&mut plan.frames, &mut plan.skipped, &claim, |f| f.photo_id);
     let mut report = BackupReport { skipped: plan.skipped, total: plan.total, ..Default::default() };
     backup_one(cat, plan.named)?;
     report.backed_up.push(photo_id);
     for frame in plan.frames {
         let frame_id = frame.photo_id;
-        let result = if superseded(abort) { Err(SUPERSEDED.to_string()) } else { backup_one(cat, frame) };
-        match result {
+        if superseded(abort) {
+            report.skipped.push(SkippedPhoto::interrupted(frame_id));
+            continue;
+        }
+        match backup_one(cat, frame) {
             Ok(()) => report.backed_up.push(frame_id),
-            Err(e) => report.skipped.push(SkippedPhoto { photo_id: frame_id, reason: e }),
+            Err(e) => report.skipped.push(SkippedPhoto::refused(frame_id, e)),
         }
     }
     Ok(report)
@@ -236,14 +237,14 @@ fn backup_one(cat: &impl CatalogAccess, plan: PhotoBackup) -> Result<(), String>
     // The idempotency gate's rows come from under the lock; its stat runs off it (#85).
     let gate = cat.with(|c| c.verified_backup_candidates(photo_id))?;
     if crate::catalog::any_backup_present(&gate) {
-        let carried = crate::catalog::carry_companions(&source, &dest).map_err(|e| e.to_string())?;
+        let carried = crate::catalog::carry_companions(&source, &dest).map_err(|e| crate::catalog::user_reason(&e))?;
         return cat.with(|c| {
             c.record_companions_at(photo_id, volume_id, LocationRole::Backup, &carried.carried)
         });
     }
     // A copy is the image plus its declared companions; `copy_with_companions` is the one
     // place that knows the set.
-    let outcome = crate::catalog::copy_with_companions(&source, &dest, None).map_err(|e| e.to_string())?;
+    let outcome = crate::catalog::copy_with_companions(&source, &dest, None).map_err(|e| crate::catalog::user_reason(&e))?;
     cat.with(|c| c.record_copy(photo_id, volume_id, &rel, LocationRole::Backup, &outcome))
 }
 
@@ -334,14 +335,14 @@ fn offload_until(
     // can go stale by the delete, but never destructively: `free_local_copies` re-hashes the
     // backup before anything is removed.
     let candidates = cat.with(|c| c.plan_offload_candidates(photo_id))?;
-    let mut plan = crate::catalog::resolve_offload_plan(candidates).map_err(|e| e.to_string())?;
+    let mut plan = crate::catalog::resolve_offload_plan(candidates).map_err(|e| crate::catalog::user_reason(&e))?;
     leave_unclaimed(&mut plan.frames, &mut plan.skipped, &claim, |f| f.photo_id);
     for member in std::iter::once(&plan.named).chain(plan.frames.iter()) {
         if let Some(local) = member.local_files.first() {
             let _ = crate::thumbnails::ensure_persistent_thumb(member.photo_id, local);
         }
     }
-    let carry = crate::catalog::verify_and_delete_locals_until(&plan, stopped).map_err(|e| e.to_string())?;
+    let carry = crate::catalog::verify_and_delete_locals_until(&plan, stopped).map_err(|e| crate::catalog::user_reason(&e))?;
     // Companions are recorded before the local rows go away, per freed photo — see
     // `commit_offload_carry`.
     let report = cat.with(|c| c.commit_offload_carry(carry));
@@ -369,17 +370,20 @@ fn restore_in(
     // Candidate rows under the lock; which frames are already home and which backup is
     // reachable are statted off it (#85).
     let candidates = cat.with(|c| c.plan_restore_candidates(photo_id, local_id))?;
-    let mut plan = crate::catalog::resolve_restore_plan(candidates).map_err(|e| e.to_string())?;
+    let mut plan = crate::catalog::resolve_restore_plan(candidates).map_err(|e| crate::catalog::user_reason(&e))?;
     leave_unclaimed(&mut plan.frames, &mut plan.skipped, &claim, |f| f.photo_id);
     let mut report = RestoreReport { skipped: plan.skipped, total: plan.total, ..Default::default() };
     restore_one(cat, plan.named)?;
     report.restored.push(photo_id);
     for frame in plan.frames {
         let frame_id = frame.photo_id;
-        let result = if superseded(abort) { Err(SUPERSEDED.to_string()) } else { restore_one(cat, frame) };
-        match result {
+        if superseded(abort) {
+            report.skipped.push(SkippedPhoto::interrupted(frame_id));
+            continue;
+        }
+        match restore_one(cat, frame) {
             Ok(()) => report.restored.push(frame_id),
-            Err(e) => report.skipped.push(SkippedPhoto { photo_id: frame_id, reason: e }),
+            Err(e) => report.skipped.push(SkippedPhoto::refused(frame_id, e)),
         }
     }
     Ok(report)
@@ -389,7 +393,7 @@ fn restore_in(
 fn restore_one(cat: &impl CatalogAccess, plan: PhotoRestore) -> Result<(), String> {
     let PhotoRestore { photo_id, source, dest, rel, volume_id, expected_hash } = plan;
     let outcome = crate::catalog::copy_with_companions(&source, &dest, expected_hash.as_deref())
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| crate::catalog::user_reason(&e))?;
     cat.with(|c| c.record_copy(photo_id, volume_id, &rel, LocationRole::LocalCache, &outcome))
 }
 
@@ -658,9 +662,35 @@ mod stack_tests {
         let report = backup_in(&state, &state.storage_claims, master, nas, Some(&tripped)).unwrap();
         assert_eq!(report.backed_up, vec![master]);
         assert_eq!(report.skipped.len(), 1);
-        assert_eq!((report.skipped[0].photo_id, report.skipped[0].reason.as_str()), (frame, SUPERSEDED));
+        assert_eq!((report.skipped[0].photo_id, report.skipped[0].kind), (frame, crate::catalog::SkipKind::Superseded));
+        assert_eq!(report.skipped[0].reason, crate::catalog::SUPERSEDED_REASON);
         assert_eq!(report.total, 2);
         assert!(!with_catalog(&state, |c| c.has_verified_backup(frame)).unwrap(), "the frame was not copied");
+    }
+
+    // --- what a refusal says to the user (#256) --------------------------------------------
+
+    /// A storage verb's refusal reads as its own words: no "invalid input:" from the
+    /// catalog error's `Display`, and the file by name, not by absolute path — in the verb's
+    /// error and in a drained op's recorded error alike.
+    #[test]
+    fn a_refusal_names_the_file_without_a_prefix_or_its_folder() {
+        let (dir, state, master, _frame, raw, _jpg) = stacked("user-reason");
+        backup_photo(&state, master).unwrap();
+        std::fs::write(&raw, b"edited").unwrap();
+
+        let err = offload_photo(&state, master).unwrap_err();
+
+        assert_eq!(err, format!("DSC1.ARW {}", crate::catalog::LOCAL_CHANGED_REASON));
+        with_catalog(&state, |c| c.enqueue_operation("offload", master).map(drop)).unwrap();
+        reconcile_now(&state).unwrap();
+        let ops = with_catalog(&state, |c| c.list_pending_operations()).unwrap();
+        assert_eq!(ops[0].error, err);
+        // A refusal from the plan, through the service's catalog access: no prefix either.
+        let nas = with_catalog(&state, |c| single_volume_of_kind(c, VolumeKind::Backup, "backup")).unwrap();
+        let err = restore_to(&state, master, nas).unwrap_err();
+        assert_eq!(err, "target is not a local volume");
+        assert!(dir.join("nas/2026/08/DSC1.ARW").exists());
     }
 
     // --- offload's check-to-delete window (#256, review probes P1/P2) ----------------------

@@ -54,7 +54,7 @@ pub use lifecycle::{
     verify_and_delete_locals_abortable, BackupCandidates, BackupPlan, BackupReport, CarriedCompanion,
     CompanionCarry, CopyOutcome, FreedPhoto, OffloadCandidates, OffloadCarry, OffloadEligibility, OffloadPlan,
     OffloadReport, PhotoBackup, PhotoOffload, PhotoRestore, RestoreCandidates, RestorePlan, RestoreReport,
-    SkippedPhoto, IN_PROGRESS_REASON, LOCAL_CHANGED_REASON, SUPERSEDED_REASON,
+    user_reason, SkipKind, SkippedPhoto, IN_PROGRESS_REASON, LOCAL_CHANGED_REASON, SUPERSEDED_REASON,
 };
 pub(crate) use lifecycle::verify_and_delete_locals_until;
 #[cfg(test)]

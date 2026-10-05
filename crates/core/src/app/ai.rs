@@ -351,13 +351,18 @@ pub async fn suggest_tags_via<P: Provider>(
 ) -> Result<Vec<AiSuggestion>, String> {
     // Inputs under the lock; released for the decode and the network call. The settings are
     // read once: the run sends with exactly the config it admitted.
-    let (config, image_path, taxonomy, rejected) = bound_blocking(state, expected, move |c| {
+    let (config, image_path, taxonomy, rejected, prompt_rejected) = bound_blocking(state, expected, move |c| {
         ai::ensure_schema(c.conn())?;
         let config = ai::read_config(c)?;
         // Private tags (people's names etc.) are withheld from cloud providers.
         let taxonomy = ai::taxonomy_text(c, config.is_local())?;
+        let rejected = ai::rejected_paths(c.conn(), photo_id)?;
+        // The rejected list rides into the prompt as "don't suggest these again", so it gets
+        // the same privacy filter as the taxonomy. The unfiltered list still suppresses
+        // re-suggestion when the results are stored.
+        let prompt_rejected = if config.is_local() { rejected.clone() } else { ai::cloud_safe_paths(c, &rejected)? };
         // The path's error waits for `admit`: an unconfirmed engine is the refusal shown.
-        Ok((config, c.require_photo_path(photo_id).map_err(|e| e.to_string()), taxonomy, ai::rejected_paths(c.conn(), photo_id)?))
+        Ok((config, c.require_photo_path(photo_id).map_err(|e| e.to_string()), taxonomy, rejected, prompt_rejected))
     })
     .await?;
     admit(&config, confirmed.as_ref())?;
@@ -365,7 +370,7 @@ pub async fn suggest_tags_via<P: Provider>(
 
     let p = provider.clone();
     let image = spawn_blocking(move || p.image(&image_path, region)).await.map_err(|e| e.to_string())??;
-    let raw = provider.suggest(&config, &image, &taxonomy, &rejected, question.as_deref()).await?;
+    let raw = provider.suggest(&config, &image, &taxonomy, &prompt_rejected, question.as_deref()).await?;
 
     bound_blocking(state, expected, move |c| store_direct(c, photo_id, &config, &rejected, &raw)).await
 }
@@ -480,7 +485,16 @@ pub async fn suggest_tags_grouped_via<P: Provider>(
             return Ok(GroupedDispatchResult { total, representatives, dispatched, propagated, cancelled: true });
         }
         let rep_id = cluster.representative_id();
-        let prep = bound_blocking(state, expected, move |c| Ok((c.require_photo_path(rep_id)?, ai::rejected_paths(c.conn(), rep_id)?))).await;
+        // This list is prompt-only (`propagate_cluster` re-reads each member's rejections for
+        // suppression), so a cloud run gets the privacy-filtered form — a padlocked path must
+        // not leave the machine even as "don't suggest this again".
+        let is_local = config.is_local();
+        let prep = bound_blocking(state, expected, move |c| {
+            let rejected = ai::rejected_paths(c.conn(), rep_id)?;
+            let rejected = if is_local { rejected } else { ai::cloud_safe_paths(c, &rejected)? };
+            Ok((c.require_photo_path(rep_id)?, rejected))
+        })
+        .await;
         let (image_path, rejected) = match prep {
             Ok(v) => v,
             // A catalog switch is not "this photo vanished": stop, writing nothing more.
@@ -614,6 +628,8 @@ mod tests {
         pub images: std::sync::atomic::AtomicUsize,
         pub calls: std::sync::Mutex<Vec<String>>,
         pub taxonomies: std::sync::Mutex<Vec<String>>,
+        /// The "already rejected" list each call carried into the prompt.
+        pub rejected: std::sync::Mutex<Vec<Vec<String>>>,
         /// Set on the first provider call: the user cancels while it is in flight.
         pub trip: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     }
@@ -624,9 +640,17 @@ mod tests {
             Ok("aW1n".into())
         }
 
-        async fn suggest(&self, config: &ai::Config, _: &str, taxonomy: &str, _: &[String], _: Option<&str>) -> Result<Vec<ai::Raw>, String> {
+        async fn suggest(
+            &self,
+            config: &ai::Config,
+            _: &str,
+            taxonomy: &str,
+            rejected: &[String],
+            _: Option<&str>,
+        ) -> Result<Vec<ai::Raw>, String> {
             self.calls.lock().unwrap().push(format!("{}/{}", config.provider, config.model()));
             self.taxonomies.lock().unwrap().push(taxonomy.to_string());
+            self.rejected.lock().unwrap().push(rejected.to_vec());
             if let Some(t) = &self.trip {
                 t.store(true, std::sync::atomic::Ordering::SeqCst);
             }
@@ -703,6 +727,44 @@ mod tests {
         rt.block_on(suggest_tags_via(&state, None, None, 1, None, None, fake.clone())).unwrap();
         let sent = fake.taxonomies.lock().unwrap().last().cloned().unwrap();
         assert!(sent.contains("People/Alice"), "the local model gets the whole vocabulary: {sent}");
+    }
+
+    /// The prompt's "already rejected" clause gets the taxonomy's privacy filter (port of
+    /// origin/main 76e045e): a path inside a padlocked subtree — or one that no longer
+    /// resolves, since a deleted person tag's name is still a name — is withheld from a
+    /// remote engine, in a direct run and a grouped one. The local model gets the whole list.
+    #[test]
+    fn a_remote_run_withholds_private_paths_from_the_rejected_clause() {
+        let (c, _dir) = catalog("rejected-private", 1);
+        ai::ensure_schema(c.conn()).unwrap();
+        c.create_tag("Animals/Birds").unwrap();
+        c.create_tag("People/Nina Example").unwrap();
+        let people = c.find_tag_id_by_path("People").unwrap().unwrap();
+        // The parent alone, non-recursively: the child's own flag stays clear.
+        c.set_tag_private(people, true, false).unwrap();
+        for path in ["Animals/Birds", "People/Nina Example", "People/Deleted Person"] {
+            ai::set_state(c.conn(), 1, path, "rejected", 1).unwrap();
+        }
+        c.set_setting("ai.ollama_url", "http://192.168.1.20:11434").unwrap();
+        c.set_setting("ai.ollama_remote_url", "http://192.168.1.20:11434").unwrap();
+        let state = AppState::default();
+        *state.catalog.lock().unwrap() = Some(c);
+        let fake = std::sync::Arc::new(FakeProvider::default());
+        let rt = super::super::runtime();
+        let last = || {
+            let mut sent = fake.rejected.lock().unwrap().last().cloned().unwrap();
+            sent.sort();
+            sent
+        };
+
+        rt.block_on(suggest_tags_via(&state, None, None, 1, None, None, fake.clone())).unwrap();
+        assert_eq!(last(), ["Animals/Birds"], "a direct remote run carried a private path");
+        rt.block_on(suggest_tags_grouped_via(&state, None, None, vec![1], &Default::default(), fake.clone())).unwrap();
+        assert_eq!(last(), ["Animals/Birds"], "a grouped remote run carried a private path");
+
+        state.catalog.lock().unwrap().as_ref().unwrap().set_setting("ai.ollama_url", "http://127.0.0.1:11434").unwrap();
+        rt.block_on(suggest_tags_via(&state, None, None, 1, None, None, fake.clone())).unwrap();
+        assert_eq!(last(), ["Animals/Birds", "People/Deleted Person", "People/Nina Example"], "the local model gets all");
     }
 
     /// A grouped run stops at Cancel: cancelled while the first representative is with the

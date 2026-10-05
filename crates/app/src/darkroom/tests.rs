@@ -2020,6 +2020,83 @@ fn a_previewed_proof_outranks_the_default_loupe_print(cx: &mut TestAppContext) {
     assert_eq!(bar_label, Some(format!("Proof: {label} — not applied")), "the bar names the proof, not the print");
 }
 
+/// Taking over from the Darkroom's print never blanks the pop-out (#250 review, probe P1):
+/// the print's own render stays wanted while a proof is previewed, so hovering off, crossing
+/// the gap between cells (nothing hovered or focused, same as off), or declining shows its
+/// already-rendered texture again at once — no new print render; and while a just-hovered
+/// candidate's own 320 px render is still on the way, the print's texture stands in rather
+/// than nothing.
+#[gpui_kit::test]
+fn the_pop_out_never_blanks_between_the_print_and_a_proof(cx: &mut TestAppContext) {
+    use super::view::Overlay;
+    use crate::loupe::window;
+    use crate::loupe::zoom::Drawn;
+    let rig = rig("dk-proof-never-blank", 2, cx);
+    work(cx);
+    advance(cx, SETTLE); // the default print goes up after the open's settle
+    let print_json = rig.app.wired.shell.read_with(cx, |s, _| s.loupe_print().expect("the print is up by default").edit_json.clone());
+    cx.update(window::open);
+    cx.run_until_parked();
+    let h = cx.update(|cx| window::handle(cx)).expect("the pop-out opened");
+    let zoom = cx.update(|cx| window::view(cx)).unwrap().read_with(cx, |v, cx| v.loupe().read(cx).zoom().clone());
+    cx.update_window(h, |_, window, cx| window.render_frame(cx)).unwrap();
+    cx.run_until_parked();
+
+    let print_jobs = |rig: &Rig| rig.edit_jobs().into_iter().filter(|j| j.max_edge == 2560 && j.edit_json == print_json).count();
+    let before = print_jobs(&rig);
+    let print_job = rig.edit_jobs().into_iter().find(|j| j.max_edge == 2560 && j.edit_json == print_json).expect("the print's render was asked for");
+    let l = pixels(400, 300);
+    let print_image = l.image.clone();
+    rig.pool.finish(&JobKey::Edit(print_job), Ok(l));
+    cx.run_until_parked();
+    cx.update_window(h, |_, window, cx| window.render_frame(cx)).unwrap();
+    assert!(
+        zoom.read_with(cx, |z, _| z.override_lo()).is_some_and(|s| Arc::ptr_eq(&s, &print_image)),
+        "the pop-out shows the print once it lands"
+    );
+
+    rig.with_view(cx, |v, window, cx| v.open_proof_sheet(window, cx));
+    let i = rig.view(cx).read_with(cx, |v, cx| match v.overlay() {
+        Some(Overlay::Proof(p)) => {
+            p.read(cx).candidates().iter().position(|c| c.group == chairphoto_model::darkroom::spreads::ProofGroup::Film).unwrap()
+        }
+        _ => panic!("the proof sheet is mounted"),
+    });
+    cx.update_window(rig.app.window(), |_, window, cx| {
+        window.render_frame(cx);
+        window.hover(("proof-cell", i as u64), cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(h, |_, window, cx| window.render_frame(cx)).unwrap();
+    // The proof's own 320 px and 2560 px renders are both still on the way (never finished):
+    // the pop-out must not go blank, so the print's texture stands in.
+    assert_eq!(
+        zoom.read_with(cx, |z, _| z.drawn().map(|(_, d)| d)),
+        Some(Drawn::OverrideLo),
+        "never blank while the proof's own render is on the way"
+    );
+    assert!(
+        zoom.read_with(cx, |z, _| z.override_lo()).is_some_and(|s| Arc::ptr_eq(&s, &print_image)),
+        "stands in with the print's own texture"
+    );
+
+    // Off the cell, onto the close button (inside the panel, not the backdrop — a decline):
+    // the print shows again, with no new print render asked for.
+    cx.update_window(rig.app.window(), |_, window, cx| {
+        window.render_frame(cx);
+        window.hover("proof-close", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(h, |_, window, cx| window.render_frame(cx)).unwrap();
+    assert_eq!(print_jobs(&rig), before, "no new print render on hover-off");
+    assert!(
+        zoom.read_with(cx, |z, _| z.override_lo()).is_some_and(|s| Arc::ptr_eq(&s, &print_image)),
+        "the print's cached texture, not a re-render"
+    );
+}
+
 /// The proof sheet's keys, as React's proof cells were buttons: Enter on the sheet as dealt
 /// (the backdrop focused, no proof) neither declines nor adopts; Tab / Shift+Tab move focus
 /// through the proofs, wrapping; Enter adopts the focused proof. A pointer click on the

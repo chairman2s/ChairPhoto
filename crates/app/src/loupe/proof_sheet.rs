@@ -199,7 +199,14 @@ impl ProofSheet {
                 cell,
             }
         });
-        self.shell.update(cx, |s, cx| s.set_loupe_proof_preview(preview, cx));
+        match preview {
+            Some(preview) => self.shell.update(cx, |s, cx| s.set_loupe_proof_preview(Some(preview), cx)),
+            // Nothing of this sheet's own to show: take only this sheet's preview down, the
+            // same as `clear_preview` (#250 review) — a non-hovered, non-focused sheet whose
+            // own 320 px render lands (the `renders` observer calls this too) must not clobber
+            // whichever other sheet is currently shown.
+            None => self.clear_preview(cx),
+        }
     }
 
     /// Takes the preview down, but only if it is still this sheet's own (#250 review: `token`).
@@ -224,6 +231,12 @@ fn group_name(g: ProofGroup) -> Option<&'static str> {
 
 impl Render for ProofSheet {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Catches a focus change that didn't go through `cycle`/`set_hovered`/an `on_click`
+        // (#250 review, probe E): a no-op when the answer hasn't changed, and — now that a
+        // `None` publish is also gated on this sheet's own token — safe to run on every
+        // render (an earlier, untokened version of this line looped two mounted sheets'
+        // windows into redrawing each other forever).
+        self.sync_preview(window, cx);
         let colors = Colors::get(cx);
         let renders = self.renders.read(cx);
         let cells: Vec<_> = self

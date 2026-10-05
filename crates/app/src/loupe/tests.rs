@@ -1305,6 +1305,59 @@ mod overlays {
         assert_eq!(previewed(cx), Some(b_candidate), "A's release did not clear B's preview");
     }
 
+    /// A sheet's own `renders` observer calling `sync_preview` with nothing of its own hovered
+    /// or focused — its own 320 px render landing, say — must not clear another live sheet's
+    /// preview, the same per-sheet token `clear_preview` already used (#250 review, probe
+    /// P2): `sync_preview`'s `None` case now delegates to `clear_preview` instead of
+    /// publishing `None` straight to `ShellState`.
+    #[gpui_kit::test]
+    fn a_sheets_own_render_landing_clears_only_its_own_preview(cx: &mut TestAppContext) {
+        let (app, pool, _dir, ids) = app_with(2, "proof-preview-token-render", cx);
+        let images = app.wired.images.clone();
+        let shell = app.wired.shell.clone();
+        let candidates = proof_spread(&VersionEdit::default(), &VersionEdit::default(), &[], None);
+
+        // Sheet A, on a different photo, in its own window, never hovered or focused.
+        let source_a = VariantSource::new(ids[0], 0, SourceToken::Preview);
+        let a_job = source_a.job(&candidates[0].record, PROOF_EDGE);
+        cx.update(|cx| {
+            let images = images.clone();
+            let candidates = candidates.clone();
+            let shell = shell.clone();
+            gpui_kit::open_window(Default::default(), cx, |window, cx| {
+                cx.new(|cx| ProofSheet::new(&images, shell, source_a, candidates, window, cx))
+            })
+        })
+        .unwrap();
+
+        // Sheet B, on another photo, hovered: B's preview is the one up.
+        let (handle_b, sheet_b) = cx
+            .update(|cx| {
+                let candidates = candidates.clone();
+                let shell = shell.clone();
+                let source = VariantSource::new(ids[1], 0, SourceToken::Preview);
+                gpui_kit::open_window(Default::default(), cx, |window, cx| {
+                    cx.new(|cx| ProofSheet::new(&images, shell, source, candidates, window, cx))
+                })
+            })
+            .unwrap();
+        cx.update_window(handle_b, |_, window, cx| {
+            window.render_frame(cx);
+            window.hover(("proof-cell", 1u64), cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        let b_candidate = sheet_b.read_with(cx, |s, _| s.candidates()[1].clone());
+        let previewed = |cx: &mut TestAppContext| shell.read_with(cx, |s, _| s.loupe_proof_preview().map(|p| p.candidate.clone()));
+        assert_eq!(previewed(cx), Some(b_candidate.clone()), "B previews");
+
+        // A's own 320 px cell render lands: A's `renders` observer calls `sync_preview`,
+        // which has nothing of A's own to show.
+        pool.finish(&JobKey::Edit(a_job), Ok(pixels(40, 30)));
+        cx.run_until_parked();
+        assert_eq!(previewed(cx), Some(b_candidate), "A's own render landing did not clear B's preview");
+    }
+
     /// An edit render that was no longer wanted when it finished is dropped, never shown.
     #[gpui_kit::test]
     fn an_unwanted_edit_render_is_dropped(cx: &mut TestAppContext) {

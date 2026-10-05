@@ -329,7 +329,39 @@ impl LoupeView {
         lo.source = source.clone();
         hi.source = source;
         let wants_hi = self.zoom.read(cx).wants_hi();
-        let jobs = if wants_hi { vec![lo.clone(), hi.clone()] } else { vec![lo.clone()] };
+        let mut jobs = if wants_hi { vec![lo.clone(), hi.clone()] } else { vec![lo.clone()] };
+        // Keep the Darkroom's print rendered even while a proof sheet's candidate is the one
+        // shown: `EditRenders::want` drops whatever is not in the wanted set, so without this
+        // the print's texture (and its full-res render) is evicted the moment a proof takes
+        // over, and hovering off — or crossing the gap between cells, which also momentarily
+        // has nothing hovered or focused — re-renders it from scratch, blanking the pop-out
+        // until it lands (#250 review). Only for this photo; a print for another photo is
+        // never wanted here regardless of what wins below.
+        // Keep the Darkroom's print rendered even while a proof sheet's candidate is the one
+        // shown: `EditRenders::want` drops whatever is not in the wanted set, so without this
+        // the print's texture (and its full-res render) is evicted the moment a proof takes
+        // over, and hovering off — or crossing the gap between cells, which also momentarily
+        // has nothing hovered or focused — re-renders it from scratch, blanking the pop-out
+        // until it lands (#250 review). Only for this photo; a print for another photo is
+        // never wanted here regardless of what wins below.
+        let print_lo = self.print(cx).filter(|p| p.photo.id == photo).map(|p| {
+            let mut j = preview_job(p.photo.id, &p.edit_json, LOUPE_EDGE, false, epoch);
+            j.source = p.source.clone();
+            j
+        });
+        let print_hi = wants_hi
+            .then(|| self.print(cx).filter(|p| p.photo.id == photo))
+            .flatten()
+            .map(|p| {
+                let mut j = preview_job(p.photo.id, &p.edit_json, 0, true, epoch);
+                j.source = p.source.clone();
+                j
+            });
+        for j in [&print_lo, &print_hi].into_iter().flatten() {
+            if !jobs.contains(j) {
+                jobs.push(j.clone());
+            }
+        }
         self.renders.update(cx, |r, cx| r.want(&jobs, cx));
         let renders = self.renders.read(cx);
         let mut over = Override::default();
@@ -344,10 +376,26 @@ impl LoupeView {
                 over.lo = Some(image);
             }
         }
+        // Never go blank while a replacement renders: the print, kept warm above, if it is
+        // already in (#250 review).
+        if over.lo.is_none() {
+            if let Some(j) = &print_lo {
+                if let RenderState::Ready(image) = renders.get(j) {
+                    over.lo = Some(image);
+                }
+            }
+        }
         match renders.get(&hi) {
             RenderState::Ready(image) => over.hi = Some(image),
             RenderState::Failed(_) => over.hi_settled = true,
             _ => {}
+        }
+        if over.hi.is_none() {
+            if let Some(j) = &print_hi {
+                if let RenderState::Ready(image) = renders.get(j) {
+                    over.hi = Some(image);
+                }
+            }
         }
         self.zoom.update(cx, |z, cx| z.set_override(Some(over), cx));
     }

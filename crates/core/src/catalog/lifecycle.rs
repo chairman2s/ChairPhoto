@@ -6,10 +6,13 @@
 //!   3. Hash-verify the backup before deleting anything local.
 //!
 //! Each op is split so the (possibly slow, network) file IO never holds the catalog
-//! lock or blocks the UI thread: a `plan_*` reads paths under the lock, a pure free
+//! lock or blocks the UI thread: a `plan_*_candidates` gathers copy rows under the lock
+//! (PURE SQL — even a `Path::exists` against an unmounted NAS can block for seconds,
+//! #85), a `resolve_*_plan` stats those candidates into a plan OFF the lock, a pure free
 //! function does the copy/verify/delete off-thread, and a `record_*`/`commit_*` writes
-//! the result under the lock. Sync `*_photo` wrappers compose the three for tests and
-//! simple callers.
+//! the result under the lock. It is the resolver's split (`photo_path_candidates` /
+//! `volume_health::pick_existing`) applied to planning. Sync `plan_*` and `*_photo`
+//! wrappers compose the pieces for tests and simple callers.
 
 use super::{Catalog, CatalogError, LocationRole, Result, VolumeKind};
 use rusqlite::{params, OptionalExtension};
@@ -60,6 +63,32 @@ pub struct BackupPlan {
     pub total: usize,
 }
 
+/// The rows a backup plan draws on, gathered in PURE SQL so the catalog lock is never
+/// held across a filesystem stat (#85). Which of these copies is actually on disk is
+/// deliberately not known yet: [`resolve_backup_plan`] stats the candidates OFF the
+/// lock — the resolver's split ([`Catalog::photo_path_candidates`] under the lock,
+/// `volume_health::pick_existing` off it) applied to planning, so a slow or unmounted
+/// NAS can stall one plan but never every catalog reader queued behind the mutex.
+pub struct BackupCandidates {
+    named: BackupMember,
+    frames: Vec<BackupMember>,
+    total: usize,
+    /// The backup volume's base path. The destination side needs no stat at all.
+    base: String,
+    volume_id: i64,
+}
+
+/// One photo's copy rows for a backup, with no reference to the stack it may be part of.
+struct BackupMember {
+    photo_id: i64,
+    /// Local copy rows; the first whose file exists becomes the source.
+    locals: Vec<Copy>,
+    /// `photos.path`. `None` when the row is gone — a vanished id also has no location
+    /// rows, so it still refuses as "no local copy to back up", the unsplit planner's
+    /// answer.
+    rel: Option<String>,
+}
+
 /// What one backup call achieved. Reported rather than counted, so the UI can say "4 of 7"
 /// and name the three it did not take.
 #[derive(Debug, Clone, Default, serde::Serialize)]
@@ -100,6 +129,25 @@ pub struct OffloadPlan {
     /// Frames left local, with why.
     pub skipped: Vec<SkippedPhoto>,
     pub total: usize,
+}
+
+/// The rows an offload plan draws on — [`BackupCandidates`]' split, for the verb where
+/// it matters most: invariant 2 is decided per frame, and each frame's gate is a stat
+/// against the (possibly slow, possibly unmounted) backup volume.
+pub struct OffloadCandidates {
+    named: OffloadMember,
+    frames: Vec<OffloadMember>,
+    total: usize,
+}
+
+/// One photo's copy rows for an offload.
+struct OffloadMember {
+    photo_id: i64,
+    /// Backup rows with a recorded verified hash; the first whose file exists is the
+    /// gate. The hash requirement is row data (SQL); presence is the stat half's call.
+    verified_backups: Vec<Copy>,
+    /// Local rows — freed wholesale, so nothing here depends on a stat.
+    locals: Vec<Copy>,
 }
 
 /// One photo's local copies, freed and confirmed at home — the caller still has to record
@@ -159,6 +207,28 @@ pub struct RestorePlan {
     pub total: usize,
 }
 
+/// The rows a restore plan draws on — see [`BackupCandidates`] for the split (#85).
+pub struct RestoreCandidates {
+    named: RestoreMember,
+    frames: Vec<RestoreMember>,
+    total: usize,
+    /// The local volume's base path.
+    base: String,
+    volume_id: i64,
+}
+
+/// One photo's copy rows for a restore.
+struct RestoreMember {
+    photo_id: i64,
+    /// Local rows — a frame with one whose file exists is already home and needs
+    /// nothing. Only frames consult these; the named photo is always attempted.
+    locals: Vec<Copy>,
+    /// Backup rows; the first whose file exists becomes the source.
+    backups: Vec<Copy>,
+    /// `photos.path`, `None` when the row is gone — see [`BackupMember::rel`].
+    rel: Option<String>,
+}
+
 /// What one restore call achieved.
 #[derive(Debug, Clone, Default, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -168,6 +238,16 @@ pub struct RestoreReport {
     /// Frames left on the backup volume, with why.
     pub skipped: Vec<SkippedPhoto>,
     pub total: usize,
+}
+
+/// One age-eligible photo and the copy paths that decide whether the offload sweep may
+/// take it — the rows half of [`Catalog::photos_eligible_for_offload`] (#85).
+pub struct OffloadEligibility {
+    photo_id: i64,
+    /// Backup rows with a recorded verified hash — one must be on disk.
+    verified_backups: Vec<PathBuf>,
+    /// Local rows — one must be on disk, else there is nothing left to free.
+    locals: Vec<PathBuf>,
 }
 
 struct Copy {
@@ -183,48 +263,53 @@ struct Copy {
 impl Catalog {
     // --- backup ------------------------------------------------------------
 
-    /// Validate the target is a backup volume and a local source exists; compute paths —
-    /// for the named photo **and every frame stacked under it** (see [`BackupPlan`]).
-    pub fn plan_backup(&self, photo_id: i64, backup_volume_id: i64) -> Result<BackupPlan> {
+    /// Gather every copy row a backup plan might need — for the named photo **and every
+    /// frame stacked under it** (see [`BackupPlan`]) — and validate the target is a
+    /// backup volume. PURE SQL: safe to call under the catalog lock; the filesystem's
+    /// half is [`resolve_backup_plan`], off it (#85).
+    pub fn plan_backup_candidates(
+        &self,
+        photo_id: i64,
+        backup_volume_id: i64,
+    ) -> Result<BackupCandidates> {
         let (base, kind) = self.volume_base_kind(backup_volume_id)?;
         if kind != VolumeKind::Backup {
             return Err(CatalogError::Validation("target is not a backup volume".into()));
         }
-        let named = self.plan_backup_one(photo_id, &base, backup_volume_id)?;
-        let mut frames = Vec::new();
-        let mut skipped = Vec::new();
+        let named = self.backup_member(photo_id)?;
         let frame_ids = self.stack_frame_ids(photo_id)?;
         let total = 1 + frame_ids.len();
-        for frame_id in frame_ids {
-            match self.plan_backup_one(frame_id, &base, backup_volume_id) {
-                Ok(plan) => frames.push(plan),
-                // A frame's own missing copy is a skip, not the master's failure. Anything
-                // else (a vanished row, a database error) is still an error.
-                Err(CatalogError::Validation(why)) => skipped.push(SkippedPhoto::new(frame_id, why)),
-                Err(e) => return Err(e),
-            }
-        }
-        Ok(BackupPlan { named, frames, skipped, total })
+        let frames = frame_ids
+            .into_iter()
+            .map(|id| self.backup_member(id))
+            .collect::<Result<Vec<_>>>()?;
+        Ok(BackupCandidates { named, frames, total, base, volume_id: backup_volume_id })
     }
 
-    /// One photo's paths, with no reference to the stack it may be part of.
-    fn plan_backup_one(
-        &self,
-        photo_id: i64,
-        base: &str,
-        backup_volume_id: i64,
-    ) -> Result<PhotoBackup> {
-        let source = self
-            .first_existing_copy(photo_id, VolumeKind::Local)?
-            .ok_or_else(|| CatalogError::Validation("no local copy to back up".into()))?;
-        let rel = self.get_photo(photo_id)?.path;
-        Ok(PhotoBackup {
-            photo_id,
-            source: source.abs,
-            dest: Path::new(base).join(&rel),
-            rel,
-            volume_id: backup_volume_id,
-        })
+    /// One photo's rows for [`BackupCandidates`]. A photo with no local rows still gets
+    /// a member — [`resolve_backup_plan`] refuses it with the same words it uses for
+    /// copies missing on disk, which keeps skip order and the vanished-id answer stable.
+    fn backup_member(&self, photo_id: i64) -> Result<BackupMember> {
+        let locals = self.copies_on_kind(photo_id, VolumeKind::Local)?;
+        let rel = self
+            .conn
+            .query_row(
+                "-- includes-hidden: a point lookup for a row the plan already names.
+                 -- Moving bytes is maintenance, not browsing (see `stack_frame_ids`):
+                 -- a hidden (trashed, missing) photo still holds bytes to move.
+                 SELECT path FROM photos WHERE id = ?1",
+                params![photo_id],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()?;
+        Ok(BackupMember { photo_id, locals, rel })
+    }
+
+    /// Statting convenience composing [`Catalog::plan_backup_candidates`] with
+    /// [`resolve_backup_plan`] — for the sync wrappers and tests. Command paths split
+    /// the two halves around the catalog lock instead (#85).
+    pub fn plan_backup(&self, photo_id: i64, backup_volume_id: i64) -> Result<BackupPlan> {
+        resolve_backup_plan(self.plan_backup_candidates(photo_id, backup_volume_id)?)
     }
 
     /// Record a verified backup location (after the copy+verify IO succeeded).
@@ -279,52 +364,49 @@ impl Catalog {
 
     // --- offload -----------------------------------------------------------
 
-    /// Validate a verified backup exists and gather the local files to free — for the named
-    /// photo **and every frame stacked under it** (see [`OffloadPlan`]). Errors (refuses) if
-    /// the named photo has no verified backup — invariants 1 & 2.
-    pub fn plan_offload(&self, photo_id: i64) -> Result<OffloadPlan> {
-        let named = self.plan_offload_one(photo_id)?;
+    /// Gather every copy row an offload plan draws on — for the named photo **and every
+    /// frame stacked under it** (see [`OffloadPlan`]). PURE SQL: safe to call under the
+    /// catalog lock; invariants 1 & 2 are enforced by [`resolve_offload_plan`], off it
+    /// (#85).
+    pub fn plan_offload_candidates(&self, photo_id: i64) -> Result<OffloadCandidates> {
+        let named = self.offload_member(photo_id)?;
         let mut frames = Vec::new();
-        let mut skipped = Vec::new();
         let frame_ids = self.stack_frame_ids(photo_id)?;
         let total = 1 + frame_ids.len();
         for frame_id in frame_ids {
             // Nothing local to free is not a refusal: an already-archived frame is the
             // state offload wants, and listing it as skipped would invite the user to act
-            // on it. Rows, not files — the rows are what `commit_offload` drops.
-            if self.copies_on_kind(frame_id, VolumeKind::Local)?.is_empty() {
+            // on it. Rows, not files — the rows are what `commit_offload` drops — which
+            // is why this stays on the SQL side of the split.
+            let member = self.offload_member(frame_id)?;
+            if member.locals.is_empty() {
                 continue;
             }
-            match self.plan_offload_one(frame_id) {
-                Ok(plan) => frames.push(plan),
-                // Invariant 2 is decided per frame: a frame without its own verified
-                // backup stays local and is named, rather than being freed on the strength
-                // of the master's backup.
-                Err(CatalogError::Validation(why)) => skipped.push(SkippedPhoto::new(frame_id, why)),
-                Err(e) => return Err(e),
-            }
+            frames.push(member);
         }
-        Ok(OffloadPlan { named, frames, skipped, total })
+        Ok(OffloadCandidates { named, frames, total })
     }
 
-    /// One photo's backup gate and local files, with no reference to the stack it may be
-    /// part of.
-    fn plan_offload_one(&self, photo_id: i64) -> Result<PhotoOffload> {
-        let backup = self
-            .verified_backup(photo_id)?
-            .ok_or_else(|| CatalogError::Validation("no verified backup — refusing to offload".into()))?;
-        let locals = self.copies_on_kind(photo_id, VolumeKind::Local)?;
-        let mut local_volume_ids: Vec<i64> = locals.iter().map(|c| c.volume_id).collect();
-        local_volume_ids.sort_unstable();
-        local_volume_ids.dedup();
-        Ok(PhotoOffload {
+    /// One photo's rows for [`OffloadCandidates`].
+    fn offload_member(&self, photo_id: i64) -> Result<OffloadMember> {
+        let verified_backups = self
+            .copies_on_kind(photo_id, VolumeKind::Backup)?
+            .into_iter()
+            .filter(|c| c.verified_hash.is_some())
+            .collect();
+        Ok(OffloadMember {
             photo_id,
-            backup_location_id: backup.location_id,
-            backup_abs: backup.abs,
-            expected_hash: backup.verified_hash.unwrap_or_default(),
-            local_files: locals.into_iter().map(|c| c.abs).collect(),
-            local_volume_ids,
+            verified_backups,
+            locals: self.copies_on_kind(photo_id, VolumeKind::Local)?,
         })
+    }
+
+    /// Statting convenience composing [`Catalog::plan_offload_candidates`] with
+    /// [`resolve_offload_plan`] — for the sync wrappers and tests; command paths split
+    /// the two halves around the catalog lock (#85). Errors (refuses) if the named photo
+    /// has no verified backup — invariants 1 & 2.
+    pub fn plan_offload(&self, photo_id: i64) -> Result<OffloadPlan> {
+        resolve_offload_plan(self.plan_offload_candidates(photo_id)?)
     }
 
     /// The frames stacked under `photo_id`, in a stable order.
@@ -546,53 +628,55 @@ impl Catalog {
 
     // --- restore -----------------------------------------------------------
 
-    /// Validate the target is a local volume and a backup copy exists; compute paths — for
-    /// the named photo **and the frames stacked under it** that are not already home.
-    pub fn plan_restore(&self, photo_id: i64, local_volume_id: i64) -> Result<RestorePlan> {
+    /// Gather every copy row a restore plan might need — for the named photo **and the
+    /// frames stacked under it** — and validate the target is a local volume. PURE SQL:
+    /// safe to call under the catalog lock; which frames are already home and which
+    /// backup is reachable are [`resolve_restore_plan`]'s questions, off it (#85).
+    pub fn plan_restore_candidates(
+        &self,
+        photo_id: i64,
+        local_volume_id: i64,
+    ) -> Result<RestoreCandidates> {
         let (base, kind) = self.volume_base_kind(local_volume_id)?;
         if kind != VolumeKind::Local {
             return Err(CatalogError::Validation("target is not a local volume".into()));
         }
-        let named = self.plan_restore_one(photo_id, &base, local_volume_id)?;
-        let mut frames = Vec::new();
-        let mut skipped = Vec::new();
+        let named = self.restore_member(photo_id)?;
         let frame_ids = self.stack_frame_ids(photo_id)?;
         let total = 1 + frame_ids.len();
-        for frame_id in frame_ids {
-            // A frame already at home needs nothing — and copying the backup over it would
-            // replace a local file the user may have edited since. Restore brings back what
-            // is away; it does not overwrite what is here.
-            if self.first_existing_copy(frame_id, VolumeKind::Local)?.is_some() {
-                continue;
-            }
-            match self.plan_restore_one(frame_id, &base, local_volume_id) {
-                Ok(plan) => frames.push(plan),
-                Err(CatalogError::Validation(why)) => skipped.push(SkippedPhoto::new(frame_id, why)),
-                Err(e) => return Err(e),
-            }
-        }
-        Ok(RestorePlan { named, frames, skipped, total })
+        let frames = frame_ids
+            .into_iter()
+            .map(|id| self.restore_member(id))
+            .collect::<Result<Vec<_>>>()?;
+        Ok(RestoreCandidates { named, frames, total, base, volume_id: local_volume_id })
     }
 
-    /// One photo's paths, with no reference to the stack it may be part of.
-    fn plan_restore_one(
-        &self,
-        photo_id: i64,
-        base: &str,
-        local_volume_id: i64,
-    ) -> Result<PhotoRestore> {
-        let backup = self
-            .first_existing_copy(photo_id, VolumeKind::Backup)?
-            .ok_or_else(|| CatalogError::Validation("no reachable backup to restore".into()))?;
-        let rel = self.get_photo(photo_id)?.path;
-        Ok(PhotoRestore {
+    /// One photo's rows for [`RestoreCandidates`].
+    fn restore_member(&self, photo_id: i64) -> Result<RestoreMember> {
+        let rel = self
+            .conn
+            .query_row(
+                "-- includes-hidden: a point lookup for a row the plan already names.
+                 -- Moving bytes is maintenance, not browsing (see `stack_frame_ids`):
+                 -- a hidden (trashed, missing) photo still holds bytes to move.
+                 SELECT path FROM photos WHERE id = ?1",
+                params![photo_id],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()?;
+        Ok(RestoreMember {
             photo_id,
-            source: backup.abs,
-            dest: Path::new(base).join(&rel),
+            locals: self.copies_on_kind(photo_id, VolumeKind::Local)?,
+            backups: self.copies_on_kind(photo_id, VolumeKind::Backup)?,
             rel,
-            volume_id: local_volume_id,
-            expected_hash: backup.verified_hash,
         })
+    }
+
+    /// Statting convenience composing [`Catalog::plan_restore_candidates`] with
+    /// [`resolve_restore_plan`] — for the sync wrappers and tests; command paths split
+    /// the two halves around the catalog lock (#85).
+    pub fn plan_restore(&self, photo_id: i64, local_volume_id: i64) -> Result<RestorePlan> {
+        resolve_restore_plan(self.plan_restore_candidates(photo_id, local_volume_id)?)
     }
 
     /// As [`Catalog::record_backup`], for a local cache copy. Private for the same reason.
@@ -688,35 +772,39 @@ impl Catalog {
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
-    fn first_existing_copy(&self, photo_id: i64, kind: VolumeKind) -> Result<Option<Copy>> {
-        Ok(self
-            .copies_on_kind(photo_id, kind)?
-            .into_iter()
-            .find(|c| c.abs.exists()))
-    }
-
-    /// A backup copy that has a recorded verified hash and whose file exists.
-    fn verified_backup(&self, photo_id: i64) -> Result<Option<Copy>> {
+    /// The backup copies with a recorded verified hash, as absolute paths — the rows
+    /// half of [`Catalog::has_verified_backup`], for callers that stat off the catalog
+    /// lock through [`any_backup_present`] (#85).
+    pub fn verified_backup_candidates(&self, photo_id: i64) -> Result<Vec<PathBuf>> {
         Ok(self
             .copies_on_kind(photo_id, VolumeKind::Backup)?
             .into_iter()
-            .find(|c| c.verified_hash.is_some() && c.abs.exists()))
+            .filter(|c| c.verified_hash.is_some())
+            .map(|c| c.abs)
+            .collect())
     }
 
     /// Whether a photo already has a verified backup whose file is present. Used to make
     /// backup idempotent: an existing good backup must never be re-copied (re-copying over
     /// a flaky mount is what risks destroying it). A *missing* backup still returns false,
     /// so it gets re-created (safely, via [`copy_and_verify`]'s temp+rename).
+    ///
+    /// Statting convenience over [`Catalog::verified_backup_candidates`] +
+    /// [`any_backup_present`]; command paths split the two around the catalog lock (#85).
     pub fn has_verified_backup(&self, photo_id: i64) -> Result<bool> {
-        Ok(self.verified_backup(photo_id)?.is_some())
+        Ok(any_backup_present(&self.verified_backup_candidates(photo_id)?))
     }
 
-    /// Photos eligible for age-based offload ("keep last N days local"): older than
-    /// `age_days` (by capture time, falling back to import time), that STILL have a local
-    /// copy AND a present, verified backup. The verified-backup requirement means a photo
-    /// is never freed unless its NAS copy is confirmed there — and only when the NAS is
-    /// reachable (else `has_verified_backup` is false), so offload never runs blind.
-    pub fn photos_eligible_for_offload(&self, age_days: i64) -> Result<Vec<i64>> {
+    /// Pure-SQL half of [`Catalog::photos_eligible_for_offload`] (#85): photos eligible
+    /// for age-based offload ("keep last N days local") — older than `age_days` (by
+    /// capture time, falling back to import time) and holding local rows — plus the copy
+    /// paths [`filter_offload_eligible`] stats to confirm each one. Split because the
+    /// sweep stats once per candidate across the whole library, the worst possible pass
+    /// to hold the catalog mutex across.
+    pub fn offload_eligibility_candidates(
+        &self,
+        age_days: i64,
+    ) -> Result<Vec<OffloadEligibility>> {
         let now_unix = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs() as i64)
@@ -744,19 +832,197 @@ impl Catalog {
                  )",
             )?;
             let rows = stmt.query_map(params![cutoff_iso, cutoff_unix], |r| r.get(0))?;
-            rows.collect::<rusqlite::Result<_>>()?
+            rows.collect::<rusqlite::Result<Vec<i64>>>()?
         };
-        // Keep only those with a present verified backup AND a present local file.
-        let mut out = Vec::new();
-        for id in candidates {
-            if self.has_verified_backup(id)?
-                && self.first_existing_copy(id, VolumeKind::Local)?.is_some()
-            {
-                out.push(id);
-            }
-        }
-        Ok(out)
+        candidates
+            .into_iter()
+            .map(|photo_id| {
+                Ok(OffloadEligibility {
+                    photo_id,
+                    verified_backups: self.verified_backup_candidates(photo_id)?,
+                    locals: self
+                        .copies_on_kind(photo_id, VolumeKind::Local)?
+                        .into_iter()
+                        .map(|c| c.abs)
+                        .collect(),
+                })
+            })
+            .collect()
     }
+
+    /// Statting convenience composing [`Catalog::offload_eligibility_candidates`] with
+    /// [`filter_offload_eligible`] — for tests and simple callers; the policy sweep
+    /// splits the two halves around the catalog lock (#85).
+    pub fn photos_eligible_for_offload(&self, age_days: i64) -> Result<Vec<i64>> {
+        Ok(filter_offload_eligible(self.offload_eligibility_candidates(age_days)?))
+    }
+}
+
+// --- the stat half of planning (#85) ---------------------------------------
+
+/// The first candidate copy whose file is on disk — the planners' one filesystem
+/// question, funnelled through [`crate::volume_health::candidate_exists`] so the unit
+/// tests can count planner stats the way they count resolver stats.
+fn first_present(copies: Vec<Copy>) -> Option<Copy> {
+    copies
+        .into_iter()
+        .find(|c| crate::volume_health::candidate_exists(&c.abs))
+}
+
+/// The "which of these exists?" half of [`Catalog::plan_backup_candidates`]. Stats the
+/// filesystem — call it from a blocking context with NO catalog lock held; everything it
+/// needs travels inside the candidates.
+pub fn resolve_backup_plan(candidates: BackupCandidates) -> Result<BackupPlan> {
+    let BackupCandidates { named, frames: members, total, base, volume_id } = candidates;
+    let named = resolve_backup_member(named, &base, volume_id)?;
+    let mut frames = Vec::new();
+    let mut skipped = Vec::new();
+    for member in members {
+        let frame_id = member.photo_id;
+        match resolve_backup_member(member, &base, volume_id) {
+            Ok(plan) => frames.push(plan),
+            // A frame's own missing copy is a skip, not the master's failure. Anything
+            // else is still an error.
+            Err(CatalogError::Validation(why)) => skipped.push(SkippedPhoto::new(frame_id, why)),
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(BackupPlan { named, frames, skipped, total })
+}
+
+fn resolve_backup_member(member: BackupMember, base: &str, volume_id: i64) -> Result<PhotoBackup> {
+    let source = first_present(member.locals)
+        .ok_or_else(|| CatalogError::Validation("no local copy to back up".into()))?;
+    // A copy row implies a photos row, so `rel` is present whenever a source was found.
+    let rel = member
+        .rel
+        .ok_or_else(|| CatalogError::Validation("photo row vanished while planning".into()))?;
+    Ok(PhotoBackup {
+        photo_id: member.photo_id,
+        source: source.abs,
+        dest: Path::new(base).join(&rel),
+        rel,
+        volume_id,
+    })
+}
+
+/// The "which of these exists?" half of [`Catalog::plan_offload_candidates`] —
+/// invariant 2's gate, statted with NO catalog lock held.
+///
+/// A stale answer here is never destructive. This stat only *admits* a photo to the
+/// plan; before anything is deleted, [`free_local_copies`] re-hashes the backup file
+/// itself (invariant 3), so a backup that vanishes between this stat and the delete
+/// fails that re-check and the photo stays local. Going stale off the lock can delay or
+/// refuse an offload — never make one wrong.
+pub fn resolve_offload_plan(candidates: OffloadCandidates) -> Result<OffloadPlan> {
+    let OffloadCandidates { named, frames: members, total } = candidates;
+    let named = resolve_offload_member(named)?;
+    let mut frames = Vec::new();
+    let mut skipped = Vec::new();
+    for member in members {
+        let frame_id = member.photo_id;
+        match resolve_offload_member(member) {
+            Ok(plan) => frames.push(plan),
+            // Invariant 2 is decided per frame: a frame without its own verified
+            // backup stays local and is named, rather than being freed on the strength
+            // of the master's backup.
+            Err(CatalogError::Validation(why)) => skipped.push(SkippedPhoto::new(frame_id, why)),
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(OffloadPlan { named, frames, skipped, total })
+}
+
+fn resolve_offload_member(member: OffloadMember) -> Result<PhotoOffload> {
+    let backup = first_present(member.verified_backups).ok_or_else(|| {
+        CatalogError::Validation("no verified backup — refusing to offload".into())
+    })?;
+    let mut local_volume_ids: Vec<i64> = member.locals.iter().map(|c| c.volume_id).collect();
+    local_volume_ids.sort_unstable();
+    local_volume_ids.dedup();
+    Ok(PhotoOffload {
+        photo_id: member.photo_id,
+        backup_location_id: backup.location_id,
+        backup_abs: backup.abs,
+        expected_hash: backup.verified_hash.unwrap_or_default(),
+        local_files: member.locals.into_iter().map(|c| c.abs).collect(),
+        local_volume_ids,
+    })
+}
+
+/// The "which of these exists?" half of [`Catalog::plan_restore_candidates`], statted
+/// with NO catalog lock held.
+pub fn resolve_restore_plan(candidates: RestoreCandidates) -> Result<RestorePlan> {
+    let RestoreCandidates { named, frames: members, total, base, volume_id } = candidates;
+    let named = resolve_restore_member(named, &base, volume_id)?;
+    let mut frames = Vec::new();
+    let mut skipped = Vec::new();
+    for member in members {
+        // A frame already at home needs nothing — and copying the backup over it would
+        // replace a local file the user may have edited since. Restore brings back what
+        // is away; it does not overwrite what is here.
+        if member
+            .locals
+            .iter()
+            .any(|c| crate::volume_health::candidate_exists(&c.abs))
+        {
+            continue;
+        }
+        let frame_id = member.photo_id;
+        match resolve_restore_member(member, &base, volume_id) {
+            Ok(plan) => frames.push(plan),
+            Err(CatalogError::Validation(why)) => skipped.push(SkippedPhoto::new(frame_id, why)),
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(RestorePlan { named, frames, skipped, total })
+}
+
+fn resolve_restore_member(
+    member: RestoreMember,
+    base: &str,
+    volume_id: i64,
+) -> Result<PhotoRestore> {
+    let backup = first_present(member.backups)
+        .ok_or_else(|| CatalogError::Validation("no reachable backup to restore".into()))?;
+    // A copy row implies a photos row, so `rel` is present whenever a source was found.
+    let rel = member
+        .rel
+        .ok_or_else(|| CatalogError::Validation("photo row vanished while planning".into()))?;
+    Ok(PhotoRestore {
+        photo_id: member.photo_id,
+        source: backup.abs,
+        dest: Path::new(base).join(&rel),
+        rel,
+        volume_id,
+        expected_hash: backup.verified_hash,
+    })
+}
+
+/// The "is one actually there?" half of [`Catalog::has_verified_backup`]. Stats — call
+/// it with no catalog lock held.
+pub fn any_backup_present(candidates: &[PathBuf]) -> bool {
+    candidates
+        .iter()
+        .any(|p| crate::volume_health::candidate_exists(p))
+}
+
+/// Keep the candidates whose verified backup AND local copy are both actually on disk —
+/// the stat half of [`Catalog::photos_eligible_for_offload`]. The backup requirement
+/// means a photo is never freed unless its NAS copy is confirmed there — and only when
+/// the NAS is reachable (an unreachable one confirms nothing), so the sweep never runs
+/// blind. Stats — call it with no catalog lock held.
+pub fn filter_offload_eligible(candidates: Vec<OffloadEligibility>) -> Vec<i64> {
+    candidates
+        .into_iter()
+        .filter(|c| {
+            any_backup_present(&c.verified_backups)
+                && c.locals
+                    .iter()
+                    .any(|p| crate::volume_health::candidate_exists(p))
+        })
+        .map(|c| c.photo_id)
+        .collect()
 }
 
 /// SHA-256 of a file as lowercase hex. Streams the file (constant memory).
@@ -1020,4 +1286,92 @@ fn free_local_copies(photo: &PhotoOffload, abort: Option<&AtomicBool>) -> Result
 
 fn io(e: std::io::Error) -> CatalogError {
     CatalogError::Io(e.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::TestTmpDir;
+    use crate::volume_health::take_candidate_stats;
+
+    /// A catalog rooted at `<tmp>/photos` with an attached "NAS" backup volume, plus one
+    /// local photo already backed up to it. Returns the fixture dir (kept alive for
+    /// cleanup), the local file, the photo id, and the NAS volume id.
+    fn backed_up_photo(tag: &str) -> (Catalog, TestTmpDir, PathBuf, i64, i64) {
+        let dir = TestTmpDir::new(&format!("lifecycle-{tag}"));
+        let root = dir.join("photos");
+        std::fs::create_dir_all(&root).unwrap();
+        let catalog = Catalog::open(&dir.join("t.chairphoto"), &root).unwrap();
+        let nas_base = dir.join("nas");
+        std::fs::create_dir_all(&nas_base).unwrap();
+        let nas = catalog.add_volume("NAS", &nas_base, VolumeKind::Backup).unwrap();
+        let raw = root.join("2026/08/DSC1.ARW");
+        std::fs::create_dir_all(raw.parent().unwrap()).unwrap();
+        std::fs::write(&raw, b"raw-bytes").unwrap();
+        let id = catalog.upsert_photo(&raw, None, 1, 9).unwrap().id;
+        catalog.backup_photo(id, nas).unwrap();
+        (catalog, dir, raw, id, nas)
+    }
+
+    /// The split's contract (#85): every `*_candidates` half is PURE SQL — zero
+    /// filesystem stats, so it is safe to run while the catalog mutex is held — and the
+    /// `resolve_*`/`filter_*`/`any_*` halves are where every planner stat happens, off
+    /// the lock. Counted rather than timed, like the resolver's own tests
+    /// (`locations.rs`). The lock interleaving itself (another catalog reader proceeding
+    /// while a plan stats a dead NAS) is not forced here; this pins the property that
+    /// makes it safe.
+    #[test]
+    fn candidate_halves_are_pure_sql_and_the_resolve_halves_stat() {
+        let (catalog, _dir, _raw, id, nas) = backed_up_photo("split-contract");
+        // Age eligibility keys on capture time falling back to import time; backdate the
+        // import so the age-0 sweep below sees the photo without waiting.
+        catalog
+            .conn
+            .execute("UPDATE photos SET created_at = created_at - 86400 WHERE id = ?1", params![id])
+            .unwrap();
+        let local = catalog.ensure_default_volume().unwrap();
+
+        let _ = take_candidate_stats();
+        let backup = catalog.plan_backup_candidates(id, nas).unwrap();
+        let offload = catalog.plan_offload_candidates(id).unwrap();
+        let restore = catalog.plan_restore_candidates(id, local).unwrap();
+        let gate = catalog.verified_backup_candidates(id).unwrap();
+        let sweep = catalog.offload_eligibility_candidates(0).unwrap();
+        assert_eq!(take_candidate_stats(), 0, "the rows halves must never touch the filesystem");
+
+        resolve_backup_plan(backup).unwrap();
+        assert!(take_candidate_stats() > 0, "backup decides its source by statting");
+        resolve_offload_plan(offload).unwrap();
+        assert!(take_candidate_stats() > 0, "offload's gate is a stat");
+        resolve_restore_plan(restore).unwrap();
+        assert!(take_candidate_stats() > 0, "restore decides its source by statting");
+        assert!(any_backup_present(&gate));
+        assert!(take_candidate_stats() > 0, "the idempotency gate is a stat");
+        assert_eq!(filter_offload_eligible(sweep), vec![id]);
+        assert!(take_candidate_stats() > 0, "the sweep confirms each candidate by statting");
+    }
+
+    /// Candidates are rows; decisions are files. A backup the catalog records but the
+    /// disk no longer holds is still among the candidates — pure SQL cannot know — and
+    /// the stat half is what refuses it. Refusal is also all a stale stat can do: before
+    /// anything is deleted, [`free_local_copies`] re-hashes the backup itself (invariant
+    /// 3), so an answer that goes stale the other way aborts there instead of freeing on
+    /// old evidence.
+    #[test]
+    fn the_stat_half_refuses_a_backup_the_rows_still_promise() {
+        let (catalog, dir, raw, id, _nas) = backed_up_photo("stale-backup");
+        std::fs::remove_file(dir.join("nas/2026/08/DSC1.ARW")).unwrap();
+
+        let candidates = catalog.plan_offload_candidates(id).unwrap();
+        assert!(
+            !candidates.named.verified_backups.is_empty(),
+            "the rows half still lists the recorded backup"
+        );
+        let err = match resolve_offload_plan(candidates) {
+            Ok(_) => panic!("a backup missing on disk must refuse the offload"),
+            Err(err) => err.to_string(),
+        };
+        assert!(err.contains("no verified backup"), "refused by the stat half: {err}");
+        assert!(raw.exists(), "a refusal never touches the local copy");
+    }
 }

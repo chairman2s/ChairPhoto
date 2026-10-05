@@ -494,6 +494,18 @@ pub const OFFLOAD_AGE_SETTING: &str = "offload_age_days";
 /// age that has a verified NAS backup. No-op when the policy is unset or the NAS is
 /// unreachable. Returns how many photos were offloaded.
 ///
+/// **The age selects moments, not photos (#87).** The cutoff picks the candidates, but each
+/// offload takes the candidate's whole stack (#82), and `plan_offload` applies no age test to
+/// the frames it cascades to. So a frame *inside* the retention window is freed when its
+/// master is outside it — a burst is one moment, and half-offloading it would leave the user
+/// with a stack split across two disks, which is worse than either whole answer.
+///
+/// Nothing is at risk either way: the offload plan demands each frame's *own* verified
+/// backup, so a frame without one stays local no matter what its master did. What this costs
+/// is exactness in the setting's promise, which is why it is written down here and in
+/// `docs/storage-and-import.md` rather than left for the next reader to discover from a frame
+/// that went to the NAS a day after it was imported.
+///
 /// Claims the reconcile generation and works on that catalog only — see [`ReconcileClaim`].
 pub fn apply_offload_policy(state: &AppState) -> Result<usize, String> {
     claim_reconcile(state)?.apply_offload_policy()

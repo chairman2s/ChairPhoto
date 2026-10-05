@@ -824,6 +824,9 @@ impl PhotoInspector {
     }
 
     // --- storage -----------------------------------------------------------------------
+    //
+    // Each verb acts on the stack — the named photo and the frames under it (#82) — so each
+    // reports what it took and what it left (`chairphoto_model::storage_outcome`).
 
     /// Back up now if the NAS is reachable, else queue a backup (React's `onBackup`).
     pub fn back_up(&mut self, cx: &mut Context<Self>) {
@@ -833,7 +836,7 @@ impl PhotoInspector {
         self.storage_action(
             id,
             move |state| match chairphoto_core::app::storage::backup_photo_as(state, from, id) {
-                Ok(_) => Ok("Backed up".to_string()),
+                Ok(report) => Ok(chairphoto_model::storage_outcome::backup_message(&report)),
                 Err(e) if e == chairphoto_core::app::CATALOG_CHANGED => Err(e),
                 Err(_) => {
                     chairphoto_core::app::storage::enqueue_backup_as(state, from, id)?;
@@ -851,7 +854,8 @@ impl PhotoInspector {
         self.storage_action(
             id,
             move |state| {
-                chairphoto_core::app::storage::offload_photo_as(state, from, id).map(|_| "Local copy freed".to_string())
+                chairphoto_core::app::storage::offload_photo_as(state, from, id)
+                    .map(|report| chairphoto_model::storage_outcome::offload_message(&report))
             },
             cx,
         );
@@ -864,7 +868,8 @@ impl PhotoInspector {
         self.storage_action(
             id,
             move |state| {
-                chairphoto_core::app::storage::restore_photo_as(state, from, id).map(|_| "Restored to local".to_string())
+                chairphoto_core::app::storage::restore_photo_as(state, from, id)
+                    .map(|report| chairphoto_model::storage_outcome::restore_message(&report))
             },
             cx,
         );

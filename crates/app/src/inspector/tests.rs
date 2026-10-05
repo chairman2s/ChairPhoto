@@ -848,6 +848,37 @@ fn back_up_queues_when_the_nas_is_unavailable(cx: &mut TestAppContext) {
     assert!(queued.iter().any(|o| o.photo_id == ids[0] && o.kind == "backup"), "{queued:?}");
 }
 
+/// Storage: a verb acts on the stack, so it says what it took and what it left (#82). The
+/// master was backed up before the frame joined it, so the frame has no backup of its own
+/// and stays local — and the status line names the count and the reason, not "Local copy
+/// freed" (port of React's `PhotoInspector.storageOutcome` case).
+#[gpui_kit::test]
+fn offload_of_a_stack_says_what_it_freed_and_what_it_left(cx: &mut TestAppContext) {
+    let dir = TempDir::new("insp-storage-stack");
+    let app = start(cx);
+    let ids = open_catalog_with_photos(&app, &dir, 2, cx);
+    let (master, frame) = (ids[0], ids[1]);
+    let nas = dir.0.join("nas");
+    std::fs::create_dir_all(dir.0.join("photos/2026")).unwrap();
+    std::fs::create_dir_all(&nas).unwrap();
+    std::fs::write(dir.0.join("photos/2026/p0.ARW"), b"raw-0").unwrap();
+    std::fs::write(dir.0.join("photos/2026/p1.ARW"), b"raw-1").unwrap();
+    catalog(&app, |c| {
+        let nas = c.add_volume("NAS", &nas, chairphoto_core::catalog::VolumeKind::Backup).unwrap();
+        c.backup_photo(master, nas).unwrap();
+        c.set_stack_parent(frame, master).unwrap();
+    });
+    select(&app, master, SelectMods::default(), cx);
+    let insp = inspector(&app, cx);
+    insp.update(cx, |i, cx| i.offload(cx));
+    work(cx);
+    insp.read_with(cx, |i, _| {
+        assert_eq!(i.storage_msg.as_deref(), Some("Freed 1 of 2 — no verified backup — refusing to offload"))
+    });
+    assert!(!dir.0.join("photos/2026/p0.ARW").exists(), "the master was freed");
+    assert!(dir.0.join("photos/2026/p1.ARW").exists(), "the frame, with no backup of its own, stayed");
+}
+
 // --- versions ------------------------------------------------------------------------
 
 /// Add (typed name, else "Version N"), choose, rename, duplicate, delete; the chosen version

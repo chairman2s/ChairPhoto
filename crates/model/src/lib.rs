@@ -18,6 +18,7 @@ pub mod publishing;
 pub mod shell_timing;
 pub mod slideshow;
 pub mod statistics;
+pub mod storage_outcome;
 pub mod tag_graph;
 pub mod tag_paste;
 pub mod tag_tree;

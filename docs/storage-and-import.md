@@ -508,6 +508,34 @@ Carrying is idempotent — an identical file already at the destination is adopt
 than rewritten — so a companion placed there by any other means is absorbed on the next
 pass instead of being re-copied or causing a conflict.
 
+**A sidecar backup is not a companion.** `<sidecar>.chairphoto-backup` — the copy the XMP
+safety rule takes before ChairPhoto's first write — is **per copy** by construction: each
+copy's sidecar had its own pre-ChairPhoto state, and the NAS copy already has its own. So
+offload neither carries it (two backups for one photo is exactly what the divergence rule
+refuses to offload over) nor deletes it (that would destroy the only record of the earlier
+sidecar, during a routine space-freeing operation, for a few KB). It is left in place and
+**reported**, so the one file left in an otherwise emptied folder is something the verb
+said rather than something the user discovers (#82).
+
+**Delete takes it, and reports it separately.** Emptying the trash removes the image, its
+companions and the catalog row, so nothing is left for the backup to be the earlier state
+*of* — and a file with no row and nothing beside it is the orphan the delete path already
+refuses to create everywhere else. It is counted in `sidecar_backups_deleted` rather than in
+`files_deleted`: a sidecar backup is not a companion, and folding it into the tally of
+destroyed originals would inflate that number with a file the user never knew about (#84).
+
+Order is part of the rule. The backups are taken **last**, only once every image and
+companion this delete is responsible for is confirmed absent — a delete that failed on the
+image leaves a photo that still exists, and the record of its earlier sidecar is then still
+a record of something. A backup that cannot be removed is itself a failure and the photo
+keeps its row: a few KB against every original already gone, but the row is what makes the
+leftover findable and the delete retryable.
+
+A backup **stranded by an earlier offload** — sitting where the local copy used to be, with
+its location row dropped — is still in reach, because `photo_path_candidates` always ends
+with the catalog-root path. That fallback, not the location rows, is what a later delete
+walks to find it.
+
 `verified_hash` deliberately stays a hash of the **image only**. The image is immutable, so
 a changed hash means bit rot; companions are mutable by design (darktable rewrites `.xmp` on
 every edit, and so does chairphoto on IPTC/GPS/face writes), so hashing them would report
@@ -574,10 +602,13 @@ drained when the NAS volume is detected:
 - `offload(photo)` — only after verified backup; frees local space
 - `restore(photo)` — pull an archived original back to local (e.g. to edit it)
 
-**The ops and verification**: `catalog/lifecycle.rs` + async `backup_photo` /
-`offload_photo` / `restore_photo` commands. SHA-256 (`photo_locations.verified_hash`,
-schema v10); each op is plan-under-lock → pure file IO off-thread → record-under-lock,
-so a NAS copy never blocks the UI. The backup target is the single backup volume and
+**The ops and verification**: `catalog/lifecycle.rs` + the `app/storage.rs` service bodies
+(`backup_photo_as` / `offload_photo_as` / `restore_photo_as`, run on a worker). SHA-256 (`photo_locations.verified_hash`,
+schema v10); each op is plan → pure file IO off-thread → record-under-lock, and the plan
+itself is split like the path resolver (#85): candidate rows are gathered in pure SQL
+under the catalog lock and their existence is statted off it, so a NAS copy never blocks
+the UI — and a slow or unmounted NAS never holds the catalog lock while a plan checks it.
+The backup target is the single backup volume and
 restore lands on the single local volume (multi-volume selection is future). The `pending_operations`
 queue and automatic draining on NAS reappearance are not implemented; the ops are
 invoked directly per photo.
@@ -622,6 +653,65 @@ trashed inside one second would restore together.
 A trashed frame stops counting toward its master's stack badge; an *offline* one still
 counts. The difference is that one is a decision about the photo and the other is a fact
 about a disk.
+
+### A storage verb acts on the moment, not the file
+
+A stack is how a burst is stored, so a tile is a *moment*: trash, back up, and offload all
+take the master **and its frames**. They did not always — trash started cascading in
+cluster B while offload and backup still took one row, so the same tile behaved two ways
+and offloading a 7-frame burst freed the keeper alone (#82).
+
+The cascade lives in `plan_offload` / `plan_backup` / `plan_restore`, so every caller of the
+service bodies in `crates/core/src/app/storage.rs` inherits it: the inspector buttons, the
+Library's Retrieve from NAS, the reconcile drain, and the age-based `apply_offload_policy`
+sweep. (The
+sweep also has to de-duplicate: a frame is eligible in its own right and its master's
+offload has already freed it, so without that it would count the same frame twice.)
+
+Two conditions keep the cascade honest:
+
+- **Every frame is gated on its own copies.** Invariant 2 is decided per frame: a frame
+  without its own verified backup stays local rather than being freed on the strength of
+  the master's. Backup likewise skips a frame with no local copy to send.
+- **What was skipped is reported**, with the reason, the way `empty_trash` reports what it
+  refused: *"Freed 4 of 7 — no verified backup — refusing to offload"*.
+
+The sweep inherits one more thing, and it is worth stating plainly: **`offload_age_days`
+selects moments, not photos.** The cutoff picks which photos are candidates, but the cascade
+that follows applies no age test, so a frame imported inside the retention window is freed
+when its master falls outside it. A burst is one moment; splitting it across two disks to
+honour the cutoff exactly would be the worse answer. Nothing is at risk either way, because
+every frame is still gated on its own verified backup — but a user who set the policy to keep
+recent work on fast local storage can find yesterday's frame on the NAS, and that is the
+behaviour, not a bug (#87).
+
+When reconcile completes only part of a stack, it replaces the completed master's queue
+row with one row per skipped frame, retried independently, so the completed master is not
+destructively replayed. A frame that refused on its own account is `failed` with its reason.
+A frame left only because the drain was superseded (a catalog switch or a newer drain) is
+`pending` again — an interruption is not a failure, and only pending rows are counted by the
+reconcile check and the queue chip, so a failed row would never be retried by itself. For
+the same reason an op the trip stopped before it did anything (an offload before its named
+photo) keeps its pending row untouched.
+
+Ownership is the service layer's (`crates/core/src/app/storage.rs`), not a lock held across
+the work. A verb the user started on ids read from one catalog runs its plan, its file IO and
+its record on a connection of its own to that catalog (`backup_photo_as` and its siblings), so
+a switch mid-copy cannot record it into the catalog switched to. A drain or offload-policy
+sweep also holds the reconcile generation (`storage::ReconcileClaim`): a switch or a newer
+drain trips it, and the claimed work then starts no further stack member — those are
+reported skipped and requeued as above — and no further queued op. Offload, the verb that
+deletes, re-checks the flag before every member's delete, the named photo's included. A copy
+or delete already under way is indivisible and is recorded on that claimed connection.
+
+Restore is the same rule pointing the other way: a stack that leaves as seven frames comes
+back as seven. It brings home only the frames that are *away* — a frame already local is
+left alone, because copying the backup over it would replace a file the user may have
+edited since.
+
+Pressing a verb on a *frame* acts on that frame alone. Stacks are one level deep, so a
+frame has nothing under it — the same asymmetry restore has, where bringing a child back
+does not bring back its master.
 
 **Delete** is the only path in the app that destroys an original, and it is gated twice:
 an explicit confirmation the backend requires rather than assumes, and **every known copy

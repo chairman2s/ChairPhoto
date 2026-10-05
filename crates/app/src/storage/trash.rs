@@ -252,6 +252,16 @@ pub fn report_lines(r: &EmptyTrashReport) -> Vec<String> {
         ui::plural(r.deleted, "photo", "photos"),
         ui::plural(r.files_deleted, "file", "files")
     )];
+    // Offload leaves these and says so; delete takes them and has to say so too — apart from
+    // the file count, which would otherwise be inflated with a file the user never knew
+    // existed (#84).
+    if r.sidecar_backups_deleted > 0 {
+        lines.push(format!(
+            "{} went with them — the copy kept of each sidecar before ChairPhoto first wrote to it, which \
+             nothing is left to describe.",
+            ui::plural(r.sidecar_backups_deleted, "sidecar backup", "sidecar backups")
+        ));
+    }
     if !r.skipped_unreachable.is_empty() {
         lines.push(format!(
             "{} left alone — a disk holding a copy could not be reached. Nothing was deleted for those: \
@@ -431,6 +441,7 @@ mod tests {
         let r = EmptyTrashReport {
             deleted: 1,
             files_deleted: 3,
+            sidecar_backups_deleted: 0,
             skipped_unreachable: vec![7, 8],
             failed: vec![(9, "/x/a.ARW could not be removed".into())],
             restored_meanwhile: vec![],
@@ -442,5 +453,17 @@ mod tests {
         assert!(lines[2].starts_with("Stopped early."));
         assert!(lines[3].starts_with("1 could not be fully deleted."));
         assert_eq!(lines[4], "• /x/a.ARW could not be removed");
+        assert!(lines.iter().all(|l| !l.contains("sidecar backup")), "none were taken, so none are named");
+    }
+
+    /// The sidecar backups delete took are named apart from the originals (port of
+    /// TrashDialog.test.tsx's "names the sidecar backups it took", origin/main 14c436c).
+    #[test]
+    fn the_report_names_the_sidecar_backups_it_took_apart_from_the_originals() {
+        let r = EmptyTrashReport { deleted: 1, files_deleted: 2, sidecar_backups_deleted: 2, ..Default::default() };
+        let lines = report_lines(&r);
+        assert_eq!(lines[0], "Deleted 1 photo and 2 files.");
+        assert!(lines[1].starts_with("2 sidecar backups went with them"), "{lines:?}");
+        assert!(lines[1].contains("nothing is left to describe"), "{lines:?}");
     }
 }

@@ -211,7 +211,7 @@ impl RootView {
         cx.spawn(async move |this, cx| {
             let result = rx.await.unwrap_or_else(|_| Err("the retrieve worker stopped".into()));
             this.update(cx, |this, cx| match result {
-                Ok(()) => {
+                Ok(report) => {
                     // As relocate's success arm (#193): the restore itself is bound to `from`
                     // and already fails closed across a switch; this only keeps the UI side
                     // effects off a view that has since moved to another (unrelated) catalog.
@@ -219,7 +219,8 @@ impl RootView {
                         this.images.update(cx, |s, cx| s.invalidate(id, cx));
                         this.photos_changed(cx);
                     }
-                    this.photo_status("Retrieved from NAS.".into(), cx);
+                    // The restore brings the stack home too (#82); say what came back.
+                    this.photo_status(chairphoto_model::storage_outcome::retrieve_message(&report), cx);
                 }
                 Err(e) => this.photo_status(format!("Couldn't retrieve from NAS: {e}"), cx),
             })

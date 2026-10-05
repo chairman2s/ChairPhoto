@@ -17,9 +17,13 @@
 //! - **A second window.** The pop-out loupe ([`crate::loupe::window`], #110) is another
 //!   `LoupeView`, with [`Follow::Window`], over the same entities: it follows the target
 //!   whatever the main stage shows, has no "Back to grid", and ignores Enter/Esc and C. While
-//!   the Darkroom has a print up (`ShellState::set_loupe_print`, `edit` feature) it shows
-//!   that record, rendered from the print's own source, instead. When its window closes it
-//!   is [released](LoupeView::release).
+//!   a proof sheet's previewed candidate (`ShellState::set_loupe_proof_preview`, `edit`
+//!   feature, #250) shows that record, rendered from the Darkroom's own source and labelled
+//!   "Proof: <label> — not applied", through its 320 px cell render until the loupe-size one
+//!   lands; it outranks the Darkroom's print (`ShellState::set_loupe_print`) on the same photo
+//!   — the sheet is transient and modal over the Darkroom, so it wins even while "🖥 Loupe
+//!   print" is on, its default. Failing both, the print alone shows its own record. When its
+//!   window closes it is [released](LoupeView::release).
 //!
 //! Keys ([`contexts::LOUPE`]): ←/→/↑/↓ step (Shift extends), Enter/Esc back to the grid, C
 //! Compare, and the culling keys, which mark the targets and advance as in the grid.
@@ -91,6 +95,15 @@ pub enum Follow {
     Inline,
     /// A loupe window (#110): the target whatever the main stage shows.
     Window,
+}
+
+/// What [`LoupeView::record_source`] picked: the proof sheet's previewed candidate, or the
+/// Darkroom's print — never both at once, and never the active version (that is `None`,
+/// [`LoupeView::sync_version`]'s own fallback).
+#[cfg(feature = "edit")]
+enum RecordSource {
+    Proof(crate::shell::state::LoupeProofPreview),
+    Print(crate::shell::state::LoupePrint),
 }
 
 /// See the module docs.
@@ -198,6 +211,24 @@ impl LoupeView {
         }
     }
 
+    /// Which record the pop-out shows in place of the active version, and why, for `photo_id`
+    /// (#250 review): a proof sheet's previewed candidate outranks the Darkroom's print — the
+    /// sheet is transient and modal over the Darkroom, so it should win even while "🖥 Loupe
+    /// print" is on, its default (`Darkroom::session.rs` `print_on_loupe: true`). `None` outside
+    /// `Follow::Window` (the inline loupe shows neither) or when neither is up for this photo.
+    /// [`Self::sync_version`] (the image) and `render_bar` (the bar's label) both ask this, so
+    /// the two can never disagree.
+    #[cfg(feature = "edit")]
+    fn record_source(&self, photo_id: i64, cx: &App) -> Option<RecordSource> {
+        if self.follow != Follow::Window {
+            return None;
+        }
+        if let Some(p) = self.shell.read(cx).loupe_proof_preview().filter(|p| p.photo_id == photo_id).cloned() {
+            return Some(RecordSource::Proof(p));
+        }
+        self.print(cx).filter(|p| p.photo.id == photo_id).cloned().map(RecordSource::Print)
+    }
+
     /// Follow the target: show it, and on a change ask for it first, then its neighbours. The
     /// photo left gives up its full-resolution tier — pending or loaded; the target keeps its.
     fn sync(&mut self, cx: &mut Context<Self>) {
@@ -269,14 +300,25 @@ impl LoupeView {
         const LOUPE_EDGE: u32 = 2560;
         let target = self.zoom.read(cx).photo();
         let epoch = self.model.read(cx).catalog_epoch;
-        // The record to render and its pixels: the Darkroom's print (pop-out only), else the
-        // active version — each only on its own photo.
-        let shell = self.shell.read(cx);
-        let record = match self.print(cx) {
-            Some(print) => Some((print.photo.id, print.edit_json.clone(), print.source.clone())),
-            None => shell.active_version().map(|v| (v.photo_id, v.edit_json.clone(), SourceToken::Preview)),
-        }
-        .filter(|(photo, _, _)| Some(*photo) == target);
+        // The record to render and its pixels, and why (`Self::record_source`, shared with
+        // `render_bar`'s label so the two can never disagree, #250 review): a proof sheet's
+        // previewed candidate, else the Darkroom's print, else the active version — each only
+        // on its own photo (the trailing filter, below). The proof case also keeps its 320 px
+        // cell render, a placeholder until its own loupe-size render lands.
+        let chosen = target.and_then(|id| self.record_source(id, cx));
+        let (record, placeholder) = match chosen {
+            Some(RecordSource::Proof(p)) => {
+                let edit_json = (p.source.encode)(&p.candidate.record);
+                (Some((p.photo_id, edit_json, p.source.source)), Some(p.cell))
+            }
+            Some(RecordSource::Print(print)) => (Some((print.photo.id, print.edit_json, print.source)), None),
+            None => {
+                let shell = self.shell.read(cx);
+                (shell.active_version().map(|v| (v.photo_id, v.edit_json.clone(), SourceToken::Preview)), None)
+            }
+        };
+        let record = record.filter(|(photo, _, _)| Some(*photo) == target);
+        let placeholder = if record.is_some() { placeholder } else { None };
         let Some((photo, edit_json, source)) = record else {
             self.renders.update(cx, |r, cx| r.want(&[], cx));
             self.zoom.update(cx, |z, cx| z.set_override(None, cx));
@@ -287,19 +329,74 @@ impl LoupeView {
         lo.source = source.clone();
         hi.source = source;
         let wants_hi = self.zoom.read(cx).wants_hi();
-        let jobs = if wants_hi { vec![lo.clone(), hi.clone()] } else { vec![lo.clone()] };
+        let mut jobs = if wants_hi { vec![lo.clone(), hi.clone()] } else { vec![lo.clone()] };
+        // Keep the Darkroom's print rendered even while a proof sheet's candidate is the one
+        // shown: `EditRenders::want` drops whatever is not in the wanted set, so without this
+        // the print's texture (and its full-res render) is evicted the moment a proof takes
+        // over, and hovering off — or crossing the gap between cells, which also momentarily
+        // has nothing hovered or focused — re-renders it from scratch, blanking the pop-out
+        // until it lands (#250 review). Only for this photo; a print for another photo is
+        // never wanted here regardless of what wins below.
+        let print_lo = self.print(cx).filter(|p| p.photo.id == photo).map(|p| {
+            let mut j = preview_job(p.photo.id, &p.edit_json, LOUPE_EDGE, false, epoch);
+            j.source = p.source.clone();
+            j
+        });
+        let print_hi = wants_hi
+            .then(|| self.print(cx).filter(|p| p.photo.id == photo))
+            .flatten()
+            .map(|p| {
+                let mut j = preview_job(p.photo.id, &p.edit_json, 0, true, epoch);
+                j.source = p.source.clone();
+                j
+            });
+        for j in [&print_lo, &print_hi].into_iter().flatten() {
+            if !jobs.contains(j) {
+                jobs.push(j.clone());
+            }
+        }
         self.renders.update(cx, |r, cx| r.want(&jobs, cx));
         let renders = self.renders.read(cx);
         let mut over = Override::default();
+        // Whether `over.lo` ended up being the print's fallback texture rather than the
+        // chosen record's own (#250 review, probe P3): only then is the print's full-res a
+        // valid stand-in for `over.hi` below — otherwise, zoomed on a proof whose own hi is
+        // still pending or failed, it would show the PRINT's full-res pixels under the
+        // proof's label. The chosen record's own lo (even scaled up, past `max_scale`) is the
+        // correct placeholder for its own hi; the print's lo is not.
+        let mut lo_from_print = false;
         match renders.get(&lo) {
             RenderState::Ready(image) => over.lo = Some(image),
             RenderState::Failed(e) => over.failed = Some(e),
             _ => {}
         }
+        // The proof sheet's own 320 px render, until the loupe-size one above lands (#250).
+        if over.lo.is_none() {
+            if let Some(RenderState::Ready(image)) = placeholder {
+                over.lo = Some(image);
+            }
+        }
+        // Never go blank while a replacement renders: the print, kept warm above, if it is
+        // already in (#250 review).
+        if over.lo.is_none() {
+            if let Some(j) = &print_lo {
+                if let RenderState::Ready(image) = renders.get(j) {
+                    over.lo = Some(image);
+                    lo_from_print = true;
+                }
+            }
+        }
         match renders.get(&hi) {
             RenderState::Ready(image) => over.hi = Some(image),
             RenderState::Failed(_) => over.hi_settled = true,
             _ => {}
+        }
+        if over.hi.is_none() && lo_from_print {
+            if let Some(j) = &print_hi {
+                if let RenderState::Ready(image) = renders.get(j) {
+                    over.hi = Some(image);
+                }
+            }
         }
         self.zoom.update(cx, |z, cx| z.set_override(Some(over), cx));
     }
@@ -389,8 +486,16 @@ impl LoupeView {
             }
             _ => {}
         }
-        if let Some(name) = version {
-            tags = tags.child(tag("loupe-tag-version", format!("· {name}"), colors.accent));
+        // A proof sheet's previewed candidate (pop-out only, #250) stands in for the version
+        // tag when it is the thing actually shown (`record_source`, the same choice the image
+        // makes) — it is a candidate record, not what the photo actually holds.
+        match proof_label(self, photo.id, cx) {
+            Some(label) => tags = tags.child(tag("loupe-tag-proof", format!("Proof: {label} — not applied"), colors.accent)),
+            None => {
+                if let Some(name) = version {
+                    tags = tags.child(tag("loupe-tag-version", format!("· {name}"), colors.accent));
+                }
+            }
         }
         div()
             .id("loupe-bar")
@@ -467,6 +572,26 @@ fn faces_enabled(modules: &Entity<ModuleRegistry>, cx: &App) -> bool {
     {
         let _ = (modules, cx);
         false
+    }
+}
+
+/// The proof sheet's previewed candidate's label for `photo_id`, shown on the pop-out's bar in
+/// place of the active version's name while that candidate is the thing actually rendered —
+/// `view.record_source`, so the label can never name a candidate the image is not showing
+/// (#250 review: the Darkroom's print outranks a proof it shares a photo with). `None` without
+/// the `edit` feature (there is no proof sheet) or in the inline loupe.
+fn proof_label(view: &LoupeView, photo_id: i64, cx: &App) -> Option<String> {
+    #[cfg(feature = "edit")]
+    {
+        match view.record_source(photo_id, cx) {
+            Some(RecordSource::Proof(p)) => Some(p.candidate.label.clone()),
+            _ => None,
+        }
+    }
+    #[cfg(not(feature = "edit"))]
+    {
+        let _ = (view, photo_id, cx);
+        None
     }
 }
 

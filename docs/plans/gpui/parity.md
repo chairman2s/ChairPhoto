@@ -1513,7 +1513,10 @@ get_system_theme / `appearance:theme_changed`
 with `Follow::Window`), awaiting the visual check: "No photo selected", the target with its
 version render and hi-res zoom, a module card while one is up, the Darkroom's print (#112);
 loupe-slot panels per window (the faces overlay, #129);
-the theme is the app's, shared
+the theme is the app's, shared;
+a Darkroom proof sheet's previewed candidate — hovered or Tab-focused cell, else the photo as
+it is, labelled "Proof: <label> — not applied", its 320 px cell render standing in until the
+loupe-size one lands (#250, `ShellState::loupe_proof_preview`, `LoupeView::sync_version`)
 Not checked: needs the owner (window rule).
 
 ### `src/components/LoupeCardView.tsx`

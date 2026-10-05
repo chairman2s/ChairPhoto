@@ -350,6 +350,54 @@ pub struct LoupePrint {
     pub source: chairphoto_core::plugins::edit::SourceToken,
 }
 
+/// What the pop-out shows while the Darkroom's proof sheet has a candidate under the pointer
+/// or Tab focus (#250): the candidate rendered at loupe size in place of whatever it would
+/// otherwise show — outranking even the Darkroom's print, [`LoupePrint`] — labelled
+/// "Proof: <label> — not applied". Scoped to the photo it was published for
+/// (`LoupeView::sync_version` only uses it for the pop-out's current target, never another
+/// photo the selection moved to) and cleared with the proof sheet's own lifetime: hover-leave
+/// falls back to the Tab-focused cell, else `None`; an adopt or a decline clears it; so does
+/// the sheet itself going away (its own `sheet` token only, never another live sheet's — see
+/// `ProofSheet::clear_preview`); and a catalog switch clears it here, the same way it clears
+/// [`LoupePrint`]. Set and cleared by the Darkroom's `ProofSheet`.
+#[cfg(feature = "edit")]
+#[derive(Clone)]
+pub struct LoupeProofPreview {
+    /// The `ProofSheet` entity that published this: `Self::set_loupe_proof_preview`'s only
+    /// caller clears what it last set, never a sheet it doesn't own.
+    pub sheet: gpui_kit::EntityId,
+    pub photo_id: i64,
+    /// The Darkroom's own source: what the candidate renders from
+    /// (`chairphoto_model::darkroom::spreads::ProofCandidate`'s record, through
+    /// `crate::loupe::duel::VariantSource::job`).
+    pub source: crate::loupe::duel::VariantSource,
+    pub candidate: chairphoto_model::darkroom::spreads::ProofCandidate,
+    /// The proof sheet's own 320 px cell render for this candidate, shown as a placeholder
+    /// until the loupe-size render lands.
+    pub cell: crate::loupe::edit_renders::RenderState,
+}
+
+/// Whether two previews would render, label and placeholder the same thing: used to skip a
+/// redundant `ShellState` notify (review NIT) when the proof sheet republishes on every render
+/// (`ProofSheet::sync_preview`) but nothing actually changed. Ignores `source.encode`'s
+/// closure identity, which never changes for one dealt sheet, and anything about `cell` beyond
+/// which state it is in (and, once `Ready`, which texture — by identity, not pixel content).
+#[cfg(feature = "edit")]
+impl PartialEq for LoupeProofPreview {
+    fn eq(&self, other: &Self) -> bool {
+        use crate::loupe::edit_renders::RenderState;
+        if self.sheet != other.sheet || self.photo_id != other.photo_id || self.candidate != other.candidate {
+            return false;
+        }
+        match (&self.cell, &other.cell) {
+            (RenderState::Ready(a), RenderState::Ready(b)) => std::sync::Arc::ptr_eq(a, b),
+            (RenderState::Failed(a), RenderState::Failed(b)) => a == b,
+            (RenderState::Rendering, RenderState::Rendering) | (RenderState::Absent, RenderState::Absent) => true,
+            _ => false,
+        }
+    }
+}
+
 /// A `chairphoto://<uuid>` link waiting for the widened grid to list its photo (App.tsx's
 /// `deepLinkTarget`).
 #[derive(Debug, Clone)]
@@ -414,6 +462,9 @@ pub struct ShellState {
     /// The Darkroom's print on the pop-out loupe, while one is up (#110).
     #[cfg(feature = "edit")]
     loupe_print: Option<LoupePrint>,
+    /// The proof sheet's previewed candidate on the pop-out loupe, while one is up (#250).
+    #[cfg(feature = "edit")]
+    loupe_proof_preview: Option<LoupeProofPreview>,
     /// Compare's presentation for the next open (`panel.compareMode`; the root view seeds it
     /// from the per-machine preferences and stores changes back).
     pub compare_mode: CompareMode,
@@ -489,6 +540,8 @@ impl ShellState {
             loupe_card: None,
             #[cfg(feature = "edit")]
             loupe_print: None,
+            #[cfg(feature = "edit")]
+            loupe_proof_preview: None,
             compare_mode: CompareMode::Duel,
             last_mark: None,
             catalog_generation: 0,
@@ -786,6 +839,25 @@ impl ShellState {
     #[cfg(feature = "edit")]
     pub fn set_loupe_print(&mut self, print: Option<LoupePrint>, cx: &mut Context<Self>) {
         self.loupe_print = print;
+        cx.notify();
+    }
+
+    /// The proof sheet's previewed candidate on the pop-out loupe, if one is up (#250).
+    #[cfg(feature = "edit")]
+    pub fn loupe_proof_preview(&self) -> Option<&LoupeProofPreview> {
+        self.loupe_proof_preview.as_ref()
+    }
+
+    /// Put a proof sheet's hovered/focused candidate up on the pop-out loupe (`None`: the
+    /// pop-out follows the active version again). The Darkroom's `ProofSheet`
+    /// (`LoupeProofPreview`'s field docs). A no-op (no notify) when `preview` would not
+    /// actually change anything shown — the sheet republishes on every render.
+    #[cfg(feature = "edit")]
+    pub fn set_loupe_proof_preview(&mut self, preview: Option<LoupeProofPreview>, cx: &mut Context<Self>) {
+        if self.loupe_proof_preview == preview {
+            return;
+        }
+        self.loupe_proof_preview = preview;
         cx.notify();
     }
 
@@ -1299,6 +1371,7 @@ impl ShellState {
                 #[cfg(feature = "edit")]
                 {
                     self.loupe_print = None;
+                    self.loupe_proof_preview = None;
                 }
                 self.catalog_generation += 1;
                 self.surface = Surface::Library;

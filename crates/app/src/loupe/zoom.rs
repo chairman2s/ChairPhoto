@@ -331,6 +331,23 @@ impl ZoomImage {
         self.last_drawn
     }
 
+    /// The current override's fit render, by identity: [`Drawn::OverrideLo`] alone cannot
+    /// tell a placeholder from the render that replaces it (#250 review), but this can, via
+    /// `Arc::ptr_eq` against the texture a test fed the pool. Its only caller is an
+    /// `edit`-gated test, so this is too (`--no-default-features` builds no override at all).
+    #[cfg(all(test, feature = "edit"))]
+    pub(crate) fn override_lo(&self) -> Option<Arc<RenderImage>> {
+        self.over.as_ref().and_then(|o| o.lo.clone())
+    }
+
+    /// The current override's full-res render, by identity (#250 review, probe P3): whether
+    /// it is the chosen record's own, or wrongly the Darkroom's print's, when zoomed on a
+    /// proof whose own hi is pending or failed.
+    #[cfg(all(test, feature = "edit"))]
+    pub(crate) fn override_hi(&self) -> Option<Arc<RenderImage>> {
+        self.over.as_ref().and_then(|o| o.hi.clone())
+    }
+
     pub fn set_unavailable_actions(&mut self, on: bool) {
         self.unavailable_actions = on;
     }

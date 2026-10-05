@@ -10,19 +10,35 @@
 //! The Darkroom (#111/#112) deals it, focuses it (its [`contexts::PROOF_SHEET`] Escape outranks
 //! the Darkroom's own while it has focus, as React's capture-phase listener did) and gives
 //! focus back on [`ProofEvent::Close`] or after an adopt.
+//!
+//! **The pop-out's preview (#250).** While the pointer is over a cell, or — nothing hovered —
+//! a cell has Tab focus, this publishes a [`LoupeProofPreview`] to [`ShellState`], which the
+//! pop-out's `LoupeView` renders at loupe size in place of whatever it would otherwise show —
+//! outranking even the Darkroom's print — (its own 320 px render stands in until that lands).
+//! Hover beats focus; neither clears it to "the photo as it is" — [`Self::sync_preview`], run
+//! from any click on the backdrop or the panel too (not only Tab/hover), since the backdrop's
+//! own `track_focus` moves focus there on the matching mouse down, off a Tab-focused cell,
+//! before any of this entity's own listeners do; and from every render, as a catch-all for
+//! whatever that list still misses, through [`Self::resync_in_render`] (which steps aside
+//! whenever another live sheet currently owns the slot, so two mounted sheets settle instead
+//! of looping — #250 review, probe P5).
+//! Cleared, by this sheet's own token, on adopt, decline, and whenever this entity is released
+//! (its window closed, the overlay replaced); a catalog switch clears it in `ShellState`
+//! itself, the same way it clears the Darkroom's print.
 
 use crate::image_store::ImageStore;
 use crate::keymap::contexts;
 use crate::loupe::duel::{variant_image, VariantSource};
 use crate::loupe::edit_renders::EditRenders;
 use crate::loupe::{ProofClose, ProofNext, ProofPrevious};
+use crate::shell::state::{LoupeProofPreview, ShellState};
 use crate::shell::style::Colors;
 use chairphoto_core::image_pool::EditJob;
 use chairphoto_model::darkroom::spreads::{ProofCandidate, ProofGroup};
 use gpui_kit::prelude::*;
 use gpui_kit::{
-    div, px, ClickEvent, Context, Entity, EventEmitter, FocusHandle, ObjectFit, SharedString, Subscription,
-    TestSupportExt as _, Window,
+    div, px, App, ClickEvent, Context, Entity, EntityId, EventEmitter, FocusHandle, ObjectFit, SharedString,
+    Subscription, TestSupportExt as _, Window,
 };
 
 /// A proof's long edge (React rendered 320 px cells).
@@ -41,9 +57,17 @@ pub struct ProofSheet {
     source: VariantSource,
     candidates: Vec<ProofCandidate>,
     renders: Entity<EditRenders>,
+    shell: Entity<ShellState>,
     focus: FocusHandle,
     /// One per proof: Tab moves among them, Enter / Space adopts the focused one.
     cell_focus: Vec<FocusHandle>,
+    /// The pointer is over this cell (`Self::sync_preview`'s precedence: hover beats focus).
+    hovered: Option<usize>,
+    /// This entity's id: stamped on every [`LoupeProofPreview`] this sheet publishes, so
+    /// [`Self::clear_preview`] takes down only its own (#250 review: two live sheets is not
+    /// reachable in-app today — one overlay, replaced before a new sheet can publish — but
+    /// `clear_preview` should not depend on that staying true).
+    token: EntityId,
     closed: bool,
     _observers: [Subscription; 1],
 }
@@ -53,17 +77,40 @@ impl EventEmitter<ProofEvent> for ProofSheet {}
 impl ProofSheet {
     pub fn new(
         images: &Entity<ImageStore>,
+        shell: Entity<ShellState>,
         source: VariantSource,
         candidates: Vec<ProofCandidate>,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
         let pool = images.read(cx).pool();
         let renders = cx.new(|cx| EditRenders::new(pool, cx));
         let jobs: Vec<EditJob> = candidates.iter().map(|c| source.job(&c.record, PROOF_EDGE)).collect();
         renders.update(cx, |r, cx| r.want(&jobs, cx));
-        let _observers = [cx.observe(&renders, |_, _, cx| cx.notify())];
+        // Keeps the 320 px placeholder the pop-out's preview shows fresh as it settles, on
+        // top of the plain re-render every other `EditRenders` observer does (#250).
+        let _observers = [cx.observe_in(&renders, window, |this, _, window, cx| {
+            this.sync_preview(window, cx);
+            cx.notify();
+        })];
         let cell_focus = candidates.iter().map(|_| cx.focus_handle()).collect();
-        ProofSheet { source, candidates, renders, focus: cx.focus_handle(), cell_focus, closed: false, _observers }
+        let this = ProofSheet {
+            source,
+            candidates,
+            renders,
+            shell,
+            focus: cx.focus_handle(),
+            cell_focus,
+            hovered: None,
+            token: cx.entity_id(),
+            closed: false,
+            _observers,
+        };
+        // Whatever ends this entity's life without going through `close`/`adopt` — the
+        // overlay dropped from under it, the window it was mounted in closing — still takes
+        // the preview down (#250).
+        cx.on_release(|this: &mut Self, cx| this.clear_preview(cx)).detach();
+        this
     }
 
     pub fn focus_handle(&self) -> &FocusHandle {
@@ -83,6 +130,19 @@ impl ProofSheet {
         self.cell_focus.iter().position(|f| f.is_focused(window))
     }
 
+    /// The pointer entered (`hovering`) or left cell `i` (`on_hover`'s own bookkeeping, then
+    /// [`Self::sync_preview`]).
+    fn set_hovered(&mut self, i: usize, hovering: bool, window: &mut Window, cx: &mut Context<Self>) {
+        self.hovered = if hovering {
+            Some(i)
+        } else if self.hovered == Some(i) {
+            None
+        } else {
+            self.hovered
+        };
+        self.sync_preview(window, cx);
+    }
+
     /// Tab / Shift+Tab: focus the next (previous) proof, wrapping; from the backdrop, the
     /// first (last).
     fn cycle(&mut self, forward: bool, window: &mut Window, cx: &mut Context<Self>) {
@@ -97,6 +157,7 @@ impl ProofSheet {
             (None, false) => n - 1,
         };
         window.focus(&self.cell_focus[next], cx);
+        self.sync_preview(window, cx);
         cx.notify();
     }
 
@@ -120,6 +181,60 @@ impl ProofSheet {
     fn end(&mut self, cx: &mut Context<Self>) {
         self.closed = true;
         self.renders.update(cx, |r, cx| r.want(&[], cx));
+        self.clear_preview(cx);
+    }
+
+    /// The pop-out's preview: the hovered cell, else the Tab-focused one, else none (the
+    /// photo as it is) — published to [`ShellState`] (#250). Called from the hover/cycle
+    /// handlers, and from a click on the backdrop or the panel: its backdrop tracks focus
+    /// too, and the matching mouse down can move focus off a Tab-focused cell before either
+    /// of those runs (#250 review, probe E). `ShellState::set_loupe_proof_preview` skips the
+    /// notify when nothing actually changed, so a same-answer call here is cheap.
+    fn sync_preview(&mut self, window: &Window, cx: &mut Context<Self>) {
+        let i = if self.closed { None } else { self.hovered.or_else(|| self.focused(window)) };
+        let preview = i.and_then(|i| self.candidates.get(i)).map(|c| {
+            let cell = self.renders.read(cx).get(&self.source.job(&c.record, PROOF_EDGE));
+            LoupeProofPreview {
+                sheet: self.token,
+                photo_id: self.source.photo_id,
+                source: self.source.clone(),
+                candidate: c.clone(),
+                cell,
+            }
+        });
+        match preview {
+            Some(preview) => self.shell.update(cx, |s, cx| s.set_loupe_proof_preview(Some(preview), cx)),
+            // Nothing of this sheet's own to show: take only this sheet's preview down, the
+            // same as `clear_preview` (#250 review) — a non-hovered, non-focused sheet whose
+            // own 320 px render lands (the `renders` observer calls this too) must not clobber
+            // whichever other sheet is currently shown.
+            None => self.clear_preview(cx),
+        }
+    }
+
+    /// Takes the preview down, but only if it is still this sheet's own (#250 review: `token`).
+    fn clear_preview(&mut self, cx: &mut App) {
+        let token = self.token;
+        self.shell.update(cx, |s, cx| {
+            if s.loupe_proof_preview().is_some_and(|p| p.sheet == token) {
+                s.set_loupe_proof_preview(None, cx);
+            }
+        });
+    }
+
+    /// [`Self::sync_preview`]'s render-time catch-all (probe E): skipped whenever another
+    /// live sheet currently owns the published preview. Resyncing unconditionally here, with
+    /// two mounted sheets each having a hovered or focused cell, has each one's own render
+    /// republish its own answer and notify the other's — forever (#250 review, probe P5, not
+    /// reachable with today's single Darkroom overlay, but `render` must not rely on that).
+    /// An actual hover, focus change or click on THIS sheet still calls `sync_preview`
+    /// directly (`set_hovered`, `cycle`, the two `on_click`s, the `renders` observer) and
+    /// takes the slot over regardless of who held it.
+    fn resync_in_render(&mut self, window: &Window, cx: &mut Context<Self>) {
+        let owned_by_another = self.shell.read(cx).loupe_proof_preview().is_some_and(|p| p.sheet != self.token);
+        if !owned_by_another {
+            self.sync_preview(window, cx);
+        }
     }
 }
 
@@ -134,6 +249,10 @@ fn group_name(g: ProofGroup) -> Option<&'static str> {
 
 impl Render for ProofSheet {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Catches a focus change that didn't go through `cycle`/`set_hovered`/an `on_click`
+        // (#250 review, probe E) — see `Self::resync_in_render`'s own docs for why this is
+        // not a plain `sync_preview` call.
+        self.resync_in_render(window, cx);
         let colors = Colors::get(cx);
         let renders = self.renders.read(cx);
         let cells: Vec<_> = self
@@ -161,6 +280,9 @@ impl Render for ProofSheet {
                     })
                     .overflow_hidden()
                     .cursor_pointer()
+                    .on_hover(cx.listener(move |this, hovering: &bool, window, cx| {
+                        this.set_hovered(i, *hovering, window, cx)
+                    }))
                     .on_click(cx.listener(move |this, _, _, cx| this.adopt(i, cx)))
                     .child(div().h(px(160.)).bg(colors.well).child(variant_image(("proof-image", i as u64), state, ObjectFit::Cover, "…", colors)))
                     .child(
@@ -193,8 +315,13 @@ impl Render for ProofSheet {
             .on_action(cx.listener(|this, _: &ProofNext, window, cx| this.cycle(true, window, cx)))
             .on_action(cx.listener(|this, _: &ProofPrevious, window, cx| this.cycle(false, window, cx)))
             // A pointer click declines. Enter / Space on the focused backdrop is a keyboard
-            // click here: not a decline (only a focused proof takes Enter, and adopts).
-            .on_click(cx.listener(|this, e: &ClickEvent, _, cx| {
+            // click here: not a decline (only a focused proof takes Enter, and adopts). Either
+            // way, a mouse click here already focused the backdrop on its mouse down (GPUI's
+            // own `track_focus` behaviour) — which can move focus off a Tab-focused cell
+            // without going through `cycle` (#250 review, probe E) — so resync; a no-op when
+            // the answer hasn't changed (and `close` below clears it anyway on a decline).
+            .on_click(cx.listener(|this, e: &ClickEvent, window, cx| {
+                this.sync_preview(window, cx);
                 if !e.is_keyboard() {
                     this.close(cx)
                 }
@@ -210,7 +337,13 @@ impl Render for ProofSheet {
                     .rounded(px(10.))
                     .bg(colors.panel)
                     .text_color(colors.txt)
-                    .on_click(|_, _, cx| cx.stop_propagation())
+                    // Stops the backdrop's decline; the click still moved focus here (#250
+                    // review, probe E), so resync the same way.
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        cx.stop_propagation();
+                        this.sync_preview(window, cx)
+                    }))
+                    .test_support()
                     .child(
                         div()
                             .flex()

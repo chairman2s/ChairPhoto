@@ -86,7 +86,7 @@ mod tests {
     use super::*;
 
     fn skipped(items: &[(i64, &str)]) -> Vec<SkippedPhoto> {
-        items.iter().map(|(id, why)| SkippedPhoto { photo_id: *id, reason: why.to_string() }).collect()
+        items.iter().map(|(id, why)| SkippedPhoto::refused(*id, *why)).collect()
     }
 
     #[test]

@@ -34,6 +34,7 @@ pub mod tag_maintenance;
 mod terms;
 mod trash;
 mod visibility;
+pub(crate) mod working_files;
 
 #[cfg(test)]
 mod performance_harness;
@@ -53,9 +54,11 @@ pub use lifecycle::{
     verify_and_delete_locals_abortable, BackupCandidates, BackupPlan, BackupReport, CarriedCompanion,
     CompanionCarry, CopyOutcome, FreedPhoto, OffloadCandidates, OffloadCarry, OffloadEligibility, OffloadPlan,
     OffloadReport, PhotoBackup, PhotoOffload, PhotoRestore, RestoreCandidates, RestorePlan, RestoreReport,
-    SkippedPhoto, IN_PROGRESS_REASON, LOCAL_CHANGED_REASON, SUPERSEDED_REASON,
+    user_reason, SkipKind, SkippedPhoto, IN_PROGRESS_REASON, LOCAL_CHANGED_REASON, SUPERSEDED_REASON,
 };
 pub(crate) use lifecycle::verify_and_delete_locals_until;
+#[cfg(test)]
+pub(crate) use lifecycle::offload_hook;
 pub use merge::{MergeOutcome, MergeSummary, IMPORTED_EDIT_VERSION};
 pub use models::{
     Album, BurstInput, CoverPin, ExportKeywords, HistoryStep, ImportBatch, IptcFields, LocationRole, MetadataEntry,

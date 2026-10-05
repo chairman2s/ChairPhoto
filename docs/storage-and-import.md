@@ -500,18 +500,37 @@ Three rules govern carrying:
   local image must not strand the history beside it. Companions go home first, then the
   local ones are freed with the image, and `restore` brings them back.
 - **Offload deletes only what home holds byte for byte (#255).** Re-hashing the backup
-  proves home is intact, not that it holds what is here. Just before deleting, offload
-  re-hashes every local copy of the image against the verified backup hash, and every
-  companion against the hash the carry confirmed at home; it deletes exactly those
-  companions, never a fresh listing. A local JPEG or DNG rewritten in place after its
-  backup, a sidecar edited after the carry, or a companion that appeared after it refuses
-  the photo — nothing is deleted, and a queued offload is kept `failed` with the reason
-  ("changed since its backup — refusing to offload; the copy at home is the earlier
-  version"). The cost is one sequential read of each local copy, on a local disk, beside the
-  NAS read of the backup offload already made; size or mtime would be cheaper and are not
-  content checks (an in-place rewrite can keep the size, and `exiftool -P` keeps the mtime).
-  Back up does not replace a verified backup that is present, so such a photo stays local
-  until the owner decides how a changed original reaches home.
+  proves home is intact, not that it holds what is here. So offload checks each local file
+  **after moving it to a hidden name** in its folder (`.<name>.chairphoto-offload-<pid>-<n>`,
+  #256): companions first, then the image, each re-hashed there — the image against the
+  verified backup hash, a companion against the hash the carry confirmed at home — and
+  freed only with exactly the companions the carry confirmed, never a fresh listing. Then
+  it looks at every name it emptied once more, and only then deletes the hidden files. A
+  write through the photo's name either landed before the move (the moved file holds it and
+  its hash says so) or comes after it and makes a new file at that name (the last look finds
+  it); what is deleted is the hidden file, which no other writer knows by name, so nothing
+  written after its check is deleted. A local JPEG or DNG rewritten in place after its
+  backup, a sidecar edited after the carry, a companion that appeared after it, or any new
+  file at an emptied name refuses the photo: every moved file goes back under its name
+  (never replacing a file there — one that cannot go back, because a new file took its name
+  or the rename failed, is never deleted, confirmed or not: it stays under its hidden name
+  beside the photo, and the refusal names it and why; where the filesystem has neither a no-replace rename nor
+  hard links, a file goes back by a plain rename once its name is seen free), nothing is
+  deleted, and a queued offload is kept `failed`
+  with the reason ("changed since its backup — refusing to offload; the copy at home is the
+  earlier version"). A crash between the move and the delete leaves the file under its
+  hidden name; the next backup, offload or restore plan that looks in that folder (once per
+  folder per run, off the catalog lock) puts every such file whose process is no longer
+  running back under its name, again never replacing one — a file left by a crash is never
+  deleted, since it may hold the only copy of a local change. An empty one is not put back
+  (it is most likely a name the offload claimed and never filled; putting it back would make
+  a 0-byte original); it is removed only when a non-empty file holds its name. A second
+  operation in a folder whose sweep is still running waits for it to finish. The cost is one sequential
+  read of each local copy, on a local disk, beside the NAS read of the backup offload
+  already made; size or mtime would be cheaper and are not content checks (an in-place
+  rewrite can keep the size, and `exiftool -P` keeps the mtime). Back up does not replace a
+  verified backup that is present, so such a photo stays local until the owner decides how
+  a changed original reaches home.
 - **Divergence refuses; it never resolves.** A companion present on both sides with
   different contents is two unreconciled edits. Backup leaves it untouched and does not
   claim it as carried; offload refuses outright. Choosing a side would silently destroy
@@ -732,6 +751,35 @@ leaf in the `app::jobs` lock order. The inspector also disables its storage butt
 photo while one of them runs, so a double-click starts one run. The `Catalog::*_photo` sync
 wrappers do not claim; they are for tests and single-threaded callers.
 
+Empty Trash and Relocate claim too (#256). Emptying the trash claims each photo just before
+its delete, reads where its copies are under that claim (not when the run listed the
+photos, which can be minutes earlier), and releases it after the delete: a photo a storage
+operation holds is reported failed with the in-progress reason and keeps its row and files,
+so it can be retried; a copy a backup or restore made just before is deleted with the rest
+rather than outliving its photo's row; and a verb that starts after the delete finds
+nothing to copy. Relocate claims the photo in the same catalog lock hold that re-points its
+row, and holds the claim until the moved file's identity is recorded; a held photo is
+refused and left pointing where it was — otherwise an offload's commit could drop the
+re-pointed row by id and leave the moved file with none.
+
+An IPTC sidecar write — a save, the debt panel's Retry, a geocode fill — claims its photo
+too, from before it opens the sidecar until it has settled (#256): an offload deletes the
+local sidecar once it has confirmed it at home, and a write landing after that check would
+leave a newer sidecar beside a freed image, untracked, with the debt settled. Whichever
+claims first goes ahead. A save that meets a claimed photo stores in the catalog and leaves
+the fields owed, reported "sidecar pending (a storage operation on this photo is already in
+progress)"; the next save or the repair pass writes them, to wherever the photo then
+resolves. An offload that meets a write is refused as in progress. The identity-repair pass,
+face-region and GPS writes do not claim. Each replaces the sidecar by a rename, so it
+either lands before the offload moves the sidecar aside — and fails its re-hash — or makes a
+new file at its name, which the offload keeps. In that second case the new file is built
+without the moved sidecar (the writer found none), so it lacks every field ChairPhoto does
+not own — another tool's keywords and history: the offload refuses, puts the image back,
+and keeps the old sidecar beside it under its hidden name, which the refusal names, for the
+user to merge by hand. Nothing is deleted, but the photo's own sidecar name now holds the
+thinner file. A write that lands after the offload's last look is beside a freed image,
+untracked (the photo is recorded archived). Both windows are one small file's hash wide.
+
 Two guards do not depend on the claim. Offload's commit drops exactly the local location
 rows it planned from, by id, so a row added after the plan (a restore) is never dropped with
 them. And every lifecycle copy (`copy_and_verify`, used for images and companions) writes its
@@ -741,8 +789,17 @@ hard link, else an exclusive create, the import's own placement. Two writers can
 write into one file. A destination that already exists is accepted only when it hashes to
 the source (another writer placed the same bytes); otherwise the copy fails and that file is
 left untouched. This also means a Restore no longer overwrites a local file that differs
-from the backup: it fails and names the file instead. A crash can leave a hidden temp file
-behind; scans skip it.
+from the backup: it fails and names the file instead. On a filesystem with neither a
+no-replace rename nor hard links (an exFAT or FAT backup drive) the destination is claimed by
+an exclusive create and the verified temp copied into it; that second copy is hashed too, and
+one that does not match is removed (the copy created it) and the copy fails (#256). A crash
+during that second copy can leave a short file at the destination, which later copies refuse
+as "already exists with different contents" until it is removed by hand; on every other
+filesystem a crash leaves at most the hidden temp file, which scans skip. The next copy into
+a folder (once per folder per run) removes the temp files there whose process is no longer
+running on this machine and that have gone an hour unwritten — the hour because a backup
+folder can be shared with another machine whose copy is still writing; a temp file only ever
+holds bytes that exist elsewhere.
 
 Restore is the same rule pointing the other way: a stack that leaves as seven frames comes
 back as seven. It brings home only the frames that are *away* — a frame already local is

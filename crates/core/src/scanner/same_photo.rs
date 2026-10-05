@@ -582,7 +582,10 @@ pub(crate) fn place_no_replace_without_copy(part: &Path, to: &Path) -> std::io::
 
 fn place(part: &Path, to: &Path, may_copy: bool) -> std::io::Result<Placed> {
     #[cfg(test)]
-    if may_copy && copy_fallback::forced() {
+    if copy_fallback::forced() {
+        if !may_copy {
+            return Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "forced: no one-step placement"));
+        }
         return place_by_copy(part, to).map(|()| {
             copy_fallback::copied(to);
             Placed::Copied

@@ -44,15 +44,24 @@ pub(crate) fn move_aside(file: &Path) -> std::io::Result<Option<PathBuf>> {
     }
 }
 
-/// Give a moved-aside file its name `original` back, never replacing a file there and never by
-/// a copy (`same_photo::place_no_replace_without_copy`). `Ok(false)` when it cannot: the name
-/// is taken (a new file was written there meanwhile) or the filesystem has neither a
-/// no-replace rename nor hard links. The aside file is then still where it was.
+/// Give a moved-aside file its name `original` back, never by a copy, and never replacing a
+/// file there (`same_photo::place_no_replace_without_copy`). `Ok(false)` when the name is
+/// taken (a new file was written there meanwhile); the aside file is then still where it was.
+///
+/// On a filesystem with neither a no-replace rename nor hard links (exFAT or FAT where the
+/// kernel offers no `RENAME_NOREPLACE`) it is put back by a plain rename once the name is seen
+/// free. A file created at that exact name between the look and the rename would be replaced
+/// there — a window of one syscall, against leaving the photo's file hidden for good.
 pub(crate) fn put_back(aside: &Path, original: &Path) -> std::io::Result<bool> {
     match crate::scanner::same_photo::place_no_replace_without_copy(aside, original) {
         Ok(()) => Ok(true),
-        Err(e) if matches!(e.kind(), std::io::ErrorKind::AlreadyExists | std::io::ErrorKind::Unsupported) => {
-            Ok(false)
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
+        Err(e) if e.kind() == std::io::ErrorKind::Unsupported => {
+            match std::fs::symlink_metadata(original) {
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => std::fs::rename(aside, original).map(|()| true),
+                Ok(_) => Ok(false),
+                Err(e) => Err(e),
+            }
         }
         Err(e) => Err(e),
     }
@@ -287,6 +296,24 @@ mod tests {
         assert!(part("E.ARW", dead).is_dir(), "a folder: kept");
         #[cfg(unix)]
         assert!(std::fs::symlink_metadata(part("F.ARW", dead)).is_ok(), "a symlink: kept");
+    }
+
+    /// Where the filesystem has neither a no-replace rename nor hard links (forced here), a
+    /// moved file still goes back while its name is free, and still never over a file there.
+    #[test]
+    fn putting_back_without_one_step_placement_takes_a_free_name_only() {
+        let dir = TestTmpDir::new("working-files-no-noreplace");
+        let file = dir.join("DSC1.ARW");
+        std::fs::write(&file, b"raw").unwrap();
+        let aside = move_aside(&file).unwrap().unwrap();
+        let _neither = crate::scanner::same_photo::copy_fallback::force(|_| {});
+        std::fs::write(&file, b"new").unwrap();
+        assert!(!put_back(&aside, &file).unwrap(), "the name is taken");
+        assert_eq!(std::fs::read(&file).unwrap(), b"new");
+        std::fs::remove_file(&file).unwrap();
+        assert!(put_back(&aside, &file).unwrap());
+        assert_eq!(std::fs::read(&file).unwrap(), b"raw");
+        assert!(!aside.exists());
     }
 
     #[test]

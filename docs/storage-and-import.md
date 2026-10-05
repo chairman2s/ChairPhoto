@@ -514,7 +514,9 @@ Three rules govern carrying:
   file at an emptied name refuses the photo: every moved file goes back under its name
   (never replacing a file there — one that cannot go back because a new file took its name
   is deleted only if it was confirmed identical to home, and otherwise kept under its hidden
-  name, which the refusal names), nothing is deleted, and a queued offload is kept `failed`
+  name, which the refusal names; where the filesystem has neither a no-replace rename nor
+  hard links, a file goes back by a plain rename once its name is seen free), nothing is
+  deleted, and a queued offload is kept `failed`
   with the reason ("changed since its backup — refusing to offload; the copy at home is the
   earlier version"). A crash between the move and the delete leaves the file under its
   hidden name; the next backup, offload or restore plan that looks in that folder (once per

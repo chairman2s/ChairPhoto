@@ -815,6 +815,61 @@ mod stack_tests {
         assert_eq!(report.restored, vec![master], "the frame is home, so only the master is named");
     }
 
+    // --- no lifecycle copy replaces a file it did not write (#254; review P4/P5, #256) -------
+
+    /// The temp files a copy left in `dir`.
+    fn parts_in(dir: &Path) -> Vec<String> {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .filter_map(|e| e.ok()?.file_name().into_string().ok())
+            .filter(|n| n.contains("chairphoto-part"))
+            .collect()
+    }
+
+    /// P4: Back up meets a file at the NAS path that the catalog does not know. Different
+    /// bytes: the backup refuses, naming the file, and leaves it untouched, records nothing
+    /// and leaves no temp. Identical bytes (already there by other means): adopted, recorded,
+    /// and the frame goes too.
+    #[test]
+    fn back_up_refuses_a_different_unrecorded_file_at_home_and_adopts_an_identical_one() {
+        let (dir, state, master, frame, _raw, _jpg) = stacked("p4-backup-existing");
+        let home = dir.join("nas/2026/08");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::write(home.join("DSC1.ARW"), b"someone else's file").unwrap();
+
+        let err = backup_photo(&state, master).unwrap_err();
+
+        assert!(err.contains("DSC1.ARW already exists with different contents — left untouched"), "{err}");
+        assert_eq!(std::fs::read(home.join("DSC1.ARW")).unwrap(), b"someone else's file");
+        assert!(!with_catalog(&state, |c| c.has_verified_backup(master)).unwrap());
+        assert!(parts_in(&home).is_empty(), "{:?}", parts_in(&home));
+
+        std::fs::write(home.join("DSC1.ARW"), b"raw-bytes").unwrap();
+        let report = backup_photo(&state, master).unwrap();
+        assert_eq!(report.backed_up, vec![master, frame]);
+        assert!(with_catalog(&state, |c| c.has_verified_backup(master)).unwrap());
+        assert_eq!(std::fs::read(home.join("DSC1.JPG")).unwrap(), b"jpeg-bytes");
+    }
+
+    /// P5: Restore of the named photo whose local file was edited after its backup. Before
+    /// #254 the backup was renamed over it; now the restore refuses and the edit stays — and
+    /// offload still refuses that photo, since the edit is not at home.
+    #[test]
+    fn restore_refuses_to_overwrite_an_edited_local_original() {
+        let (_dir, state, master, _frame, raw, _jpg) = stacked("p5-restore-edited");
+        backup_photo(&state, master).unwrap();
+        std::fs::write(&raw, b"edited locally").unwrap();
+
+        let err = restore_photo(&state, master).unwrap_err();
+
+        assert!(err.contains("DSC1.ARW already exists with different contents — left untouched"), "{err}");
+        assert_eq!(std::fs::read(&raw).unwrap(), b"edited locally");
+        assert!(parts_in(raw.parent().unwrap()).is_empty());
+        let off = offload_photo(&state, master).unwrap_err();
+        assert!(off.contains(crate::catalog::LOCAL_CHANGED_REASON), "{off}");
+        assert_eq!(std::fs::read(&raw).unwrap(), b"edited locally");
+    }
+
     // --- one storage operation per photo at a time (#254) ---------------------------------
 
     fn db_of(state: &AppState) -> PathBuf {

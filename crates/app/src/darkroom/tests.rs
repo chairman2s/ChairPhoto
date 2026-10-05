@@ -1969,6 +1969,57 @@ fn the_loupe_print_follows_the_record_onto_the_pop_out(cx: &mut TestAppContext) 
     assert_eq!(print(cx), None);
 }
 
+// --- the proof sheet's preview vs. the Darkroom's print (#250 review) ----------------------
+
+/// "🖥 Loupe print" is on by default (`the_loupe_print_follows_the_record_onto_the_pop_out`),
+/// so it is up on the same photo a dealt proof sheet previews. The previewed candidate must
+/// outrank it: the sheet is transient and modal over the Darkroom, so hovering a proof should
+/// show that proof on the pop-out, labelled, not silently keep showing the print underneath
+/// while the bar still claims to show the proof.
+#[gpui_kit::test]
+fn a_previewed_proof_outranks_the_default_loupe_print(cx: &mut TestAppContext) {
+    use super::view::Overlay;
+    use crate::loupe::window;
+    let rig = rig("dk-proof-vs-print", 2, cx);
+    work(cx); // the proof sheet's auto-tone fragment
+    advance(cx, SETTLE); // the default print goes up after the open's settle
+    let print_json =
+        rig.app.wired.shell.read_with(cx, |s, _| s.loupe_print().expect("the print is up by default").edit_json.clone());
+    cx.update(window::open);
+    cx.run_until_parked();
+    let h = cx.update(|cx| window::handle(cx)).expect("the pop-out opened");
+
+    rig.with_view(cx, |v, window, cx| v.open_proof_sheet(window, cx));
+    let sheet = rig.view(cx).read_with(cx, |v, _| match v.overlay() {
+        Some(Overlay::Proof(p)) => p.clone(),
+        _ => panic!("the proof sheet is mounted"),
+    });
+    // A candidate whose record differs from the print's `{}` — not the "Auto" cell, which can
+    // coincidentally share it and pass either way regardless of which one wins (#250 review:
+    // the first version of this test hovered "Auto" and passed by coincidence).
+    let i = sheet
+        .read_with(cx, |s, _| s.candidates().iter().position(|c| c.group == chairphoto_model::darkroom::spreads::ProofGroup::Film))
+        .unwrap();
+    let want = sheet.read_with(cx, |s, _| s.candidates()[i].record.to_json());
+    let label = sheet.read_with(cx, |s, _| s.candidates()[i].label.clone());
+    assert_ne!(want, print_json, "a candidate that differs from the print");
+
+    cx.update_window(rig.app.window(), |_, window, cx| {
+        window.render_frame(cx);
+        window.hover(("proof-cell", i as u64), cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(h, |_, window, cx| window.render_frame(cx)).unwrap();
+    cx.run_until_parked();
+
+    let asked = rig.edit_jobs().iter().any(|j| j.max_edge == 2560 && j.edit_json == want);
+    assert!(asked, "the pop-out asks for the hovered proof at loupe size, not the print's");
+    let bar_label =
+        cx.update_window(h, |_, window, _| window.try_find("loupe-tag-proof").and_then(|e| e.label().map(str::to_string))).unwrap();
+    assert_eq!(bar_label, Some(format!("Proof: {label} — not applied")), "the bar names the proof, not the print");
+}
+
 /// The proof sheet's keys, as React's proof cells were buttons: Enter on the sheet as dealt
 /// (the backdrop focused, no proof) neither declines nor adopts; Tab / Shift+Tab move focus
 /// through the proofs, wrapping; Enter adopts the focused proof. A pointer click on the

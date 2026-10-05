@@ -470,11 +470,16 @@ fn the_pop_out_shows_a_proof_sheets_previewed_candidate(cx: &mut TestAppContext)
 
     let candidate = proof_spread(&VersionEdit::default(), &VersionEdit::default(), &[], None)[1].clone();
     let source = VariantSource::new(ids[1], 0, SourceToken::Preview);
-    let cell = RenderState::Ready(pixels(40, 30).image);
+    let cell_image = pixels(40, 30).image;
+    let cell = RenderState::Ready(cell_image.clone());
+    // No real `ProofSheet` entity here (as the Darkroom's print test also publishes directly):
+    // any stable id serves as its token.
+    let sheet = app.wired.images.entity_id();
     let publish = |cx: &mut TestAppContext| {
         app.wired.shell.update(cx, |s, cx| {
             s.set_loupe_proof_preview(
                 Some(LoupeProofPreview {
+                    sheet,
                     photo_id: ids[1],
                     source: source.clone(),
                     candidate: candidate.clone(),
@@ -512,16 +517,24 @@ fn the_pop_out_shows_a_proof_sheets_previewed_candidate(cx: &mut TestAppContext)
         (ids[1], candidate.record.to_json().as_str(), &SourceToken::Preview)
     );
 
-    // Before the loupe-size render lands, the 320 px cell's own render stands in.
+    // Before the loupe-size render lands, the 320 px cell's own render stands in — by
+    // identity, not just `Drawn::OverrideLo` (#250 review: that alone cannot tell the
+    // placeholder from the render that replaces it, since both are `OverrideLo`).
     render_popout(h, cx);
     assert_eq!(popout_zoom(cx).read_with(cx, |z, _| z.drawn()), Some((ids[1], Drawn::OverrideLo)), "the cell render stands in");
+    let shown = popout_zoom(cx).read_with(cx, |z, _| z.override_lo());
+    assert!(shown.is_some_and(|s| Arc::ptr_eq(&s, &cell_image)), "the cell's own texture, until the big one lands");
     let label = cx.update_window(h, |_, window, _| window.find("loupe-tag-proof").label().map(str::to_string)).unwrap();
     assert_eq!(label, Some(format!("Proof: {} — not applied", candidate.label)));
 
-    pool.finish(&JobKey::Edit(job), Ok(pixels(400, 300)));
+    let big = pixels(400, 300);
+    let big_image = big.image.clone();
+    pool.finish(&JobKey::Edit(job), Ok(big));
     cx.run_until_parked();
     render_popout(h, cx);
     assert_eq!(popout_zoom(cx).read_with(cx, |z, _| z.drawn()), Some((ids[1], Drawn::OverrideLo)), "now the loupe-size render");
+    let shown = popout_zoom(cx).read_with(cx, |z, _| z.override_lo());
+    assert!(shown.is_some_and(|s| Arc::ptr_eq(&s, &big_image)), "the loupe-size texture now, not the cell's placeholder");
 
     close(cx);
 }
@@ -548,7 +561,9 @@ fn a_proof_preview_is_scoped_to_its_own_photo_and_catalog(cx: &mut TestAppContex
 
     let candidate = proof_spread(&VersionEdit::default(), &VersionEdit::default(), &[], None)[1].clone();
     let source = VariantSource::new(ids[1], 0, SourceToken::Preview);
+    let sheet = app.wired.images.entity_id();
     let preview_for = |id: i64| LoupeProofPreview {
+        sheet,
         photo_id: id,
         source: source.clone(),
         candidate: candidate.clone(),

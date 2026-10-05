@@ -499,6 +499,19 @@ Three rules govern carrying:
 - **Offload carries before it deletes.** Invariant 1 covers edit state too: freeing the
   local image must not strand the history beside it. Companions go home first, then the
   local ones are freed with the image, and `restore` brings them back.
+- **Offload deletes only what home holds byte for byte (#255).** Re-hashing the backup
+  proves home is intact, not that it holds what is here. Just before deleting, offload
+  re-hashes every local copy of the image against the verified backup hash, and every
+  companion against the hash the carry confirmed at home; it deletes exactly those
+  companions, never a fresh listing. A local JPEG or DNG rewritten in place after its
+  backup, a sidecar edited after the carry, or a companion that appeared after it refuses
+  the photo — nothing is deleted, and a queued offload is kept `failed` with the reason
+  ("changed since its backup — refusing to offload; the copy at home is the earlier
+  version"). The cost is one sequential read of each local copy, on a local disk, beside the
+  NAS read of the backup offload already made; size or mtime would be cheaper and are not
+  content checks (an in-place rewrite can keep the size, and `exiftool -P` keeps the mtime).
+  Back up does not replace a verified backup that is present, so such a photo stays local
+  until the owner decides how a changed original reaches home.
 - **Divergence refuses; it never resolves.** A companion present on both sides with
   different contents is two unreconciled edits. Backup leaves it untouched and does not
   claim it as carried; offload refuses outright. Choosing a side would silently destroy
@@ -729,7 +742,8 @@ where nothing can be recovered afterwards.
 1. **Never delete the last verified copy** of a photo — including the companions that
    carry its edit state.
 2. **Never offload** anything not verified-backed-up.
-3. **Hash-verify** the NAS copy before marking safe or deleting anything local.
+3. **Hash-verify** the NAS copy before marking safe or deleting anything local — and the
+   local copy against it: a local file that no longer matches its backup is never deleted.
 4. On a NAS-less machine, offload of un-backed-up photos is **unavailable**; they
    stay local and flagged at-risk.
 5. If local fills up with **no NAS**, chairphoto may auto-evict only the

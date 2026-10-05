@@ -3,7 +3,8 @@
 //! the non-negotiable safety invariants in docs/storage-and-import.md:
 //!
 //!   1. Never delete the last copy. 2. Never offload without a verified backup.
-//!   3. Hash-verify the backup before deleting anything local.
+//!   3. Hash-verify the backup before deleting anything local, and the local copy against
+//!      it (#255): a local file that moved on since its backup is never deleted.
 //!
 //! Each op is split so the (possibly slow, network) file IO never holds the catalog
 //! lock or blocks the UI thread: a `plan_*_candidates` gathers copy rows under the lock
@@ -1047,6 +1048,12 @@ pub struct CarriedCompanion {
     /// question a later pass asks is "has the local file moved on since we copied it",
     /// so the local side is the reference point.
     pub source_mtime: i64,
+    /// The local file that was carried — what an offload deletes once it is confirmed home.
+    pub source: PathBuf,
+    /// SHA-256 of the bytes confirmed identical on both sides at carry time. An offload
+    /// re-hashes the local file against it just before deleting (#255): a companion
+    /// rewritten after it was carried is newer than what is at home and must not be freed.
+    pub hash: String,
 }
 
 /// What one carry pass achieved.
@@ -1106,17 +1113,21 @@ pub fn carry_companions(src_image: &Path, dest_image: &Path) -> Result<Companion
     let mut out = CompanionCarry::default();
     for found in crate::companions::carried_beside(src_image) {
         let dest = found.destination(dest_image);
-        if dest.is_file() {
-            if sha256_file(&dest)? != sha256_file(&found.path)? {
+        let hash = if dest.is_file() {
+            let source_hash = sha256_file(&found.path)?;
+            if sha256_file(&dest)? != source_hash {
                 out.diverged.push(found.path.clone());
                 continue;
             }
+            source_hash
         } else {
-            copy_and_verify(&found.path, &dest, None)?;
-        }
+            copy_and_verify(&found.path, &dest, None)?
+        };
         out.carried.push(CarriedCompanion {
             name: found.name(),
             source_mtime: mtime_secs(&found.path)?,
+            source: found.path.clone(),
+            hash,
         });
     }
     Ok(out)
@@ -1236,9 +1247,9 @@ pub(crate) fn verify_and_delete_locals_until(plan: &OffloadPlan, stopped: &dyn F
     Ok(out)
 }
 
-/// Re-verify one photo's backup hash, carry its local companions home, then delete its
-/// local files. Invariant 3: never delete a local copy unless the backup is present and
-/// still hashes to the recorded value.
+/// Re-verify one photo's backup hash, carry its local companions home, confirm every local
+/// file still matches what is at home, then delete its local files. Invariant 3: never delete
+/// a local copy unless the backup is present and still hashes to the recorded value.
 ///
 /// Returns what is now confirmed at home — for the caller to record *before*
 /// `commit_offload`, since that drops the local location rows and the companion rows
@@ -1270,16 +1281,24 @@ fn free_local_copies(photo: &PhotoOffload, stopped: &dyn Fn() -> bool) -> Result
         }
         carried.extend(carry.carried);
     }
+    // The carry can take a while over a NAS; a run taken over meanwhile stops before the
+    // content check below — which is also where a test lands a write "just after the carry".
+    if stopped() {
+        return Err(CatalogError::Validation(SUPERSEDED_REASON.into()));
+    }
+    let to_free = confirm_locals_match_home(photo, &carried)?;
 
     let mut sidecar_backups_left = 0usize;
-    for file in &photo.local_files {
+    for (file, companions) in photo.local_files.iter().zip(&to_free) {
         if stopped() {
             return Err(CatalogError::Validation(SUPERSEDED_REASON.into()));
         }
         // Companions first: if this fails part-way, the image is still local, so the
-        // photo is never left with its edit state gone and its bytes freed.
-        for found in crate::companions::carried_beside(file) {
-            std::fs::remove_file(&found.path).map_err(io)?;
+        // photo is never left with its edit state gone and its bytes freed. Exactly the
+        // ones confirmed above — never a fresh look, which could take one that appeared
+        // after the check and was never carried.
+        for companion in companions {
+            std::fs::remove_file(companion).map_err(io)?;
         }
         // Counted, never carried and never deleted — see
         // `companions::sidecar_backups_beside`. Counting is what turns "the one file
@@ -1300,6 +1319,57 @@ fn free_local_copies(photo: &PhotoOffload, stopped: &dyn Fn() -> bool) -> Result
         sidecar_backups_left,
     ))
 }
+
+/// The content check offload makes just before it deletes anything (#255): every local
+/// copy of the image must still hash to the verified backup's hash, and every companion
+/// beside it must be one the carry confirmed at home, byte for byte. Returns, per local
+/// file, the companions to delete with it.
+///
+/// Re-hashing the backup (invariant 3) proves home is intact, not that home holds what is
+/// here: a JPEG or DNG rewritten in place by another tool after its backup, or a sidecar
+/// edited after the carry, would otherwise be deleted while home kept the older bytes.
+///
+/// The cost is one sequential read of each local copy — a local disk, usually far faster
+/// than the NAS read of the backup that offload already makes — plus companions of a few KB.
+/// Size or mtime would be cheaper and are not content checks: an in-place rewrite can keep
+/// the size, and a tool may preserve the mtime (`exiftool -P`).
+fn confirm_locals_match_home(photo: &PhotoOffload, carried: &[CarriedCompanion]) -> Result<Vec<Vec<PathBuf>>> {
+    let mut to_free = Vec::with_capacity(photo.local_files.len());
+    for file in &photo.local_files {
+        if file.exists() && sha256_file(file)? != photo.expected_hash {
+            return Err(CatalogError::Validation(format!(
+                "{} {LOCAL_CHANGED_REASON}",
+                file.display()
+            )));
+        }
+        let mut companions = Vec::new();
+        for found in crate::companions::carried_beside(file) {
+            match carried.iter().find(|c| c.source == found.path) {
+                Some(c) if sha256_file(&found.path)? == c.hash => companions.push(found.path),
+                Some(_) => {
+                    return Err(CatalogError::Validation(format!(
+                        "{} changed since it was carried home — refusing to offload",
+                        found.path.display()
+                    )))
+                }
+                None => {
+                    return Err(CatalogError::Validation(format!(
+                        "{} appeared after its companions were carried home — refusing to offload",
+                        found.path.display()
+                    )))
+                }
+            }
+        }
+        to_free.push(companions);
+    }
+    Ok(to_free)
+}
+
+/// Why offload left a photo whose local copy no longer matches its verified backup (#255).
+/// The backup still holds the earlier bytes, and Back up does not replace a verified backup
+/// that is present, so the reason says what is true rather than offering a retry.
+pub const LOCAL_CHANGED_REASON: &str =
+    "changed since its backup — refusing to offload; the copy at home is the earlier version";
 
 fn io(e: std::io::Error) -> CatalogError {
     CatalogError::Io(e.to_string())
@@ -1390,5 +1460,74 @@ mod tests {
         };
         assert!(err.contains("no verified backup"), "refused by the stat half: {err}");
         assert!(raw.exists(), "a refusal never touches the local copy");
+    }
+
+    // --- offload deletes only what home holds byte for byte (#255) --------------------------
+
+    /// Review probe P5: a local original rewritten after its backup (an external tool
+    /// writing into a JPEG or DNG in place). The backup re-hashes fine — it is the local copy
+    /// that moved on — so offload must refuse, delete nothing, and keep the rows.
+    #[test]
+    fn offload_refuses_a_local_copy_rewritten_after_its_backup() {
+        let (catalog, dir, raw, id, _nas) = backed_up_photo("local-changed");
+        std::fs::write(&raw, b"raw-bytes edited elsewhere").unwrap();
+
+        let err = catalog.offload_photo(id).err().expect("a changed local copy must refuse").to_string();
+
+        assert!(err.contains(LOCAL_CHANGED_REASON), "{err}");
+        assert_eq!(std::fs::read(&raw).unwrap(), b"raw-bytes edited elsewhere", "the newer bytes stay");
+        assert_eq!(std::fs::read(dir.join("nas/2026/08/DSC1.ARW")).unwrap(), b"raw-bytes");
+        assert_eq!(catalog.photo_storage_status(id).unwrap(), super::super::StorageStatus::BackedUp);
+    }
+
+    /// A companion carried at backup time and edited locally since: the carry finds the two
+    /// sides differ and refuses, as before #255.
+    #[test]
+    fn offload_refuses_a_companion_edited_after_its_backup() {
+        let (catalog, dir, raw, id, nas) = backed_up_photo("companion-changed");
+        let xmp = crate::companions::appended_path(&raw, "xmp");
+        std::fs::write(&xmp, b"history v1").unwrap();
+        catalog.backup_photo(id, nas).unwrap(); // carries it home
+        std::fs::write(&xmp, b"history v2").unwrap();
+
+        let err = catalog.offload_photo(id).err().expect("an edited companion must refuse").to_string();
+
+        assert!(err.contains("differs from the copy at home"), "{err}");
+        assert!(raw.exists() && xmp.exists());
+        assert_eq!(std::fs::read(&xmp).unwrap(), b"history v2");
+        assert_eq!(std::fs::read(dir.join("nas/2026/08/DSC1.ARW.xmp")).unwrap(), b"history v1");
+    }
+
+    /// **Forced interleaving.** A companion that offload itself carries home, then edited
+    /// (or a new one written) in the window between the carry and the delete. The check made
+    /// just before deleting catches both; nothing local is deleted.
+    #[test]
+    fn offload_refuses_a_companion_written_after_its_carry() {
+        for (tag, late) in [("edited", "rrdata"), ("new", "pp3")] {
+            let (catalog, _dir, raw, id, _nas) = backed_up_photo(&format!("companion-after-carry-{tag}"));
+            let rrdata = crate::companions::appended_path(&raw, "rrdata");
+            std::fs::write(&rrdata, b"masks v1").unwrap(); // not at home yet: offload carries it
+            let home = _dir.join("nas/2026/08/DSC1.ARW.rrdata");
+            let plan = catalog.plan_offload(id).unwrap();
+            let wrote = std::cell::Cell::new(false);
+            // `stopped` is consulted after the carry; the first time the carried file is at
+            // home, write the late change.
+            let after_carry = || {
+                if home.exists() && !wrote.replace(true) {
+                    std::fs::write(crate::companions::appended_path(&raw, late), b"written late").unwrap();
+                }
+                false
+            };
+
+            let err = match verify_and_delete_locals_until(&plan, &after_carry) {
+                Ok(_) => panic!("{tag}: a companion written after the carry must refuse"),
+                Err(e) => e.to_string(),
+            };
+
+            assert!(wrote.get(), "{tag}: the write landed after the carry");
+            assert!(err.contains("refusing to offload"), "{tag}: {err}");
+            assert!(raw.exists() && rrdata.exists(), "{tag}: nothing local was deleted");
+            assert!(crate::companions::appended_path(&raw, late).exists());
+        }
     }
 }

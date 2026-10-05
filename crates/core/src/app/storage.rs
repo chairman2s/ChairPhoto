@@ -468,6 +468,27 @@ mod stack_tests {
         assert_eq!(reconcile_due(&state).unwrap().0, 0);
     }
 
+    /// #255 through the drain: a queued offload whose local master was rewritten after its
+    /// backup is a refusal of that photo, not an interruption — the op is kept `failed` with
+    /// the reason, and the newer local bytes stay.
+    #[test]
+    fn a_drained_offload_of_a_changed_local_copy_fails_with_the_reason() {
+        let (_dir, state, master, _frame, raw, jpg) = stacked("drain-local-changed");
+        backup_photo(&state, master).unwrap();
+        std::fs::write(&raw, b"raw-bytes rewritten by another tool").unwrap();
+        with_catalog(&state, |c| c.enqueue_operation("offload", master).map(drop)).unwrap();
+
+        let summary = reconcile_now(&state).unwrap();
+
+        assert_eq!((summary.ran, summary.failed, summary.partial), (0, 1, 0), "{summary:?}");
+        let ops = with_catalog(&state, |c| c.list_pending_operations()).unwrap();
+        assert_eq!(ops.len(), 1, "{ops:?}");
+        assert_eq!((ops[0].photo_id, ops[0].status.as_str()), (master, "failed"));
+        assert!(ops[0].error.contains(crate::catalog::LOCAL_CHANGED_REASON), "{}", ops[0].error);
+        assert_eq!(std::fs::read(&raw).unwrap(), b"raw-bytes rewritten by another tool");
+        assert!(jpg.exists(), "the named photo's refusal is the call's: the frame stays too");
+    }
+
     /// A claimed backup tripped mid-stack: the named photo — the op in flight — finishes,
     /// and no further frame is started; the frame is reported with why, which is what the
     /// drain requeues.

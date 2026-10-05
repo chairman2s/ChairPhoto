@@ -70,7 +70,8 @@ CREATE TABLE photo_versions (
     edit_json  TEXT NOT NULL,            -- crop + tone for THIS version (shape below)
     position   INTEGER NOT NULL,         -- display order
     created_at INTEGER NOT NULL,
-    updated_at INTEGER NOT NULL
+    updated_at INTEGER NOT NULL,
+    changed_seq INTEGER NOT NULL DEFAULT 0  -- settings-write order: the automatic face (#252)
 );
 ```
 
@@ -112,16 +113,37 @@ order and filter, the one being developed centred. Click a frame, or ← / →, 
 on saves first. With the RAW engine on, the next and previous photos are already decoded
 in memory (docs/plans/raw-foundation, slice 4), so a step shows the RAW at once.
 
-**Cover.** "☆ Use as cover" on the Darkroom bar makes the current version the photo's
-face in the Library grid, the Bench and the filmstrip; "★ Cover" clears it. The original is
-untouched: the grid thumbnail is rendered from the version's settings at 512 px on a worker
-(`plugins/edit/cover.rs`, with the RAW engine when the version uses it) and cached under
-`<cache>/chairphoto/cover512v2/`, keyed by file and settings. If that render fails the plain
-thumbnail is shown. The photo row carries a cover token, `"<version>:<rev>"`, which the grid
-puts in the `thumb://` URL; `rev` rises on every change to the cover's look and on every
-new, cleared or deleted cover, so the webview never shows a cached stale face. Stored in
-the core table `photo_cover` (one row per photo, kept when the cover is cleared so `rev`
-keeps counting); local to this catalog like the history.
+**Cover (the Library face).** A photo's face in the Library grid, the Bench and the
+filmstrip is the look of its **most recently changed version** — the one whose settings were
+written last: a settled edit, a proof adopted, a history step (undo/redo included), a new or
+duplicated version, a version merged in from a bundle. Opening or renaming a version is not a
+change. With no versions it is the original (owner decision, #252). "☆ Use as cover" on the
+Darkroom bar **pins** what is shown as the face — the version being edited, or, with
+"Original" chosen on the shelf, the untouched original — and it stays the face whatever is
+edited later; "★ Cover" unpins it, and the face follows the latest change again. The bar says
+"Face: latest edit" while nothing is pinned, and the shelf stars the pinned chip. Deleting
+the face's version falls back to the next most recently changed version, else the original;
+a pin on a deleted version is lifted.
+
+The original is untouched: the grid thumbnail is rendered from the version's settings at
+512 px on a worker (`plugins/edit/cover.rs`, with the RAW engine when the version uses it) and
+cached under `<cache>/chairphoto/cover512v2/`, keyed by file and settings. If that render
+fails the plain thumbnail is shown; the original's own thumbnail is still kept as the
+offline fallback. The photo row carries a face token, `"<version>:<rev>"` (none for the
+original), which the views ask for the thumbnail under; `rev` rises on every change of the
+face — it moving to another version, the face version's settings changing, a pin or unpin, a
+deletion — so no view shows a cached stale face. Only settled writes count, so a slider drag
+renders no faces; the Library's rows (and so the faces) are re-read when Develop is left,
+after a pin or a version operation, and when the filmstrip steps on from a photo whose
+changes were saved.
+
+Stored in the core table `photo_cover` (one row per photo): `version_id` is the face itself,
+kept current in the transaction of every write that can move it (`catalog::edits`,
+`settings_written` / `refresh_face`), `pin` says how it is chosen (0 automatic, 1 the
+version, 2 the original), and `rev` counts. Versions order by `photo_versions.changed_seq`,
+which each settings write sets one past the photo's highest. Covers set before #252 migrate
+as pinned. Local to this catalog like the history: catalog merge and bundle export do not
+carry it.
 
 Storage: core tables `photo_version_history` and `photo_version_history_head`
 (`catalog/schema.rs`), both cascading with their version. They are local to the catalog:

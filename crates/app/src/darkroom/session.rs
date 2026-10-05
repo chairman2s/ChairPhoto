@@ -86,7 +86,7 @@ use crate::shell::state::{ShellState, Surface};
 use crate::storage::Runner;
 use chairphoto_core::app::editing::{self, DevelopTicket};
 use chairphoto_core::app::{with_catalog_as, AppState, CatalogIdentity, CoreEvent};
-use chairphoto_core::catalog::{Photo, PhotoVersion, VersionHistory};
+use chairphoto_core::catalog::{CoverPin, Photo, PhotoVersion, VersionHistory};
 use chairphoto_core::develop_source::DevelopSource;
 use chairphoto_core::plugins::edit::SourceToken;
 use chairphoto_model::darkroom::develop_source::{is_preparing, reduce_source, SourceState};
@@ -175,8 +175,10 @@ pub struct OpenPhoto {
     pub versions_len: usize,
     /// The photo's versions, for the shelf (read at the open and after each operation).
     pub versions: Vec<PhotoVersion>,
-    /// The version the Library shows for the photo (its cover), if any.
-    pub cover: Option<i64>,
+    /// How the photo's Library face is chosen (#252): automatically (the version changed
+    /// last), or pinned to the original or a version. Read from the photo's row at the open,
+    /// set by the pin operations.
+    pub pin: CoverPin,
     /// The proof last adopted: the name "+ New version" gives.
     adopted_label: Option<String>,
     /// Version operations waiting for the commit on the worker.
@@ -227,6 +229,10 @@ pub struct OpenPhoto {
     replacing: bool,
     commit_again: bool,
     pub saving: bool,
+    /// A commit of this open saved: the photo's face may have moved to the version (#252),
+    /// so the Library's rows are re-read once the photo is left, even within Develop — the
+    /// filmstrip shows the face its row names.
+    saved: bool,
     _stage_observer: Subscription,
 }
 
@@ -304,11 +310,6 @@ impl OpenPhoto {
     pub fn editable(&self) -> bool {
         !self.replacing && !(self.reopened_during_commit && !self.loaded)
     }
-}
-
-/// The cover version a row's token names (`"<version>:<rev>"`).
-fn cover_of(photo: &Photo) -> Option<i64> {
-    photo.cover_token.as_deref()?.split(':').next()?.parse().ok()
 }
 
 /// What a commit's worker answers: the version id it created, if it did — known even when
@@ -502,7 +503,7 @@ impl Darkroom {
         let working = parse_edit(version.as_ref().map(|v| v.edit_json.as_str()));
         let engine1_version = version.is_some() && is_engine1_version(&working);
         let photo_id = photo.id;
-        let cover = cover_of(&photo);
+        let pin = photo.cover_pin;
         let stage = self.new_stage(photo_id, epoch, SourceToken::Preview, None, cx);
         let _stage_observer = cx.observe(&stage, |_, _, cx| cx.notify());
         let committed_json = working.to_json();
@@ -519,7 +520,7 @@ impl Darkroom {
             version_unlisted: false,
             versions_len: 0,
             versions: Vec::new(),
-            cover,
+            pin,
             adopted_label: None,
             ops: VecDeque::new(),
             perspective_mode: false,
@@ -549,6 +550,7 @@ impl Darkroom {
             replacing: false,
             commit_again: false,
             saving: false,
+            saved: false,
             _stage_observer,
         };
         self.open = Some(open);
@@ -1083,6 +1085,7 @@ impl Darkroom {
                 }
                 open.version_id = Some(c.version_id);
                 open.history = Some(c.history);
+                open.saved = true;
                 open.last_step = Some(LastStep { key: change.key, at: now });
                 let photo_id = open.photo.id;
                 if let Some(v) = &c.version {
@@ -1209,6 +1212,13 @@ impl Darkroom {
             open.autosave_timer = None;
             open.masses_timer = None;
             self.leaving.push(open);
+        } else if save && open.saved && {
+            let shell = self.shell.read(cx);
+            shell.surface == Surface::Develop && shell.rows_from() == Some(open.from)
+        } {
+            // A step to another photo: the strip's frame for this one shows its new face.
+            // (Leaving Develop re-reads the rows itself, in `leave`.)
+            self.shell.update(cx, |s, cx| s.refresh_rows(cx));
         }
         cx.notify();
     }
@@ -1220,7 +1230,7 @@ impl Darkroom {
         let Some(i) = self.leaving.iter().position(|o| o.seq == seq && !o.committing) else { return };
         let left = self.leaving.remove(i);
         let shell = self.shell.read(cx);
-        if !left.dirty() && shell.surface != Surface::Develop && shell.rows_from() == Some(left.from) {
+        if !left.dirty() && (shell.surface != Surface::Develop || left.saved) && shell.rows_from() == Some(left.from) {
             self.shell.update(cx, |s, cx| s.refresh_rows(cx));
         }
         // The photo was opened again meanwhile: its versions are read now that nothing of its

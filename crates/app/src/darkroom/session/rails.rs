@@ -361,24 +361,25 @@ impl Darkroom {
         );
     }
 
-    /// "☆ Use as cover" / "★ Cover": the version being edited becomes the photo's face in
-    /// the Library, or stops being it. Pending changes are saved first.
+    /// "☆ Use as cover" / "★ Cover": pin what is being edited — the version, or the Original
+    /// when that is shown — as the photo's face in the Library, or unpin it so the face
+    /// follows the latest change again (#252). Pending changes are saved first.
     pub fn toggle_cover(&mut self, cx: &mut Context<Self>) {
         self.after_save(
             Box::new(|this, seq, cx| {
                 let Some(open) = this.open.as_ref() else { return };
-                let Some(vid) = open.version_id else { return };
-                let next = if open.cover == Some(vid) { None } else { Some(vid) };
+                let shown = open.version_id.map_or(CoverPin::Original, CoverPin::Version);
+                let next = if open.pin == shown { CoverPin::Auto } else { shown };
                 let (from, photo_id) = (open.from, open.photo.id);
                 this.run_op(
                     seq,
                     false,
-                    move |state| with_catalog_as(state, from, |c| c.set_cover_version(photo_id, next)),
+                    move |state| with_catalog_as(state, from, |c| c.set_cover_pin(photo_id, next)),
                     // The version edited stays the same.
                     |_, _| {},
                     move |this, result, cx| match result {
                         Ok(_) => {
-                            this.open.as_mut().expect("open").cover = next;
+                            this.open.as_mut().expect("open").pin = next;
                             this.shell.update(cx, |s, cx| s.refresh_rows(cx));
                         }
                         Err(e) => this.error = Some(format!("Could not set the cover: {e}")),

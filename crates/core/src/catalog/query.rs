@@ -158,7 +158,11 @@ pub(crate) fn photo_columns(alias: &str) -> String {
          {alias}.stack_parent_id, {alias}.metadata_ready, {alias}.sharpness,
          {alias}.sharpness_method, {alias}.burst_flag,
          (SELECT COUNT(*) FROM photo_versions pv WHERE pv.photo_id = {alias}.id),
-         (SELECT pc.version_id || ':' || pc.rev FROM photo_cover pc WHERE pc.photo_id = {alias}.id)"
+         (SELECT pc.version_id || ':' || pc.rev FROM photo_cover pc WHERE pc.photo_id = {alias}.id),
+         -- The face's pin (#252): NULL = automatic, 0 = the original, else the version. A
+         -- version pin whose version is gone reads as automatic, as `edits::refresh_face` does.
+         (SELECT CASE pc.pin WHEN 2 THEN 0 WHEN 1 THEN pc.version_id END
+          FROM photo_cover pc WHERE pc.photo_id = {alias}.id)"
     )
 }
 

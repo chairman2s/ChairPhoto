@@ -53,7 +53,7 @@ pub use lifecycle::{
 };
 pub use merge::{MergeOutcome, MergeSummary, IMPORTED_EDIT_VERSION};
 pub use models::{
-    Album, BurstInput, ExportKeywords, HistoryStep, ImportBatch, IptcFields, LocationRole, MetadataEntry,
+    Album, BurstInput, CoverPin, ExportKeywords, HistoryStep, ImportBatch, IptcFields, LocationRole, MetadataEntry,
     PendingOperation, Photo, PhotoLocation, PhotoVersion, PickState, PromotedMetadata,
     Publication, StorageStatus, SmartAlbum, Tag, TagGroup, TagTerm, TagWithCount, VersionHistory,
     Volume, VolumeKind,
@@ -421,6 +421,7 @@ impl Catalog {
         ] {
             self.ensure_column("photos", col, "TEXT NOT NULL DEFAULT ''")?;
         }
+        self.migrate_auto_faces()?;
 
         // Persist the root the first time; keep any existing value otherwise.
         let root_str = self.root.to_string_lossy().to_string();
@@ -577,6 +578,38 @@ impl Catalog {
                 .execute(&format!("ALTER TABLE {table} ADD COLUMN {column} {declaration}"), [])?;
         }
         Ok(())
+    }
+
+    /// #252: the Library face follows the most recently changed version unless pinned.
+    /// Additive, gated on the columns rather than `schema_version` (like the history tables):
+    /// - `photo_versions.changed_seq`, backfilled per photo in `updated_at` order (then id) —
+    ///   the best record of the last change there is, though a rename or reorder bumped it too;
+    /// - `photo_cover.pin`: every existing cover was chosen by hand, so it is pinned; a
+    ///   cleared one (NULL) becomes automatic;
+    /// - then every face is brought up to date, so a photo edited before this shows its
+    ///   latest version at once.
+    fn migrate_auto_faces(&self) -> Result<()> {
+        let had_seq = has_column(&self.conn, "photo_versions", "changed_seq")?;
+        let had_pin = has_column(&self.conn, "photo_cover", "pin")?;
+        if had_seq && had_pin {
+            return Ok(());
+        }
+        self.ensure_column("photo_versions", "changed_seq", "INTEGER NOT NULL DEFAULT 0")?;
+        self.ensure_column("photo_cover", "pin", "INTEGER NOT NULL DEFAULT 0")?;
+        if !had_seq {
+            self.conn.execute_batch(
+                "UPDATE photo_versions SET changed_seq = (
+                     SELECT COUNT(*) FROM photo_versions o
+                      WHERE o.photo_id = photo_versions.photo_id
+                        AND (o.updated_at < photo_versions.updated_at
+                             OR (o.updated_at = photo_versions.updated_at AND o.id <= photo_versions.id)));",
+            )?;
+        }
+        if !had_pin {
+            self.conn
+                .execute_batch("UPDATE photo_cover SET pin = 1 WHERE version_id IS NOT NULL;")?;
+        }
+        self.refresh_all_faces()
     }
 
     /// Schema v26 (#136): fill `photos.exif_orientation` from the `EXIF:Orientation` entry a
@@ -2446,6 +2479,12 @@ fn row_to_photo(r: &Row) -> rusqlite::Result<Photo> {
         burst_flag: r.get(21)?,
         version_count: r.get(22)?,
         cover_token: r.get(23)?,
+        // `photo_columns`: NULL = automatic, 0 = the original, else the pinned version.
+        cover_pin: match r.get::<_, Option<i64>>(24)? {
+            None => CoverPin::Auto,
+            Some(0) => CoverPin::Original,
+            Some(v) => CoverPin::Version(v),
+        },
     })
 }
 

@@ -131,7 +131,25 @@ fn decode_tier(id: i64, kind: ImageKind, resolved: Resolved) -> Result<(DynamicI
             if let Some(json) = &cover {
                 #[cfg(feature = "edit")]
                 match crate::plugins::edit::cover::cover_thumb(&absolute, id, json) {
-                    Ok(bytes) => return decode(&bytes).map(|i| (rotate(i), true)),
+                    Ok(bytes) => {
+                        // The offline fallback above is the original's own thumbnail, kept by
+                        // the plain path below — which a photo whose tile has only ever shown
+                        // its face never took (#252: every edited photo now has one). Kept
+                        // once, here, while the original is reachable.
+                        if !crate::thumbnails::persistent_thumb_path(id).exists() {
+                            if let Ok(plain) = thumbnail_bytes(&absolute) {
+                                if ((rotation % 360) + 360) % 360 == 0 {
+                                    crate::thumbnails::save_persistent_thumb(id, &plain);
+                                } else if let Ok(rotated) = decode(&plain)
+                                    .map(rotate)
+                                    .and_then(|img| crate::thumbnails::encode_rotated_jpeg(&img))
+                                {
+                                    crate::thumbnails::save_persistent_thumb(id, &rotated);
+                                }
+                            }
+                        }
+                        return decode(&bytes).map(|i| (rotate(i), true));
+                    }
                     Err(e) => eprintln!("cover thumbnail for photo {id}: {e}"),
                 }
                 #[cfg(not(feature = "edit"))]

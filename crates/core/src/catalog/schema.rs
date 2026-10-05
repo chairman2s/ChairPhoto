@@ -348,6 +348,12 @@ CREATE TABLE IF NOT EXISTS photo_location_companions (
     PRIMARY KEY (location_id, name)
 );
 
+-- `changed_seq` orders a photo's versions by when their settings were last written (a save,
+-- a commit, a history step, a new or duplicated version) — not a rename or a reorder, which
+-- bump `updated_at`. Each write sets it one past the photo's highest, so the most recently
+-- changed version has the largest; the automatic Library face is that version (#252,
+-- `photo_cover`). A counter, not a time: two writes in one second still order. Added to
+-- older catalogs by `ensure_column` and backfilled from `updated_at` there.
 CREATE TABLE IF NOT EXISTS photo_versions (
     id         INTEGER PRIMARY KEY,
     photo_id   INTEGER NOT NULL REFERENCES photos(id) ON DELETE CASCADE,
@@ -355,7 +361,8 @@ CREATE TABLE IF NOT EXISTS photo_versions (
     edit_json  TEXT NOT NULL DEFAULT '{}',
     position   INTEGER NOT NULL,
     created_at INTEGER NOT NULL,
-    updated_at INTEGER NOT NULL
+    updated_at INTEGER NOT NULL,
+    changed_seq INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_photo_versions_photo ON photo_versions(photo_id);
 
@@ -377,17 +384,23 @@ CREATE TABLE IF NOT EXISTS photo_version_history (
     created_at INTEGER NOT NULL,
     UNIQUE(version_id, seq)
 );
--- A photo's cover: the version whose look the Library shows for it (grid thumbnail). One
--- per photo; gone with the photo or the version. `rev` counts changes to the cover
--- version's settings (save, history step, undo), so the grid's thumbnail URL — which
--- carries "version:rev" — changes whenever the cover's look does, and the webview's cache
--- can never show a stale one. Local to this catalog, like the history.
+-- A photo's face: the look the Library grid, the Bench and the filmstrip show for it
+-- (#252). `pin` says how it is chosen: 0 = automatically — the version whose settings were
+-- written last (`photo_versions.changed_seq`), else the original; 1 = pinned to the
+-- version in `version_id` ("Use as cover"); 2 = pinned to the original. `version_id` is
+-- the face itself, kept current by `catalog::edits` in the transaction of every write
+-- that can move it (NULL = the original). `rev` rises on every change of the face — it
+-- moving to another version, the face version's settings changing, a pin or unpin, a
+-- deletion — so the thumbnail look `"version:rev"` the rows carry is never one shown
+-- before for another look. One per photo; gone with the photo. Local to this catalog,
+-- like the history. Rows from before #252 were all set by hand: migrated as pinned.
 CREATE TABLE IF NOT EXISTS photo_cover (
     photo_id   INTEGER PRIMARY KEY REFERENCES photos(id) ON DELETE CASCADE,
-    -- NULL = no cover. The row outlives a cleared or deleted cover so `rev` keeps
-    -- counting and a later cover never reuses a token the webview has cached.
+    -- NULL = the original is the face. The row outlives a pinned face's version so `rev`
+    -- keeps counting and a later face never reuses a token the views have cached.
     version_id INTEGER REFERENCES photo_versions(id) ON DELETE SET NULL,
-    rev        INTEGER NOT NULL DEFAULT 0
+    rev        INTEGER NOT NULL DEFAULT 0,
+    pin        INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS photo_version_history_head (
     version_id INTEGER PRIMARY KEY REFERENCES photo_versions(id) ON DELETE CASCADE,

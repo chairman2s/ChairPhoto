@@ -2573,10 +2573,11 @@ fn version_history_records_steps_and_steps_back() {
     assert!(catalog.version_history(v).unwrap().steps.is_empty());
 }
 
-/// A version as the photo's cover: the photo row carries a token the grid puts in the
+/// A version pinned as the photo's cover: the photo row carries a token the grid puts in the
 /// thumbnail URL; the token changes on every change to the cover's look (a save, a history
-/// step, an undo) and on a new cover; a version of another photo is refused; deleting the
-/// cover version clears it.
+/// step, an undo) and on a new cover; a version of another photo is refused; unpinning or
+/// deleting the cover version hands the face back to the most recently changed version
+/// (#252; the automatic face's own cases are in `catalog::edits`).
 #[test]
 fn a_version_can_be_the_photo_cover_and_its_token_follows_the_look() {
     let (catalog, root) = temp_catalog("cover");
@@ -2591,7 +2592,8 @@ fn a_version_can_be_the_photo_cover_and_its_token_follows_the_look() {
     let foreign = catalog.create_version(other, "X").unwrap();
     let token = |id: i64| catalog.get_photo(id).unwrap().cover_token;
 
-    assert_eq!(token(photo), None);
+    // Unpinned, the face is the version changed last: B, created last.
+    assert!(token(photo).unwrap().starts_with(&format!("{b}:")));
     let t0 = catalog.set_cover_version(photo, Some(a)).unwrap().unwrap();
     assert!(t0.starts_with(&format!("{a}:")));
     assert_eq!(token(photo), Some(t0.clone()));
@@ -2616,19 +2618,23 @@ fn a_version_can_be_the_photo_cover_and_its_token_follows_the_look() {
     assert!(tb.starts_with(&format!("{b}:")));
     assert!(![&t0, &t1, &t2, &t3].contains(&&tb));
 
-    // Another photo's version is refused; clearing works; deleting the cover version clears.
+    // Another photo's version is refused; unpinning hands the face to the version changed
+    // last (B), under a token never seen; deleting the cover version falls back to A.
     assert!(catalog.set_cover_version(photo, Some(foreign)).is_err());
-    assert_eq!(catalog.set_cover_version(photo, None).unwrap(), None);
-    assert_eq!(token(photo), None);
-    // Clearing and choosing the same version again must not bring back a cached token.
+    let auto = catalog.set_cover_version(photo, None).unwrap().unwrap();
+    assert!(auto.starts_with(&format!("{b}:")));
+    assert!(![&t0, &t1, &t2, &t3, &tb].contains(&&auto));
+    assert_eq!(token(photo), Some(auto.clone()));
+    // Unpinning and choosing the same version again must not bring back a cached token.
     let tb2 = catalog.set_cover_version(photo, Some(b)).unwrap().unwrap();
-    assert_ne!(tb2, tb);
+    assert!(![&tb, &auto].contains(&&tb2));
     catalog.delete_version(b).unwrap();
-    assert_eq!(token(photo), None);
-    assert!(catalog.cover_of(photo).unwrap().is_none());
+    let fallback = token(photo).unwrap();
+    assert!(fallback.starts_with(&format!("{a}:")));
+    assert_eq!(catalog.cover_of(photo).unwrap().unwrap().0, a);
     // …nor after the cover version was deleted.
     let ta = catalog.set_cover_version(photo, Some(a)).unwrap().unwrap();
-    assert!(![&t0, &t1, &t2, &t3].contains(&&ta));
+    assert!(![&t0, &t1, &t2, &t3, &fallback].contains(&&ta));
 }
 
 /// History is bounded: the oldest steps go first, the head stays on the newest.

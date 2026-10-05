@@ -2,8 +2,11 @@
 //! queue, reconcile-on-focus and the Trash dialog.
 //!
 //! Every function here **blocks** (file copies over a possibly slow mount, hashing, volume
-//! stats): run it on a worker, never a UI thread. Each operation is plan-under-lock → file IO
-//! off the lock → record-under-lock, so a NAS copy never holds the catalog lock.
+//! stats): run it on a worker, never a UI thread. Each operation is plan → file IO off the
+//! lock → record-under-lock, so a NAS copy never holds the catalog lock — and the plan is
+//! itself split (#85): its candidate rows come from under the lock in pure SQL, and which
+//! copies exist is statted off it (`resolve_*_plan` in `catalog/lifecycle.rs`), so a slow or
+//! unmounted NAS stalls one plan but never every catalog reader queued behind the mutex.
 //!
 //! "Nothing ever leaves home" is binding here — see `docs/storage-and-import.md`.
 
@@ -70,7 +73,10 @@ fn backup_in(
     backup_id: i64,
     abort: Option<&AtomicBool>,
 ) -> Result<BackupReport, String> {
-    let plan = cat.with(|c| c.plan_backup(photo_id, backup_id))?;
+    // Candidate rows under the lock; which copies are actually on disk is decided off it
+    // (#85), so a slow NAS stalls this plan but no other catalog reader.
+    let candidates = cat.with(|c| c.plan_backup_candidates(photo_id, backup_id))?;
+    let plan = crate::catalog::resolve_backup_plan(candidates).map_err(|e| e.to_string())?;
     let mut report = BackupReport { skipped: plan.skipped, total: plan.total, ..Default::default() };
     backup_one(cat, plan.named)?;
     report.backed_up.push(photo_id);
@@ -93,7 +99,9 @@ fn backup_in(
 /// companions existed has a verified image and no carried sidecars (#80).
 fn backup_one(cat: &impl CatalogAccess, plan: PhotoBackup) -> Result<(), String> {
     let PhotoBackup { photo_id, source, dest, rel, volume_id } = plan;
-    if cat.with(|c| c.has_verified_backup(photo_id))? {
+    // The idempotency gate's rows come from under the lock; its stat runs off it (#85).
+    let gate = cat.with(|c| c.verified_backup_candidates(photo_id))?;
+    if crate::catalog::any_backup_present(&gate) {
         let carried = crate::catalog::carry_companions(&source, &dest).map_err(|e| e.to_string())?;
         return cat.with(|c| {
             c.record_companions_at(photo_id, volume_id, LocationRole::Backup, &carried.carried)
@@ -167,7 +175,11 @@ pub fn offload_photo(state: &AppState, photo_id: i64) -> Result<OffloadReport, S
 /// keeping the queue row; a frame it reaches tripped is reported skipped. Whatever was
 /// already freed is recorded either way: a deleted local file must never keep its row.
 fn offload_in(cat: &impl CatalogAccess, photo_id: i64, abort: Option<&AtomicBool>) -> Result<OffloadReport, String> {
-    let plan = cat.with(|c| c.plan_offload(photo_id))?;
+    // Candidate rows under the lock; the per-frame backup gate stats off it (#85). The stat
+    // can go stale by the delete, but never destructively: `free_local_copies` re-hashes the
+    // backup before anything is removed.
+    let candidates = cat.with(|c| c.plan_offload_candidates(photo_id))?;
+    let plan = crate::catalog::resolve_offload_plan(candidates).map_err(|e| e.to_string())?;
     for member in std::iter::once(&plan.named).chain(plan.frames.iter()) {
         if let Some(local) = member.local_files.first() {
             let _ = crate::thumbnails::ensure_persistent_thumb(member.photo_id, local);
@@ -198,7 +210,10 @@ fn restore_in(
     local_id: i64,
     abort: Option<&AtomicBool>,
 ) -> Result<RestoreReport, String> {
-    let plan = cat.with(|c| c.plan_restore(photo_id, local_id))?;
+    // Candidate rows under the lock; which frames are already home and which backup is
+    // reachable are statted off it (#85).
+    let candidates = cat.with(|c| c.plan_restore_candidates(photo_id, local_id))?;
+    let plan = crate::catalog::resolve_restore_plan(candidates).map_err(|e| e.to_string())?;
     let mut report = RestoreReport { skipped: plan.skipped, total: plan.total, ..Default::default() };
     restore_one(cat, plan.named)?;
     report.restored.push(photo_id);
@@ -328,6 +343,38 @@ mod stack_tests {
         assert!(pending[0].error.contains("no verified backup"), "{}", pending[0].error);
         assert!(!raw.exists(), "the master's offload is kept");
         assert!(jpg.exists(), "the frame without a backup stays local");
+    }
+
+    /// A [`CatalogAccess`] that fails the test if anything statted a candidate copy while it
+    /// was "held" — the stand-in for the catalog lock the service's plan steps take (#85).
+    struct NoStatUnderLock<'a>(&'a Catalog);
+
+    impl CatalogAccess for NoStatUnderLock<'_> {
+        fn with<T>(&self, f: impl FnOnce(&Catalog) -> crate::catalog::Result<T>) -> Result<T, String> {
+            let _ = crate::volume_health::take_candidate_stats();
+            let out = f(self.0).map_err(|e| e.to_string());
+            assert_eq!(crate::volume_health::take_candidate_stats(), 0, "a copy was statted under the lock");
+            out
+        }
+    }
+
+    /// The verbs plan with rows from under the lock and stats off it (port of origin/main
+    /// 3105a31): run against a stack through an access that forbids stats while held, they
+    /// still back up, offload and restore the whole moment.
+    #[test]
+    fn the_verbs_stat_their_plans_with_no_lock_held() {
+        let (_dir, state, master, frame, _raw, jpg) = stacked("stats-off-lock");
+        let guard = state.catalog.lock().unwrap();
+        let held = NoStatUnderLock(guard.as_ref().unwrap());
+        let nas = held.with(|c| single_volume_of_kind(c, VolumeKind::Backup, "backup")).unwrap();
+        let local = held.with(|c| single_volume_of_kind(c, VolumeKind::Local, "local")).unwrap();
+
+        assert_eq!(backup_in(&held, master, nas, None).unwrap().backed_up, vec![master, frame]);
+        assert_eq!(backup_in(&held, master, nas, None).unwrap().backed_up, vec![master, frame], "idempotent");
+        assert_eq!(offload_in(&held, master, None).unwrap().freed, vec![master, frame]);
+        assert!(!jpg.exists());
+        assert_eq!(restore_in(&held, master, local, None).unwrap().restored, vec![master, frame]);
+        assert!(jpg.exists());
     }
 
     /// A claimed offload whose claim was tripped deletes nothing and fails, so its queue
@@ -500,7 +547,7 @@ pub const OFFLOAD_AGE_SETTING: &str = "offload_age_days";
 /// master is outside it — a burst is one moment, and half-offloading it would leave the user
 /// with a stack split across two disks, which is worse than either whole answer.
 ///
-/// Nothing is at risk either way: the offload plan demands each frame's *own* verified
+/// Nothing is at risk either way: `resolve_offload_plan` demands each frame's *own* verified
 /// backup, so a frame without one stays local no matter what its master did. What this costs
 /// is exactness in the setting's promise, which is why it is written down here and in
 /// `docs/storage-and-import.md` rather than left for the next reader to discover from a frame
@@ -653,7 +700,10 @@ impl ReconcileClaim {
         if age <= 0 {
             return Ok(0);
         }
-        let candidates = cat.with(|c| c.photos_eligible_for_offload(age))?;
+        // The rows are one library-wide SQL pass; the once-per-candidate stats run with no
+        // lock held at all (#85).
+        let rows = cat.with(|c| c.offload_eligibility_candidates(age))?;
+        let candidates = crate::catalog::filter_offload_eligible(rows);
         let mut offloaded = 0;
         // A stack's frames are eligible in their own right, and the master's offload already
         // freed them (#82). Without this the sweep would run a second offload per frame and

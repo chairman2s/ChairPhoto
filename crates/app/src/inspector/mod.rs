@@ -833,7 +833,7 @@ impl PhotoInspector {
         self.storage_action(
             id,
             move |state| match chairphoto_core::app::storage::backup_photo_as(state, from, id) {
-                Ok(()) => Ok("Backed up".to_string()),
+                Ok(_) => Ok("Backed up".to_string()),
                 Err(e) if e == chairphoto_core::app::CATALOG_CHANGED => Err(e),
                 Err(_) => {
                     chairphoto_core::app::storage::enqueue_backup_as(state, from, id)?;
@@ -851,7 +851,7 @@ impl PhotoInspector {
         self.storage_action(
             id,
             move |state| {
-                chairphoto_core::app::storage::offload_photo_as(state, from, id).map(|()| "Local copy freed".to_string())
+                chairphoto_core::app::storage::offload_photo_as(state, from, id).map(|_| "Local copy freed".to_string())
             },
             cx,
         );
@@ -864,7 +864,7 @@ impl PhotoInspector {
         self.storage_action(
             id,
             move |state| {
-                chairphoto_core::app::storage::restore_photo_as(state, from, id).map(|()| "Restored to local".to_string())
+                chairphoto_core::app::storage::restore_photo_as(state, from, id).map(|_| "Restored to local".to_string())
             },
             cx,
         );

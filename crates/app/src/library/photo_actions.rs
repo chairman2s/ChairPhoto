@@ -211,7 +211,7 @@ impl RootView {
         cx.spawn(async move |this, cx| {
             let result = rx.await.unwrap_or_else(|_| Err("the retrieve worker stopped".into()));
             this.update(cx, |this, cx| match result {
-                Ok(()) => {
+                Ok(_report) => {
                     // As relocate's success arm (#193): the restore itself is bound to `from`
                     // and already fails closed across a switch; this only keeps the UI side
                     // effects off a view that has since moved to another (unrelated) catalog.

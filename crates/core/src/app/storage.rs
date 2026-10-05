@@ -8,7 +8,11 @@
 //! "Nothing ever leaves home" is binding here — see `docs/storage-and-import.md`.
 
 use super::{now_secs, with_catalog, AppState};
-use crate::catalog::{Catalog, DrainSummary, LocationRole, VolumeKind};
+use crate::catalog::{
+    BackupReport, Catalog, DrainSummary, LocationRole, OffloadReport, PhotoBackup, PhotoRestore, RestoreReport,
+    VolumeKind,
+};
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -34,30 +38,46 @@ impl CatalogAccess for Catalog {
 
 // ── Backup, offload, restore ─────────────────────────────────────────────────
 
-/// Back a photo up to volume `backup_id`, idempotently.
+/// Back a photo up to volume `backup_id` — **and the frames stacked under it** (#82): a
+/// stack is how a burst is stored, so a tile is a moment rather than a file. The plan
+/// carries the whole stack, so every caller (the inspector, the reconcile drain) inherits
+/// the cascade rather than each deciding for itself.
+///
+/// The named photo's failure is the call's failure; a frame that fails is reported and the
+/// rest continue, because the master is already at home by then.
+pub fn backup_to(state: &AppState, photo_id: i64, backup_id: i64) -> Result<BackupReport, String> {
+    backup_in(state, photo_id, backup_id)
+}
+
+fn backup_in(cat: &impl CatalogAccess, photo_id: i64, backup_id: i64) -> Result<BackupReport, String> {
+    let plan = cat.with(|c| c.plan_backup(photo_id, backup_id))?;
+    let mut report = BackupReport { skipped: plan.skipped, ..Default::default() };
+    backup_one(cat, plan.named)?;
+    report.backed_up.push(photo_id);
+    for frame in plan.frames {
+        let frame_id = frame.photo_id;
+        match backup_one(cat, frame) {
+            Ok(()) => report.backed_up.push(frame_id),
+            Err(e) => report.skipped.push((frame_id, e)),
+        }
+    }
+    Ok(report)
+}
+
+/// Back up one photo — the named photo or one frame of its stack — idempotently. Split out
+/// so the stack cascade applies exactly the same rules to a frame as to the master.
 ///
 /// If a verified backup already exists the image is not re-copied (over a flaky mount that
 /// risks a good backup), but its companions are reconciled: every backup made before
 /// companions existed has a verified image and no carried sidecars (#80).
-pub fn backup_to(state: &AppState, photo_id: i64, backup_id: i64) -> Result<(), String> {
-    backup_in(state, photo_id, backup_id)
-}
-
-fn backup_in(cat: &impl CatalogAccess, photo_id: i64, backup_id: i64) -> Result<(), String> {
-    let plan = || {
-        cat.with(|c| {
-            let p = c.plan_backup(photo_id, backup_id)?;
-            Ok((p.source, p.dest, p.rel, p.volume_id))
-        })
-    };
+fn backup_one(cat: &impl CatalogAccess, plan: PhotoBackup) -> Result<(), String> {
+    let PhotoBackup { photo_id, source, dest, rel, volume_id } = plan;
     if cat.with(|c| c.has_verified_backup(photo_id))? {
-        let (source, dest, _rel, volume_id) = plan()?;
         let carried = crate::catalog::carry_companions(&source, &dest).map_err(|e| e.to_string())?;
         return cat.with(|c| {
             c.record_companions_at(photo_id, volume_id, LocationRole::Backup, &carried.carried)
         });
     }
-    let (source, dest, rel, volume_id) = plan()?;
     // A copy is the image plus its declared companions; `copy_with_companions` is the one
     // place that knows the set.
     let outcome = crate::catalog::copy_with_companions(&source, &dest, None).map_err(|e| e.to_string())?;
@@ -75,7 +95,11 @@ fn bound(state: &AppState, expected: super::CatalogIdentity) -> Result<Catalog, 
 }
 
 /// [`backup_photo`] of a photo read from the catalog `expected` names (see [`bound`]).
-pub fn backup_photo_as(state: &AppState, expected: super::CatalogIdentity, photo_id: i64) -> Result<(), String> {
+pub fn backup_photo_as(
+    state: &AppState,
+    expected: super::CatalogIdentity,
+    photo_id: i64,
+) -> Result<BackupReport, String> {
     let cat = bound(state, expected)?;
     let backup_id = cat.with(|c| single_volume_of_kind(c, VolumeKind::Backup, "backup"))?;
     backup_in(&cat, photo_id, backup_id)
@@ -88,51 +112,73 @@ pub fn enqueue_backup_as(state: &AppState, expected: super::CatalogIdentity, pho
 }
 
 /// [`offload_photo`] of a photo read from the catalog `expected` names (see [`bound`]).
-pub fn offload_photo_as(state: &AppState, expected: super::CatalogIdentity, photo_id: i64) -> Result<(), String> {
+pub fn offload_photo_as(
+    state: &AppState,
+    expected: super::CatalogIdentity,
+    photo_id: i64,
+) -> Result<OffloadReport, String> {
     offload_in(&bound(state, expected)?, photo_id)
 }
 
 /// [`restore_photo`] of a photo read from the catalog `expected` names (see [`bound`]).
-pub fn restore_photo_as(state: &AppState, expected: super::CatalogIdentity, photo_id: i64) -> Result<(), String> {
+pub fn restore_photo_as(
+    state: &AppState,
+    expected: super::CatalogIdentity,
+    photo_id: i64,
+) -> Result<RestoreReport, String> {
     let cat = bound(state, expected)?;
     let local_id = cat.with(|c| single_volume_of_kind(c, VolumeKind::Local, "local"))?;
     restore_in(&cat, photo_id, local_id)
 }
 
-/// Free a photo's local copies, only after re-verifying its backup. Persists an id-keyed
-/// thumbnail from a local copy first, so the photo stays visible once only the NAS copy
-/// remains.
-pub fn offload_photo(state: &AppState, photo_id: i64) -> Result<(), String> {
+/// Free a photo's local copies **and its stack frames'** (#82), each only after re-verifying
+/// its own backup, and report what it did: which photos were freed, which frames were left
+/// local and why, and how many sidecar backups it deliberately left on disk. Persists an
+/// id-keyed thumbnail from a local copy of every member first, so each stays visible once
+/// only the NAS copy remains (frames are what the inspector's Stack section shows).
+pub fn offload_photo(state: &AppState, photo_id: i64) -> Result<OffloadReport, String> {
     offload_in(state, photo_id)
 }
 
-fn offload_in(cat: &impl CatalogAccess, photo_id: i64) -> Result<(), String> {
+fn offload_in(cat: &impl CatalogAccess, photo_id: i64) -> Result<OffloadReport, String> {
     let plan = cat.with(|c| c.plan_offload(photo_id))?;
-    let volume_ids = plan.local_volume_ids.clone();
-    if let Some(local) = plan.local_files.first() {
-        let _ = crate::thumbnails::ensure_persistent_thumb(photo_id, local);
+    for member in std::iter::once(&plan.named).chain(plan.frames.iter()) {
+        if let Some(local) = member.local_files.first() {
+            let _ = crate::thumbnails::ensure_persistent_thumb(member.photo_id, local);
+        }
     }
-    let backup_location_id = plan.backup_location_id;
-    let carried = crate::catalog::verify_and_delete_locals(&plan).map_err(|e| e.to_string())?;
-    cat.with(|c| {
-        // Before `commit_offload`: it drops the local location rows, and companion rows
-        // cascade with them.
-        c.record_companions(backup_location_id, &carried)?;
-        c.commit_offload(photo_id, &volume_ids)
-    })
+    let carry = crate::catalog::verify_and_delete_locals(&plan).map_err(|e| e.to_string())?;
+    // Companions are recorded before the local rows go away, per freed photo — see
+    // `commit_offload_carry`.
+    cat.with(|c| c.commit_offload_carry(carry))
 }
 
 /// Pull a photo's backup copy back to local volume `local_id`, hash-verified, companions
-/// included (a restored photo arrives with the edit state an offload moved home).
-pub fn restore_to(state: &AppState, photo_id: i64, local_id: i64) -> Result<(), String> {
+/// included (a restored photo arrives with the edit state an offload moved home) — **and the
+/// frames stacked under it that are away** (#82): offload frees the moment, so restore brings
+/// it back. A frame already local is left alone rather than overwritten.
+pub fn restore_to(state: &AppState, photo_id: i64, local_id: i64) -> Result<RestoreReport, String> {
     restore_in(state, photo_id, local_id)
 }
 
-fn restore_in(cat: &impl CatalogAccess, photo_id: i64, local_id: i64) -> Result<(), String> {
-    let (source, dest, rel, volume_id, expected_hash) = cat.with(|c| {
-        let p = c.plan_restore(photo_id, local_id)?;
-        Ok((p.source, p.dest, p.rel, p.volume_id, p.expected_hash))
-    })?;
+fn restore_in(cat: &impl CatalogAccess, photo_id: i64, local_id: i64) -> Result<RestoreReport, String> {
+    let plan = cat.with(|c| c.plan_restore(photo_id, local_id))?;
+    let mut report = RestoreReport { skipped: plan.skipped, ..Default::default() };
+    restore_one(cat, plan.named)?;
+    report.restored.push(photo_id);
+    for frame in plan.frames {
+        let frame_id = frame.photo_id;
+        match restore_one(cat, frame) {
+            Ok(()) => report.restored.push(frame_id),
+            Err(e) => report.skipped.push((frame_id, e)),
+        }
+    }
+    Ok(report)
+}
+
+/// Bring one photo home — the named photo or one frame of its stack.
+fn restore_one(cat: &impl CatalogAccess, plan: PhotoRestore) -> Result<(), String> {
+    let PhotoRestore { photo_id, source, dest, rel, volume_id, expected_hash } = plan;
     let outcome = crate::catalog::copy_with_companions(&source, &dest, expected_hash.as_deref())
         .map_err(|e| e.to_string())?;
     cat.with(|c| c.record_copy(photo_id, volume_id, &rel, LocationRole::LocalCache, &outcome))
@@ -140,15 +186,83 @@ fn restore_in(cat: &impl CatalogAccess, photo_id: i64, local_id: i64) -> Result<
 
 /// Back up to the single backup volume. Errors when the NAS is offline; the UI queues a
 /// backup op instead (drained on reconcile).
-pub fn backup_photo(state: &AppState, photo_id: i64) -> Result<(), String> {
+pub fn backup_photo(state: &AppState, photo_id: i64) -> Result<BackupReport, String> {
     let backup_id = with_catalog(state, |c| single_volume_of_kind(c, VolumeKind::Backup, "backup"))?;
     backup_to(state, photo_id, backup_id)
 }
 
 /// Restore to the single local volume.
-pub fn restore_photo(state: &AppState, photo_id: i64) -> Result<(), String> {
+pub fn restore_photo(state: &AppState, photo_id: i64) -> Result<RestoreReport, String> {
     let local_id = with_catalog(state, |c| single_volume_of_kind(c, VolumeKind::Local, "local"))?;
     restore_to(state, photo_id, local_id)
+}
+
+// --- the storage verbs take the moment (#82) ---------------------------------------------
+// The catalog-level cascade is pinned in `tests/catalog_integration.rs`; these pin that the
+// service bodies the GPUI app runs carry it too, since they plan and record step by step
+// rather than through the catalog's sync wrappers.
+#[cfg(test)]
+mod stack_tests {
+    use super::*;
+    use crate::catalog::StorageStatus;
+
+    /// A catalog with a reachable NAS and a two-photo stack (a RAW master and its JPEG
+    /// frame), both local. Returns the state, the master and frame ids, and their files.
+    fn stacked(tag: &str) -> (crate::test_support::TestTmpDir, AppState, i64, i64, PathBuf, PathBuf) {
+        let dir = crate::test_support::TestTmpDir::new(&format!("storage-stack-{tag}"));
+        let root = dir.join("photos");
+        let nas = dir.join("nas");
+        std::fs::create_dir_all(root.join("2026/08")).unwrap();
+        std::fs::create_dir_all(&nas).unwrap();
+        let c = Catalog::open(&dir.join("c.chairphoto"), &root).unwrap();
+        c.add_volume("NAS", &nas, VolumeKind::Backup).unwrap();
+        let raw = root.join("2026/08/DSC1.ARW");
+        let jpg = root.join("2026/08/DSC1.JPG");
+        std::fs::write(&raw, b"raw-bytes").unwrap();
+        std::fs::write(&jpg, b"jpeg-bytes").unwrap();
+        let master = c.upsert_photo(&raw, None, 1, 9).unwrap().id;
+        let frame = c.upsert_photo(&jpg, None, 1, 10).unwrap().id;
+        c.set_stack_parent(frame, master).unwrap();
+        let state = AppState::default();
+        *state.catalog.lock().unwrap() = Some(c);
+        (dir, state, master, frame, raw, jpg)
+    }
+
+    #[test]
+    fn the_service_verbs_take_the_whole_stack_and_say_so() {
+        let (_dir, state, master, frame, raw, jpg) = stacked("verbs");
+
+        let backed = backup_photo(&state, master).unwrap();
+        assert_eq!(backed.backed_up, vec![master, frame], "backup took the frame too");
+        assert!(backed.skipped.is_empty());
+
+        let freed = offload_photo(&state, master).unwrap();
+        assert_eq!(freed.freed, vec![master, frame]);
+        assert!(!raw.exists() && !jpg.exists(), "the whole moment was freed");
+        assert_eq!(with_catalog(&state, |c| c.photo_storage_status(frame)).unwrap(), StorageStatus::Archived);
+
+        let restored = restore_photo(&state, master).unwrap();
+        assert_eq!(restored.restored, vec![master, frame], "and the whole moment came back");
+        assert_eq!(std::fs::read(&jpg).unwrap(), b"jpeg-bytes");
+    }
+
+    /// The age sweep: the frame is a candidate in its own right, and the master's offload
+    /// has already freed it. Counted once, not twice.
+    #[test]
+    fn the_offload_policy_counts_a_stack_frame_once() {
+        let (_dir, state, master, frame, raw, jpg) = stacked("policy");
+        backup_photo(&state, master).unwrap();
+        with_catalog(&state, |c| {
+            c.conn().execute("UPDATE photos SET created_at = created_at - 10 * 86400", [])?;
+            c.set_setting(OFFLOAD_AGE_SETTING, "1")
+        })
+        .unwrap();
+        let eligible = with_catalog(&state, |c| c.photos_eligible_for_offload(1)).unwrap();
+        assert_eq!(eligible, vec![master, frame], "both are candidates, master first");
+
+        assert_eq!(apply_offload_policy(&state).unwrap(), 2, "two photos freed, each counted once");
+        assert!(!raw.exists() && !jpg.exists());
+    }
 }
 
 /// Re-point a photo at a file the user moved (under the library root), then bind that
@@ -385,11 +499,13 @@ impl ReconcileClaim {
                 break;
             }
             before_op(i);
+            // The reports are for the user who pressed a button; the drain only needs to
+            // know whether the op can be cleared from the queue.
             let result = match op.kind.as_str() {
-                "backup" => backup_in(&cat, op.photo_id, backup_id),
-                "offload" => offload_in(&cat, op.photo_id),
+                "backup" => backup_in(&cat, op.photo_id, backup_id).map(drop),
+                "offload" => offload_in(&cat, op.photo_id).map(drop),
                 "restore" => match local_id {
-                    Some(l) => restore_in(&cat, op.photo_id, l),
+                    Some(l) => restore_in(&cat, op.photo_id, l).map(drop),
                     None => Err("no local volume".into()),
                 },
                 other => Err(format!("unknown operation: {other}")),
@@ -427,12 +543,20 @@ impl ReconcileClaim {
         }
         let candidates = cat.with(|c| c.photos_eligible_for_offload(age))?;
         let mut offloaded = 0;
+        // A stack's frames are eligible in their own right, and the master's offload already
+        // freed them (#82). Without this the sweep would run a second offload per frame and
+        // count each one twice.
+        let mut already_freed: HashSet<i64> = HashSet::new();
         for id in candidates {
             if self.aborted() {
                 break;
             }
-            if offload_in(&cat, id).is_ok() {
-                offloaded += 1;
+            if already_freed.contains(&id) {
+                continue;
+            }
+            if let Ok(report) = offload_in(&cat, id) {
+                offloaded += report.freed.len();
+                already_freed.extend(report.freed);
             }
         }
         Ok(offloaded)

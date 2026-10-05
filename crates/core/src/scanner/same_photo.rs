@@ -521,7 +521,7 @@ fn create_new_with(
 
 /// A new hidden temporary file beside `wanted`, created exclusively under a name unique to
 /// this process and call.
-fn create_part(wanted: &Path) -> std::io::Result<(PathBuf, std::fs::File)> {
+pub(crate) fn create_part(wanted: &Path) -> std::io::Result<(PathBuf, std::fs::File)> {
     use std::sync::atomic::AtomicU64;
     static NEXT: AtomicU64 = AtomicU64::new(0);
     let dir = wanted.parent().unwrap_or_else(|| Path::new("."));
@@ -541,7 +541,7 @@ fn create_part(wanted: &Path) -> std::io::Result<(PathBuf, std::fs::File)> {
 /// Give the file at `part` the name `to` without replacing a file there (`AlreadyExists`
 /// when one is), in one step where the filesystem allows ([`create_new_file`]). On success
 /// `part` is gone.
-fn place_no_replace(part: &Path, to: &Path) -> std::io::Result<()> {
+pub(crate) fn place_no_replace(part: &Path, to: &Path) -> std::io::Result<()> {
     #[cfg(any(target_os = "linux", target_os = "android"))]
     {
         use rustix::fs::{renameat_with, RenameFlags, CWD};

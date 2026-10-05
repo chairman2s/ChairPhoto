@@ -717,6 +717,33 @@ reported skipped and requeued as above — and no further queued op. Offload, th
 deletes, re-checks the flag before every member's delete, the named photo's included. A copy
 or delete already under way is indivisible and is recorded on that claimed connection.
 
+**One storage operation per photo at a time (#254).** User verbs run on the blocking pool
+beside each other and beside a drain or the offload-policy sweep. Every backup, offload and
+restore the service layer runs therefore claims, in `AppState::storage_claims`
+(`storage::StorageClaims`, keyed by catalog file and photo id), the photo it was named on
+**and the frames it will take** before it plans, and holds the claim until it has recorded.
+Nothing waits on a claim: a verb whose named photo is held fails with "a storage operation
+on this photo is already in progress"; a held frame is left and reported with that reason;
+a drain whose op's photo is held leaves the op `pending` and untouched (`DrainSummary::busy`),
+and a held frame of a stack op is requeued `pending`, not failed — both are retried by the
+next drain. The claim is per photo rather than one global gate because a drain can run for
+hours, and a user's Offload of an unrelated photo must not wait behind it. Its mutex is a
+leaf in the `app::jobs` lock order. The inspector also disables its storage buttons for a
+photo while one of them runs, so a double-click starts one run. The `Catalog::*_photo` sync
+wrappers do not claim; they are for tests and single-threaded callers.
+
+Two guards do not depend on the claim. Offload's commit drops exactly the local location
+rows it planned from, by id, so a row added after the plan (a restore) is never dropped with
+them. And every lifecycle copy (`copy_and_verify`, used for images and companions) writes its
+own temp file (`.<name>.chairphoto-part-<pid>-<n>`, created exclusively) and places it
+**without replacing** whatever is at the destination — `renameat2(RENAME_NOREPLACE)`, else a
+hard link, else an exclusive create, the import's own placement. Two writers can never
+write into one file. A destination that already exists is accepted only when it hashes to
+the source (another writer placed the same bytes); otherwise the copy fails and that file is
+left untouched. This also means a Restore no longer overwrites a local file that differs
+from the backup: it fails and names the file instead. A crash can leave a hidden temp file
+behind; scans skip it.
+
 Restore is the same rule pointing the other way: a stack that leaves as seven frames comes
 back as seven. It brings home only the frames that are *away* — a frame already local is
 left alone, because copying the backup over it would replace a file the user may have

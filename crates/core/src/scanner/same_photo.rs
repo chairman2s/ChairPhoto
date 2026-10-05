@@ -552,6 +552,23 @@ pub(crate) fn create_hidden(wanted: &Path, tag: &str) -> std::io::Result<(PathBu
 /// when one is), in one step where the filesystem allows ([`create_new_file`]). On success
 /// `part` is gone.
 pub(crate) fn place_no_replace(part: &Path, to: &Path) -> std::io::Result<()> {
+    place(part, to, true).map(drop)
+}
+
+/// How [`place_no_replace_reporting`] gave a file its name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Placed {
+    /// One step (`renameat2(RENAME_NOREPLACE)` or a hard link): `to` is the very file that
+    /// was at `part`, never partly written.
+    InOneStep,
+    /// The filesystem had neither (exFAT, FAT): `to` was created and the bytes copied into
+    /// it. A caller that verified `part` must verify `to` again.
+    Copied,
+}
+
+/// [`place_no_replace`], saying how — so a caller that verified `part` knows whether `to`
+/// is that same file or a second copy of it (#256).
+pub(crate) fn place_no_replace_reporting(part: &Path, to: &Path) -> std::io::Result<Placed> {
     place(part, to, true)
 }
 
@@ -560,16 +577,23 @@ pub(crate) fn place_no_replace(part: &Path, to: &Path) -> std::io::Result<()> {
 /// putting back a file whose bytes exist nowhere else (`catalog::working_files::put_back`),
 /// where a copy that a crash cut short would be the only copy left.
 pub(crate) fn place_no_replace_without_copy(part: &Path, to: &Path) -> std::io::Result<()> {
-    place(part, to, false)
+    place(part, to, false).map(drop)
 }
 
-fn place(part: &Path, to: &Path, may_copy: bool) -> std::io::Result<()> {
+fn place(part: &Path, to: &Path, may_copy: bool) -> std::io::Result<Placed> {
+    #[cfg(test)]
+    if may_copy && copy_fallback::forced() {
+        return place_by_copy(part, to).map(|()| {
+            copy_fallback::copied(to);
+            Placed::Copied
+        });
+    }
     #[cfg(any(target_os = "linux", target_os = "android"))]
     {
         use rustix::fs::{renameat_with, RenameFlags, CWD};
         use rustix::io::Errno;
         match renameat_with(CWD, part, CWD, to, RenameFlags::NOREPLACE) {
-            Ok(()) => return Ok(()),
+            Ok(()) => return Ok(Placed::InOneStep),
             // Not supported by this kernel or filesystem: fall through to a hard link.
             Err(Errno::INVAL | Errno::NOSYS | Errno::OPNOTSUPP) => {}
             Err(e) => return Err(e.into()),
@@ -581,15 +605,15 @@ fn place(part: &Path, to: &Path, may_copy: bool) -> std::io::Result<()> {
 /// [`place_no_replace`] by a hard link (which fails with "exists" rather than replace) and
 /// the removal of `part`; on a filesystem without hard links, [`place_by_copy`] when
 /// `may_copy`, else `Unsupported`.
-fn place_by_link(part: &Path, to: &Path, may_copy: bool) -> std::io::Result<()> {
+fn place_by_link(part: &Path, to: &Path, may_copy: bool) -> std::io::Result<Placed> {
     match std::fs::hard_link(part, to) {
         Ok(()) => {
             // The file is placed; a temporary name that will not go is only litter.
             let _ = std::fs::remove_file(part);
-            Ok(())
+            Ok(Placed::InOneStep)
         }
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Err(e),
-        Err(e) if links_unsupported(&e) && may_copy => place_by_copy(part, to),
+        Err(e) if links_unsupported(&e) && may_copy => place_by_copy(part, to).map(|()| Placed::Copied),
         Err(e) if links_unsupported(&e) => {
             Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "no no-replace rename or hard links here"))
         }
@@ -597,6 +621,45 @@ fn place_by_link(part: &Path, to: &Path, may_copy: bool) -> std::io::Result<()> 
     }
 }
 
+/// Make this thread's placements take the copy fallback, as on a filesystem with neither a
+/// no-replace rename nor hard links, and run a hook on each placed copy — where a test
+/// damages the copy to see it caught.
+#[cfg(test)]
+pub(crate) mod copy_fallback {
+    use std::cell::RefCell;
+    use std::path::Path;
+
+    type Hook = Box<dyn FnMut(&Path)>;
+    thread_local! {
+        static HOOK: RefCell<Option<Hook>> = RefCell::new(None);
+    }
+
+    /// Force the fallback on this thread until the guard is dropped.
+    pub(crate) fn force(hook: impl FnMut(&Path) + 'static) -> Guard {
+        HOOK.with(|h| *h.borrow_mut() = Some(Box::new(hook)));
+        Guard
+    }
+
+    pub(crate) struct Guard;
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            HOOK.with(|h| h.borrow_mut().take());
+        }
+    }
+
+    pub(super) fn forced() -> bool {
+        HOOK.with(|h| h.borrow().is_some())
+    }
+
+    pub(super) fn copied(to: &Path) {
+        HOOK.with(|h| {
+            if let Some(hook) = h.borrow_mut().as_mut() {
+                hook(to);
+            }
+        });
+    }
+}
 /// Whether a failed hard link means the filesystem has none (`EPERM`, `EOPNOTSUPP`, `ENOSYS`
 /// on Unix; any "unsupported" elsewhere).
 fn links_unsupported(e: &std::io::Error) -> bool {
@@ -911,7 +974,7 @@ mod tests {
         let taken = dir.join("taken");
         std::fs::write(&taken, b"theirs").unwrap();
         type Place = fn(&Path, &Path) -> std::io::Result<()>;
-        let link: Place = |part, to| place_by_link(part, to, true);
+        let link: Place = |part, to| place_by_link(part, to, true).map(drop);
         let without_copy: Place = place_no_replace_without_copy;
         for (how, place) in [("no-replace", place_no_replace as Place), ("link", link), ("copy", place_by_copy), ("without-copy", without_copy)] {
             let part = dir.join(format!(".part-{how}"));

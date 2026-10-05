@@ -7,12 +7,17 @@
 //!   re-hash sees it) or makes a new file at the photo's name (which the offload sees, and
 //!   keeps).
 //!
-//! A crash can leave such a file behind. Its bytes may be the only copy of a local edit that
-//! never reached home, so it is never deleted by a sweep: [`sweep_once`] puts it back under
-//! its own name, without replacing anything there.
+//! - `.<name>.chairphoto-part-<pid>-<n>` — a copy being written before it is verified and
+//!   given its name (`same_photo::create_part`: a lifecycle copy, an import).
+//!
+//! A crash can leave either behind. An offload's file may hold the only copy of a local edit
+//! that never reached home, so it is never deleted by a sweep: [`sweep_once`] puts it back
+//! under its own name, without replacing anything there. A copy's temporary file only ever
+//! holds bytes that exist elsewhere, and is removed once it is stale ([`STALE_PART_AGE`]).
 //!
 //! Everything here is file IO: call it off the catalog lock, on a blocking worker.
 
+use crate::scanner::same_photo::PART_TAG;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -123,17 +128,30 @@ pub(crate) fn sweep_once(dir: &Path) {
         }
         return;
     };
+    let now = std::time::SystemTime::now();
     for entry in entries.flatten() {
         let name = entry.file_name();
-        let Some(working) = name.to_str().and_then(|n| parse(n, &[ASIDE_TAG])) else { continue };
+        let Some(working) = name.to_str().and_then(|n| parse(n, &[ASIDE_TAG, PART_TAG])) else { continue };
         // `symlink_metadata`: decided from the entry itself, never through a link.
         let Ok(meta) = std::fs::symlink_metadata(entry.path()) else { continue };
         if !meta.file_type().is_file() || running(working.pid) {
             continue;
         }
-        recover_aside(&entry.path(), &dir.join(working.original), meta.len());
+        if working.tag == ASIDE_TAG {
+            recover_aside(&entry.path(), &dir.join(working.original), meta.len());
+        } else if meta.modified().is_ok_and(|m| now.duration_since(m).is_ok_and(|age| age > STALE_PART_AGE)) {
+            let _ = std::fs::remove_file(entry.path());
+        }
     }
 }
+
+/// How long a copy's temporary file must have gone unwritten before a sweep removes it, on
+/// top of its process not running here. A backup folder on a NAS is shared: the pid in the
+/// name may be a live process on another machine, whose copy is writing that file (its mtime
+/// moves) or about to place it (within seconds of the last write). An hour leaves room for
+/// clock skew between the machines; a temp file is only ever a copy of bytes that exist
+/// elsewhere, so a late removal costs disk space, never data.
+const STALE_PART_AGE: std::time::Duration = std::time::Duration::from_secs(60 * 60);
 
 /// Let `dir` be swept again in this run — a test standing in for the next run after a crash.
 #[cfg(test)]
@@ -232,6 +250,43 @@ mod tests {
             assert!(std::fs::symlink_metadata(aside("E.ARW", dead)).is_ok(), "a symlink is left");
             assert!(!folder.join("E.ARW").exists());
         }
+    }
+
+    /// A copy's temporary file is removed once its process is gone and it has gone an hour
+    /// unwritten — and nothing else: not a fresh one (another machine's copy in progress on a
+    /// shared NAS folder), not a running process's, not a symlink or a folder of that name,
+    /// not a name off the pattern.
+    #[test]
+    fn a_stale_copy_temp_of_a_dead_process_is_removed() {
+        if !cfg!(target_os = "linux") {
+            println!("SKIPPED: a_stale_copy_temp_of_a_dead_process_is_removed — needs /proc");
+            return;
+        }
+        let dir = TestTmpDir::new("working-files-parts");
+        let dead = dead_pid();
+        let part = |name: &str, pid: u32| dir.join(format!(".{name}.{PART_TAG}-{pid}-7"));
+        let old = std::time::SystemTime::now() - STALE_PART_AGE - std::time::Duration::from_secs(60);
+        let write_old = |path: &Path| {
+            std::fs::write(path, b"partial").unwrap();
+            std::fs::File::options().write(true).open(path).unwrap().set_modified(old).unwrap();
+        };
+        write_old(&part("A.ARW", dead));
+        std::fs::write(part("B.ARW", dead), b"being written elsewhere").unwrap();
+        write_old(&part("C.ARW", std::process::id()));
+        write_old(&dir.join(format!(".D.ARW.{PART_TAG}-{dead}")));
+        std::fs::create_dir(part("E.ARW", dead)).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(part("C.ARW", std::process::id()), part("F.ARW", dead)).unwrap();
+
+        sweep_once(&dir);
+
+        assert!(!part("A.ARW", dead).exists(), "stale and its process gone: removed");
+        assert!(part("B.ARW", dead).exists(), "recently written: kept");
+        assert!(part("C.ARW", std::process::id()).exists(), "a running process's: kept");
+        assert!(dir.join(format!(".D.ARW.{PART_TAG}-{dead}")).exists(), "off the pattern: kept");
+        assert!(part("E.ARW", dead).is_dir(), "a folder: kept");
+        #[cfg(unix)]
+        assert!(std::fs::symlink_metadata(part("F.ARW", dead)).is_ok(), "a symlink: kept");
     }
 
     #[test]

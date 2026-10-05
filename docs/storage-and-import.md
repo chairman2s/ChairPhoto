@@ -768,8 +768,17 @@ hard link, else an exclusive create, the import's own placement. Two writers can
 write into one file. A destination that already exists is accepted only when it hashes to
 the source (another writer placed the same bytes); otherwise the copy fails and that file is
 left untouched. This also means a Restore no longer overwrites a local file that differs
-from the backup: it fails and names the file instead. A crash can leave a hidden temp file
-behind; scans skip it.
+from the backup: it fails and names the file instead. On a filesystem with neither a
+no-replace rename nor hard links (an exFAT or FAT backup drive) the destination is claimed by
+an exclusive create and the verified temp copied into it; that second copy is hashed too, and
+one that does not match is removed (the copy created it) and the copy fails (#256). A crash
+during that second copy can leave a short file at the destination, which later copies refuse
+as "already exists with different contents" until it is removed by hand; on every other
+filesystem a crash leaves at most the hidden temp file, which scans skip. The next copy into
+a folder (once per folder per run) removes the temp files there whose process is no longer
+running on this machine and that have gone an hour unwritten — the hour because a backup
+folder can be shared with another machine whose copy is still writing; a temp file only ever
+holds bytes that exist elsewhere.
 
 Restore is the same rule pointing the other way: a stack that leaves as seven frames comes
 back as seven. It brings home only the frames that are *away* — a frame already local is

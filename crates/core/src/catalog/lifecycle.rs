@@ -16,6 +16,7 @@
 //! wrappers compose the pieces for tests and simple callers.
 
 use super::{Catalog, CatalogError, LocationRole, Result, VolumeKind};
+use crate::scanner::same_photo::Placed;
 use rusqlite::{params, OptionalExtension};
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
@@ -1214,8 +1215,16 @@ pub fn sha256_file(path: &Path) -> Result<String> {
 /// hard-link and exclusive-create fallbacks the import uses —
 /// `scanner::same_photo::place_no_replace`). A destination that already exists is accepted
 /// only if it hashes to the source's hash (another writer placed the same bytes, or they
-/// were already there); otherwise the copy fails and that file is left untouched. A crash
-/// leaves at most the hidden temp file.
+/// were already there); otherwise the copy fails and that file is left untouched.
+///
+/// **On a filesystem with neither (exFAT, FAT)** the destination is claimed by an exclusive
+/// create and the verified temp copied into it — a second copy, so it is hashed again
+/// (#256); one that does not match is removed (this call created it) and the copy fails.
+/// A crash during that second copy can leave a short file at `dst`, which a later copy then
+/// refuses as "already exists with different contents" until it is removed by hand; on
+/// every other filesystem a crash leaves at most the hidden temp file. A temp file whose
+/// process is no longer running is removed by the next copy into its folder
+/// (`working_files::sweep_once`).
 pub fn copy_and_verify(src: &Path, dst: &Path, expected: Option<&str>) -> Result<String> {
     copy_and_verify_with(src, dst, expected, &mut || {})
 }
@@ -1238,6 +1247,7 @@ pub(crate) fn copy_and_verify_with(
     }
     if let Some(parent) = dst.parent() {
         std::fs::create_dir_all(parent).map_err(io)?;
+        super::working_files::sweep_once(parent);
     }
     // Hidden (dot-prefixed, so scans skip it), unique to this call, and on the same
     // filesystem so the final step is one rename.
@@ -1256,8 +1266,19 @@ pub(crate) fn copy_and_verify_with(
                 "copy verification failed (hash mismatch)".into(),
             ));
         }
-        match crate::scanner::same_photo::place_no_replace(&part, dst) {
-            Ok(()) => Ok(()),
+        match crate::scanner::same_photo::place_no_replace_reporting(&part, dst) {
+            Ok(Placed::InOneStep) => Ok(()),
+            // A second copy, made without a no-replace rename or hard links: verify it
+            // too. It is this call's own file (created exclusively), so a bad one goes.
+            Ok(Placed::Copied) => match sha256_file(dst) {
+                Ok(hash) if hash == src_hash => Ok(()),
+                _ => {
+                    std::fs::remove_file(dst).ok();
+                    Err(CatalogError::Validation(
+                        "copy verification failed at its destination (hash mismatch)".into(),
+                    ))
+                }
+            },
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
                 if sha256_file(dst)? == src_hash {
                     std::fs::remove_file(&part).ok();
@@ -1737,6 +1758,88 @@ mod tests {
         assert!(second.unwrap().is_ok() && first.is_ok());
         assert_eq!(std::fs::read(&dst).unwrap(), b"history");
         assert!(parts_in(&dir.join("home")).is_empty());
+    }
+
+    // --- the copy fallback on a filesystem without no-replace rename or links (#256) --------
+
+    /// exFAT/FAT: the verified temp is copied a second time into the destination. That copy
+    /// is hashed too; one that does not match (damaged here by the test hook) is removed —
+    /// it is this call's own file — and the copy fails, leaving nothing behind. An intact one
+    /// is accepted, also leaving no temp file.
+    #[test]
+    fn a_copy_placed_by_the_copy_fallback_is_verified_at_its_destination() {
+        let dir = TestTmpDir::new("lifecycle-copy-fallback");
+        let (src, dst) = (dir.join("DSC1.ARW"), dir.join("home/DSC1.ARW"));
+        std::fs::write(&src, b"raw-bytes").unwrap();
+        let copies = std::rc::Rc::new(std::cell::Cell::new(0));
+        let damaged = {
+            let copies = copies.clone();
+            crate::scanner::same_photo::copy_fallback::force(move |to| {
+                copies.set(copies.get() + 1);
+                std::fs::write(to, b"raw-").unwrap(); // a copy cut short
+            })
+        };
+
+        let err = copy_and_verify(&src, &dst, None).expect_err("a short copy must not pass").to_string();
+
+        drop(damaged);
+        assert_eq!(copies.get(), 1, "the fallback was taken");
+        assert!(err.contains("at its destination"), "{err}");
+        assert!(!dst.exists(), "the bad copy, this call's own, is gone");
+        assert!(parts_in(&dir.join("home")).is_empty());
+
+        let _intact = crate::scanner::same_photo::copy_fallback::force(|_| {});
+        assert_eq!(copy_and_verify(&src, &dst, None).unwrap(), sha256_file(&src).unwrap());
+        assert_eq!(std::fs::read(&dst).unwrap(), b"raw-bytes");
+        assert!(parts_in(&dir.join("home")).is_empty());
+    }
+
+    /// A temp file a crashed run left in a destination folder is removed by the next copy
+    /// into that folder; the new copy's own temp never is.
+    #[test]
+    fn a_copy_sweeps_a_crashed_runs_temp_from_its_folder() {
+        if !cfg!(target_os = "linux") {
+            println!("SKIPPED: a_copy_sweeps_a_crashed_runs_temp_from_its_folder — needs /proc");
+            return;
+        }
+        let dir = TestTmpDir::new("lifecycle-copy-sweep");
+        let home = dir.join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let stale = home.join(format!(
+            ".DSC0.ARW.chairphoto-part-{}-0",
+            super::super::working_files::dead_pid()
+        ));
+        std::fs::write(&stale, b"half a copy").unwrap();
+        let hour_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(2 * 60 * 60);
+        std::fs::File::options().write(true).open(&stale).unwrap().set_modified(hour_ago).unwrap();
+        std::fs::write(dir.join("DSC1.ARW"), b"raw").unwrap();
+
+        copy_and_verify(&dir.join("DSC1.ARW"), &home.join("DSC1.ARW"), None).unwrap();
+
+        assert!(!stale.exists());
+        assert!(parts_in(&home).is_empty());
+    }
+
+    /// Back up through the fallback with a copy that comes out wrong: nothing is recorded,
+    /// so the photo is not taken as backed up (and offload stays refused).
+    #[test]
+    fn a_backup_whose_fallback_copy_is_wrong_is_not_recorded() {
+        let dir = TestTmpDir::new("lifecycle-copy-fallback-backup");
+        let root = dir.join("photos");
+        std::fs::create_dir_all(root.join("2026/08")).unwrap();
+        let catalog = Catalog::open(&dir.join("t.chairphoto"), &root).unwrap();
+        std::fs::create_dir_all(dir.join("nas")).unwrap();
+        let nas = catalog.add_volume("NAS", &dir.join("nas"), VolumeKind::Backup).unwrap();
+        let raw = root.join("2026/08/DSC1.ARW");
+        std::fs::write(&raw, b"raw-bytes").unwrap();
+        let id = catalog.upsert_photo(&raw, None, 1, 9).unwrap().id;
+        let _damaged = crate::scanner::same_photo::copy_fallback::force(|to| std::fs::write(to, b"x").unwrap());
+
+        assert!(catalog.backup_photo(id, nas).is_err());
+
+        assert!(!catalog.has_verified_backup(id).unwrap());
+        assert!(!dir.join("nas/2026/08/DSC1.ARW").exists());
+        assert!(catalog.offload_photo(id).is_err() && raw.exists());
     }
 
     /// A location row added after the offload planned (a restore bringing the photo back)

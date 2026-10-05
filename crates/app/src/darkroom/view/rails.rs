@@ -8,6 +8,7 @@
 
 use super::*;
 use crate::darkroom::session::{DarkroomEvent, OpenPhoto};
+use chairphoto_core::catalog::CoverPin;
 use crate::loupe::duel::{variant_image, DuelEvent, DuelView};
 use crate::loupe::edit_renders::EditRenders;
 use crate::loupe::proof_sheet::{ProofEvent, ProofSheet, PROOF_EDGE};
@@ -523,14 +524,17 @@ impl DarkroomView {
 
     // --- the bar ---------------------------------------------------------------------------------
 
-    /// The version shelf: Original and every version; a click saves first, then switches.
+    /// The version shelf: Original and every version; a click saves first, then switches. A
+    /// pinned face is starred (#252).
     pub(super) fn render_shelf(&self, d: &Darkroom, colors: Colors) -> Option<AnyElement> {
         let open = d.open.as_ref()?;
         let on = |el: gpui_kit::Stateful<gpui_kit::Div>, on: bool| el.when(on, |c| c.border_color(colors.accent).text_color(colors.accent));
+        let starred = |name: &str, pinned: bool| if pinned { format!("★ {name}") } else { name.to_string() };
         let mut shelf = div().id("dk-shelf").flex().gap(px(4.)).overflow_x_scroll();
         let dk = self.darkroom.clone();
+        let original = starred("Original", open.pin == CoverPin::Original);
         shelf = shelf.child(clickable(
-            on(chip("dk-shelf-original", "Original", open.loaded, colors), open.version_id.is_none())
+            on(chip("dk-shelf-original", original, open.loaded, colors), open.version_id.is_none())
                 .tooltip(crate::shell::title_bar::tooltip("The unedited original. Changing anything here starts a new version.")),
             open.loaded,
             move |_, _, cx| dk.update(cx, |d, cx| d.switch_version(None, cx)),
@@ -539,7 +543,7 @@ impl DarkroomView {
             let (id, dk) = (v.id, self.darkroom.clone());
             let tip = format!("Edit \"{}\" — every change is saved to it, with history", v.name);
             shelf = shelf.child(clickable(
-                on(chip(format!("dk-shelf-{id}"), v.name.clone(), true, colors), open.version_id == Some(id))
+                on(chip(format!("dk-shelf-{id}"), starred(&v.name, open.pin == CoverPin::Version(id)), true, colors), open.version_id == Some(id))
                     .tooltip(move |window, cx| gpui_kit::component::tooltip::Tooltip::new(tip.clone()).build(window, cx)),
                 true,
                 move |_, _, cx| dk.update(cx, |d, cx| d.switch_version(Some(id), cx)),
@@ -548,22 +552,36 @@ impl DarkroomView {
         Some(shelf.test_support().into_any_element())
     }
 
-    /// The cover toggle and "+ New version".
+    /// The face: whether it is pinned or follows the latest change, the pin toggle for what is
+    /// shown (a version, or the Original) (#252); and "+ New version".
     pub(super) fn render_bar_actions(&self, d: &Darkroom, colors: Colors) -> Vec<AnyElement> {
         let Some(open) = d.open.as_ref() else { return Vec::new() };
         let mut out = vec![div().flex_1().into_any_element()];
-        if let Some(vid) = open.version_id {
-            let is_cover = open.cover == Some(vid);
-            let dk = self.darkroom.clone();
-            let el = chip("dk-cover", if is_cover { "★ Cover" } else { "☆ Use as cover" }, true, colors)
-                .when(is_cover, |c| c.border_color(colors.accent).text_color(colors.accent))
-                .tooltip(crate::shell::title_bar::tooltip(if is_cover {
-                    "The Library shows this version for the photo — click to show the original again"
-                } else {
-                    "Show this version's look as the photo's thumbnail in the Library"
-                }));
-            out.push(clickable(el, true, move |_, _, cx| dk.update(cx, |d, cx| d.toggle_cover(cx))));
+        let shown = open.version_id.map_or(CoverPin::Original, CoverPin::Version);
+        let is_cover = open.pin == shown;
+        if open.pin == CoverPin::Auto {
+            out.push(
+                div()
+                    .id("dk-face-auto")
+                    .text_size(px(11.))
+                    .text_color(colors.dim)
+                    .child("Face: latest edit")
+                    .tooltip(crate::shell::title_bar::tooltip(
+                        "The Library shows the version you changed last. Pin one with \"Use as cover\" to keep it.",
+                    ))
+                    .test_support()
+                    .into_any_element(),
+            );
         }
+        let dk = self.darkroom.clone();
+        let el = chip("dk-cover", if is_cover { "★ Cover" } else { "☆ Use as cover" }, open.loaded, colors)
+            .when(is_cover, |c| c.border_color(colors.accent).text_color(colors.accent))
+            .tooltip(crate::shell::title_bar::tooltip(match (is_cover, open.version_id) {
+                (true, _) => "Pinned: the Library shows this for the photo whatever you edit later — click to unpin, and the face follows your latest edit again",
+                (false, Some(_)) => "Pin this version's look as the photo's face in the Library",
+                (false, None) => "Pin the unedited original as the photo's face in the Library, whatever the versions hold",
+            }));
+        out.push(clickable(el, open.loaded, move |_, _, cx| dk.update(cx, |d, cx| d.toggle_cover(cx))));
         let dk = self.darkroom.clone();
         out.push(clickable(
             chip("dk-new-version", "+ New version", open.loaded, colors).tooltip(crate::shell::title_bar::tooltip(

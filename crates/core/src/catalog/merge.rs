@@ -493,6 +493,8 @@ impl MergeCtx<'_> {
                         ?4, ?4)",
                 params![photo_id, name, value, ts],
             )?;
+            // A version written into this catalog: the automatic face moves to it (#252).
+            super::edits::settings_written(self.tx, self.tx.last_insert_rowid())?;
             has.push(parsed);
             added += 1;
         }
@@ -605,6 +607,8 @@ impl MergeCtx<'_> {
                  VALUES(?1, ?2, ?3, ?4, ?5, ?5)",
                 params![photo_id, v.name, edit_json, v.position, ts],
             )?;
+            // In bundle order, so the last one is the new photo's automatic face (#252).
+            super::edits::settings_written(self.tx, self.tx.last_insert_rowid())?;
         }
 
         Ok(photo_id)
@@ -788,6 +792,27 @@ mod tests {
     /// An existing photo keeps every value it has — culling, IPTC, its edit record and its
     /// version — and gains the bundle's edit record and version as new versions after its
     /// own; its tags union. Merging again adds nothing more.
+    // --- the Library face (#252): `photo_cover` is local, versions merged in move it ------
+
+    #[test]
+    fn merged_versions_give_a_new_photo_its_face_and_leave_a_pin_alone() {
+        let (cat, _root) = temp_catalog("face");
+        cat.merge_bundle(&sample_manifest()).unwrap();
+        let photo = cat.get_photo_by_uuid("photo-a").unwrap();
+        let versions = cat.list_versions(photo.id).unwrap();
+        let last = versions.last().unwrap().id;
+        assert_eq!(cat.cover_of(photo.id).unwrap().map(|f| f.0), Some(last), "the last merged version");
+        assert_eq!(photo.cover_pin, crate::catalog::CoverPin::Auto);
+
+        // A pinned face stays where the user put it when another merge adds versions.
+        cat.set_cover_pin(photo.id, crate::catalog::CoverPin::Original).unwrap();
+        let mut more = sample_manifest();
+        more.photos[0].versions[0].edit_json = r#"{"crop":"4:5"}"#.into();
+        cat.merge_bundle(&more).unwrap();
+        assert_eq!(cat.list_versions(photo.id).unwrap().len(), versions.len() + 1, "a version was added");
+        assert_eq!(cat.cover_of(photo.id).unwrap(), None, "the pinned original stays the face");
+    }
+
     #[test]
     fn existing_photo_keeps_its_values_and_gains_the_bundles_edits_as_new_versions() {
         let (cat, _root) = temp_catalog("preserve");

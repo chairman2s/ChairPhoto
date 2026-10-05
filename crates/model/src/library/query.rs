@@ -38,7 +38,7 @@
 //!   than by arrival order. Nothing read the order.
 //! - `total` is `usize` (the backend's `PhotoPage::total`).
 
-use chairphoto_core::catalog::{Photo, PhotoPage, PhotoQuery, StorageStatus};
+use chairphoto_core::catalog::{CoverPin, Photo, PhotoPage, PhotoQuery, StorageStatus};
 use std::collections::{BTreeMap, HashSet};
 
 /// A `list_photos` call the host must make, and the generation its answer belongs to.
@@ -148,6 +148,20 @@ impl LibraryQuery {
     /// never merely because one was requested (#191 M2; see the field doc).
     pub fn rows_landed(&self) -> u64 {
         self.rows_landed
+    }
+
+    /// One row's face (#252) read again on its own — its look token and pin — instead of
+    /// re-reading every row. Returns whether the row is listed and its face changed; then it
+    /// counts as rows landed, so the views keyed by them ask for the new look.
+    pub fn patch_face(&mut self, id: i64, cover_token: Option<String>, cover_pin: CoverPin) -> bool {
+        let Some(row) = self.photos.iter_mut().find(|p| p.id == id) else { return false };
+        if row.cover_token == cover_token && row.cover_pin == cover_pin {
+            return false;
+        }
+        row.cover_token = cover_token;
+        row.cover_pin = cover_pin;
+        self.rows_landed += 1;
+        true
     }
 
     /// Hand back a refresh's answer.

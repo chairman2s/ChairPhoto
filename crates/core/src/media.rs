@@ -131,7 +131,26 @@ fn decode_tier(id: i64, kind: ImageKind, resolved: Resolved) -> Result<(DynamicI
             if let Some(json) = &cover {
                 #[cfg(feature = "edit")]
                 match crate::plugins::edit::cover::cover_thumb(&absolute, id, json) {
-                    Ok(bytes) => return decode(&bytes).map(|i| (rotate(i), true)),
+                    Ok(bytes) => {
+                        // The offline fallback above is the original's own thumbnail, which
+                        // the plain path below refreshes on every render — so a rotation
+                        // change, or another catalog's photo of this id, never leaves it
+                        // stale. A photo whose tile shows its face (#252: every edited one)
+                        // never takes that path, so the face path refreshes it the same way,
+                        // writing only when it differs. The cost is the plain path's own:
+                        // the cached thumbnail read, plus for a rotated photo one decode and
+                        // q90 encode of it, on this worker.
+                        if let Ok(plain) = thumbnail_bytes(&absolute) {
+                            if ((rotation % 360) + 360) % 360 == 0 {
+                                keep_offline_thumb(id, &plain);
+                            } else if let Ok(rotated) =
+                                decode(&plain).map(rotate).and_then(|img| crate::thumbnails::encode_rotated_jpeg(&img))
+                            {
+                                keep_offline_thumb(id, &rotated);
+                            }
+                        }
+                        return decode(&bytes).map(|i| (rotate(i), true));
+                    }
                     Err(e) => eprintln!("cover thumbnail for photo {id}: {e}"),
                 }
                 #[cfg(not(feature = "edit"))]
@@ -150,6 +169,14 @@ fn decode_tier(id: i64, kind: ImageKind, resolved: Resolved) -> Result<(DynamicI
         }
         ImageKind::Preview => decode(&preview_bytes(&absolute)?).map(|i| (rotate(i), false)),
         ImageKind::Zoom => decode(&zoom_bytes(&absolute)?).map(|i| (rotate(i), false)),
+    }
+}
+
+/// Keep `bytes` as the photo's offline fallback thumbnail unless that is what it holds.
+#[cfg(feature = "edit")]
+fn keep_offline_thumb(id: i64, bytes: &[u8]) {
+    if crate::thumbnails::read_persistent_thumb(id).as_deref() != Some(bytes) {
+        crate::thumbnails::save_persistent_thumb(id, bytes);
     }
 }
 

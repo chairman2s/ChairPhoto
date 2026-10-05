@@ -14,7 +14,7 @@ use crate::tests::{click, colliding_catalog, core_switch, open_catalog_with_phot
 use chairphoto_core::app::{CoreEvent, CATALOG_CHANGED};
 #[cfg(feature = "raw")]
 use chairphoto_core::app::EventSink as _;
-use chairphoto_core::catalog::Catalog;
+use chairphoto_core::catalog::{Catalog, CoverPin};
 #[cfg(feature = "raw")]
 use chairphoto_core::develop::session::DevelopSourceEvent;
 use chairphoto_core::develop_source::DevelopSource;
@@ -23,7 +23,7 @@ use chairphoto_core::plugins::edit::SourceToken;
 use chairphoto_model::darkroom::controls::ToneKey;
 use crate::image_store::{ImageState, Look};
 use chairphoto_core::image_pool::ImageKind;
-use chairphoto_model::darkroom::filmstrip::{CoverLook, KeyTarget, STRIP_LAYOUT};
+use chairphoto_model::darkroom::filmstrip::{cover_look, CoverLook, KeyTarget, STRIP_LAYOUT};
 use chairphoto_model::editing::parse_edit;
 use chairphoto_model::library::session::SelectMods;
 use gpui_kit::component::slider::{SliderEvent, SliderValue};
@@ -479,10 +479,7 @@ fn a_queued_version_operation_dropped_by_leaving_is_reported(cx: &mut TestAppCon
     work(cx);
     let versions = rig.catalog(|c| c.list_versions(p).unwrap());
     assert_eq!(versions.len(), 1, "the autosave landed");
-    let cover = rig.catalog(|c| {
-        c.conn().query_row("SELECT version_id FROM photo_cover WHERE photo_id = ?1", [p], |r| r.get::<_, Option<i64>>(0)).ok().flatten()
-    });
-    assert_eq!(cover, None, "the cover was not set");
+    assert_eq!(rig.catalog(|c| c.cover_pin(p).unwrap()), CoverPin::Auto, "the cover was not pinned");
 }
 
 /// "Version N" is created at most once: the first commit creates the version and its write
@@ -1172,14 +1169,116 @@ fn the_version_shelf_new_version_switching_and_the_cover(cx: &mut TestAppContext
     let shown = rig.darkroom(cx).read_with(cx, |d, _| d.open.as_ref().unwrap().history.as_ref().map(|h| h.version_id));
     assert_eq!(shown, Some(v1), "its history is shown");
 
-    // The cover.
+    // The cover: pinned, then unpinned — the face is then the version changed last (#252).
     rig.darkroom(cx).update(cx, |d, cx| d.toggle_cover(cx));
     work(cx);
+    assert_eq!(rig.catalog(|c| c.cover_pin(photo).unwrap()), CoverPin::Version(v1));
     assert_eq!(rig.catalog(|c| c.cover_of(photo).unwrap().map(|c| c.0)), Some(v1));
     assert!(rig.present("dk-cover", cx));
     rig.darkroom(cx).update(cx, |d, cx| d.toggle_cover(cx));
     work(cx);
-    assert_eq!(rig.catalog(|c| c.cover_of(photo).unwrap()), None);
+    assert_eq!(rig.catalog(|c| c.cover_pin(photo).unwrap()), CoverPin::Auto);
+    let v3 = rig.versions().last().unwrap().id;
+    assert_eq!(rig.catalog(|c| c.cover_of(photo).unwrap().map(|c| c.0)), Some(v3));
+}
+
+// --- the Library face (#252) ------------------------------------------------------------------
+
+/// The face follows the version changed last, the bar saying so; "☆ Use as cover" pins the
+/// version shown, or the Original when that is shown; "★ Cover" unpins.
+#[gpui_kit::test]
+fn the_face_follows_the_latest_edit_until_a_version_or_the_original_is_pinned(cx: &mut TestAppContext) {
+    let rig = rig("dk-face", 1, cx);
+    let photo = rig.ids[0];
+    let face = |rig: &Rig| rig.catalog(|c| c.cover_of(photo).unwrap().map(|f| f.0));
+    let pin = |rig: &Rig, cx: &mut TestAppContext| rig.darkroom(cx).read_with(cx, |d, _| d.open.as_ref().unwrap().pin);
+    rig.slide(Control::Tone(ToneKey::Ev), 0.5, cx);
+    rig.settle_and_save(cx);
+    let v1 = rig.versions()[0].id;
+    assert_eq!(face(&rig), Some(v1), "the first change's version is the face");
+    assert!(rig.present("dk-face-auto", cx), "the bar says the face follows the latest edit");
+    rig.darkroom(cx).update(cx, |d, cx| d.new_version(cx));
+    work(cx);
+    let v2 = rig.version_id(cx).unwrap();
+    assert_eq!(face(&rig), Some(v2));
+    // Back on version 1, a change: the face follows it.
+    rig.darkroom(cx).update(cx, |d, cx| d.switch_version(Some(v1), cx));
+    work(cx);
+    assert_eq!(face(&rig), Some(v2), "opening a version is not a change");
+    rig.slide(Control::Tone(ToneKey::Contrast), 0.3, cx);
+    rig.settle_and_save(cx);
+    assert_eq!(face(&rig), Some(v1));
+
+    // Pinned: version 2's later change leaves the face on version 1.
+    rig.darkroom(cx).update(cx, |d, cx| d.toggle_cover(cx));
+    work(cx);
+    assert_eq!(pin(&rig, cx), CoverPin::Version(v1));
+    assert!(!rig.present("dk-face-auto", cx));
+    rig.darkroom(cx).update(cx, |d, cx| d.switch_version(Some(v2), cx));
+    work(cx);
+    rig.slide(Control::Tone(ToneKey::Contrast), -0.2, cx);
+    rig.settle_and_save(cx);
+    assert_eq!(face(&rig), Some(v1), "pinned beats the later change");
+
+    // On the Original, the toggle pins the original.
+    rig.darkroom(cx).update(cx, |d, cx| d.switch_version(None, cx));
+    work(cx);
+    rig.darkroom(cx).update(cx, |d, cx| d.toggle_cover(cx));
+    work(cx);
+    assert_eq!(rig.catalog(|c| c.cover_pin(photo).unwrap()), CoverPin::Original);
+    assert_eq!(pin(&rig, cx), CoverPin::Original);
+    assert_eq!(face(&rig), None, "the original is the face");
+    let row = rig.app.wired.shell.read_with(cx, |s, _| s.library.photos().iter().find(|p| p.id == photo).cloned()).unwrap();
+    assert_eq!((row.cover_pin, row.cover_token), (CoverPin::Original, None), "the rows were re-read");
+    // "★ Cover" on the Original unpins: the face is the version changed last again.
+    rig.darkroom(cx).update(cx, |d, cx| d.toggle_cover(cx));
+    work(cx);
+    assert_eq!(rig.catalog(|c| c.cover_pin(photo).unwrap()), CoverPin::Auto);
+    assert_eq!(face(&rig), Some(v2));
+    assert!(rig.present("dk-face-auto", cx));
+}
+
+/// **Catalog identity.** Pinning the Original after the core switched to a catalog with
+/// colliding ids writes nothing there: refused with the event withheld; with it delivered,
+/// Develop has closed and there is nothing to pin.
+fn pin_original_across_a_switch(delivered: bool, cx: &mut TestAppContext) {
+    let rig = rig(if delivered { "dk-pin-switch-ev" } else { "dk-pin-switch" }, 1, cx);
+    let photo = rig.ids[0];
+    rig.slide(Control::Tone(ToneKey::Ev), 0.5, cx);
+    rig.settle_and_save(cx);
+    rig.darkroom(cx).update(cx, |d, cx| d.switch_version(None, cx));
+    work(cx);
+    let (b, b_ids) = colliding_catalog(&rig.dir, "b", 1);
+    let b_version = b.create_version(b_ids[0], "B's").unwrap();
+    assert_eq!((b_ids[0], b_version), (photo, rig.versions()[0].id), "the ids collide");
+    let b_token = b.get_photo(photo).unwrap().cover_token;
+    core_switch(&rig.app, b);
+    if delivered {
+        crate::tests::deliver_switch(&rig.app, cx);
+        work(cx);
+    }
+    rig.darkroom(cx).update(cx, |d, cx| d.toggle_cover(cx));
+    work(cx);
+    if !delivered {
+        let error = rig.darkroom(cx).read_with(cx, |d, _| d.error.clone()).unwrap_or_default();
+        assert!(error.contains(CATALOG_CHANGED), "{error}");
+    } else {
+        assert!(rig.darkroom(cx).read_with(cx, |d, _| d.open.is_none()), "Develop closed on the switch");
+    }
+    rig.catalog(|c| {
+        assert_eq!(c.cover_pin(photo).unwrap(), CoverPin::Auto, "nothing pinned in the new catalog");
+        assert_eq!(c.get_photo(photo).unwrap().cover_token, b_token, "its face untouched");
+    });
+}
+
+#[gpui_kit::test]
+fn pinning_the_original_never_writes_the_new_catalog_before_the_switch_event(cx: &mut TestAppContext) {
+    pin_original_across_a_switch(false, cx);
+}
+
+#[gpui_kit::test]
+fn pinning_the_original_never_writes_the_new_catalog_after_the_switch_event(cx: &mut TestAppContext) {
+    pin_original_across_a_switch(true, cx);
 }
 
 /// **Forced interleaving** (#202). "+ New version" on the worker (held by `Runner::manual`),
@@ -1794,7 +1893,7 @@ fn rails_writes_fail_closed_across_a_switch(cx: &mut TestAppContext) {
     rig.darkroom(cx).update(cx, |d, cx| d.save_preset("Mine", cx));
     work(cx);
     rig.catalog(|c| {
-        assert_eq!(c.cover_of(photo).unwrap(), None, "no cover set in the new catalog");
+        assert_eq!(c.cover_pin(photo).unwrap(), CoverPin::Auto, "no cover pinned in the new catalog");
         assert_eq!(c.get_setting(chairphoto_model::presets::USER_PRESETS_KEY).unwrap(), None, "no preset saved there");
         assert!(c.version_history(v).unwrap().steps.is_empty(), "no step taken there");
         assert_eq!(c.list_versions(photo).unwrap()[0].edit_json, "{}");
@@ -2769,6 +2868,55 @@ fn refresh_rows(rig: &Rig, cx: &mut TestAppContext) {
     cx.run_until_parked();
 }
 
+/// #252: a saved change moves the photo's face to its version. Stepping on reads that one
+/// row's face again — never the whole library (review M1) — so the strip's frame for the
+/// photo left asks for its new face without leaving Develop, whether the save had landed
+/// before the step or was still on the worker. The other rows are left as they were.
+#[gpui_kit::test]
+fn a_frame_shows_the_new_face_of_the_photo_just_edited(cx: &mut TestAppContext) {
+    let rig = rig("dk-face-strip", 3, cx);
+    let from = rig.app.wired.shell.read_with(cx, |s, _| s.rows_from()).unwrap();
+    let face_look = |rig: &Rig, photo: i64| cover_look(rig.catalog(|c| c.get_photo(photo).unwrap().cover_token).as_deref());
+    draw(&rig, cx);
+    let first = rig.open_photo(cx).unwrap();
+    assert_eq!(look(&rig, first, cx), Some(Look { from, cover: None }), "unedited: the original");
+    let row_reads = |cx: &mut TestAppContext| rig.app.wired.shell.read_with(cx, |s, _| s.row_reads);
+    let rows = |cx: &mut TestAppContext| rig.app.wired.shell.read_with(cx, |s, _| s.library.photos().to_vec());
+    let reads_before = row_reads(cx);
+    let rows_before = rows(cx);
+
+    // Saved, then a step.
+    rig.slide(Control::Tone(ToneKey::Ev), 0.5, cx);
+    rig.settle_and_save(cx);
+    let want = face_look(&rig, first);
+    assert!(want.is_some());
+    assert!(rig.view(cx).update(cx, |v, cx| v.step(1, None, cx)));
+    cx.run_until_parked();
+    work(cx);
+    let second = rig.open_photo(cx).unwrap();
+    assert_ne!(second, first);
+    assert_eq!(look(&rig, first, cx), Some(Look { from, cover: want }), "the frame asks for the new face");
+
+    // A step while the save is still on the worker: the rows are re-read once it lands.
+    rig.slide(Control::Tone(ToneKey::Ev), -0.5, cx);
+    assert!(rig.view(cx).update(cx, |v, cx| v.step(1, None, cx)));
+    cx.run_until_parked();
+    work(cx);
+    let want = face_look(&rig, second);
+    assert!(want.is_some(), "the change on the second photo was saved");
+    assert_eq!(look(&rig, second, cx), Some(Look { from, cover: want }));
+
+    assert_eq!(row_reads(cx), reads_before, "no whole-library row read on a step");
+    let after = rows(cx);
+    assert_eq!(after.len(), rows_before.len());
+    for (b, a) in rows_before.iter().zip(&after) {
+        assert_eq!(a.id, b.id);
+        if a.id != first && a.id != second {
+            assert_eq!(a.cover_token, b.cover_token, "photo {}: untouched", a.id);
+        }
+    }
+}
+
 /// A frame shows its photo's cover look, asked for under the row's cover token — (photo,
 /// cover version, revision) in the catalog the rows came from: a new cover or a new revision
 /// of it asks again, the same look asks nothing.
@@ -2796,7 +2944,8 @@ fn a_frame_asks_for_the_cover_look_its_row_names(cx: &mut TestAppContext) {
         v
     });
     refresh_rows(&rig, cx);
-    assert_eq!(look(&rig, photo, cx), Some(Look { from, cover: Some(CoverLook { version, rev: 0 }) }));
+    // Created (the automatic face, rev 0), then pinned (rev 1) before the rows were re-read.
+    assert_eq!(look(&rig, photo, cx), Some(Look { from, cover: Some(CoverLook { version, rev: 1 }) }));
     assert_eq!(thumb_jobs(&rig, photo), jobs + 1, "a new cover: asked again");
     assert!(preview_ready(cx), "only the thumbnail shows the cover: the preview stays");
 
@@ -2806,7 +2955,7 @@ fn a_frame_asks_for_the_cover_look_its_row_names(cx: &mut TestAppContext) {
     // The cover version's settings change: its revision moves.
     rig.catalog(|c| c.set_version_edit(version, r#"{"tone":{"ev":1}}"#).unwrap());
     refresh_rows(&rig, cx);
-    assert_eq!(look(&rig, photo, cx).unwrap().cover, Some(CoverLook { version, rev: 1 }));
+    assert_eq!(look(&rig, photo, cx).unwrap().cover, Some(CoverLook { version, rev: 2 }));
     assert_eq!(thumb_jobs(&rig, photo), jobs + 2, "a new revision: asked again");
 }
 
@@ -2967,7 +3116,7 @@ fn cover_look_across_a_switch(delivered: bool, cx: &mut TestAppContext) {
         v
     });
     refresh_rows(&rig, cx);
-    let cover = Some(CoverLook { version, rev: 0 });
+    let cover = Some(CoverLook { version, rev: 1 });
     assert_eq!(look(&rig, photo, cx), Some(Look { from: a, cover }));
     let key = JobKey::photo(photo, ImageKind::Thumb);
     rig.pool.start(key.clone());
@@ -2975,7 +3124,7 @@ fn cover_look_across_a_switch(delivered: bool, cx: &mut TestAppContext) {
     let (b, b_ids) = colliding_catalog(&rig.dir, "b", 2);
     let b_version = b.create_version(b_ids[1], "B's").unwrap();
     let token = b.set_cover_version(b_ids[1], Some(b_version)).unwrap();
-    assert_eq!((b_ids[1], token), (photo, Some(format!("{version}:0"))), "the ids and the token collide");
+    assert_eq!((b_ids[1], token), (photo, Some(format!("{version}:1"))), "the ids and the token collide");
     core_switch(&rig.app, b);
 
     if !delivered {

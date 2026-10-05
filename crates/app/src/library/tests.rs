@@ -1138,11 +1138,20 @@ fn a_grid_tile_follows_its_rows_cover_look(cx: &mut TestAppContext) {
     rig.finish(photo, 12, cx);
     assert_eq!(rig.tile(photo, cx), Ok(12));
 
-    // The cover taken off: the plain thumbnail again.
+    // Unpinned (#252): the face follows the latest change — the same version here — under a
+    // new look, so it is rendered again.
     rig.catalog(|c| c.set_cover_version(photo, None).unwrap());
     rig.refresh_rows(cx);
     want[1] += 1;
-    assert_eq!(rig.all_jobs(), want, "no cover: rendered again");
+    assert_eq!(rig.all_jobs(), want, "unpinned: rendered again");
+    rig.finish(photo, 10, cx);
+    assert_eq!(rig.tile(photo, cx), Ok(10));
+
+    // The original pinned: the plain thumbnail again.
+    rig.catalog(|c| c.set_cover_pin(photo, chairphoto_core::catalog::CoverPin::Original).unwrap());
+    rig.refresh_rows(cx);
+    want[1] += 1;
+    assert_eq!(rig.all_jobs(), want, "the original: rendered again");
     rig.finish(photo, 4, cx);
     assert_eq!(rig.tile(photo, cx), Ok(4));
 }
@@ -1239,7 +1248,7 @@ fn grid_cover_across_a_switch(delivered: bool, cx: &mut TestAppContext) {
     let (b, b_ids) = colliding_catalog(&rig.dir, "b", 2);
     let b_version = b.create_version(b_ids[1], "B's").unwrap();
     let token = b.set_cover_version(b_ids[1], Some(b_version)).unwrap();
-    assert_eq!((b_ids[1], token), (photo, Some(format!("{version}:0"))), "the ids and the token collide");
+    assert_eq!((b_ids[1], token), (photo, Some(format!("{version}:1"))), "the ids and the token collide");
     core_switch(&rig.app, b);
 
     if !delivered {
@@ -1460,7 +1469,7 @@ fn a_plain_render_in_a_switch_window_is_not_drawn_under_the_old_row(cx: &mut Tes
     let a = rig.app.wired.shell.read_with(cx, |s, _| s.rows_from()).unwrap();
     let (b, b_ids) = colliding_catalog(&rig.dir, "b", 2);
     let bv = b.create_version(b_ids[1], "B's").unwrap();
-    assert_eq!(b.set_cover_version(b_ids[1], Some(bv)).unwrap(), Some(format!("{version}:0")), "the token collides");
+    assert_eq!(b.set_cover_version(b_ids[1], Some(bv)).unwrap(), Some(format!("{version}:1")), "the token collides");
     core_switch(&rig.app, b);
 
     // The eviction and the plain request in one update: the plain view asks first.
@@ -1501,7 +1510,7 @@ fn a_foreign_render_is_never_painted_even_in_the_frame_that_discovers_it(cx: &mu
     }
     let (b, b_ids) = colliding_catalog(&rig.dir, "b", 2);
     let bv = b.create_version(b_ids[1], "B's").unwrap();
-    assert_eq!(b.set_cover_version(b_ids[1], Some(bv)).unwrap(), Some(format!("{version}:0")), "the token collides");
+    assert_eq!(b.set_cover_version(b_ids[1], Some(bv)).unwrap(), Some(format!("{version}:1")), "the token collides");
     core_switch(&rig.app, b);
 
     // The eviction and the plain request in one update: the plain view asks first (rv151 L1).
@@ -1537,7 +1546,7 @@ fn a_tile_dropped_while_the_grid_draws_leaves_the_screen(cx: &mut TestAppContext
     }
     let (b, b_ids) = colliding_catalog(&rig.dir, "b", 2);
     let bv = b.create_version(b_ids[1], "B's").unwrap();
-    assert_eq!(b.set_cover_version(b_ids[1], Some(bv)).unwrap(), Some(format!("{version}:0")), "the token collides");
+    assert_eq!(b.set_cover_version(b_ids[1], Some(bv)).unwrap(), Some(format!("{version}:1")), "the token collides");
     core_switch(&rig.app, b);
     let images = rig.app.wired.images.clone();
     images.update(cx, |s, cx| {

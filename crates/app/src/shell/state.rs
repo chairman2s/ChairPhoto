@@ -459,6 +459,12 @@ pub struct ShellState {
     pub rows_loaded: bool,
     /// The generation of the row read still in flight, if any.
     rows_pending: Option<u64>,
+    /// Faces read on their own (`refresh_face`) that landed while a row read was in flight:
+    /// that read may predate the write, so they are read again once it lands.
+    faces_after_rows: Vec<(i64, CatalogIdentity)>,
+    /// How many whole-library row reads `refresh_rows` started (tests).
+    #[cfg(test)]
+    pub(crate) row_reads: usize,
     /// The catalog the rows — and so every id in the selection — were read from. Every
     /// write keyed by those ids (marks, burst analysis, stacks, the inspector's) is bound to
     /// it (`with_catalog_as`), so it fails closed once another catalog is open, even before
@@ -561,6 +567,9 @@ impl ShellState {
             soft_threshold: SOFT_THRESHOLD_DEFAULT,
             rows_loaded: false,
             rows_pending: None,
+            faces_after_rows: Vec::new(),
+            #[cfg(test)]
+            row_reads: 0,
             rows_from: None,
             lists_from: None,
             pending_link: None,
@@ -1020,6 +1029,10 @@ impl ShellState {
     /// catalog it read. Only the newest read lands: the session drops a page whose
     /// generation is stale.
     pub fn refresh_rows(&mut self, cx: &mut Context<Self>) {
+        #[cfg(test)]
+        {
+            self.row_reads += 1;
+        }
         let request = self.library.refresh();
         self.rows_pending = Some(request.generation);
         let state = self.app.clone();
@@ -1034,6 +1047,35 @@ impl ShellState {
                 let rows = page.as_ref().ok().map(|(_, p)| p.photos.len());
                 super::timing::ShellTimer::end_invoke(span, "list_photos", rows, cx);
                 s.on_page(&request, page, cx)
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Read one photo's face (#252) — its look token and pin — from `from` off the UI thread
+    /// and patch its row, instead of re-reading the whole library (`refresh_rows`): the
+    /// Darkroom asks this when it steps on from a photo whose changes were saved. Dropped
+    /// when the rows shown are another catalog's; refused on the worker when `from` is no
+    /// longer the open catalog.
+    pub fn refresh_face(&mut self, photo_id: i64, from: CatalogIdentity, cx: &mut Context<Self>) {
+        let state = self.app.clone();
+        let read = cx.background_executor().spawn(async move {
+            with_catalog_as(&state, from, |c| c.get_photo(photo_id).map(|p| (p.cover_token, p.cover_pin)))
+        });
+        cx.spawn(async move |this, cx| {
+            let Ok((token, pin)) = read.await else { return };
+            this.update(cx, |s, cx| {
+                if s.rows_from != Some(from) {
+                    return;
+                }
+                if s.rows_pending.is_some() {
+                    s.faces_after_rows.push((photo_id, from));
+                }
+                if s.library.patch_face(photo_id, token, pin) {
+                    cx.emit(RowsLanded);
+                    cx.notify();
+                }
             })
             .ok();
         })
@@ -1086,6 +1128,9 @@ impl ShellState {
                     self.apply_pending_link(cx);
                     self.after_input(cx);
                     cx.emit(RowsLanded);
+                    for (photo, from) in std::mem::take(&mut self.faces_after_rows) {
+                        self.refresh_face(photo, from, cx);
+                    }
                 }
             }
             // The rows stay as they were: an empty grid would read as "no photos match".

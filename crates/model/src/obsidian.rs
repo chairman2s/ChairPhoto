@@ -306,6 +306,7 @@ mod tests {
             burst_flag: None,
             version_count: 0,
             cover_token: None,
+            cover_pin: Default::default(),
         }
     }
 

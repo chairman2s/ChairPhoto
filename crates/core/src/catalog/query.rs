@@ -141,7 +141,8 @@ pub enum PhotoSort {
 }
 
 /// The photo columns every `row_to_photo` query selects, in that mapper's order.
-/// `{alias}` is how the `photos` table is named in the surrounding statement.
+/// `{alias}` is how the `photos` table is named in the surrounding statement, which must
+/// also join [`face_join`] for the face columns.
 pub(crate) fn photo_columns(alias: &str) -> String {
     format!(
         "{alias}.id, {alias}.uuid, {alias}.path, {alias}.rating, {alias}.color_label,
@@ -158,8 +159,21 @@ pub(crate) fn photo_columns(alias: &str) -> String {
          {alias}.stack_parent_id, {alias}.metadata_ready, {alias}.sharpness,
          {alias}.sharpness_method, {alias}.burst_flag,
          (SELECT COUNT(*) FROM photo_versions pv WHERE pv.photo_id = {alias}.id),
-         (SELECT pc.version_id || ':' || pc.rev FROM photo_cover pc WHERE pc.photo_id = {alias}.id)"
+         {FACE}.version_id || ':' || {FACE}.rev,
+         -- The face's pin (#252): NULL = automatic, 0 = the original, else the version. A
+         -- version pin whose version is gone reads as automatic, as `edits::refresh_face` does.
+         CASE {FACE}.pin WHEN 2 THEN 0 WHEN 1 THEN {FACE}.version_id END",
+        FACE = FACE_ALIAS,
     )
+}
+
+/// How [`face_join`] names `photo_cover`.
+const FACE_ALIAS: &str = "photo_face";
+
+/// The join [`photo_columns`] reads the face from: one lookup of `photo_cover` by its
+/// primary key per row, for both the token and the pin (#252 review L4).
+pub(crate) fn face_join(alias: &str) -> String {
+    format!("LEFT JOIN photo_cover {FACE_ALIAS} ON {FACE_ALIAS}.photo_id = {alias}.id")
 }
 
 /// The FROM/JOIN/WHERE half of a query — everything the row select and the count share.
@@ -203,9 +217,10 @@ impl Catalog {
     ) -> Result<(String, Vec<Box<dyn rusqlite::ToSql>>)> {
         let parts = self.build_query(query)?;
         let mut sql = format!(
-            "SELECT DISTINCT {cols} FROM {from} WHERE {wheres}{order}",
+            "SELECT DISTINCT {cols} FROM {from} {face} WHERE {wheres}{order}",
             cols = photo_columns("p"),
             from = parts.from,
+            face = face_join("p"),
             wheres = parts.wheres.join(" AND "),
             order = order_by(query),
         );

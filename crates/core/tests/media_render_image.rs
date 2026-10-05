@@ -192,6 +192,72 @@ fn a_rotated_cover_thumbnail_is_the_cover_render_rotated() {
     assert_ne!(decoded, plain, "the cover's look, not the plain thumbnail");
 }
 
+/// #252: with no cover pinned, the thumbnail is the render of the version changed last, and
+/// follows the next change to another version. The original's own thumbnail is still kept as
+/// the offline fallback, though the tile has only ever shown a face.
+#[cfg(feature = "edit")]
+#[test]
+fn the_thumbnail_is_the_render_of_the_last_changed_version() {
+    let dir = Fixture::new("media-auto-face");
+    let (state, ids) = catalog_with(&dir, &["f.jpg"], |root, n| {
+        write_jpeg(root, n, 1600, 1000);
+    });
+    let id = ids[0];
+    let abs = dir.join("photos").join("f.jpg");
+    let (bright, dark, mid) = (r#"{"tone": {"ev": 1.0}}"#, r#"{"tone": {"ev": -1.0}}"#, r#"{"tone": {"ev": 0.5}}"#);
+    let with_catalog = |f: &dyn Fn(&Catalog)| f(state.catalog.lock().unwrap().as_ref().unwrap());
+    with_catalog(&|c| {
+        let v = c.create_version(id, "Bright").unwrap();
+        c.set_version_edit(v, bright).unwrap();
+        let w = c.create_version(id, "Dark").unwrap();
+        c.set_version_edit(w, dark).unwrap();
+    });
+    with_catalog(&|c| assert_eq!(c.get_photo(id).unwrap().cover_pin, chairphoto_core::catalog::CoverPin::Auto));
+    let look = |json: &str| decode(&chairphoto_core::plugins::edit::cover::cover_thumb(&abs, id, json).unwrap());
+    let thumb = || render_image(&state, JobKey::photo(id, ImageKind::Thumb)).unwrap();
+
+    let shown = thumb();
+    assert!(shown.cover, "a version's render");
+    assert_eq!(shown.image.to_rgb8(), look(dark), "Dark, changed last");
+    assert_ne!(look(dark), look(bright));
+    with_catalog(&|c| {
+        let bright_id = c.list_versions(id).unwrap()[0].id;
+        c.set_version_edit(bright_id, mid).unwrap();
+    });
+    assert_eq!(thumb().image.to_rgb8(), look(mid), "the first version changed again: its look");
+    let kept = std::fs::read(chairphoto_core::thumbnails::persistent_thumb_path(id)).unwrap();
+    assert_eq!(kept, cached_tier(&abs, ImageKind::Thumb), "the original's own thumbnail kept for offline");
+}
+
+/// #252 review L3: a photo showing its face keeps its offline fallback current — a user
+/// rotation after the fallback was kept rewrites it, as the plain path would.
+#[cfg(feature = "edit")]
+#[test]
+fn the_face_path_keeps_the_offline_fallback_current_after_a_rotation() {
+    let dir = Fixture::new("media-face-rotated-fallback");
+    let (state, ids) = catalog_with(&dir, &["g.jpg"], |root, n| {
+        write_jpeg(root, n, 1600, 1000);
+    });
+    let id = ids[0];
+    let abs = dir.join("photos").join("g.jpg");
+    {
+        let guard = state.catalog.lock().unwrap();
+        let c = guard.as_ref().unwrap();
+        let v = c.create_version(id, "Bright").unwrap();
+        c.set_version_edit(v, r#"{"tone": {"ev": 1.0}}"#).unwrap();
+    }
+    let kept = || std::fs::read(chairphoto_core::thumbnails::persistent_thumb_path(id)).unwrap();
+    assert!(render_image(&state, JobKey::photo(id, ImageKind::Thumb)).unwrap().cover);
+    assert_eq!(kept(), cached_tier(&abs, ImageKind::Thumb), "unrotated: the cached thumbnail itself");
+
+    state.catalog.lock().unwrap().as_ref().unwrap().set_photo_rotation(id, 90).unwrap();
+    assert!(render_image(&state, JobKey::photo(id, ImageKind::Thumb)).unwrap().cover);
+    let rotated = image::load_from_memory(&cached_tier(&abs, ImageKind::Thumb)).unwrap().rotate90();
+    let mut q90 = std::io::Cursor::new(Vec::new());
+    rotated.write_with_encoder(JpegEncoder::new_with_quality(&mut q90, 90)).unwrap();
+    assert_eq!(kept(), q90.into_inner(), "rewritten for the new rotation");
+}
+
 /// Original gone: the thumbnail tier falls back to the persistent copy; preview has no
 /// fallback and errors.
 #[test]

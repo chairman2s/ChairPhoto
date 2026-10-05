@@ -73,10 +73,26 @@ pub struct Photo {
     /// correlated `COUNT` over `idx_photo_versions_photo`, alongside the stack count that
     /// was already computed this way. 0 = never edited.
     pub version_count: i64,
-    /// `"<version id>:<rev>"` when a version is this photo's cover (`photo_cover`), else
-    /// `None`. The grid puts it in the thumbnail URL, so a new cover — or a change to the
-    /// cover's settings — is a new URL.
+    /// `"<version id>:<rev>"` when a version is this photo's face (`photo_cover`) — pinned,
+    /// or automatically the most recently changed version (#252) — else `None` (the
+    /// original). The grid asks for the thumbnail under it, so a new face — or a change to
+    /// the face's settings — is a new look.
     pub cover_token: Option<String>,
+    /// How the face is chosen: automatically, or pinned to the original or a version.
+    pub cover_pin: CoverPin,
+}
+
+/// How a photo's Library face is chosen (`photo_cover.pin`, #252).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
+#[serde(rename_all = "camelCase", tag = "kind", content = "version")]
+pub enum CoverPin {
+    /// The version whose settings were written last; the original when there is none.
+    #[default]
+    Auto,
+    /// The original, whatever the versions hold.
+    Original,
+    /// This version, whichever is edited later.
+    Version(i64),
 }
 
 /// Lightweight row used by the burst analysis engine to avoid fetching full Photo rows.

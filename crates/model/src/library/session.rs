@@ -324,6 +324,11 @@ impl LibrarySession {
         self.library.rows_landed()
     }
 
+    /// One row's face read again (see [`LibraryQuery::patch_face`]).
+    pub fn patch_face(&mut self, id: i64, cover_token: Option<String>, cover_pin: chairphoto_core::catalog::CoverPin) -> bool {
+        self.library.patch_face(id, cover_token, cover_pin)
+    }
+
     /// Re-run the query: perform the returned request, then [`Self::apply_page`].
     pub fn refresh(&mut self) -> RefreshRequest {
         let query = self.query();

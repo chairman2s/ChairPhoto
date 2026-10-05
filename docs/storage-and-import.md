@@ -746,6 +746,17 @@ leaf in the `app::jobs` lock order. The inspector also disables its storage butt
 photo while one of them runs, so a double-click starts one run. The `Catalog::*_photo` sync
 wrappers do not claim; they are for tests and single-threaded callers.
 
+Empty Trash and Relocate claim too (#256). Emptying the trash claims each photo just before
+its delete, reads where its copies are under that claim (not when the run listed the
+photos, which can be minutes earlier), and releases it after the delete: a photo a storage
+operation holds is reported failed with the in-progress reason and keeps its row and files,
+so it can be retried; a copy a backup or restore made just before is deleted with the rest
+rather than outliving its photo's row; and a verb that starts after the delete finds
+nothing to copy. Relocate claims the photo in the same catalog lock hold that re-points its
+row, and holds the claim until the moved file's identity is recorded; a held photo is
+refused and left pointing where it was — otherwise an offload's commit could drop the
+re-pointed row by id and leave the moved file with none.
+
 An IPTC sidecar write — a save, the debt panel's Retry, a geocode fill — claims its photo
 too, from before it opens the sidecar until it has settled (#256): an offload deletes the
 local sidecar once it has confirmed it at home, and a write landing after that check would

@@ -65,6 +65,9 @@ pub const IN_PROGRESS: &str = crate::catalog::IN_PROGRESS_REASON;
 /// pending); a drain whose op's photo is claimed leaves the op pending, untouched
 /// (`DrainSummary::busy`). So a claim cannot deadlock against anything.
 ///
+/// Empty Trash claims each photo for its delete ([`destroy_planned_photos`]) and Relocate for
+/// its re-pointing ([`relocate_photo`]), refusing a held photo with [`IN_PROGRESS`] (#256).
+///
 /// An IPTC sidecar write claims its photo too (`iptc::write_and_settle`, #256), so a save
 /// never writes a sidecar an offload of that photo is confirming and deleting: whichever
 /// claims first goes ahead, and the other is refused — the write stays owed for the next
@@ -924,13 +927,26 @@ pub fn relocate_photo(
     photo_id: i64,
     path: &std::path::Path,
 ) -> Result<(), String> {
+    // Claimed like a storage verb (#256): Relocate re-points the photo's primary location row,
+    // and an offload under way would drop that row by id at its commit — leaving the moved
+    // file with no row — or a restore record a copy beside the old path. Taken under the same
+    // catalog lock hold as the re-pointing (the claim set's mutex is a leaf), and held until
+    // the identity outcome is recorded. A held photo is refused, unchanged.
+    let mut claim = None;
     let relocate = |c: &Catalog| {
+        claim = state.storage_claims.claim(c.db_path(), photo_id, &[]);
+        if claim.is_none() {
+            return Ok(None);
+        }
         let uuid = c.relocate_photo(photo_id, path)?;
-        Ok((uuid, c.db_path().to_path_buf(), c.root().to_path_buf()))
+        Ok(Some((uuid, c.db_path().to_path_buf(), c.root().to_path_buf())))
     };
-    let (uuid, db_path, root) = match expected {
+    let relocated = match expected {
         Some(expected) => super::with_catalog_as(state, expected, relocate)?,
         None => with_catalog(state, relocate)?,
+    };
+    let Some((uuid, db_path, root)) = relocated else {
+        return Err(IN_PROGRESS.to_string());
     };
     // The file usually already carries the UUID (its sidecar moved with it); a sidecar
     // holding somebody else's identity is left alone and recorded as a conflict.
@@ -960,6 +976,33 @@ mod relocate_tests {
         let state = AppState::default();
         *state.catalog.lock().unwrap() = Some(catalog);
         state
+    }
+
+    /// #256: Relocate takes the storage claim like the storage verbs. While another storage
+    /// operation holds the photo it is refused, and the row still points where it did; the
+    /// claim is released after a relocation, so the next storage verb runs.
+    #[test]
+    fn relocate_is_refused_while_a_storage_operation_holds_the_photo() {
+        let (catalog, root) = temp_catalog("relocate-claimed");
+        let old = root.join("old/DSC0008.ARW");
+        std::fs::create_dir_all(old.parent().unwrap()).unwrap();
+        std::fs::write(&old, b"raw").unwrap();
+        let id = catalog.upsert_photo(&old, None, 1, 8).unwrap().id;
+        let moved = root.join("new/DSC0008.ARW");
+        std::fs::create_dir_all(moved.parent().unwrap()).unwrap();
+        std::fs::write(&moved, b"raw").unwrap();
+        let state = state_with(catalog);
+        let db = with_catalog(&state, |c| Ok(c.db_path().to_path_buf())).unwrap();
+        let offload = state.storage_claims.claim(&db, id, &[]).unwrap();
+
+        assert_eq!(relocate_photo(&state, None, id, &moved).unwrap_err(), IN_PROGRESS);
+        let path = with_catalog(&state, |c| c.require_photo_path(id)).unwrap();
+        assert_eq!(path, old, "the row was not re-pointed");
+
+        drop(offload);
+        relocate_photo(&state, None, id, &moved).unwrap();
+        assert_eq!(with_catalog(&state, |c| c.require_photo_path(id)).unwrap(), moved);
+        assert!(!state.storage_claims.is_claimed(&db, id), "released");
     }
 
     #[test]
@@ -1414,9 +1457,11 @@ pub fn empty_trash_as(
     };
     let catalog = state.catalog.clone();
     let health = state.volume_health.clone();
+    let claims = state.storage_claims.clone();
     (move || {
-        // 1. Under the lock: which photos, and where every copy of each one lives.
-        let (candidates, plans, pairs) = {
+        // 1. Under the lock: which photos, and every volume's base path. Where each photo's
+        //    copies are is read again under its storage claim, just before its delete.
+        let (db, plans, pairs) = {
             let guard = catalog.lock().map_err(|e| e.to_string())?;
             let c = guard.as_ref().ok_or("No catalog is open")?;
             if expected.is_some_and(|id| !id.is(c)) {
@@ -1437,12 +1482,13 @@ pub fn empty_trash_as(
                 if !c.is_trashed(id).map_err(|e| e.to_string())? {
                     continue;
                 }
-                plans.push((id, c.photo_path_candidates(id).map_err(|e| e.to_string())?));
+                plans.push(id);
             }
             let pairs = c.volume_base_paths().map_err(|e| e.to_string())?;
-            (candidates.len(), plans, pairs)
+            (c.db_path().to_path_buf(), plans, pairs)
         };
-        let _ = candidates;
+        #[cfg(test)]
+        trash_delete_tests::AFTER_PLAN.with(|h| h.take().map(|hook| hook()));
 
         // 2. Off the lock: reachability, then the deletes themselves. Both can block on a
         //    slow mount and neither may hold the catalog.
@@ -1451,13 +1497,17 @@ pub fn empty_trash_as(
             &plans,
             &reachable,
             &abort,
+            &mut |id| claims.claim(&db, id, &[]),
             &mut |id| {
                 let guard = catalog.lock().map_err(|e| e.to_string())?;
                 let c = guard.as_ref().ok_or("No catalog is open")?;
                 if expected.is_some_and(|e| !e.is(c)) {
                     return Err(super::CATALOG_CHANGED.to_string());
                 }
-                c.is_trashed(id).map_err(|e| e.to_string())
+                if !c.is_trashed(id).map_err(|e| e.to_string())? {
+                    return Ok(None);
+                }
+                c.photo_path_candidates(id).map(Some).map_err(|e| e.to_string())
             },
         )?;
 
@@ -1482,46 +1532,60 @@ pub fn empty_trash_as(
     })()
 }
 
-/// Walk the planned photos, destroying each one's copies — the part of emptying the trash
+/// Walk the trashed photos, destroying each one's copies — the part of emptying the trash
 /// where ownership actually matters.
 ///
-/// Split out because the two interleavings that make this dangerous are otherwise
-/// reachable only through a front end's own handler type, and a race nobody can test is a
-/// race nobody has checked. `still_trashed` is a callback so a test can make a photo come
-/// back mid-run the way Restore does.
+/// Split out because the interleavings that make this dangerous are otherwise reachable only
+/// through a front end's own handler type, and a race nobody can test is a race nobody has
+/// checked. `copies_now` and `claim` are callbacks so a test can make a photo come back
+/// mid-run the way Restore does, or be held by a storage operation.
 ///
 /// Stops at the first sign it is no longer the owner. `abort` is tripped by a catalog
 /// switch (so an old worker cannot apply one catalog's ids to another's rows) and by
 /// Restore (so pulling a photo out of the trash beats a delete already in flight).
 ///
+/// Each photo is claimed like a storage verb's (`claim`, [`StorageClaims`], #256) before
+/// its copies are read and held through their delete, so a backup, offload or restore of it
+/// is never under way at the same time: one that started first refuses the delete (the photo
+/// is reported failed with [`IN_PROGRESS`] and keeps its row, so the user can retry), and one
+/// that starts later finds nothing to copy. Reading the copies under the claim
+/// (`copies_now`) rather than at plan time means a copy such a verb made just before is
+/// deleted with the rest instead of surviving as an orphan of a destroyed photo.
+///
 /// Returns the report and the ids whose files are now gone, for the caller to forget.
 pub fn destroy_planned_photos(
-    plans: &[(i64, Vec<crate::catalog::PathCandidate>)],
+    ids: &[i64],
     reachable: &std::collections::HashMap<i64, bool>,
     abort: &std::sync::atomic::AtomicBool,
-    still_trashed: &mut dyn FnMut(i64) -> Result<bool, String>,
+    claim: &mut dyn FnMut(i64) -> Option<StorageClaim>,
+    copies_now: &mut dyn FnMut(i64) -> Result<Option<Vec<crate::catalog::PathCandidate>>, String>,
 ) -> Result<(EmptyTrashReport, Vec<i64>), String> {
     let mut report = EmptyTrashReport::default();
     let mut destroyed: Vec<i64> = Vec::new();
-    for (id, locations) in plans {
+    for &id in ids {
         if abort.load(Ordering::Relaxed) {
             report.aborted = true;
             break;
         }
-        // Re-read trash membership immediately before deleting *this* photo, not once for
-        // the batch at plan time: the plan can be minutes old over a slow mount, and
-        // Restore clears `trashed_at` underneath it.
-        if !still_trashed(*id)? {
-            report.restored_meanwhile.push(*id);
+        let Some(_held) = claim(id) else {
+            report.failed.push((id, IN_PROGRESS.to_string()));
             continue;
-        }
-        let (outcome, tally) = delete_one_photos_copies(locations, reachable);
+        };
+        // Re-read trash membership — and where the copies are — immediately before deleting
+        // *this* photo, not once for the batch at plan time: the plan can be minutes old over
+        // a slow mount, Restore clears `trashed_at` underneath it, and a storage verb that
+        // finished meanwhile may have added a copy.
+        let Some(locations) = copies_now(id)? else {
+            report.restored_meanwhile.push(id);
+            continue;
+        };
+        let (outcome, tally) = delete_one_photos_copies(&locations, reachable);
         report.files_deleted += tally.files;
         report.sidecar_backups_deleted += tally.sidecar_backups;
         match outcome {
-            DeleteOutcome::Destroyed => destroyed.push(*id),
-            DeleteOutcome::Unreachable => report.skipped_unreachable.push(*id),
-            DeleteOutcome::Failed(why) => report.failed.push((*id, why)),
+            DeleteOutcome::Destroyed => destroyed.push(id),
+            DeleteOutcome::Unreachable => report.skipped_unreachable.push(id),
+            DeleteOutcome::Failed(why) => report.failed.push((id, why)),
         }
     }
     Ok((report, destroyed))
@@ -1664,6 +1728,103 @@ mod trash_delete_tests {
         (id, vec![candidate(p, 1)])
     }
 
+    /// [`destroy_planned_photos`] over `plans`, with no photo held by a storage operation, and
+    /// each photo's copies answered from its plan while `still_trashed` says it is trashed.
+    fn destroy(
+        plans: &[(i64, Vec<PathCandidate>)],
+        reachable: &HashMap<i64, bool>,
+        abort: &AtomicBool,
+        still_trashed: &mut dyn FnMut(i64) -> Result<bool, String>,
+    ) -> Result<(EmptyTrashReport, Vec<i64>), String> {
+        let claims = Arc::new(StorageClaims::default());
+        let ids: Vec<i64> = plans.iter().map(|(id, _)| *id).collect();
+        let plan = |id: i64| plans.iter().find(|(p, _)| *p == id).map(|(_, c)| c.clone());
+        destroy_planned_photos(&ids, reachable, abort, &mut |id| claims.claim(Path::new("/t.chairphoto"), id, &[]), &mut |id| {
+            Ok(if still_trashed(id)? { plan(id) } else { None })
+        })
+    }
+
+    // --- Empty Trash takes the storage claim (#256) -----------------------------------------
+
+    /// A photo a storage operation holds (a backup copying it home) is not deleted: it is
+    /// reported failed with "in progress", its file stays, and the run carries on with the
+    /// rest. The claim is released after each photo.
+    #[test]
+    fn a_photo_a_storage_operation_holds_is_not_destroyed() {
+        let dir = crate::test_support::TestTmpDir::new("empty-trash-claimed");
+        let plans = vec![planned(&dir, 1), planned(&dir, 2)];
+        let claims = Arc::new(StorageClaims::default());
+        let db = Path::new("/t.chairphoto");
+        let backup = claims.claim(db, 2, &[]).unwrap();
+
+        let (report, destroyed) = destroy_planned_photos(
+            &[1, 2],
+            &HashMap::from([(1, true)]),
+            &AtomicBool::new(false),
+            &mut |id| claims.claim(db, id, &[]),
+            &mut |id| Ok(plans.iter().find(|(p, _)| *p == id).map(|(_, c)| c.clone())),
+        )
+        .unwrap();
+
+        assert_eq!(destroyed, vec![1]);
+        assert_eq!(report.failed, vec![(2, IN_PROGRESS.to_string())]);
+        assert!(dir.join("DSC2.ARW").exists() && !dir.join("DSC1.ARW").exists());
+        assert!(!claims.is_claimed(db, 1), "released after its delete");
+        drop(backup);
+    }
+
+    thread_local! {
+        /// Run once by `empty_trash_as` after it has listed the photos, before the deletes.
+        pub(super) static AFTER_PLAN: std::cell::Cell<Option<Box<dyn FnOnce()>>> = std::cell::Cell::new(None);
+    }
+
+    /// **Forced interleaving**, through `empty_trash`: a backup of A completes after the
+    /// trash listed its photos and before A's delete (before #256 the copies were read with
+    /// the list, so that NAS copy outlived its photo's row, an orphan). Read under A's claim,
+    /// it is deleted with the rest. And a photo held right now keeps its row and its files.
+    #[test]
+    fn empty_trash_reads_copies_under_the_claim_and_refuses_a_held_photo() {
+        let dir = crate::test_support::TestTmpDir::new("empty-trash-claim-service");
+        let root = dir.join("photos");
+        let nas = dir.join("nas");
+        std::fs::create_dir_all(root.join("2026/08")).unwrap();
+        std::fs::create_dir_all(&nas).unwrap();
+        let c = Catalog::open(&dir.join("c.chairphoto"), &root).unwrap();
+        c.add_volume("NAS", &nas, VolumeKind::Backup).unwrap();
+        let (a, b) = (root.join("2026/08/A.ARW"), root.join("2026/08/B.ARW"));
+        std::fs::write(&a, b"a").unwrap();
+        std::fs::write(&b, b"b").unwrap();
+        let a_id = c.upsert_photo(&a, None, 1, 1).unwrap().id;
+        let b_id = c.upsert_photo(&b, None, 1, 2).unwrap().id;
+        c.trash_photos(&[a_id, b_id]).unwrap();
+        let state = std::sync::Arc::new(AppState::default());
+        *state.catalog.lock().unwrap() = Some(c);
+        let held = state.storage_claims.claim(&db_of(&state), b_id, &[]).unwrap();
+        let (backed, nas_a) = (std::rc::Rc::new(std::cell::Cell::new(false)), nas.join("2026/08/A.ARW"));
+        AFTER_PLAN.with(|h| {
+            let (state, backed) = (state.clone(), backed.clone());
+            h.set(Some(Box::new(move || {
+                backup_photo(&state, a_id).unwrap();
+                backed.set(true);
+            })))
+        });
+
+        let report = empty_trash(&state, Some(vec![a_id, b_id]), None, true).unwrap();
+
+        assert!(backed.get(), "the backup ran after the listing");
+        assert!(!nas_a.exists(), "A's backup, made after the listing, went with A");
+        assert_eq!(report.deleted, 1, "{report:?}");
+        assert!(!a.exists() && !nas.join("2026/08/A.ARW").exists(), "every copy of A, the backup included");
+        assert_eq!(report.failed, vec![(b_id, IN_PROGRESS.to_string())]);
+        assert!(b.exists());
+        assert!(with_catalog(&state, |c| c.is_trashed(b_id)).unwrap(), "B keeps its row in the trash");
+        drop(held);
+    }
+
+    fn db_of(state: &AppState) -> PathBuf {
+        with_catalog(state, |c| Ok(c.db_path().to_path_buf())).unwrap()
+    }
+
     /// Restore must beat a delete already walking the filesystem. The plan is made once and
     /// can be minutes old over a slow mount; a photo the user pulled back out of the trash
     /// in the meantime must survive, files and row alike.
@@ -1679,7 +1840,7 @@ mod trash_delete_tests {
         let mut still_trashed = |id: i64| Ok(id != 2);
 
         let (report, destroyed) =
-            destroy_planned_photos(&plans, &reachable, &abort, &mut still_trashed).unwrap();
+            destroy(&plans, &reachable, &abort, &mut still_trashed).unwrap();
 
         assert_eq!(destroyed, vec![1, 3]);
         assert_eq!(report.restored_meanwhile, vec![2], "and it is reported, not silent");
@@ -1709,7 +1870,7 @@ mod trash_delete_tests {
         };
 
         let (report, destroyed) =
-            destroy_planned_photos(&plans, &reachable, &abort, &mut still_trashed).unwrap();
+            destroy(&plans, &reachable, &abort, &mut still_trashed).unwrap();
 
         assert!(report.aborted, "the run says it stopped early");
         assert_eq!(destroyed, vec![1], "only the photo already in flight");
@@ -1725,7 +1886,7 @@ mod trash_delete_tests {
         let plans = vec![planned(&dir, 1)];
         let abort = AtomicBool::new(true);
 
-        let (report, destroyed) = destroy_planned_photos(
+        let (report, destroyed) = destroy(
             &plans,
             &HashMap::from([(1, true)]),
             &abort,

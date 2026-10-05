@@ -18,7 +18,10 @@
 //! Hover beats focus; neither clears it to "the photo as it is" — [`Self::sync_preview`], run
 //! from any click on the backdrop or the panel too (not only Tab/hover), since the backdrop's
 //! own `track_focus` moves focus there on the matching mouse down, off a Tab-focused cell,
-//! before any of this entity's own listeners do.
+//! before any of this entity's own listeners do; and from every render, as a catch-all for
+//! whatever that list still misses, through [`Self::resync_in_render`] (which steps aside
+//! whenever another live sheet currently owns the slot, so two mounted sheets settle instead
+//! of looping — #250 review, probe P5).
 //! Cleared, by this sheet's own token, on adopt, decline, and whenever this entity is released
 //! (its window closed, the overlay replaced); a catalog switch clears it in `ShellState`
 //! itself, the same way it clears the Darkroom's print.
@@ -218,6 +221,21 @@ impl ProofSheet {
             }
         });
     }
+
+    /// [`Self::sync_preview`]'s render-time catch-all (probe E): skipped whenever another
+    /// live sheet currently owns the published preview. Resyncing unconditionally here, with
+    /// two mounted sheets each having a hovered or focused cell, has each one's own render
+    /// republish its own answer and notify the other's — forever (#250 review, probe P5, not
+    /// reachable with today's single Darkroom overlay, but `render` must not rely on that).
+    /// An actual hover, focus change or click on THIS sheet still calls `sync_preview`
+    /// directly (`set_hovered`, `cycle`, the two `on_click`s, the `renders` observer) and
+    /// takes the slot over regardless of who held it.
+    fn resync_in_render(&mut self, window: &Window, cx: &mut Context<Self>) {
+        let owned_by_another = self.shell.read(cx).loupe_proof_preview().is_some_and(|p| p.sheet != self.token);
+        if !owned_by_another {
+            self.sync_preview(window, cx);
+        }
+    }
 }
 
 fn group_name(g: ProofGroup) -> Option<&'static str> {
@@ -232,11 +250,9 @@ fn group_name(g: ProofGroup) -> Option<&'static str> {
 impl Render for ProofSheet {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // Catches a focus change that didn't go through `cycle`/`set_hovered`/an `on_click`
-        // (#250 review, probe E): a no-op when the answer hasn't changed, and — now that a
-        // `None` publish is also gated on this sheet's own token — safe to run on every
-        // render (an earlier, untokened version of this line looped two mounted sheets'
-        // windows into redrawing each other forever).
-        self.sync_preview(window, cx);
+        // (#250 review, probe E) — see `Self::resync_in_render`'s own docs for why this is
+        // not a plain `sync_preview` call.
+        self.resync_in_render(window, cx);
         let colors = Colors::get(cx);
         let renders = self.renders.read(cx);
         let cells: Vec<_> = self

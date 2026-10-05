@@ -2097,6 +2097,94 @@ fn the_pop_out_never_blanks_between_the_print_and_a_proof(cx: &mut TestAppContex
     );
 }
 
+/// Zoomed, the Darkroom's print full-res render must not fill a proof's own hi-res slot
+/// (#250 review, probe P3): it is only a valid stand-in for `over.hi` when `over.lo` is
+/// *itself* the print's fallback — otherwise, hovering a proof whose own lo has landed but
+/// whose hi is still pending (or has failed) would show the PRINT's full-res pixels under
+/// the proof's "Proof: <label> — not applied" bar, which is exactly where one judges a
+/// film/grain proof.
+#[gpui_kit::test]
+fn the_pop_out_never_shows_the_prints_full_res_under_a_proof(cx: &mut TestAppContext) {
+    use super::view::Overlay;
+    use crate::loupe::window;
+    use crate::loupe::zoom::Drawn;
+    let rig = rig("dk-proof-no-print-hires", 2, cx);
+    work(cx);
+    advance(cx, SETTLE); // the default print goes up after the open's settle
+    let print_json = rig.app.wired.shell.read_with(cx, |s, _| s.loupe_print().expect("the print is up by default").edit_json.clone());
+    cx.update(window::open);
+    cx.run_until_parked();
+    let h = cx.update(|cx| window::handle(cx)).expect("the pop-out opened");
+    let zoom = cx.update(|cx| window::view(cx)).unwrap().read_with(cx, |v, cx| v.loupe().read(cx).zoom().clone());
+    cx.update_window(h, |_, window, cx| window.render_frame(cx)).unwrap();
+    cx.run_until_parked();
+
+    // Land the print's lo, zoom the pop-out in, and land the print's full-res too.
+    let print_lo_job = rig.edit_jobs().into_iter().find(|j| j.max_edge == 2560 && j.edit_json == print_json).expect("the print's render was asked for");
+    rig.pool.finish(&JobKey::Edit(print_lo_job), Ok(pixels(400, 300)));
+    cx.run_until_parked();
+    cx.update_window(h, |_, window, cx| window.double_click("loupe-image", cx)).unwrap();
+    cx.run_until_parked();
+    cx.update_window(h, |_, window, cx| window.render_frame(cx)).unwrap();
+    let print_hi_job = rig.edit_jobs().into_iter().find(|j| j.hi_res && j.edit_json == print_json).expect("the print's full-res was asked for once zoomed");
+    let l = pixels(800, 600);
+    let print_hi_image = l.image.clone();
+    rig.pool.finish(&JobKey::Edit(print_hi_job), Ok(l));
+    cx.run_until_parked();
+    cx.update_window(h, |_, window, cx| window.render_frame(cx)).unwrap();
+    assert!(
+        zoom.read_with(cx, |z, _| z.override_hi()).is_some_and(|s| Arc::ptr_eq(&s, &print_hi_image)),
+        "the print's own full-res shows, zoomed, with nothing else up"
+    );
+
+    rig.with_view(cx, |v, window, cx| v.open_proof_sheet(window, cx));
+    let i = rig.view(cx).read_with(cx, |v, cx| match v.overlay() {
+        Some(Overlay::Proof(p)) => {
+            p.read(cx).candidates().iter().position(|c| c.group == chairphoto_model::darkroom::spreads::ProofGroup::Film).unwrap()
+        }
+        _ => panic!("the proof sheet is mounted"),
+    });
+    cx.update_window(rig.app.window(), |_, window, cx| {
+        window.render_frame(cx);
+        window.hover(("proof-cell", i as u64), cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(h, |_, window, cx| window.render_frame(cx)).unwrap();
+    let proof_json = rig.app.wired.shell.read_with(cx, |s, _| s.loupe_proof_preview().map(|p| (p.source.encode)(&p.candidate.record))).unwrap();
+    let proof_lo_job = rig.edit_jobs().into_iter().find(|j| j.max_edge == 2560 && j.edit_json == proof_json).expect("the proof's own render was asked for");
+    let proof_hi_job = rig.edit_jobs().into_iter().find(|j| j.hi_res && j.edit_json == proof_json).expect("the proof's own full-res was asked for too, zoomed");
+    let l = pixels(400, 300);
+    let proof_lo_image = l.image.clone();
+    rig.pool.finish(&JobKey::Edit(proof_lo_job), Ok(l));
+    cx.run_until_parked();
+    cx.update_window(h, |_, window, cx| window.render_frame(cx)).unwrap();
+    // The proof's own lo landed; its own hi is still pending: the print's full-res must not
+    // stand in, and the proof's own lo shows (scaled up), not the print's.
+    assert!(
+        zoom.read_with(cx, |z, _| z.override_hi()).map_or(true, |s| !Arc::ptr_eq(&s, &print_hi_image)),
+        "the print's full-res does not stand in for the proof's own pending hi"
+    );
+    assert_eq!(
+        zoom.read_with(cx, |z, _| z.drawn().map(|(_, d)| d)),
+        Some(Drawn::OverrideLo),
+        "the proof's own lo shows, scaled up, while its own hi is pending"
+    );
+    assert!(
+        zoom.read_with(cx, |z, _| z.override_lo()).is_some_and(|s| Arc::ptr_eq(&s, &proof_lo_image)),
+        "specifically the proof's own lo, not the print's"
+    );
+
+    // The proof's own hi fails outright: still never the print's.
+    rig.pool.finish(&JobKey::Edit(proof_hi_job), Err("decode failed".into()));
+    cx.run_until_parked();
+    cx.update_window(h, |_, window, cx| window.render_frame(cx)).unwrap();
+    assert!(
+        zoom.read_with(cx, |z, _| z.override_hi()).map_or(true, |s| !Arc::ptr_eq(&s, &print_hi_image)),
+        "a failed proof hi does not fall back to the print's full-res either"
+    );
+}
+
 /// The proof sheet's keys, as React's proof cells were buttons: Enter on the sheet as dealt
 /// (the backdrop focused, no proof) neither declines nor adopts; Tab / Shift+Tab move focus
 /// through the proofs, wrapping; Enter adopts the focused proof. A pointer click on the

@@ -1358,6 +1358,48 @@ mod overlays {
         assert_eq!(previewed(cx), Some(b_candidate), "A's own render landing did not clear B's preview");
     }
 
+    /// Two mounted sheets, each with a hovered cell, must settle rather than loop (#250
+    /// review, probe P5): `ProofSheet::resync_in_render` steps aside once another sheet owns
+    /// the slot, so each sheet's own render no longer republishes its answer and notifies the
+    /// other's forever. Not reachable in today's app (one Darkroom, one overlay), but
+    /// `render` must not depend on that staying true. Run under a bounded `timeout` when
+    /// checking for a hang — a broken guard never lets this test return.
+    #[gpui_kit::test]
+    fn two_hovered_sheets_settle_without_looping(cx: &mut TestAppContext) {
+        let (app, _pool, _dir, ids) = app_with(2, "proof-preview-two-sheets", cx);
+        let images = app.wired.images.clone();
+        let shell = app.wired.shell.clone();
+        let candidates = proof_spread(&VersionEdit::default(), &VersionEdit::default(), &[], None);
+        let mut handles = Vec::new();
+        for k in 0..2 {
+            let (handle, _sheet) = cx
+                .update(|cx| {
+                    let images = images.clone();
+                    let candidates = candidates.clone();
+                    let shell = shell.clone();
+                    let source = VariantSource::new(ids[k], 0, SourceToken::Preview);
+                    gpui_kit::open_window(Default::default(), cx, |window, cx| {
+                        cx.new(|cx| ProofSheet::new(&images, shell, source, candidates, window, cx))
+                    })
+                })
+                .unwrap();
+            cx.update_window(handle, |_, window, cx| {
+                window.render_frame(cx);
+                window.hover(("proof-cell", 1u64), cx);
+            })
+            .unwrap();
+            handles.push(handle);
+        }
+        cx.run_until_parked();
+        // Render each once more, now that both have hovered: the point of this test is that
+        // this settles and returns at all (checked under a bounded `timeout` for a hang).
+        for h in &handles {
+            cx.update_window(*h, |_, window, cx| window.render_frame(cx)).unwrap();
+        }
+        cx.run_until_parked();
+        assert!(shell.read_with(cx, |s, _| s.loupe_proof_preview().is_some()), "one of the two sheets' hovered candidate is shown");
+    }
+
     /// An edit render that was no longer wanted when it finished is dropped, never shown.
     #[gpui_kit::test]
     fn an_unwanted_edit_render_is_dropped(cx: &mut TestAppContext) {

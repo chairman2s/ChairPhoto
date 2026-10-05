@@ -340,6 +340,14 @@ impl ZoomImage {
         self.over.as_ref().and_then(|o| o.lo.clone())
     }
 
+    /// The current override's full-res render, by identity (#250 review, probe P3): whether
+    /// it is the chosen record's own, or wrongly the Darkroom's print's, when zoomed on a
+    /// proof whose own hi is pending or failed.
+    #[cfg(all(test, feature = "edit"))]
+    pub(crate) fn override_hi(&self) -> Option<Arc<RenderImage>> {
+        self.over.as_ref().and_then(|o| o.hi.clone())
+    }
+
     pub fn set_unavailable_actions(&mut self, on: bool) {
         self.unavailable_actions = on;
     }

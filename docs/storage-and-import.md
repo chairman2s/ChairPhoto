@@ -512,9 +512,9 @@ Three rules govern carrying:
   written after its check is deleted. A local JPEG or DNG rewritten in place after its
   backup, a sidecar edited after the carry, a companion that appeared after it, or any new
   file at an emptied name refuses the photo: every moved file goes back under its name
-  (never replacing a file there — one that cannot go back because a new file took its name
-  is deleted only if it was confirmed identical to home, and otherwise kept under its hidden
-  name, which the refusal names; where the filesystem has neither a no-replace rename nor
+  (never replacing a file there — one that cannot go back, because a new file took its name
+  or the rename failed, is never deleted, confirmed or not: it stays under its hidden name
+  beside the photo, and the refusal names it and why; where the filesystem has neither a no-replace rename nor
   hard links, a file goes back by a plain rename once its name is seen free), nothing is
   deleted, and a queued offload is kept `failed`
   with the reason ("changed since its backup — refusing to offload; the copy at home is the
@@ -522,7 +522,10 @@ Three rules govern carrying:
   hidden name; the next backup, offload or restore plan that looks in that folder (once per
   folder per run, off the catalog lock) puts every such file whose process is no longer
   running back under its name, again never replacing one — a file left by a crash is never
-  deleted, since it may hold the only copy of a local change. The cost is one sequential
+  deleted, since it may hold the only copy of a local change. An empty one is not put back
+  (it is most likely a name the offload claimed and never filled; putting it back would make
+  a 0-byte original); it is removed only when a non-empty file holds its name. A second
+  operation in a folder whose sweep is still running waits for it to finish. The cost is one sequential
   read of each local copy, on a local disk, beside the NAS read of the backup offload
   already made; size or mtime would be cheaper and are not content checks (an in-place
   rewrite can keep the size, and `exiftool -P` keeps the mtime). Back up does not replace a
@@ -767,10 +770,15 @@ claims first goes ahead. A save that meets a claimed photo stores in the catalog
 the fields owed, reported "sidecar pending (a storage operation on this photo is already in
 progress)"; the next save or the repair pass writes them, to wherever the photo then
 resolves. An offload that meets a write is refused as in progress. The identity-repair pass,
-face-region and GPS writes do not claim; what they write is still never deleted by an
-offload (each sidecar write replaces the file by a rename, so it either lands before the
-offload moves the sidecar aside — and fails its re-hash — or makes a new file at its name,
-which the offload keeps).
+face-region and GPS writes do not claim. Each replaces the sidecar by a rename, so it
+either lands before the offload moves the sidecar aside — and fails its re-hash — or makes a
+new file at its name, which the offload keeps. In that second case the new file is built
+without the moved sidecar (the writer found none), so it lacks every field ChairPhoto does
+not own — another tool's keywords and history: the offload refuses, puts the image back,
+and keeps the old sidecar beside it under its hidden name, which the refusal names, for the
+user to merge by hand. Nothing is deleted, but the photo's own sidecar name now holds the
+thinner file. A write that lands after the offload's last look is beside a freed image,
+untracked (the photo is recorded archived). Both windows are one small file's hash wide.
 
 Two guards do not depend on the claim. Offload's commit drops exactly the local location
 rows it planned from, by id, so a row added after the plan (a restore) is never dropped with

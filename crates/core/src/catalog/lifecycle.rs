@@ -1576,46 +1576,55 @@ impl Aside {
             Ok(_) => format!("{} {why}", name(file)),
             Err(e) => format!("{} could not be read back ({}) — refusing to offload", name(file), user_reason(&e)),
         };
-        Err(CatalogError::Validation(match super::working_files::put_back(&hidden, file) {
-            Ok(true) => refusal,
-            _ => format!("{refusal}; its bytes were kept beside it as {} because its name was taken", name(&hidden)),
+        Err(CatalogError::Validation(match put_back_or_why(&hidden, file) {
+            None => refusal,
+            Some(cause) => format!("{refusal}; its bytes were kept beside it as {} ({cause})", name(&hidden)),
         }))
     }
 
-    /// Delete every confirmed file. Stops at the first that cannot be deleted.
+    /// Delete every confirmed file, in the order they were moved — each copy's companions
+    /// before its image, as the move was, so a delete that fails part-way leaves the image
+    /// to say what the remaining files belong to. Stops at the first that cannot be deleted;
+    /// the rest stay moved, for [`Self::put_back`].
     fn unlink(&mut self) -> Result<()> {
-        while let Some((file, hidden)) = self.moved.pop() {
-            if let Err(e) = std::fs::remove_file(&hidden) {
-                self.moved.push((file, hidden));
-                return Err(io(e));
-            }
+        while let Some((_file, hidden)) = self.moved.first() {
+            #[cfg(test)]
+            offload_hook::step(offload_hook::Step::BeforeUnlink, _file);
+            std::fs::remove_file(hidden).map_err(io)?;
+            self.moved.remove(0);
         }
         Ok(())
     }
 
     /// Undo [`Self::take`] for everything still moved, newest first, and return `refusal`.
-    /// A confirmed file whose name a new file took is at home byte for byte, so it is
-    /// deleted rather than left hidden; one that cannot be put back for any other reason
-    /// is named in the refusal.
+    /// A file that cannot go back under its name — a new file took it (a sidecar written
+    /// meanwhile, built without the old one's foreign fields), or the rename failed — is
+    /// never deleted, confirmed or not: it stays under its hidden name beside the photo, and
+    /// the refusal names it and says why.
     fn put_back(&mut self, refusal: Stop) -> Stop {
         let mut kept = Vec::new();
         while let Some((file, hidden)) = self.moved.pop() {
-            match super::working_files::put_back(&hidden, &file) {
-                Ok(true) => {}
-                Ok(false) if std::fs::symlink_metadata(&file).is_ok() => {
-                    let _ = std::fs::remove_file(&hidden);
-                }
-                _ => kept.push(name(&hidden)),
+            if let Some(why) = put_back_or_why(&hidden, &file) {
+                kept.push(format!("{} as {} ({why})", name(&file), name(&hidden)));
             }
         }
         if kept.is_empty() {
             return refusal;
         }
         let refusal = user_reason(&refusal.into_error());
-        Stop::Refused(CatalogError::Validation(format!("{refusal}; could not put back {}", kept.join(", "))))
+        Stop::Refused(CatalogError::Validation(format!("{refusal}; kept beside it: {}", kept.join(", "))))
     }
 }
 
+/// Put a moved file back under its name ([`super::working_files::put_back`]); `None` when it
+/// went back, else why it is still under its hidden name — in words that match the cause.
+fn put_back_or_why(hidden: &Path, file: &Path) -> Option<String> {
+    match super::working_files::put_back(hidden, file) {
+        Ok(true) => None,
+        Ok(false) => Some("a new file took its name".into()),
+        Err(e) => Some(format!("it could not be put back: {e}")),
+    }
+}
 /// Which companions beside each local file an offload frees with it: exactly the ones the
 /// carry confirmed at home. One the carry did not take (it appeared after the carry) refuses
 /// the photo. Content is checked later, on the moved file ([`move_aside_confirmed`]).
@@ -1658,6 +1667,8 @@ pub(crate) mod offload_hook {
     pub(crate) enum Step {
         BeforeMove,
         AfterMove,
+        /// Just before a confirmed file is deleted; `file` is its own name.
+        BeforeUnlink,
     }
 
     type Hook = Box<dyn FnMut(Step, &Path)>;

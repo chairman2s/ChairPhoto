@@ -242,16 +242,21 @@ pub(crate) fn write_and_settle(
 ) -> IptcSaveOutcome {
     // Lock order: turn → catalog (the path read) → the claim set's leaf mutex, each released
     // before the next; the claim itself is held across the write and the settle.
+    // A switch since the store: the settle cannot record a write in that catalog any more,
+    // and its photo's claim is not this state's to take — so nothing is written, and the
+    // fields stay owed there for its next repair pass.
     let claim = if write.fields.is_empty() {
         None // nothing owed: the sidecar is not opened
     } else {
-        super::with_catalog_as(state, identity, |c| Ok(c.db_path().to_path_buf()))
-            .ok()
-            .map(|db| state.storage_claims.claim(&db, write.photo_id, &[]))
+        Some(
+            super::with_catalog_as(state, identity, |c| Ok(c.db_path().to_path_buf()))
+                .map(|db| state.storage_claims.claim(&db, write.photo_id, &[])),
+        )
     };
     let outcome = match &claim {
-        Some(None) => Err(super::storage::IN_PROGRESS.to_string()),
-        _ => write.run(original),
+        Some(Err(e)) => Err(e.clone()),
+        Some(Ok(None)) => Err(super::storage::IN_PROGRESS.to_string()),
+        None | Some(Ok(Some(_))) => write.run(original),
     };
     #[cfg(test)]
     tests::before_settle(original);
@@ -804,6 +809,26 @@ mod tests {
         assert_eq!(outcome.sidecar, crate::catalog::IptcSidecarState::Written, "{outcome:?}");
         assert_eq!(owed(&state, id), crate::catalog::IptcMask::NONE);
         assert!(!state.storage_claims.is_claimed(&db, id), "the write released its claim");
+    }
+
+    /// A catalog switch between the store and the write: the write cannot be settled in the
+    /// catalog that stored it, nor claimed there, so the sidecar is not opened at all —
+    /// rather than written with no claim held. The fields stay owed in the old catalog.
+    #[test]
+    fn a_write_after_a_catalog_switch_does_not_open_the_sidecar() {
+        let (dir, state, id, xmp) = foreign_photo("iptc-256-switched", crate::xmp::test_fixtures::LIGHTROOM);
+        let identity = crate::app::catalog_identity(&state).unwrap();
+        let (original, write) = crate::app::with_catalog_as(&state, identity, |c| store(c, id, &typed())).unwrap();
+        let other = dir.join("other");
+        std::fs::create_dir_all(&other).unwrap();
+        let b = crate::catalog::Catalog::open(&dir.join("b.chairphoto"), &other).unwrap();
+        let a = state.catalog.lock().unwrap().replace(b).unwrap();
+
+        let outcome = write_and_settle(&state, identity, &original, &write, turn(&original));
+
+        assert_eq!(outcome.sidecar, crate::catalog::IptcSidecarState::Pending, "{outcome:?}");
+        assert_eq!(read(&xmp), crate::xmp::test_fixtures::LIGHTROOM, "the sidecar was not opened");
+        assert_ne!(a.owed_iptc(id).unwrap(), crate::catalog::IptcMask::NONE, "still owed where it was stored");
     }
 
     /// **Forced interleaving.** An offload pressed while a save's sidecar write is in flight

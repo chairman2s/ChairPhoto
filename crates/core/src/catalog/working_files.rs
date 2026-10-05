@@ -18,9 +18,9 @@
 //! Everything here is file IO: call it off the catalog lock, on a blocking worker.
 
 use crate::scanner::same_photo::PART_TAG;
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Condvar, Mutex};
 
 /// The tag in the name of a file an offload moved aside.
 pub(crate) const ASIDE_TAG: &str = "chairphoto-offload";
@@ -107,9 +107,18 @@ fn running(pid: u32) -> bool {
     }
 }
 
-/// The folders swept in this run: each is listed at most once, so a folder of thousands of
-/// photos is not listed on every storage operation.
-static SWEPT: Mutex<Option<HashSet<PathBuf>>> = Mutex::new(None);
+/// Where each folder's sweep stands in this run: each is listed at most once, so a folder of
+/// thousands of photos is not listed on every storage operation. A folder is `Done` only once
+/// its sweep has finished, so an operation never plans in a folder whose crashed files are
+/// still being put back.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Sweep {
+    Running,
+    Done,
+}
+
+static SWEPT: Mutex<Option<HashMap<PathBuf, Sweep>>> = Mutex::new(None);
+static SWEPT_CHANGED: Condvar = Condvar::new();
 
 /// Sweep each folder holding one of `paths` ([`sweep_once`]).
 pub(crate) fn sweep_beside<'a>(paths: impl IntoIterator<Item = &'a Path>) {
@@ -124,19 +133,41 @@ pub(crate) fn sweep_beside<'a>(paths: impl IntoIterator<Item = &'a Path>) {
 /// Only names of the exact pattern, only regular files (a symlink is never followed or
 /// touched), and only those whose process is no longer running. Best effort: a folder that
 /// cannot be listed is tried again by a later call.
+///
+/// Returns only once `dir` has been swept in this run: a caller that finds another thread's
+/// sweep of it running waits for that sweep to finish (or, if it could not list the folder,
+/// sweeps it itself). Nothing else is held while it waits.
 pub(crate) fn sweep_once(dir: &Path) {
     {
         let mut swept = SWEPT.lock().unwrap_or_else(|e| e.into_inner());
-        if !swept.get_or_insert_with(HashSet::new).insert(dir.to_path_buf()) {
-            return;
+        loop {
+            match swept.get_or_insert_with(HashMap::new).get(dir) {
+                Some(Sweep::Done) => return,
+                Some(Sweep::Running) => {
+                    swept = SWEPT_CHANGED.wait(swept).unwrap_or_else(|e| e.into_inner());
+                }
+                None => break,
+            }
         }
+        swept.get_or_insert_with(HashMap::new).insert(dir.to_path_buf(), Sweep::Running);
     }
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        if let Some(swept) = SWEPT.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
-            swept.remove(dir);
-        }
-        return;
-    };
+    let listed = sweep(dir);
+    let mut swept = SWEPT.lock().unwrap_or_else(|e| e.into_inner());
+    let swept = swept.get_or_insert_with(HashMap::new);
+    if listed {
+        swept.insert(dir.to_path_buf(), Sweep::Done);
+    } else {
+        swept.remove(dir);
+    }
+    SWEPT_CHANGED.notify_all();
+}
+
+/// One sweep of `dir`; `false` when it could not be listed. A panic here would leave the
+/// folder `Running` for good, so nothing in it panics: every step is best effort.
+fn sweep(dir: &Path) -> bool {
+    #[cfg(test)]
+    tests::before_listing(dir);
+    let Ok(entries) = std::fs::read_dir(dir) else { return false };
     let now = std::time::SystemTime::now();
     for entry in entries.flatten() {
         let name = entry.file_name();
@@ -152,6 +183,7 @@ pub(crate) fn sweep_once(dir: &Path) {
             let _ = std::fs::remove_file(entry.path());
         }
     }
+    true
 }
 
 /// How long a copy's temporary file must have gone unwritten before a sweep removes it, on
@@ -179,19 +211,30 @@ pub(crate) fn dead_pid() -> u32 {
     pid
 }
 
-/// Put a crashed offload's file back under its name. When that name has been taken since, an
-/// empty file is removed (a name claimed but never filled, or an empty file: no bytes to
-/// lose) and any other is left where it is, for a person to look at.
+/// Put a crashed offload's file back under its name, never replacing a file there.
+///
+/// An empty one is not put back: it is most likely the name an offload claimed and crashed
+/// before filling (`move_aside` creates it empty, then renames the file onto it), and putting
+/// it back would make a 0-byte original out of nothing. It is removed only when a non-empty
+/// file holds its name — then it is that claim, with nothing to lose — and otherwise left.
+/// Any other file whose name is taken is left where it is, for a person to look at.
 fn recover_aside(aside: &Path, original: &Path, len: u64) {
-    match put_back(aside, original) {
-        Ok(true) => eprintln!("storage: put back {} left by an interrupted offload", original.display()),
-        Ok(false) if len == 0 => {
+    if len == 0 {
+        if std::fs::symlink_metadata(original).is_ok_and(|m| m.len() > 0) {
             let _ = std::fs::remove_file(aside);
         }
-        Ok(false) | Err(_) => eprintln!(
+        return;
+    }
+    match put_back(aside, original) {
+        Ok(true) => eprintln!("storage: put back {} left by an interrupted offload", original.display()),
+        Ok(false) => eprintln!(
             "storage: {} was left by an interrupted offload and {} is taken; left as it is",
             aside.display(),
             original.display()
+        ),
+        Err(e) => eprintln!(
+            "storage: {} was left by an interrupted offload and could not be put back ({e}); left as it is",
+            aside.display()
         ),
     }
 }
@@ -200,6 +243,60 @@ fn recover_aside(aside: &Path, original: &Path, len: u64) {
 mod tests {
     use super::*;
     use crate::test_support::TestTmpDir;
+
+    type Pause = Box<dyn FnOnce() + Send>;
+    /// Run by a sweep of the named folder just before it lists it, once — where a test holds
+    /// one sweep while another caller arrives. Global, keyed by a test's own folder.
+    static BEFORE_LISTING: Mutex<Option<HashMap<PathBuf, Pause>>> = Mutex::new(None);
+
+    pub(super) fn before_listing(dir: &Path) {
+        let hook = BEFORE_LISTING.lock().unwrap_or_else(|e| e.into_inner()).as_mut().and_then(|m| m.remove(dir));
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+
+    /// **Forced interleaving (review LOW-4).** A second operation in a folder whose sweep is
+    /// still running does not go ahead before that sweep has put a crashed offload's file
+    /// back: it waits, and finds the file where the catalog says it is.
+    #[test]
+    fn a_second_caller_waits_for_a_running_sweep() {
+        if !cfg!(target_os = "linux") {
+            println!("SKIPPED: a_second_caller_waits_for_a_running_sweep — needs /proc");
+            return;
+        }
+        let dir = TestTmpDir::new("working-files-concurrent-sweep");
+        let folder = dir.to_path_buf();
+        std::fs::write(folder.join(format!(".A.ARW.{ASIDE_TAG}-{}-0", dead_pid())), b"A").unwrap();
+        let (paused_tx, paused_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        BEFORE_LISTING.lock().unwrap().get_or_insert_with(HashMap::new).insert(
+            folder.clone(),
+            Box::new(move || {
+                paused_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+            }),
+        );
+        let first = {
+            let folder = folder.clone();
+            std::thread::spawn(move || sweep_once(&folder))
+        };
+        paused_rx.recv().unwrap();
+        let second = {
+            let folder = folder.clone();
+            std::thread::spawn(move || {
+                sweep_once(&folder);
+                folder.join("A.ARW").exists()
+            })
+        };
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        let returned_early = second.is_finished();
+        release_tx.send(()).unwrap();
+        first.join().unwrap();
+
+        assert!(!returned_early, "the second caller returned while the sweep was still running");
+        assert!(second.join().unwrap(), "and found the file put back when it returned");
+    }
 
     #[test]
     fn only_the_exact_pattern_is_a_working_file() {
@@ -244,8 +341,13 @@ mod tests {
         std::fs::write(aside("D.ARW", std::process::id()), b"in progress").unwrap();
         #[cfg(unix)]
         std::os::unix::fs::symlink(folder.join("C.ARW"), aside("E.ARW", dead)).unwrap();
+        // Review S8: an empty claim whose name is free is not made into a 0-byte original.
+        std::fs::write(aside("F.ARW", dead), b"").unwrap();
 
         sweep_once(&folder);
+
+        assert!(!folder.join("F.ARW").exists(), "no 0-byte original out of an empty claim");
+        assert!(aside("F.ARW", dead).exists(), "it is left as it was");
 
         assert_eq!(std::fs::read(folder.join("A.ARW")).unwrap(), b"only copy of A");
         assert!(!aside("A.ARW", dead).exists());

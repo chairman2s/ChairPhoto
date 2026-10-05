@@ -745,8 +745,9 @@ mod stack_tests {
 
     /// **Forced interleaving (P1, the other side).** A new file is written at the image's name
     /// just after offload moved the image aside. The final look finds it: the offload refuses,
-    /// the new file is kept, and the moved file — confirmed identical to home — is deleted
-    /// rather than left hidden. The photo is still recorded local, pointing at the new file.
+    /// the new file is kept, and the moved file is kept too, under its hidden name, which the
+    /// refusal gives — never deleted (review of #256, LOW-1). The photo is still recorded
+    /// local, pointing at the new file.
     #[test]
     fn an_image_written_after_its_move_is_kept() {
         use crate::catalog::offload_hook::Step;
@@ -760,8 +761,69 @@ mod stack_tests {
         assert!(err.contains("was written while the photo was being offloaded"), "{err}");
         assert_eq!(std::fs::read(&raw).unwrap(), b"NEW BYTES");
         assert_eq!(std::fs::read(dir.join("nas/2026/08/DSC1.ARW")).unwrap(), b"raw-bytes", "home untouched");
-        assert!(hidden_in(raw.parent().unwrap()).is_empty(), "{:?}", hidden_in(raw.parent().unwrap()));
+        let hidden = hidden_in(raw.parent().unwrap());
+        assert_eq!(hidden.len(), 1, "{hidden:?}");
+        assert!(err.contains(&hidden[0]) && err.contains("a new file took its name"), "{err}");
+        assert_eq!(std::fs::read(raw.parent().unwrap().join(&hidden[0])).unwrap(), b"raw-bytes");
         assert_eq!(with_catalog(&state, |c| c.photo_storage_status(master)).unwrap(), StorageStatus::BackedUp);
+    }
+
+    /// A foreign sidecar: another tool's keyword and history, which no ChairPhoto writer owns.
+    const FOREIGN_XMP: &str = r#"<?xpacket begin="" id="W5M0MpCehiHzreSzNTczkc9d"?>
+<x:xmpmeta xmlns:x="adobe:ns:meta/"><rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
+<rdf:Description rdf:about="" xmlns:darktable="http://darktable.sf.net/" xmlns:dc="http://purl.org/dc/elements/1.1/" darktable:history_end="7">
+<dc:subject><rdf:Bag><rdf:li>ForeignKeyword</rdf:li></rdf:Bag></dc:subject>
+</rdf:Description></rdf:RDF></x:xmpmeta>
+<?xpacket end="w"?>"#;
+
+    /// **Forced interleaving (review S1).** A sidecar writer that takes no storage claim (GPS)
+    /// runs while the sidecar is moved aside and before the image is: finding no sidecar, it
+    /// makes a new one with only its own fields. The offload refuses, and the old sidecar —
+    /// the only local copy of the other tool's keyword and history — is kept beside the photo
+    /// under its hidden name, named in the refusal, not deleted.
+    #[test]
+    fn a_sidecar_written_while_the_old_one_is_aside_never_costs_the_old_one() {
+        use crate::catalog::offload_hook::Step;
+        let (_dir, state, master, _frame, raw, _jpg) = stacked("s1-gps-aside");
+        let xmp = crate::xmp::sidecar_path(&raw);
+        std::fs::write(&xmp, FOREIGN_XMP).unwrap();
+        backup_photo(&state, master).unwrap();
+        let target = raw.clone();
+        let _hook = at_step(Step::BeforeMove, &raw, move || crate::xmp::write_gps(&target, 59.9, 10.7).unwrap());
+
+        let err = offload_photo(&state, master).unwrap_err();
+
+        let folder = raw.parent().unwrap();
+        let hidden = hidden_in(folder);
+        assert_eq!(hidden.len(), 1, "{hidden:?}");
+        assert!(hidden[0].starts_with(".DSC1.ARW.xmp."), "{hidden:?}");
+        assert!(err.contains(&hidden[0]), "the refusal names it: {err}");
+        assert_eq!(std::fs::read_to_string(folder.join(&hidden[0])).unwrap(), FOREIGN_XMP);
+        assert!(std::fs::read_to_string(&xmp).unwrap().contains("GPSLatitude"), "the new sidecar stays");
+        assert_eq!(std::fs::read(&raw).unwrap(), b"raw-bytes", "the image is back");
+    }
+
+    /// Review LOW-3: confirmed files are deleted in the order they were moved — a copy's
+    /// companions before its image — so a delete failing part-way leaves the image.
+    #[test]
+    fn confirmed_files_are_deleted_companions_first() {
+        use crate::catalog::offload_hook::Step;
+        let (_dir, state, master, _frame, raw, jpg) = stacked("unlink-order");
+        let xmp = crate::xmp::sidecar_path(&raw);
+        std::fs::write(&xmp, FOREIGN_XMP).unwrap();
+        backup_photo(&state, master).unwrap();
+        let order = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let seen = order.clone();
+        let _hook = crate::catalog::offload_hook::set(move |step, path| {
+            if step == Step::BeforeUnlink {
+                seen.borrow_mut().push(path.file_name().unwrap().to_string_lossy().into_owned());
+            }
+        });
+
+        offload_photo(&state, master).unwrap();
+
+        assert_eq!(*order.borrow(), ["DSC1.ARW.xmp", "DSC1.ARW", "DSC1.JPG"]);
+        assert!(!raw.exists() && !jpg.exists() && !xmp.exists());
     }
 
     /// **Forced interleaving (P2).** A companion nobody carried appears after the image was

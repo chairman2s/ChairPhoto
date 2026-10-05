@@ -15,7 +15,21 @@ use super::{Catalog, CatalogError, LocationRole, Result, VolumeKind};
 use rusqlite::{params, OptionalExtension};
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SkippedPhoto {
+    pub photo_id: i64,
+    pub reason: String,
+}
+
+impl SkippedPhoto {
+    fn new(photo_id: i64, reason: impl Into<String>) -> Self {
+        Self { photo_id, reason: reason.into() }
+    }
+}
 
 /// One photo's share of a backup: where its image is now and where the copy goes.
 pub struct PhotoBackup {
@@ -42,7 +56,8 @@ pub struct BackupPlan {
     /// The frames that can travel with it.
     pub frames: Vec<PhotoBackup>,
     /// Frames left behind, with why.
-    pub skipped: Vec<(i64, String)>,
+    pub skipped: Vec<SkippedPhoto>,
+    pub total: usize,
 }
 
 /// What one backup call achieved. Reported rather than counted, so the UI can say "4 of 7"
@@ -53,7 +68,8 @@ pub struct BackupReport {
     /// Photos now backed up: the named photo, then the frames that went with it.
     pub backed_up: Vec<i64>,
     /// Frames left local, with why.
-    pub skipped: Vec<(i64, String)>,
+    pub skipped: Vec<SkippedPhoto>,
+    pub total: usize,
 }
 
 /// One photo's share of an offload: the verified backup that permits it and the local
@@ -82,7 +98,8 @@ pub struct OffloadPlan {
     /// The frames that can be freed with it.
     pub frames: Vec<PhotoOffload>,
     /// Frames left local, with why.
-    pub skipped: Vec<(i64, String)>,
+    pub skipped: Vec<SkippedPhoto>,
+    pub total: usize,
 }
 
 /// One photo's local copies, freed and confirmed at home — the caller still has to record
@@ -98,7 +115,8 @@ pub struct FreedPhoto {
 pub struct OffloadCarry {
     pub freed: Vec<FreedPhoto>,
     /// Frames left local — planned-out, or refused by their own IO.
-    pub skipped: Vec<(i64, String)>,
+    pub skipped: Vec<SkippedPhoto>,
+    pub total: usize,
     /// `<sidecar>.chairphoto-backup` files left beside a freed image. See
     /// [`crate::companions::sidecar_backups_beside`] for why they are left.
     pub sidecar_backups_left: usize,
@@ -111,7 +129,8 @@ pub struct OffloadReport {
     /// Photos whose local copies were freed: the named photo, then its frames.
     pub freed: Vec<i64>,
     /// Frames left local, with why (no verified backup yet, a diverged companion).
-    pub skipped: Vec<(i64, String)>,
+    pub skipped: Vec<SkippedPhoto>,
+    pub total: usize,
     /// Sidecar backups deliberately left in place, so offload says what it left rather
     /// than leaving it silently (#82).
     pub sidecar_backups_left: usize,
@@ -136,7 +155,8 @@ pub struct RestorePlan {
     /// Frames that are not at home and can be brought back.
     pub frames: Vec<PhotoRestore>,
     /// Frames left on the backup volume, with why.
-    pub skipped: Vec<(i64, String)>,
+    pub skipped: Vec<SkippedPhoto>,
+    pub total: usize,
 }
 
 /// What one restore call achieved.
@@ -146,7 +166,8 @@ pub struct RestoreReport {
     /// Photos now local again: the named photo, then the frames that came with it.
     pub restored: Vec<i64>,
     /// Frames left on the backup volume, with why.
-    pub skipped: Vec<(i64, String)>,
+    pub skipped: Vec<SkippedPhoto>,
+    pub total: usize,
 }
 
 struct Copy {
@@ -172,16 +193,18 @@ impl Catalog {
         let named = self.plan_backup_one(photo_id, &base, backup_volume_id)?;
         let mut frames = Vec::new();
         let mut skipped = Vec::new();
-        for frame_id in self.stack_frame_ids(photo_id)? {
+        let frame_ids = self.stack_frame_ids(photo_id)?;
+        let total = 1 + frame_ids.len();
+        for frame_id in frame_ids {
             match self.plan_backup_one(frame_id, &base, backup_volume_id) {
                 Ok(plan) => frames.push(plan),
                 // A frame's own missing copy is a skip, not the master's failure. Anything
                 // else (a vanished row, a database error) is still an error.
-                Err(CatalogError::Validation(why)) => skipped.push((frame_id, why)),
+                Err(CatalogError::Validation(why)) => skipped.push(SkippedPhoto::new(frame_id, why)),
                 Err(e) => return Err(e),
             }
         }
-        Ok(BackupPlan { named, frames, skipped })
+        Ok(BackupPlan { named, frames, skipped, total })
     }
 
     /// One photo's paths, with no reference to the stack it may be part of.
@@ -226,7 +249,7 @@ impl Catalog {
     /// not.
     pub fn backup_photo(&self, photo_id: i64, backup_volume_id: i64) -> Result<BackupReport> {
         let plan = self.plan_backup(photo_id, backup_volume_id)?;
-        let mut report = BackupReport { skipped: plan.skipped, ..Default::default() };
+        let mut report = BackupReport { skipped: plan.skipped, total: plan.total, ..Default::default() };
         let outcome = copy_with_companions(&plan.named.source, &plan.named.dest, None)?;
         self.record_copy(
             plan.named.photo_id,
@@ -248,7 +271,7 @@ impl Catalog {
                     )?;
                     report.backed_up.push(frame.photo_id);
                 }
-                Err(e) => report.skipped.push((frame.photo_id, e.to_string())),
+                Err(e) => report.skipped.push(SkippedPhoto::new(frame.photo_id, e.to_string())),
             }
         }
         Ok(report)
@@ -263,7 +286,9 @@ impl Catalog {
         let named = self.plan_offload_one(photo_id)?;
         let mut frames = Vec::new();
         let mut skipped = Vec::new();
-        for frame_id in self.stack_frame_ids(photo_id)? {
+        let frame_ids = self.stack_frame_ids(photo_id)?;
+        let total = 1 + frame_ids.len();
+        for frame_id in frame_ids {
             // Nothing local to free is not a refusal: an already-archived frame is the
             // state offload wants, and listing it as skipped would invite the user to act
             // on it. Rows, not files — the rows are what `commit_offload` drops.
@@ -275,11 +300,11 @@ impl Catalog {
                 // Invariant 2 is decided per frame: a frame without its own verified
                 // backup stays local and is named, rather than being freed on the strength
                 // of the master's backup.
-                Err(CatalogError::Validation(why)) => skipped.push((frame_id, why)),
+                Err(CatalogError::Validation(why)) => skipped.push(SkippedPhoto::new(frame_id, why)),
                 Err(e) => return Err(e),
             }
         }
-        Ok(OffloadPlan { named, frames, skipped })
+        Ok(OffloadPlan { named, frames, skipped, total })
     }
 
     /// One photo's backup gate and local files, with no reference to the stack it may be
@@ -334,6 +359,7 @@ impl Catalog {
     pub fn commit_offload_carry(&self, carry: OffloadCarry) -> Result<OffloadReport> {
         let mut report = OffloadReport {
             skipped: carry.skipped,
+            total: carry.total,
             sidecar_backups_left: carry.sidecar_backups_left,
             ..Default::default()
         };
@@ -530,7 +556,9 @@ impl Catalog {
         let named = self.plan_restore_one(photo_id, &base, local_volume_id)?;
         let mut frames = Vec::new();
         let mut skipped = Vec::new();
-        for frame_id in self.stack_frame_ids(photo_id)? {
+        let frame_ids = self.stack_frame_ids(photo_id)?;
+        let total = 1 + frame_ids.len();
+        for frame_id in frame_ids {
             // A frame already at home needs nothing — and copying the backup over it would
             // replace a local file the user may have edited since. Restore brings back what
             // is away; it does not overwrite what is here.
@@ -539,11 +567,11 @@ impl Catalog {
             }
             match self.plan_restore_one(frame_id, &base, local_volume_id) {
                 Ok(plan) => frames.push(plan),
-                Err(CatalogError::Validation(why)) => skipped.push((frame_id, why)),
+                Err(CatalogError::Validation(why)) => skipped.push(SkippedPhoto::new(frame_id, why)),
                 Err(e) => return Err(e),
             }
         }
-        Ok(RestorePlan { named, frames, skipped })
+        Ok(RestorePlan { named, frames, skipped, total })
     }
 
     /// One photo's paths, with no reference to the stack it may be part of.
@@ -580,7 +608,7 @@ impl Catalog {
     /// state an offload freed rather than as bare pixels.
     pub fn restore_photo(&self, photo_id: i64, local_volume_id: i64) -> Result<RestoreReport> {
         let plan = self.plan_restore(photo_id, local_volume_id)?;
-        let mut report = RestoreReport { skipped: plan.skipped, ..Default::default() };
+        let mut report = RestoreReport { skipped: plan.skipped, total: plan.total, ..Default::default() };
         let outcome = copy_with_companions(
             &plan.named.source,
             &plan.named.dest,
@@ -606,7 +634,7 @@ impl Catalog {
                     )?;
                     report.restored.push(frame.photo_id);
                 }
-                Err(e) => report.skipped.push((frame.photo_id, e.to_string())),
+                Err(e) => report.skipped.push(SkippedPhoto::new(frame.photo_id, e.to_string())),
             }
         }
         Ok(report)
@@ -896,21 +924,30 @@ pub fn copy_and_verify(src: &Path, dst: &Path, expected: Option<&str>) -> Result
 /// tile. A **frame** that refuses is recorded and left local instead: aborting would not
 /// un-free what is already gone, and it would hide which frame objected.
 pub fn verify_and_delete_locals(plan: &OffloadPlan) -> Result<OffloadCarry> {
+    verify_and_delete_locals_inner(plan, None)
+}
+
+pub fn verify_and_delete_locals_abortable(plan: &OffloadPlan, abort: &AtomicBool) -> Result<OffloadCarry> {
+    verify_and_delete_locals_inner(plan, Some(abort))
+}
+
+fn verify_and_delete_locals_inner(plan: &OffloadPlan, abort: Option<&AtomicBool>) -> Result<OffloadCarry> {
     let mut out = OffloadCarry {
         freed: Vec::new(),
         skipped: plan.skipped.clone(),
+        total: plan.total,
         sidecar_backups_left: 0,
     };
-    let (freed, left_behind) = free_local_copies(&plan.named)?;
+    let (freed, left_behind) = free_local_copies(&plan.named, abort)?;
     out.freed.push(freed);
     out.sidecar_backups_left += left_behind;
     for frame in &plan.frames {
-        match free_local_copies(frame) {
+        match free_local_copies(frame, abort) {
             Ok((freed, left_behind)) => {
                 out.freed.push(freed);
                 out.sidecar_backups_left += left_behind;
             }
-            Err(e) => out.skipped.push((frame.photo_id, e.to_string())),
+            Err(e) => out.skipped.push(SkippedPhoto::new(frame.photo_id, e.to_string())),
         }
     }
     Ok(out)
@@ -923,7 +960,10 @@ pub fn verify_and_delete_locals(plan: &OffloadPlan) -> Result<OffloadCarry> {
 /// Returns what is now confirmed at home — for the caller to record *before*
 /// `commit_offload`, since that drops the local location rows and the companion rows
 /// cascade with them — and how many sidecar backups were left beside the freed files.
-fn free_local_copies(photo: &PhotoOffload) -> Result<(FreedPhoto, usize)> {
+fn free_local_copies(photo: &PhotoOffload, abort: Option<&AtomicBool>) -> Result<(FreedPhoto, usize)> {
+    if abort.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+        return Err(CatalogError::Validation("storage operation superseded or catalog switched".into()));
+    }
     let current = sha256_file(&photo.backup_abs)?;
     if current != photo.expected_hash {
         return Err(CatalogError::Validation(
@@ -950,6 +990,9 @@ fn free_local_copies(photo: &PhotoOffload) -> Result<(FreedPhoto, usize)> {
 
     let mut sidecar_backups_left = 0usize;
     for file in &photo.local_files {
+        if abort.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+            return Err(CatalogError::Validation("storage operation superseded or catalog switched".into()));
+        }
         // Companions first: if this fails part-way, the image is still local, so the
         // photo is never left with its edit state gone and its bytes freed.
         for found in crate::companions::carried_beside(file) {

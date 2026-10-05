@@ -49,9 +49,10 @@ pub use iptc_owed::{IptcMask, IptcSettled, IptcSidecarState, IptcSidecarWrite, O
 pub use locations::{PathCandidate, ResolveMode};
 pub use lifecycle::{
     carry_companions, copy_and_verify, copy_with_companions, sha256_file, verify_and_delete_locals,
-    BackupPlan, BackupReport, CarriedCompanion, CompanionCarry, CopyOutcome, FreedPhoto, OffloadCarry,
+    verify_and_delete_locals_abortable, BackupPlan, BackupReport, CarriedCompanion, CompanionCarry, CopyOutcome,
+    FreedPhoto, OffloadCarry,
     OffloadPlan, OffloadReport, PhotoBackup, PhotoOffload, PhotoRestore, RestorePlan,
-    RestoreReport,
+    RestoreReport, SkippedPhoto,
 };
 pub use merge::{MergeOutcome, MergeSummary, IMPORTED_EDIT_VERSION};
 pub use models::{

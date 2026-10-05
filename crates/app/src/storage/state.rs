@@ -466,10 +466,17 @@ impl StorageState {
                 }
                 match result {
                     Ok(Ok((summary, offloaded))) => {
-                        if !summary.skipped_offline && summary.ran + summary.failed > 0 {
+                        if !summary.skipped_offline && summary.ran + summary.failed + summary.partial > 0 {
                             let failed =
                                 if summary.failed > 0 { format!(", {} failed", summary.failed) } else { String::new() };
-                            s.status(format!("Backed up {}{failed}", summary.ran), cx);
+                            // A stack op that finished only some members: the rest stay
+                            // queued, one row per frame, with why (#82).
+                            let partial = if summary.partial > 0 {
+                                format!(", {} part-done (frames left queued)", summary.partial)
+                            } else {
+                                String::new()
+                            };
+                            s.status(format!("Backed up {}{failed}{partial}", summary.ran), cx);
                         }
                         if offloaded > 0 {
                             s.status(format!("Offloaded {offloaded} older photo(s) to the NAS"), cx);

@@ -654,6 +654,20 @@ Two conditions keep the cascade honest:
 - **What was skipped is reported**, with the reason, the way `empty_trash` reports what it
   refused: *"Freed 4 of 7 — no verified backup yet"*.
 
+When reconcile completes only part of a stack, it replaces the completed master's queue
+row with one failed row per skipped frame. Each child row keeps the refusal reason and is
+retried independently, so the completed master is not destructively replayed.
+
+Ownership is the service layer's (`crates/core/src/app/storage.rs`), not a lock held across
+the work. A verb the user started on ids read from one catalog runs its plan, its file IO and
+its record on a connection of its own to that catalog (`backup_photo_as` and its siblings), so
+a switch mid-copy cannot record it into the catalog switched to. A drain or offload-policy
+sweep also holds the reconcile generation (`storage::ReconcileClaim`): a switch or a newer
+drain trips it, and the claimed work then starts no further stack member — those are
+reported skipped and requeued as above — and no further queued op. Offload, the verb that
+deletes, re-checks the flag before every member's delete, the named photo's included. A copy
+or delete already under way is indivisible and is recorded on that claimed connection.
+
 Restore is the same rule pointing the other way: a stack that leaves as seven frames comes
 back as seven. It brings home only the frames that are *away* — a frame already local is
 left alone, because copying the backup over it would replace a file the user may have

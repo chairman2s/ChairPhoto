@@ -108,10 +108,7 @@ impl Found {
 
 /// `<image>.<ext>` — the extension appended to the whole filename.
 pub fn appended_path(image: &Path, ext: &str) -> PathBuf {
-    let mut s = image.as_os_str().to_os_string();
-    s.push(".");
-    s.push(ext);
-    PathBuf::from(s)
+    with_suffix(image, &format!(".{ext}"))
 }
 
 /// Every declared companion that currently exists beside `image`.
@@ -143,6 +140,52 @@ pub fn carried_beside(image: &Path) -> Vec<Found> {
             COMPANIONS.iter().any(|c| c.ext == f.ext && c.carry)
         })
         .collect()
+}
+
+/// The suffix `xmp::SidecarDocument` appends when it preserves a sidecar before its first
+/// chairphoto write (AGENTS.md "XMP safety").
+pub const SIDECAR_BACKUP_SUFFIX: &str = ".chairphoto-backup";
+
+/// Where a sidecar's pre-chairphoto backup lives: `<sidecar>.chairphoto-backup`.
+///
+/// One definition, because two halves of the app care about these files — the writer that
+/// creates them (`xmp::SidecarDocument::open`) and the offload that must recognise them
+/// without deleting them (#82).
+pub fn sidecar_backup(sidecar: &Path) -> PathBuf {
+    with_suffix(sidecar, SIDECAR_BACKUP_SUFFIX)
+}
+
+/// Sidecar backups sitting beside `image`, in both sidecar shapes.
+///
+/// Deliberately **not** a companion: a backup records what *this copy's* sidecar looked
+/// like before chairphoto first touched it, so it is per-copy by construction. Carrying one
+/// home would routinely leave two different backups for one photo, which the divergence
+/// rule reads as unreconciled edits and refuses to offload over; deleting it would destroy
+/// the only record of the pre-chairphoto sidecar during a space-freeing operation. So
+/// offload leaves them alone and reports them, and this is how it finds them (#82).
+pub fn sidecar_backups_beside(image: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    for c in COMPANIONS {
+        // Both shapes, whether or not the sidecar itself still exists — a backup outlives
+        // the sidecar it was taken from, which is exactly the case offload leaves behind.
+        for candidate in [appended_path(image, c.ext), image.with_extension(c.ext)] {
+            if candidate == *image {
+                continue; // `with_extension` on a bare name would name the image itself
+            }
+            let backup = sidecar_backup(&candidate);
+            if backup.is_file() && !out.contains(&backup) {
+                out.push(backup);
+            }
+        }
+    }
+    out
+}
+
+/// `<path><suffix>` — a suffix appended to the whole file name, extension included.
+fn with_suffix(path: &Path, suffix: &str) -> PathBuf {
+    let mut s = path.as_os_str().to_os_string();
+    s.push(suffix);
+    PathBuf::from(s)
 }
 
 /// The registry entry for an extension, if it is declared.
@@ -183,6 +226,38 @@ mod tests {
         touch(&dir.join("DSC1.ARW.txt"));
         touch(&dir.join("notes.md"));
 
+        assert!(found_beside(&img).is_empty());
+    }
+
+    #[test]
+    fn a_sidecar_backup_is_found_but_is_not_a_companion() {
+        // The two halves of #82's second finding: offload has to *recognise* these files
+        // to report them, and must never carry them (a backup is per copy, so carrying
+        // one produces two different backups for one photo).
+        let dir = TestTmpDir::new("companions-sidecar-backup");
+        let img = dir.join("DSC1.ARW");
+        touch(&img);
+        touch(&dir.join("DSC1.ARW.xmp"));
+        touch(&dir.join("DSC1.ARW.xmp.chairphoto-backup"));
+
+        assert_eq!(sidecar_backups_beside(&img).len(), 1);
+        assert!(
+            carried_beside(&img).iter().all(|f| f.ext == "xmp"),
+            "the backup is not carried — only the sidecar itself is"
+        );
+    }
+
+    #[test]
+    fn a_sidecar_backup_outlives_the_sidecar_it_was_taken_from() {
+        // Exactly what offload leaves behind: the sidecar went home and was freed, the
+        // backup did not. Deriving the path from the image rather than from what is on
+        // disk is what lets it still be counted.
+        let dir = TestTmpDir::new("companions-orphan-backup");
+        let img = dir.join("DSC1.ARW");
+        touch(&img);
+        touch(&dir.join("DSC1.xmp.chairphoto-backup")); // basename shape, no sidecar left
+
+        assert_eq!(sidecar_backups_beside(&img).len(), 1);
         assert!(found_beside(&img).is_empty());
     }
 

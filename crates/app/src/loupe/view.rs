@@ -32,7 +32,9 @@ use crate::image_store::{ClaimId, ImageStore};
 use crate::keymap::contexts;
 use crate::library::*;
 use crate::loupe::zoom::ZoomImage;
-use crate::loupe::CloseLoupe;
+use crate::loupe::{CloseLoupe, LoupeConfirm};
+#[cfg(feature = "edit")]
+use crate::loupe::{ProofNext, ProofPrevious};
 use crate::model::AppModel;
 use crate::modules::{ModuleRegistry, PanelSlot};
 use crate::shell::actions::OpenCompare;
@@ -200,6 +202,23 @@ impl LoupeView {
             Follow::Window => true,
         };
         showing.then(|| shell.loupe_target().cloned()).flatten()
+    }
+
+    /// The Darkroom's proof sheet to route this pop-out's ←/→/↑/↓, Enter and Esc to instead of
+    /// stepping the library selection or doing nothing (#250 review follow-up) — `None` for
+    /// the inline loupe, which never sits over a Darkroom overlay, and whenever no sheet is
+    /// dealt. The sheet lives in the Darkroom's own window, a different one from the
+    /// pop-out's: its focus/row navigation (`ProofSheet::cycle`, `move_row`) moves that
+    /// window's own `FocusHandle` state, which is meaningless anywhere else, so callers
+    /// re-dispatch the matching action into `.window` (`AppContext::update_window` +
+    /// `Window::dispatch_action`) rather than driving the sheet's own, private methods with
+    /// the wrong window.
+    #[cfg(feature = "edit")]
+    fn proof_sheet_route(&self, cx: &App) -> Option<crate::shell::state::LoupeProofSheetHandle> {
+        if self.follow != Follow::Window {
+            return None;
+        }
+        self.shell.read(cx).loupe_proof_sheet().cloned()
     }
 
     /// The Darkroom's print, which the pop-out shows in place of the target while it is up.
@@ -666,8 +685,31 @@ impl Render for LoupeView {
             .flex_col()
             .min_h_0()
             .on_mouse_down(gpui_kit::MouseButton::Left, cx.listener(|this, _, window, cx| this.focus.focus(window, cx)))
-            .on_action(cx.listener(|this, _: &SelectNext, _, cx| this.step(1, false, cx)))
-            .on_action(cx.listener(|this, _: &SelectPrevious, _, cx| this.step(-1, false, cx)))
+            // → and ↓ both step forward; ← and ↑ both step back — the same conflation
+            // `SelectNext`/`SelectPrevious` already make for the library grid, so while a
+            // proof sheet is up on the pop-out (#250 review follow-up) all four cycle its
+            // candidates the one way its own ← / → do, rather than silently moving the
+            // library selection the pop-out no longer shows (`Self::proof_sheet_route`). GPUI
+            // gives action handlers no way to tell *which* key matched a binding bound to
+            // more than one, so this is the routing's own granularity, documented rather than
+            // guessed around; the sheet's own ↑ / ↓ row navigation is still reachable by
+            // pressing those keys on the Darkroom's own window.
+            .on_action(cx.listener(|this, _: &SelectNext, _, cx| {
+                #[cfg(feature = "edit")]
+                if let Some(route) = this.proof_sheet_route(cx) {
+                    cx.update_window(route.window, |_, window, cx| window.dispatch_action(Box::new(ProofNext), cx)).ok();
+                    return;
+                }
+                this.step(1, false, cx)
+            }))
+            .on_action(cx.listener(|this, _: &SelectPrevious, _, cx| {
+                #[cfg(feature = "edit")]
+                if let Some(route) = this.proof_sheet_route(cx) {
+                    cx.update_window(route.window, |_, window, cx| window.dispatch_action(Box::new(ProofPrevious), cx)).ok();
+                    return;
+                }
+                this.step(-1, false, cx)
+            }))
             .on_action(cx.listener(|this, _: &ExtendNext, _, cx| this.step(1, true, cx)))
             .on_action(cx.listener(|this, _: &ExtendPrevious, _, cx| this.step(-1, true, cx)))
             // Select every photo in the view, keeping the one shown active (React's grid handler,
@@ -675,11 +717,38 @@ impl Render for LoupeView {
             .on_action(cx.listener(|this, _: &SelectAll, _, cx| {
                 this.shell.update(cx, |s, cx| s.select_with(cx, |l| l.select_all()))
             }))
-            // Enter/Esc and C act on the main window's stage; in the pop-out they do nothing (the
-            // window manager closes the window).
+            // Inline: back to the grid, same as Esc (`CloseLoupe`). Pop-out, no sheet up: C
+            // acts on the main stage, but Enter/Esc do nothing (the window manager closes the
+            // window) — unless a proof sheet is up there (#250 review follow-up), in which
+            // case Enter adopts whatever it is currently showing, the sheet's own ↑/↓/←/→-
+            // dealt candidate included.
+            .on_action(cx.listener(|this, _: &LoupeConfirm, _, cx| {
+                if this.follow == Follow::Inline {
+                    this.shell.update(cx, |s, cx| s.set_loupe(false, cx));
+                    return;
+                }
+                #[cfg(feature = "edit")]
+                if let Some(route) = this.proof_sheet_route(cx) {
+                    let Some(preview) = this.shell.read(cx).loupe_proof_preview().cloned() else { return };
+                    let i = route.sheet.read(cx).candidates().iter().position(|c| *c == preview.candidate);
+                    if let Some(i) = i {
+                        route.sheet.update(cx, |s, cx| s.adopt(i, cx));
+                    }
+                }
+            }))
+            // Inline: back to the grid. Pop-out, no sheet up: nothing, as `LoupeConfirm`'s own
+            // docs — the window manager closes the window instead. With a sheet up there
+            // (#250 review follow-up), declines it instead of leaving it stranded behind a
+            // pop-out whose own Esc otherwise does nothing: chosen over leaving Esc inert,
+            // for symmetry with Enter now reaching the sheet too.
             .on_action(cx.listener(|this, _: &CloseLoupe, _, cx| {
                 if this.follow == Follow::Inline {
-                    this.shell.update(cx, |s, cx| s.set_loupe(false, cx))
+                    this.shell.update(cx, |s, cx| s.set_loupe(false, cx));
+                    return;
+                }
+                #[cfg(feature = "edit")]
+                if let Some(route) = this.proof_sheet_route(cx) {
+                    route.sheet.update(cx, |s, cx| s.close(cx));
                 }
             }))
             .on_action(cx.listener(|this, _: &CompareSelection, window, cx| {

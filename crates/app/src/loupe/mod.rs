@@ -56,8 +56,15 @@ use gpui_kit::{actions, KeyBinding, NoAction};
 actions!(
     loupe,
     [
-        /// Escape in the loupe: back to the grid.
+        /// Escape in the loupe: back to the grid. Also what the pop-out's Escape still is,
+        /// even while a proof sheet is up there (#250 review follow-up): it declines the
+        /// sheet instead (`LoupeView::proof_sheet_route`), rather than nothing at all.
         CloseLoupe,
+        /// Enter in the loupe: back to the grid — split out from `CloseLoupe` (which Escape
+        /// alone keeps) so the pop-out's Enter can mean something different while a proof
+        /// sheet is up there: adopts the sheet's own currently-previewed candidate (#250
+        /// review follow-up), rather than nothing at all.
+        LoupeConfirm,
         /// Escape or C in Compare: back to the grid.
         CloseCompare,
         /// ← in Compare: the duel's left verdict, else the previous pane.
@@ -144,7 +151,7 @@ pub fn bindings() -> Vec<KeyBinding> {
         KeyBinding::new("shift-left", ExtendPrevious, loupe),
         KeyBinding::new("shift-up", ExtendPrevious, loupe),
         KeyBinding::new("ctrl-a", SelectAll, loupe),
-        KeyBinding::new("enter", CloseLoupe, loupe),
+        KeyBinding::new("enter", LoupeConfirm, loupe),
         KeyBinding::new("escape", CloseLoupe, loupe),
         KeyBinding::new("c", CompareSelection, loupe),
         // Compare.

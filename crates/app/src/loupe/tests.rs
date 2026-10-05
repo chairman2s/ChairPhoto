@@ -1515,6 +1515,17 @@ mod overlays {
         .unwrap();
         press("down", cx); // from the backdrop: the first cell
         let cols = sheet.read_with(cx, |s, _| s.columns());
+        // Checked against the cells' own rendered positions (review mutation B: `columns()`
+        // hard-coded to 1 passed this test before, since its oracle below only re-reads the
+        // same value under test) — the first row's actual width, not `columns()`'s opinion of
+        // it.
+        let actual_cols = cx
+            .update_window(handle, |_, window, _| {
+                let ys: Vec<f32> = (0..n).map(|i| f32::from(window.find(("proof-cell", i as u64)).bounds().origin.y)).collect();
+                ys.iter().filter(|y| (**y - ys[0]).abs() < 0.5).count()
+            })
+            .unwrap();
+        assert_eq!(cols, actual_cols, "columns() must match how many cells actually rendered on the first row");
         assert!(cols < n, "this fixture's {n} cells must wrap past one row at the narrowed window: {cols} columns");
         assert_eq!(focused(cx), Some(0));
         assert_eq!(preview(cx), Some(candidates[0].clone()));
@@ -1535,10 +1546,16 @@ mod overlays {
     /// arrow navigation's own preview, since hover always won before. An arrow press must
     /// outrank the still-hovered cell, repeatedly, until the pointer itself actually moves —
     /// only then does hover take the preview back. Checked synchronously, right after each
-    /// key — not after `run_until_parked`, which (in this test harness only, not the real
-    /// windowed app) lets GPUI's own deferred hover re-evaluation settle on `None` for a
-    /// pointer this test never actually moves, which would quietly agree with the focused
-    /// cell either way and hide a broken precedence.
+    /// key — not after `run_until_parked`, which also lets this settle to the right answer
+    /// under a *broken* `keyboard_wins`: GPUI's own on-hover default
+    /// (`HoverListenerMode::InputModalityAware`) ends a hover after any key press too, real
+    /// app included, deferred to the next paint (gpui-pre 0.3.7 `elements/div.rs`
+    /// `default_hover_listener_ends_after_key_press`) — so a pointer this test never moves
+    /// settles to `None` there regardless, and `None.or(focused)` gives the focused cell's
+    /// preview either way, mutated `keyboard_wins` included. `keyboard_wins` only has to
+    /// bridge the one frame between the key press and that deferred end (#250 review); this
+    /// test's synchronous read is what actually exercises it (mutation-checked: removing the
+    /// `keyboard_wins` branch in `sync_preview` fails this specific assertion).
     #[gpui_kit::test]
     fn an_arrow_press_outranks_a_resting_pointer_until_it_moves_again(cx: &mut TestAppContext) {
         let (app, _pool, _dir, ids) = app_with(1, "proof-preview-keyboard-wins", cx);

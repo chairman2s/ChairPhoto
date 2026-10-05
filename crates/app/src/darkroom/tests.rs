@@ -2202,6 +2202,78 @@ fn the_pop_out_never_shows_the_prints_full_res_under_a_proof(cx: &mut TestAppCon
     );
 }
 
+/// The pop-out's own ←/→ and Enter no longer silently act on the library/main stage while a
+/// proof sheet is up (#250 review follow-up, `LoupeView::proof_sheet_route`): with a sheet up,
+/// → re-dispatches `ProofNext` into the Darkroom's own window instead of stepping the library
+/// selection, and Enter adopts the sheet's own currently-previewed candidate directly. With no
+/// sheet up, the pop-out's own arrow still steps the selection exactly as before.
+#[gpui_kit::test]
+fn the_pop_out_routes_arrows_and_enter_to_a_live_proof_sheet(cx: &mut TestAppContext) {
+    use super::view::Overlay;
+    use crate::loupe::window;
+    let rig = rig("dk-popout-proof-route", 3, cx);
+    work(cx);
+    advance(cx, SETTLE); // the auto-tone fragment `open_proof_sheet` needs
+    cx.update(window::open);
+    cx.run_until_parked();
+    let h = cx.update(|cx| window::handle(cx)).expect("the pop-out opened");
+    let active = |cx: &mut TestAppContext| rig.app.wired.shell.read_with(cx, |s, _| s.library.selection().active_id);
+    let press_in_popout = |key: &str, cx: &mut TestAppContext| {
+        cx.update_window(h, |_, window, cx| {
+            window.render_frame(cx);
+            window.press(key, cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+    };
+
+    // With no sheet up: the pop-out's own → still steps the library selection, as before —
+    // which, with the Darkroom open, also re-targets it to the new active photo, so its own
+    // auto-tone fragment needs a fresh settle before a sheet can be dealt on it below.
+    let before = active(cx);
+    press_in_popout("right", cx);
+    let stepped = active(cx);
+    assert_ne!(stepped, before, "no sheet up: → still steps the selection");
+    work(cx);
+    advance(cx, SETTLE);
+
+    // Open a proof sheet on the Darkroom's own window.
+    rig.with_view(cx, |v, window, cx| v.open_proof_sheet(window, cx));
+    let sheet = rig.view(cx).read_with(cx, |v, _| match v.overlay() {
+        Some(Overlay::Proof(p)) => p.clone(),
+        _ => panic!("the proof sheet is mounted"),
+    });
+    let focused_in_main = |cx: &mut TestAppContext| cx.update_window(rig.app.window(), |_, window, cx| sheet.read(cx).focused(window)).unwrap();
+    assert_eq!(focused_in_main(cx), None, "the backdrop is focused, no cell yet");
+
+    // → from the pop-out moves the sheet's own focus/preview; the selection does not move.
+    press_in_popout("right", cx);
+    assert_eq!(active(cx), stepped, "the selection stayed put while the sheet is up");
+    assert_eq!(focused_in_main(cx), Some(0), "→ reached the sheet's own first cell, like from its own backdrop");
+    let candidate0 = sheet.read_with(cx, |s, _| s.candidates()[0].clone());
+    assert_eq!(
+        rig.app.wired.shell.read_with(cx, |s, _| s.loupe_proof_preview().map(|p| p.candidate.clone())),
+        Some(candidate0),
+        "the pop-out's own preview follows the sheet's new focus"
+    );
+
+    // ← wraps the sheet's own focus backward, same as if pressed on the main window.
+    press_in_popout("left", cx);
+    let n = sheet.read_with(cx, |s, _| s.candidates().len());
+    assert_eq!(focused_in_main(cx), Some(n - 1), "← wrapped to the sheet's own last cell");
+    assert_eq!(active(cx), stepped, "still untouched");
+
+    // Enter from the pop-out adopts whichever candidate the sheet is now showing.
+    let last = sheet.read_with(cx, |s, _| s.candidates()[n - 1].clone());
+    press_in_popout("enter", cx);
+    assert!(rig.view(cx).read_with(cx, |v, _| v.overlay().is_none()), "Enter from the pop-out adopted and closed the sheet");
+    assert_eq!(
+        rig.working(cx),
+        serde_json::from_str::<Value>(&last.record.to_json()).unwrap(),
+        "adopted exactly the cell the pop-out's Enter left focused"
+    );
+}
+
 /// The proof sheet's keys, as React's proof cells were buttons: Enter on the sheet as dealt
 /// (the backdrop focused, no proof) neither declines nor adopts; Tab / Shift+Tab move focus
 /// through the proofs, wrapping; Enter adopts the focused proof. A pointer click on the

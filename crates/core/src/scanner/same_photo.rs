@@ -406,11 +406,13 @@ fn holds_bytes(path: &Path, bytes: &[u8]) -> bool {
 /// `dir/stem (n).ext`, the name a collision is renamed to.
 pub(crate) fn numbered(path: &Path, n: u32) -> PathBuf {
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
-    let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("file");
-    let mut name = format!("{stem} ({n})");
-    if let Some(ext) = path.extension().and_then(|s| s.to_str()) {
-        name.push('.');
-        name.push_str(ext);
+    // The stem's own bytes, UTF-8 or not: a non-UTF-8 stem is not `file`, whose ` (n)` name
+    // would be judged short enough for a sidecar when the name placed is not (relB3 NIT-A).
+    let mut name = path.file_stem().unwrap_or(std::ffi::OsStr::new("file")).to_os_string();
+    name.push(format!(" ({n})"));
+    if let Some(ext) = path.extension() {
+        name.push(".");
+        name.push(ext);
     }
     dir.join(name)
 }
@@ -543,13 +545,23 @@ pub(crate) fn absent(path: &Path) -> bool {
     std::fs::symlink_metadata(path).is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound)
 }
 
-/// Whether a photo named like `path` can have its sidecar, `<name>.xmp`, beside it: the
-/// sidecar's name fits in [`NAME_MAX`] bytes. A photo whose sidecar can never be written
-/// could never carry its identity (`xmp:Identifier`), so card ingest and bundle import
-/// refuse such a file with that reason rather than import it with a debt no repair can pay
-/// (review of #231 N-4, LOW-5).
+/// Whether a photo named like `path` can have its sidecar, `<name>.xmp`, written beside it:
+/// the sidecar's name and every name its writer makes on the way (its temp file, its backup)
+/// fit the filesystem's limit ([`crate::xmp::sidecar_fits`], the writer's own budget). A
+/// photo whose sidecar can never be written could never carry its identity
+/// (`xmp:Identifier`), so card ingest and bundle import refuse such a file with that reason
+/// rather than import it with a debt no repair can pay (review of #231 N-4, LOW-5; relB2
+/// LOW-1).
 pub fn sidecar_name_fits(path: &Path) -> bool {
-    path.file_name().is_some_and(|n| n.len() + ".xmp".len() <= NAME_MAX)
+    crate::xmp::sidecar_fits(path)
+}
+
+/// Whether every ` (n)` name the free-name search may try beside `wanted` can have its sidecar
+/// written. When not, a placement that found no free name ran out of names that fit rather
+/// than of free ones: the file is refused for a name too long, not counted as an error
+/// (relB2 LOW-3).
+pub fn numbered_fits(wanted: &Path) -> bool {
+    sidecar_name_fits(&numbered(wanted, 9_999))
 }
 
 /// Create a new file at `wanted`, or at the next free ` (n)` name beside it, and fill it with
@@ -1092,6 +1104,25 @@ mod tests {
         assert_eq!(same_size_candidates(&dest, 4).len(), 4, "a fresh listing sees all");
     }
 
+    // --- numbered names of a non-UTF-8 stem (relB3 NIT-A) ---------------------------------
+
+    /// A stem that is not UTF-8 keeps its own bytes in its ` (n)` name, so the free-name
+    /// search and `numbered_fits` judge the name that is placed, not a short `file (n)`.
+    #[test]
+    fn a_numbered_name_keeps_a_non_utf8_stem() {
+        use std::os::unix::ffi::OsStrExt;
+        let dir = Path::new("/lib/2026/06/28");
+        let wanted = dir.join(std::ffi::OsStr::from_bytes(b"IMG\xff.jpg"));
+        assert_eq!(numbered(&wanted, 2), dir.join(std::ffi::OsStr::from_bytes(b"IMG\xff (2).jpg")));
+        assert_eq!(numbered(&dir.join("IMG.jpg"), 3), dir.join("IMG (3).jpg"));
+        let mut long = vec![0xff];
+        long.extend(std::iter::repeat_n(b'D', 206));
+        long.extend(b".jpg");
+        let long = dir.join(std::ffi::OsStr::from_bytes(&long));
+        assert!(sidecar_name_fits(&long));
+        assert!(!numbered_fits(&long), "its ` (n)` names are as long as it, and more");
+    }
+
     // --- placing a new file (L-4) ---------------------------------------------------------
 
     /// M-a of the second #246 review: a name whose sidecar exists without it (an orphan
@@ -1195,7 +1226,7 @@ mod tests {
     fn a_name_near_the_length_limit_is_still_placed() {
         let dir = temp("long-name");
         for name in [format!("{}.ARW", "D".repeat(246)), format!("{}é{}.ARW", "D".repeat(188), "x".repeat(57))] {
-            assert!(name.len() > 240 && sidecar_name_fits(&dir.join(&name)), "{}", name.len());
+            assert!(name.len() > 240 && name.len() + ".xmp".len() <= 255, "{}", name.len());
             let wanted = dir.join(&name);
             let placed = create_new_with(&wanted, unique_dest, |f| {
                 use std::io::Write;

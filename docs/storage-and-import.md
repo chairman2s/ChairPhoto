@@ -1020,14 +1020,25 @@ Two modes over the same core location model:
   running here, unwritten for over an hour (`working_files::remove_if_stale_part`). A name
   within the temporary name's ~30 bytes of the 255-byte limit is carried shortened in the
   temporary name (a prefix and a hash, N-4); the file still takes its full name. A file
-  whose sidecar's name (`<name>.xmp`) would be over 255 bytes is not imported at all — its
-  identity could never be written beside it — and the result counts it apart ("name too
-  long for a sidecar"). On a filesystem with neither (some FUSE mounts; current Linux vfat,
-  exFAT and SMB drivers accept the no-replace rename) the name is claimed by an exclusive
-  create and the temporary file copied in: still no overwrite, but without that
-  crash guarantee. A name is free only when
-  nothing is at it and nothing at its sidecar's name (`<name>.xmp`) either: a sidecar with
-  no original beside it (another tool's, or one whose original was removed) belongs to some
+  whose sidecar could not be written — its name (`<name>.xmp`), or a name the sidecar writer
+  makes on the way (its `.<sidecar>.<pid>-<hex>.chairphoto-tmp` temp file, its
+  `.chairphoto-backup`), over 255 bytes (`xmp::sidecar_fits`, the writer's own budget) — is
+  not imported at all, no row either: its identity could never be written beside it. Only a
+  name the import must make is held to that budget — a new photo's, or a ` (n)` name. A
+  photo the catalog already has keeps the name it has (relB3): a file found already in the
+  library under such a name (#246), and a row's own photo coming back to the row's name
+  after its file was lost (#247; that row's sidecar exists or is owed), are handled as for
+  any other name, and a bundle photo whose identity has a row here still merges onto that
+  row even when its original is refused. A bundle entry with no original, at a path too long
+  for a sidecar, for a photo the catalog does not have, gets no metadata-only row either
+  (relB3 LOW-A): no later import could place its original there with its identity beside
+  it. The result counts a refused photo apart ("name too long for a sidecar"), as it does a
+  file whose name fits but whose ` (n)` names, needed because the name is taken, do not. On
+  a filesystem with neither (some FUSE mounts; current Linux vfat, exFAT and SMB drivers
+  accept the no-replace rename) the name is claimed by an exclusive create and the
+  temporary file copied in: still no overwrite, but without that crash guarantee. A name is
+  free only when nothing is at it and nothing at its sidecar's name (`<name>.xmp`) either:
+  a sidecar with no original beside it (another tool's, or one whose original was removed) belongs to some
   other photo, and a new file placed beside it would adopt its identity and metadata. Nor is
   a name free that a catalog row holds (#247) — by its logical path, or by one of its
   locations (any role) under that location's own volume base, its file there or not
@@ -1059,7 +1070,9 @@ Two modes over the same core location model:
   and a backup location with a verified hash — is already imported: its card's file (or a
   bundle's original) is skipped, counted apart ("already offloaded, not copied back"), and
   not copied back to this disk (#231 F5). The record decides, not a look at the backup
-  volume, which may be unmounted. A photo that still has a local location row lost its file
+  volume, which may be unmounted. Removing a local volume drops its location rows, so its
+  photos then count as offloaded here too — the same rule as the NAS-only filter
+  (`StorageTier::Nas`). A photo that still has a local location row lost its file
   some other way, and the card may hold its last copy: it is restored to its row; when
   unsure, the file is copied. The import dialog's listing flags an offloaded photo the same
   way. Every other arriving file goes on to the next free ` (n)` with a

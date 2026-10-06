@@ -57,9 +57,16 @@ pub struct BundleImportResult {
     /// Originals whose photo was offloaded — its row has no local location left and a
     /// verified backup (#231 F5): already imported, not copied back.
     pub offloaded: usize,
-    /// Originals whose name is too long for a sidecar beside it (`<name>.xmp` over 255
-    /// bytes): not unpacked, since the photo's identity could never be written.
+    /// Photos refused for a name too long for a sidecar beside it (`xmp::sidecar_fits`):
+    /// an original that would need a new name that long is not unpacked, and a
+    /// metadata-only photo the catalog does not have at such a path gets no row, since the
+    /// photo's identity could never be written beside its file.
     pub name_too_long: usize,
+    /// The (uuid, relative path) of each photo refused as `name_too_long`: the index phase
+    /// leaves those whose identity has no row here out of the merge, so they get no row at
+    /// all (relB2 LOW-2, relB3 LOW-A); one whose identity has a row still merges onto it.
+    #[serde(skip)]
+    pub refused: Vec<(String, String)>,
     /// What the F1c merge did (new photos, new tags, etc.).
     pub merge: MergeSummary,
 }
@@ -189,6 +196,7 @@ pub fn extract_originals_abortable(
         restored_trashed: 0,
         offloaded: 0,
         name_too_long: 0,
+        refused: Vec::new(),
         merge: MergeSummary::default(),
     };
     let mut extracted: Vec<ExtractedItem> = Vec::new();
@@ -224,7 +232,20 @@ pub fn extract_originals_abortable(
                 }
             }
             Err(_) => {
-                // Original absent (metadata-only bundle or offline original).
+                // Original absent (metadata-only bundle or offline original). A photo the
+                // catalog does not have, at a name too long for a sidecar, is not given the
+                // metadata-only row either: no import could later place its original there
+                // with its identity beside it (relB3 LOW-A). One the catalog has still merges.
+                if !same_photo::sidecar_name_fits(&dest_base.join(&bp.relative_path))
+                    && !identity_has_row(catalog, &bp.uuid)
+                {
+                    eprintln!(
+                        "bundle import: {} not imported: its name is too long for a sidecar beside it",
+                        bp.relative_path
+                    );
+                    result.name_too_long += 1;
+                    result.refused.push((bp.uuid.clone(), bp.relative_path.clone()));
+                }
                 None
             }
         };
@@ -267,14 +288,6 @@ pub fn extract_originals_abortable(
         }
 
         let dest = dir.join(filename);
-        if !same_photo::sidecar_name_fits(&dest) {
-            eprintln!(
-                "bundle import: {} not unpacked: its name is too long for a sidecar beside it",
-                bp.relative_path
-            );
-            result.name_too_long += 1;
-            continue;
-        }
 
         // A same-name, same-size file may be this photo, already imported (#246): decided
         // now, against the bytes in memory.
@@ -325,12 +338,34 @@ pub fn extract_originals_abortable(
             result.offloaded += 1;
             continue;
         }
+        // Only a name made here must fit its sidecar: a photo already in the library (above)
+        // and the row of this identity whose file is gone, which the original goes back to,
+        // keep the name they have (relB3 MEDIUM-A). A new photo whose name is too long for a
+        // sidecar beside it is not unpacked — its identity could never be written.
+        if !same_photo::sidecar_name_fits(&dest) && names.relink_target(&dest, &arriving).is_none() {
+            eprintln!(
+                "bundle import: {} not unpacked: its name is too long for a sidecar beside it",
+                bp.relative_path
+            );
+            result.name_too_long += 1;
+            result.refused.push((bp.uuid.clone(), bp.relative_path.clone()));
+            continue;
+        }
         let placed = same_photo::create_new_file(&dest, &mut names, &arriving, |file| {
             use std::io::Write;
             file.write_all(&orig_bytes)
         });
         let dest = match placed {
             Ok(dest) => dest,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && !same_photo::numbered_fits(&dest) => {
+                eprintln!(
+                    "bundle import: {} not unpacked: no name beside it short enough for a sidecar",
+                    bp.relative_path
+                );
+                result.name_too_long += 1;
+                result.refused.push((bp.uuid.clone(), bp.relative_path.clone()));
+                continue;
+            }
             Err(e) => {
                 eprintln!("bundle import: placing {} ({}) failed: {e}", bp.uuid, dest.display());
                 result.errors += 1;
@@ -746,7 +781,13 @@ pub(crate) fn index_bundle_with(
     // A blank-uuid photo whose original was indexed carries, for the merge, the identity of
     // the row it was indexed into (#150).
     let prepared;
-    let manifest = if indexed < total || !indexed_blank.is_empty() || !matched_by_capture.is_empty() {
+    // Originals refused for a name too long for a sidecar are not imported at all: no row,
+    // not even the metadata-only one the merge gives a photo whose original is not here. A
+    // refused photo whose identity already has a row here still merges onto that row, as any
+    // photo the catalog has does (relB3 MEDIUM-A): no new name is made for it.
+    let refused: std::collections::HashSet<(String, String)> =
+        partial_result.refused.iter().filter(|(uuid, _)| !identity_has_row(catalog, uuid)).cloned().collect();
+    let manifest = if indexed < total || !indexed_blank.is_empty() || !matched_by_capture.is_empty() || !refused.is_empty() {
         let done: std::collections::HashSet<(&str, &str)> = extracted[..indexed]
             .iter()
             .map(|i| (i.photo_uuid.as_str(), i.relative_path.as_str()))
@@ -756,6 +797,7 @@ pub(crate) fn index_bundle_with(
                 .photos
                 .iter()
                 .filter(|p| indexed == total || done.contains(&(p.uuid.as_str(), p.relative_path.as_str())))
+                .filter(|p| !refused.contains(&(p.uuid.clone(), p.relative_path.clone())))
                 .map(|p| {
                     let mut p = p.clone();
                     if let Some(row) = matched_by_capture.get(&(p.uuid.as_str(), p.relative_path.as_str())) {
@@ -869,6 +911,15 @@ pub(crate) fn index_bundle_with(
     merge_summary.photos_matched_by_capture = matched_by_capture.len();
     partial_result.merge = merge_summary;
     Ok(Indexed { result: partial_result, indexed, total })
+}
+
+/// Whether a row here holds the identity of a bundle photo with manifest id `bundle_uuid`
+/// ([`crate::catalog::photo_identity_for`]; a blank one names none): the row the merge
+/// fills for it. A catalog that cannot be read answers no.
+fn identity_has_row(catalog: &Catalog, bundle_uuid: &str) -> bool {
+    crate::catalog::photo_identity_for(bundle_uuid).is_some_and(|identity| {
+        catalog.conn().query_row("SELECT 1 FROM photos WHERE uuid = ?1", [identity], |_| Ok(())).is_ok()
+    })
 }
 
 /// The identity of the row at `path` when it is not the bundle photo's (`bundle_uuid`, as
@@ -2153,16 +2204,18 @@ mod tests {
         }
     }
 
-    /// Review LOW-5 of #231 N-4: an original whose sidecar's name would be over 255 bytes is
-    /// not unpacked — its identity could never be written beside it — and the result says
-    /// why; the merge inserts no row for it at that path either (it has no original here and
-    /// its path is free, so it is a metadata-only row, as for an original the bundle lacks).
+    /// Review LOW-5 of #231 N-4 (and relB2 LOW-2): an original whose sidecar could not be
+    /// written beside it — its name, with the sidecar writer's temp name, over 255 bytes — is
+    /// not imported at all: not unpacked, the result says why, and the index phase gives it
+    /// no row (not the metadata-only row a photo whose original the bundle lacks gets).
     #[test]
     fn an_original_too_long_for_a_sidecar_is_not_unpacked() {
         let src_dir = temp_dir("long-src");
         let src = src_dir.join("long.ARW");
         std::fs::write(&src, b"FAKE RAW BYTES").unwrap();
-        let long = format!("{}.ARW", "D".repeat(249));
+        // 230 bytes: its sidecar's own name (234) fits in 255, the sidecar writer's temp name
+        // does not (relB2 LOW-1), so its sidecar could never be written.
+        let long = format!("{}.ARW", "D".repeat(226));
         assert!(!crate::scanner::same_photo::sidecar_name_fits(Path::new(&long)));
         let bundle_path = bundle_of(
             "long",
@@ -2174,6 +2227,163 @@ mod tests {
         assert_eq!((partial.name_too_long, partial.copied, partial.errors), (1, 0, 0), "{partial:?}");
         assert!(extracted.is_empty());
         assert!(!root.join("2026/06/28").join(&long).exists());
+        let result = index_bundle(&catalog, &manifest, &extracted, &root, partial).unwrap();
+        assert_eq!((result.name_too_long, result.merge.photos_added), (1, 0), "{:?}", result.merge);
+        assert!(photo_paths(&catalog).is_empty(), "no row, not even a metadata-only one");
+    }
+
+    // --- a long name the catalog already has (relB3 MEDIUM-A) ---------------------------
+
+    /// A 220-byte name: its sidecar's own name fits in 255 bytes, the sidecar writer's temp
+    /// name does not, so a new photo of this name is refused (relB2 LOW-1).
+    fn long_name() -> String {
+        let long = format!("{}.ARW", "L".repeat(216));
+        assert!(!crate::scanner::same_photo::sidecar_name_fits(Path::new(&long)));
+        long
+    }
+
+    /// The bundle's photo with rating 3, label green and City Oslo.
+    fn rated_photo(uuid: &str, rel: &str) -> crate::bundle::BundlePhoto {
+        let mut bp = plain_photo(uuid, rel);
+        bp.rating = 3;
+        bp.label = "green".into();
+        bp.iptc = crate::catalog::IptcFields { city: "Oslo".into(), ..Default::default() };
+        bp
+    }
+
+    /// relB3 P1: the catalog has the photo — same identity, same bytes, file present — under a
+    /// name too long for a sidecar (a folder scan has no limit; an import under the old rule).
+    /// The bundle of it is not refused: the file is found already here, and its rating, label
+    /// and IPTC fill the row as for any photo the catalog has. A 253-byte name, whose sidecar
+    /// could not even be named, merges its culling the same way.
+    #[test]
+    fn a_bundle_photo_the_catalog_has_under_a_long_name_merges_onto_its_row() {
+        const UUID: &str = "66666666-6666-4666-8666-666666666666";
+        for long in [long_name(), format!("{}.ARW", "M".repeat(249))] {
+            let tag = format!("relb3-p1-{}", long.len());
+            let (catalog, root) = temp_catalog(&tag);
+            let rel = format!("2026/06/28/{long}");
+            let original = root.join(&rel);
+            std::fs::create_dir_all(original.parent().unwrap()).unwrap();
+            std::fs::write(&original, b"FAKE RAW BYTES").unwrap();
+            let row = catalog.upsert_photo_with_identity(&original, None, 1, 14, Some(UUID)).unwrap();
+            let src_dir = temp_dir(&format!("{tag}-src"));
+            let src = src_dir.join("x.ARW");
+            std::fs::write(&src, b"FAKE RAW BYTES").unwrap();
+            let bundle_path = bundle_of(&tag, vec![(rated_photo(UUID, &rel), Some(src))]);
+
+            let (manifest, mut archive) = open_bundle(&bundle_path).unwrap();
+            let (extracted, partial) = extract_originals(&catalog, &manifest, &mut archive, &root, |_, _| {}).unwrap();
+            assert_eq!(
+                (partial.skipped_duplicate, partial.name_too_long, partial.errors),
+                (1, 0, 0),
+                "{}: {partial:?}",
+                long.len()
+            );
+            let result = index_bundle(&catalog, &manifest, &extracted, &root, partial).unwrap();
+            assert_eq!(
+                (result.name_too_long, result.merge.photos_existing, result.merge.photos_filled),
+                (0, 1, 1),
+                "{result:?}"
+            );
+            let after = catalog.get_photo(row.id).unwrap();
+            assert_eq!((after.rating, after.label.as_str()), (3, "green"), "{}", long.len());
+            // A 253-byte name's sidecar cannot even be read (its name is over 255 bytes), so
+            // its IPTC is not filled: what that sidecar holds is unknown.
+            let city = if long.len() < 251 { "Oslo" } else { "" };
+            assert_eq!(catalog.get_iptc(row.id).unwrap().city, city, "{}", long.len());
+            assert_eq!(photo_paths(&catalog), [rel], "one row");
+        }
+    }
+
+    /// The photo's own row lost its file (its local location row still there) under a name too
+    /// long for a sidecar: the bundle's original goes back to the row's name, as for any row
+    /// that lost its file — no new name is made, so none is refused.
+    #[test]
+    fn a_bundle_photo_whose_row_lost_its_file_under_a_long_name_goes_back_to_it() {
+        const UUID: &str = "77777777-7777-4777-8777-777777777777";
+        let (catalog, root) = temp_catalog("relb3-relink");
+        let rel = format!("2026/06/28/{}", long_name());
+        let name = root.join(&rel);
+        std::fs::create_dir_all(name.parent().unwrap()).unwrap();
+        std::fs::write(&name, b"FAKE RAW BYTES").unwrap();
+        let row = catalog.upsert_photo_with_identity(&name, None, 1, 14, Some(UUID)).unwrap();
+        std::fs::remove_file(&name).unwrap();
+        catalog.reconcile_missing_for(&[row.id]).unwrap();
+        let src_dir = temp_dir("relb3-relink-src");
+        let src = src_dir.join("x.ARW");
+        std::fs::write(&src, b"FAKE RAW BYTES").unwrap();
+        let bundle_path = bundle_of("relb3-relink", vec![(rated_photo(UUID, &rel), Some(src))]);
+
+        let (manifest, mut archive) = open_bundle(&bundle_path).unwrap();
+        let (extracted, partial) = extract_originals(&catalog, &manifest, &mut archive, &root, |_, _| {}).unwrap();
+        assert_eq!((partial.copied, partial.name_too_long), (1, 0), "{partial:?}");
+        let result = index_bundle(&catalog, &manifest, &extracted, &root, partial).unwrap();
+        assert_eq!((result.restored, result.merge.photos_added), (1, 0), "{result:?}");
+        assert!(name.exists(), "the original is back at the row's name");
+        assert_eq!(row_at(&catalog, &rel), Some((row.id, UUID.to_string(), 0)));
+        assert_eq!(catalog.get_photo(row.id).unwrap().rating, 3);
+    }
+
+    /// The row of the bundle photo's identity holds its long name with a different file: the
+    /// original would need a new ` (n)` name, too long for a sidecar, so it is refused — but
+    /// the photo is the catalog's, and its rating, label and IPTC still fill that row.
+    #[test]
+    fn a_refused_original_whose_identity_has_a_row_still_merges_onto_it() {
+        const UUID: &str = "88888888-8888-4888-8888-888888888888";
+        let (catalog, root) = temp_catalog("relb3-refused-row");
+        let rel = format!("2026/06/28/{}", long_name());
+        let original = root.join(&rel);
+        std::fs::create_dir_all(original.parent().unwrap()).unwrap();
+        std::fs::write(&original, b"THE ROW'S OWN BYTES").unwrap();
+        let row = catalog.upsert_photo_with_identity(&original, None, 1, 19, Some(UUID)).unwrap();
+        let src_dir = temp_dir("relb3-refused-row-src");
+        let src = src_dir.join("x.ARW");
+        std::fs::write(&src, b"FAKE RAW BYTES").unwrap();
+        let bundle_path = bundle_of("relb3-refused-row", vec![(rated_photo(UUID, &rel), Some(src))]);
+
+        let (manifest, mut archive) = open_bundle(&bundle_path).unwrap();
+        let (extracted, partial) = extract_originals(&catalog, &manifest, &mut archive, &root, |_, _| {}).unwrap();
+        assert_eq!((partial.name_too_long, partial.copied, partial.errors), (1, 0, 0), "{partial:?}");
+        let result = index_bundle(&catalog, &manifest, &extracted, &root, partial).unwrap();
+        assert_eq!((result.merge.photos_existing, result.merge.photos_filled), (1, 1), "{:?}", result.merge);
+        let after = catalog.get_photo(row.id).unwrap();
+        assert_eq!((after.rating, after.label.as_str()), (3, "green"));
+        assert_eq!(catalog.get_iptc(row.id).unwrap().city, "Oslo");
+        assert_eq!(photo_paths(&catalog), [rel], "no second row");
+    }
+
+    /// relB3 LOW-A: a metadata-only entry (no original in the bundle) at a name too long for
+    /// a sidecar, for a photo the catalog does not have, gets no row — no import could later
+    /// place its original there with its identity beside it — and is counted as refused. The
+    /// same entry for a photo the catalog has merges onto that row as before.
+    #[test]
+    fn a_metadata_only_photo_at_a_long_name_gets_a_row_only_if_it_has_one() {
+        const UUID: &str = "99999999-9999-4999-8999-999999999999";
+        for has_row in [false, true] {
+            let tag = format!("relb3-meta-{has_row}");
+            let (catalog, root) = temp_catalog(&tag);
+            let rel = format!("2026/06/28/{}", long_name());
+            let row = has_row.then(|| {
+                let file = root.join("2026/06/27/short.ARW");
+                std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+                std::fs::write(&file, b"FAKE RAW BYTES").unwrap();
+                catalog.upsert_photo_with_identity(&file, None, 1, 14, Some(UUID)).unwrap().id
+            });
+            let bundle_path = bundle_of(&tag, vec![(rated_photo(UUID, &rel), None)]);
+
+            let (manifest, mut archive) = open_bundle(&bundle_path).unwrap();
+            let (extracted, partial) = extract_originals(&catalog, &manifest, &mut archive, &root, |_, _| {}).unwrap();
+            let result = index_bundle(&catalog, &manifest, &extracted, &root, partial).unwrap();
+            if let Some(id) = row {
+                assert_eq!((result.name_too_long, result.merge.photos_existing), (0, 1), "{result:?}");
+                assert_eq!(catalog.get_photo(id).unwrap().rating, 3, "merged onto its row");
+                assert_eq!(photo_paths(&catalog), ["2026/06/27/short.ARW"]);
+            } else {
+                assert_eq!((result.name_too_long, result.merge.photos_added), (1, 0), "{result:?}");
+                assert!(photo_paths(&catalog).is_empty(), "no metadata-only row");
+            }
+        }
     }
 
     #[test]

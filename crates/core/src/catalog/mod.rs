@@ -772,6 +772,14 @@ impl Catalog {
         Ok(catalog_uuid(&self.conn)?)
     }
 
+    /// This catalog's identity, as [`read_catalog_uuid`] — a read only, never the
+    /// `INSERT OR IGNORE` [`Self::catalog_uuid`] does. `None` only for a catalog never opened
+    /// through [`Catalog::open`] (every one of those has an identity, minted by the
+    /// migration); a caller on a read path that must not fail on a write error uses this one.
+    pub fn read_catalog_uuid(&self) -> Result<Option<String>> {
+        Ok(read_catalog_uuid(&self.conn)?)
+    }
+
     /// What `photo_id`'s offline thumbnail is kept under (#258): this catalog's identity and
     /// the photo's UUID, read together. A read only — it never mints the catalog's identity,
     /// so it costs a grid tile no write. `None` when the photo is not in the catalog or either

@@ -369,11 +369,22 @@ fn hosts_only(stored: Option<String>) -> Option<String> {
     Some(serde_json::to_string(&map).unwrap())
 }
 
-/// The catalogs this machine records as merged, as the file at `prefs` holds them (#229).
+/// The catalogs this machine records as merged, as the file at `prefs` holds them (#229),
+/// regardless of whether their copy is confirmed cleared yet (#231; see [`cleared_catalogs`]).
 fn merged_catalogs(prefs: &std::path::Path) -> Vec<String> {
+    cleared_catalogs(prefs).into_keys().collect()
+}
+
+/// [`merged_catalogs`], with each catalog's confirmed-cleared state (#231).
+fn cleared_catalogs(prefs: &std::path::Path) -> std::collections::BTreeMap<String, bool> {
     let stored = MachinePrefs::load(prefs.to_path_buf()).get(MACHINE_TILE_HOSTS).unwrap_or_default();
     let map: std::collections::BTreeMap<String, serde_json::Value> = serde_json::from_str(&stored).unwrap_or_default();
-    serde_json::from_value(map.get(MERGED_CATALOGS).cloned().unwrap_or_default()).unwrap_or_default()
+    match map.get(MERGED_CATALOGS) {
+        Some(serde_json::Value::Object(record)) => {
+            record.iter().map(|(uuid, v)| (uuid.clone(), matches!(v, serde_json::Value::Bool(true)))).collect()
+        }
+        _ => Default::default(),
+    }
 }
 
 /// Gate #119, and #214's fail-closed fix. Here every write fails (the store's directory is
@@ -946,6 +957,46 @@ fn a_catalog_whose_clear_was_refused_is_not_merged_again(cx: &mut TestAppContext
     assert_eq!(b_consent(&app, cx), Consent::Allowed, "A's old Deny is not merged over the user's Allow");
     assert_eq!(disk_hosts(&prefs).as_deref(), Some(r#"{"b.example":true}"#));
     assert_eq!(open_a().get_setting(LEGACY_HOSTS).unwrap().as_deref(), Some("{}"), "and the clear went through now");
+}
+
+/// **#231**: catalog A's legacy copy Allows `b.example`; it merges and its clear runs,
+/// uninterrupted, and a later read confirms the clear (`cleared_catalogs` turns `true`). Only
+/// then does something write into A's old per-catalog setting again — a file copy sharing the
+/// UUID, or a pre-#231 build using its old consent UI on a host it has not seen — Denying a
+/// new host `c.example` and (harmlessly) repeating the Allow for `b.example`. The repopulated
+/// Deny merges; the repopulated Allow never does, so a stale copy can only make a host ask
+/// again, never silently allow one.
+#[gpui_kit::test]
+fn a_cleared_catalogs_repopulated_deny_still_merges(cx: &mut TestAppContext) {
+    let dir = TempDir::new("repop");
+    let (app, _fake, prefs) = migration_queued(&dir, r#"{"b.example":true}"#, cx);
+    work(&app, cx); // nothing interrupts this merge: it lands, and so does the clear
+    assert_eq!(b_consent(&app, cx), Consent::Allowed, "the legacy Allow merged");
+    let open_a = || chairphoto_core::catalog::Catalog::open(&dir.0.join("photos.chairphoto"), &dir.0.join("photos")).unwrap();
+    assert_eq!(open_a().get_setting(LEGACY_HOSTS).unwrap().as_deref(), Some("{}"), "cleared");
+    let a_uuid = open_a().catalog_uuid().unwrap();
+    assert_eq!(cleared_catalogs(&prefs).get(&a_uuid), Some(&false), "not yet confirmed: no read has seen it empty");
+
+    // A fresh read confirms the clear, before anything repopulates the copy.
+    reload_module(&app, cx);
+    work(&app, cx);
+    assert_eq!(cleared_catalogs(&prefs).get(&a_uuid), Some(&true), "the clear is confirmed");
+
+    {
+        let guard = app.state.catalog.lock().unwrap();
+        guard.as_ref().unwrap().set_setting(LEGACY_HOSTS, r#"{"b.example":true,"c.example":false}"#).unwrap();
+    }
+    reload_module(&app, cx);
+    work(&app, cx);
+    assert_eq!(b_consent(&app, cx), Consent::Allowed, "legacy's repopulated Allow is never merged");
+    let state = map_state_via_settings(&app, cx);
+    assert_eq!(
+        state.read_with(cx, |s, cx| s.host_consent(cx).get("c.example")),
+        Consent::Denied,
+        "legacy's repopulated Deny merges"
+    );
+    assert_eq!(open_a().get_setting(LEGACY_HOSTS).unwrap().as_deref(), Some("{}"), "cleared again");
+    assert_eq!(cleared_catalogs(&prefs).get(&a_uuid), Some(&false), "pending again until that clear is confirmed");
 }
 
 /// **#198**, the success path: the machine's copy is saved, but the core switches to

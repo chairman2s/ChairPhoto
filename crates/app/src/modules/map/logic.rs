@@ -21,9 +21,13 @@ pub const MACHINE_TILE_HOSTS: &str = "map.tileHosts";
 /// failed is never merged again (#229).
 pub const TILE_HOSTS_KEY: &str = "tileHosts";
 /// The entry of [`MACHINE_TILE_HOSTS`] listing the catalogs (by `settings.catalog_uuid`)
-/// whose old per-catalog answers are already merged into this machine's: a JSON array of
-/// UUIDs. It lives in the answers' own value so it reaches the disk in the very write that
-/// carries the merged answers, never apart from them. Not a host: a host name never holds `#`.
+/// whose old per-catalog answers are already merged into this machine's: a JSON object of
+/// `{<uuid>: <cleared>}`, `cleared` true once a read has found that catalog's copy actually
+/// emptied (`HostConsent::confirm_cleared`). It lives in the answers' own value so it reaches
+/// the disk in the very write that carries the merged answers, never apart from them. Not a
+/// host: a host name never holds `#`. A pre-#231 record is a bare JSON array of UUIDs, with
+/// no cleared state; read as if every one were still pending (never cleared) — the same
+/// "skip the merge, retry the clear" the old build always gave them.
 pub const MERGED_CATALOGS: &str = "#mergedCatalogs";
 /// The module setting holding the tile URL template (`map.tileUrl`, React's key).
 pub const TILE_URL_KEY: &str = "tileUrl";
@@ -50,8 +54,11 @@ pub struct HostConsent {
     answers: BTreeMap<String, bool>,
     /// Hosts reset with "Ask again": `Unknown`, and closed to old per-catalog answers.
     ask: BTreeSet<String>,
-    /// The catalogs whose old answers are merged in ([`MERGED_CATALOGS`]).
-    merged: BTreeSet<String>,
+    /// The catalogs whose old answers are merged in ([`MERGED_CATALOGS`]): `catalog_uuid` ->
+    /// whether a read has since found that catalog's copy actually emptied
+    /// ([`Self::confirm_cleared`]). `false` for one just recorded, or re-recorded after a
+    /// denies-only re-merge (#231) — its copy is not known emptied yet.
+    merged: BTreeMap<String, bool>,
 }
 
 impl HostConsent {
@@ -64,9 +71,20 @@ impl HostConsent {
         let mut consent = HostConsent::default();
         for (host, value) in map {
             match value {
-                serde_json::Value::Array(ids) if host == MERGED_CATALOGS => {
-                    consent.merged.extend(ids.into_iter().filter_map(|id| id.as_str().map(str::to_string)));
+                serde_json::Value::Object(record) if host == MERGED_CATALOGS => {
+                    for (uuid, cleared) in record {
+                        consent.merged.insert(uuid, matches!(cleared, serde_json::Value::Bool(true)));
+                    }
                 }
+                // Pre-#231: a bare array of UUIDs, no cleared state recorded. Treated as
+                // pending (not yet confirmed cleared) for every one of them.
+                serde_json::Value::Array(ids) if host == MERGED_CATALOGS => {
+                    consent.merged.extend(ids.into_iter().filter_map(|id| id.as_str().map(|s| (s.to_string(), false))));
+                }
+                // A corrupt value here (e.g. a stray bool) names no host: it must not fall
+                // through to the arms below and get listed as one (Preferences' allowed
+                // list, `view.rs`). It can't affect consent either way.
+                _ if host == MERGED_CATALOGS => {}
                 serde_json::Value::Bool(a) => {
                     consent.answers.insert(host, a);
                 }
@@ -118,16 +136,64 @@ impl HostConsent {
         changed
     }
 
-    /// Whether the catalog `catalog_uuid`'s old answers are already merged in: a later read of
-    /// that catalog, whose copy survived because emptying it failed, must not merge it again —
-    /// that would undo, "denied wins", an Allow the user gave since (#229).
+    /// Whether the catalog `catalog_uuid`'s old answers are already merged in at all,
+    /// recorded or pending alike. [`Self::is_cleared`] tells whether its copy is confirmed
+    /// emptied since, which decides what a later non-empty read of it means (#229, #231).
     pub fn merged_from(&self, catalog_uuid: &str) -> bool {
-        self.merged.contains(catalog_uuid)
+        self.merged.contains_key(catalog_uuid)
     }
 
-    /// Record that the catalog `catalog_uuid`'s old answers are merged in.
+    /// Whether `catalog_uuid`'s copy has been *confirmed* emptied since it was last recorded
+    /// ([`Self::confirm_cleared`]) — observed, not assumed. `false` for a catalog just
+    /// recorded (its clear has not landed, or was refused by a switch) and for a pre-#231
+    /// record (unknown history, read as still pending): a later non-empty read of it is then
+    /// a retry of the very clear that has not landed yet, and must not be re-merged — that
+    /// would undo, "denied wins", an Allow the user gave since (#229). Once `true`, a later
+    /// non-empty read is new content instead — a file copy sharing the UUID, or a
+    /// pre-#231 build, writing into the copy again — and [`Self::merge_legacy_denies_except`]
+    /// folds in only its Denies (#231).
+    pub fn is_cleared(&self, catalog_uuid: &str) -> bool {
+        self.merged.get(catalog_uuid).copied().unwrap_or(false)
+    }
+
+    /// Record that the catalog `catalog_uuid`'s current legacy content is merged in (or
+    /// deliberately left out, host by host — #214). Its copy is not confirmed emptied by
+    /// this: a later read still finds it non-empty until the clear actually lands, and
+    /// [`Self::confirm_cleared`] is what notices that.
     pub fn record_merged(&mut self, catalog_uuid: &str) {
-        self.merged.insert(catalog_uuid.to_string());
+        self.merged.insert(catalog_uuid.to_string(), false);
+    }
+
+    /// A read found `catalog_uuid`'s copy already empty: if it is recorded and not yet
+    /// known cleared, mark it so, so a *later* non-empty read for this catalog is known to be
+    /// new content, not a retry of this same clear (#231). Returns whether this changed
+    /// anything, so a caller can skip writing when there is nothing to confirm.
+    pub fn confirm_cleared(&mut self, catalog_uuid: &str) -> bool {
+        match self.merged.get_mut(catalog_uuid) {
+            Some(cleared) if !*cleared => {
+                *cleared = true;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// [`merge_legacy_except`](Self::merge_legacy_except), but folds in only `legacy`'s
+    /// denied entries, never an allowed one — the safe direction when the catalog's legacy
+    /// copy reappeared with content after being confirmed emptied (#231): new information is
+    /// not assumed to be an Allow, only ever a Deny. Returns whether anything changed.
+    pub fn merge_legacy_denies_except(&mut self, legacy: &HostConsent, users: impl Fn(&str) -> bool) -> bool {
+        let mut changed = false;
+        for (host, &allowed) in &legacy.answers {
+            if allowed || self.ask.contains(host) || users(host) {
+                continue;
+            }
+            if self.answers.get(host) != Some(&false) {
+                self.answers.insert(host.clone(), false);
+                changed = true;
+            }
+        }
+        changed
     }
 
     pub fn to_json(&self) -> String {
@@ -137,8 +203,9 @@ impl HostConsent {
             map.insert(host, serde_json::Value::String(ASK.into()));
         }
         if !self.merged.is_empty() {
-            let ids = self.merged.iter().map(|id| serde_json::Value::String(id.clone())).collect();
-            map.insert(MERGED_CATALOGS, serde_json::Value::Array(ids));
+            let record: serde_json::Map<String, serde_json::Value> =
+                self.merged.iter().map(|(uuid, &cleared)| (uuid.clone(), serde_json::Value::Bool(cleared))).collect();
+            map.insert(MERGED_CATALOGS, serde_json::Value::Object(record));
         }
         serde_json::to_string(&map).unwrap_or_else(|_| "{}".into())
     }
@@ -308,6 +375,16 @@ mod tests {
         assert_eq!(f.get("tiles.example.org"), Consent::Unknown);
     }
 
+    /// #231 nit: a corrupt `#mergedCatalogs` value (anything but an object or an array) names
+    /// no host — it must not be listed as one (Preferences' Map tab, `view.rs`) — and leaves
+    /// no recorded catalog, since there is nothing readable to record.
+    #[test]
+    fn a_corrupt_merged_catalogs_value_is_not_a_host() {
+        let c = HostConsent::parse(Some(r##"{"#mergedCatalogs":true,"b.example":false}"##));
+        assert_eq!(c.hosts().collect::<Vec<_>>(), vec![("b.example", false)], "the corrupt entry is not a host");
+        assert!(!c.merged_from("true"), "nothing usable was recorded");
+    }
+
     /// Migration from the per-catalog store: only boolean entries count; a host the machine
     /// never answered takes the catalog's answer; on disagreement denied wins, whichever
     /// side denied; agreement changes nothing.
@@ -360,13 +437,15 @@ mod tests {
     }
 
     /// #229: the record of merged catalogs survives a save and a re-read, and the user's own
-    /// answers (which re-serialize the value) keep it; it is neither a host nor an answer.
+    /// answers (which re-serialize the value) keep it; it is neither a host nor an answer. A
+    /// catalog just recorded is not yet known cleared (#231).
     #[test]
     fn the_merged_catalogs_record_round_trips_and_survives_the_users_answers() {
         let mut machine = HostConsent::parse(Some(r#"{"b.example":true}"#));
         assert!(!machine.merged_from("cat-a"));
         machine.record_merged("cat-a");
-        assert_eq!(machine.to_json(), r##"{"#mergedCatalogs":["cat-a"],"b.example":true}"##);
+        assert!(!machine.is_cleared("cat-a"), "not confirmed emptied yet");
+        assert_eq!(machine.to_json(), r##"{"#mergedCatalogs":{"cat-a":false},"b.example":true}"##);
         let mut machine = HostConsent::parse(Some(&machine.to_json()));
         assert!(machine.merged_from("cat-a") && !machine.merged_from("cat-b"));
         machine.set("c.example", false);
@@ -375,6 +454,47 @@ mod tests {
         assert!(back.merged_from("cat-a"), "the user's answers keep the record");
         assert_eq!(back.hosts().collect::<Vec<_>>(), vec![("c.example", false)], "the record is not a host");
         assert_eq!(back.get(MERGED_CATALOGS), Consent::Unknown);
+    }
+
+    /// #231: a pre-#231 record (a bare array of UUIDs) is read as still pending — the same
+    /// "skip the merge, retry the clear" an old build always gave that catalog.
+    #[test]
+    fn a_pre_231_merged_catalogs_array_is_read_as_not_yet_cleared() {
+        let machine = HostConsent::parse(Some(r##"{"#mergedCatalogs":["cat-a"]}"##));
+        assert!(machine.merged_from("cat-a") && !machine.is_cleared("cat-a"));
+    }
+
+    /// #231: once a catalog's copy is confirmed emptied, a later non-empty read is new
+    /// content — its Denies fold in (never an Allow), and recording the re-merge marks it
+    /// pending again, awaiting the clear this content now needs.
+    #[test]
+    fn a_cleared_catalogs_repopulated_copy_merges_only_its_denies() {
+        let mut machine = HostConsent::parse(Some(r#"{"b.example":true}"#));
+        machine.record_merged("cat-a");
+        assert!(machine.confirm_cleared("cat-a"), "first confirmation changes something");
+        assert!(!machine.confirm_cleared("cat-a"), "a second one is a no-op");
+        assert!(machine.is_cleared("cat-a"));
+
+        // Repopulated with a Deny for a never-before-seen host, and (harmlessly) the same
+        // Allow again for b.example.
+        let legacy = HostConsent::parse(Some(r#"{"b.example":true,"c.example":false}"#));
+        assert!(machine.merge_legacy_denies_except(&legacy, |_| false));
+        assert_eq!(machine.get("b.example"), Consent::Allowed, "legacy's Allow is never merged");
+        assert_eq!(machine.get("c.example"), Consent::Denied, "legacy's Deny is merged");
+        machine.record_merged("cat-a");
+        assert!(!machine.is_cleared("cat-a"), "pending again: this content still needs clearing");
+    }
+
+    /// #231: a repopulated Deny never overrides a host the user already answered since the
+    /// merge was queued, same as the first-time merge (#214).
+    #[test]
+    fn a_repopulated_deny_leaves_out_a_host_the_user_answered_meanwhile() {
+        let mut machine = HostConsent::parse(Some(r#"{"b.example":true}"#));
+        machine.record_merged("cat-a");
+        machine.confirm_cleared("cat-a");
+        let legacy = HostConsent::parse(Some(r#"{"b.example":false}"#));
+        assert!(!machine.merge_legacy_denies_except(&legacy, |h| h == "b.example"), "left out, so nothing changed");
+        assert_eq!(machine.get("b.example"), Consent::Allowed, "the user's answer stands");
     }
 
     #[test]

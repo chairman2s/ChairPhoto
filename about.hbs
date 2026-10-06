@@ -1,0 +1,36 @@
+================================================================================
+ChairPhoto — Third-Party Rust Crate Licence Notices
+================================================================================
+
+ChairPhoto itself is licensed GPL-3.0-only (see LICENSE). The binary also links the Rust
+crates listed below, pulled in by `Cargo.lock` for the `chairphoto-app` package as packaged
+(default features, plus `flickr` and `smugmug` — see `packaging/PKGBUILD`'s `build()`).
+Each crate keeps its own license; this file collects their notices in one place, generated
+by `cargo about` from `about.toml` (see `packaging/README.md`, "Third-party notices", for the
+regeneration command). It does not cover ChairPhoto's own bundled non-Rust assets (vendored
+LibRaw, the RAWmakase-derived lens-correction code, the Lucide icon set, the Instrument Sans/
+Serif fonts) — those are documented separately in `MODULE_LICENSING.md` and installed next to
+this file.
+
+Overview
+--------
+{{#each overview}}
+  * {{{name}}} ({{{id}}}): {{count}} crate(s)
+{{/each}}
+
+================================================================================
+
+
+{{#each licenses}}
+--------------------------------------------------------------------------------
+{{{name}}} ({{{id}}})
+--------------------------------------------------------------------------------
+
+Used by:
+{{#each used_by}}
+  - {{{crate.name}}} {{{crate.version}}}
+{{/each}}
+
+{{{text}}}
+
+{{/each}}

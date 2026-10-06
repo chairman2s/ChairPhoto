@@ -13,6 +13,53 @@ separate source of truth.
 | `icons/` | The app icon, installed into `hicolor` at each size `PKGBUILD` needs. |
 | `omarchy/chairphoto.lua` | Hyprland window rule for Omarchy, keeping the app opaque (see below). |
 
+## Third-party notices (`THIRD_PARTY_LICENSES.txt`)
+
+`THIRD_PARTY_LICENSES.txt` (repository root) collects the license text for every crate in
+`chairphoto-app`'s dependency graph as packaged — default features plus the `flickr`/`smugmug`
+opt-ins `build()` enables below — deduplicated by exact text. `PKGBUILD` installs it under
+`/usr/share/licenses/chairphoto/`, next to `LICENSE` and the other bundled notices
+`MODULE_LICENSING.md` documents.
+
+It is generated with [`cargo-about`](https://github.com/EmbarkStudios/cargo-about) from two
+repo-root files: `about.toml` (the accepted-license allowlist and scan settings) and
+`about.hbs` (the plain-text Handlebars template). It is committed rather than generated inside
+`build()`, so a `makepkg` build stays offline — the same reason `prepare()` runs `cargo fetch`
+ahead of time rather than letting `build()` reach the network. Regenerate it after any change
+to `Cargo.lock` (a dependency added, removed, or bumped to a version with different license
+text):
+
+```bash
+cargo install --locked --features cli cargo-about@0.9.2   # once; a dev-only tool, not a build dependency
+cargo about generate about.hbs -m crates/app/Cargo.toml --features flickr,smugmug \
+  --locked --fail -o THIRD_PARTY_LICENSES.txt
+git diff --stat THIRD_PARTY_LICENSES.txt   # review before committing
+```
+
+The version is pinned and must match `.github/workflows/ci.yml`'s "Third-party notices
+staleness check" exactly: `cargo-about`'s own license-detection corpus and output formatting
+can shift between releases even with an unchanged `about.toml`/`about.hbs`, which would make a
+locally-regenerated file read as "stale" against a differently-pinned CI (or vice versa).
+Bump both together, deliberately, when there's a reason to move to a newer `cargo-about`.
+
+`-m crates/app/Cargo.toml` (without `--workspace`) scans the shipped binary's own graph:
+`chairphoto-app` plus its path dependencies `chairphoto-core`/`chairphoto-model`, not every
+workspace member's dev-dependencies. `--fail` makes `cargo-about` exit non-zero if any crate's
+license doesn't resolve against `about.toml`'s `accepted` list, which is how a dependency
+change that introduces a new license gets caught here instead of shipping unreviewed: add the
+new SPDX id to `accepted` (with a comment, matching the ones already there) only after checking
+it's compatible with linking into a GPL-3.0-only binary — permissive is fine, anything
+copyleft needs the same reasoning `MODULE_LICENSING.md` gives for MPL-2.0, and anything else
+needs a maintainer decision, not a reflexive allow. `about.toml`'s `targets` is pinned to
+`x86_64-unknown-linux-gnu` (this package's only target) specifically so a dependency that is
+real in the full cross-platform graph but never actually linked into this binary doesn't need
+vetting at all — lifting that pin during the #244 investigation surfaced exactly one such case,
+`libfuzzer-sys` under the unreviewed `NCSA` license, confirming the filter earns its keep.
+
+CI regenerates the file on every push and fails if it differs from the committed copy
+(`.github/workflows/ci.yml`, "Third-party notices staleness check"), so a `Cargo.lock` change
+that should have come with a regenerated notices file can't merge silently out of date.
+
 ## Why `omarchy/chairphoto.lua` exists
 
 Omarchy 4 tags every window `default-opacity` and applies `opacity = "0.985 0.96"` to the

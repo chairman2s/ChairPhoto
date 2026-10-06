@@ -10,7 +10,15 @@ url="https://github.com/chairman2s/ChairPhoto"
 # reader ported from RAWmakase, and a Feather-derived subset of the embedded Lucide icons.
 # ISC: the rest of the embedded Lucide icons. Apache-2.0: gpui-kit-assets' own 6 non-Lucide
 # icon SVGs. OFL-1.1: the embedded Instrument Sans/Serif fonts. See MODULE_LICENSING.md.
-license=('GPL-3.0-only' 'LGPL-2.1-only' 'MIT' 'ISC' 'Apache-2.0' 'OFL-1.1')
+#
+# The rest (BSD-2-Clause, BSD-3-Clause, Zlib, Unicode-3.0, CC0-1.0, 0BSD, MPL-2.0,
+# CDLA-Permissive-2.0, bzip2-1.0.6) cover the ~600 Rust crates chairphoto-app links at build
+# time (MIT/Apache-2.0 for almost all of them, already listed above) — THIRD_PARTY_LICENSES.txt,
+# installed below, has the per-crate breakdown and text; see MODULE_LICENSING.md and
+# packaging/README.md ("Third-party notices").
+license=('GPL-3.0-only' 'LGPL-2.1-only' 'MIT' 'ISC' 'Apache-2.0' 'OFL-1.1' 'BSD-2-Clause'
+          'BSD-3-Clause' 'Zlib' 'Unicode-3.0' 'CC0-1.0' '0BSD' 'MPL-2.0' 'CDLA-Permissive-2.0'
+          'bzip2-1.0.6')
 
 # Every direct library dependency is listed, per the packaging guidelines: relying on a
 # transitive edge (another depends pulling one of these in) breaks the moment that
@@ -243,6 +251,10 @@ package() {
   # release tarball.
   install -Dm644 crates/app/assets/icons/LICENSE-APACHE-GPUI-KIT-ASSETS \
     "$pkgdir/usr/share/licenses/$pkgname/LICENSE-APACHE-GPUI-KIT-ASSETS"
+  # The ~600 third-party Rust crates chairphoto-app links at build time (#244; MODULE_LICENSING.md,
+  # packaging/README.md "Third-party notices"). Committed and regenerated with `cargo about`,
+  # not built here, so this build stays offline.
+  install -Dm644 THIRD_PARTY_LICENSES.txt "$pkgdir/usr/share/licenses/$pkgname/THIRD_PARTY_LICENSES.txt"
 
   install -Dm644 "packaging/icons/32x32.png" \
     "$pkgdir/usr/share/icons/hicolor/32x32/apps/$pkgname.png"

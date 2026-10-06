@@ -123,5 +123,34 @@ post-merge review of #177 itself:
 Everything else `crates/app/assets` and the gpui-component/gpui-base/gpui-kit crates bring in
 is Rust source code pulled in as an ordinary Cargo dependency (Apache-2.0, per their own
 `LICENSE-APACHE`), not a bundled asset — the same category as the project's other Rust
-dependencies, which this note does not enumerate individually. (Those ~800 MIT/Apache-2.0
-Rust crates' own notices are a broader, separate gap — tracked as #244.)
+dependencies, covered next.
+
+## Third-party Rust crate notices (#244)
+
+`chairphoto-app`'s own dependency graph — everything `Cargo.lock` pulls in for the package as
+shipped (default features, plus the `flickr`/`smugmug` opt-ins `packaging/PKGBUILD` enables;
+`crates/core` and `crates/model` are path dependencies of it, so their graphs are included,
+not scanned separately) — is a little over 600 crates, almost all MIT and/or Apache-2.0, with
+a handful of BSD-2/3-Clause, ISC, Zlib, Unicode-3.0, CC0-1.0, 0BSD, MPL-2.0, bzip2-1.0.6 and
+CDLA-Permissive-2.0 crates mixed in. None of those licenses require a packaged notice file the
+way GPL/LGPL attribution does, but `THIRD_PARTY_LICENSES.txt` collects them anyway, deduplicated
+by exact license text, and the package installs it next to this file's other license texts
+(`packaging/PKGBUILD`).
+
+It is generated with [`cargo-about`](https://github.com/EmbarkStudios/cargo-about) from
+`about.toml` (the accepted-license allowlist, with `targets` pinned to
+`x86_64-unknown-linux-gnu` so a platform-specific dependency this package never actually links —
+one surfaced only once that pin was lifted to check: `libfuzzer-sys`, under the unreviewed
+`NCSA` license — never has to be vetted) and `about.hbs` (the plain-text template). It is
+committed, not generated during `packaging/PKGBUILD`'s `build()`, so a `makepkg` build stays
+offline and needs neither `cargo-about` nor network access; CI instead checks on every push
+that the committed file still matches what `about.toml`/`about.hbs`/`Cargo.lock` would
+generate today (`.github/workflows/ci.yml`), so it cannot silently go stale. See
+`packaging/README.md` ("Third-party notices") for the regeneration command and what to do when
+a dependency change introduces a license `about.toml` doesn't already accept.
+
+MPL-2.0 (`option-ext`) is the one weak-copyleft license in the graph: its share-alike
+obligation attaches only to the MPL-covered file itself, not to code merely linked against it,
+so it does not reach into GPL-3.0-only ChairPhoto's own terms. CDLA-Permissive-2.0
+(`webpki-roots`) licenses a data bundle (Mozilla's CA root certificates), not code, and is
+itself permissive. Both are deliberate entries in `about.toml`'s allowlist, not oversights.

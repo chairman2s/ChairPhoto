@@ -14,6 +14,27 @@ const ACCESS_TOKEN_URL: &str = "https://www.flickr.com/services/oauth/access_tok
 const UPLOAD_URL: &str = "https://up.flickr.com/services/upload/";
 const REST_URL: &str = "https://api.flickr.com/services/rest/";
 
+/// Where each call goes: [`Endpoints::LIVE`] for every public function, a loopback stub in
+/// tests. Every signed request sends its OAuth protocol params (the token and signature
+/// included) in the `Authorization` header, never the URL (#190).
+struct Endpoints<'a> {
+    request_token: &'a str,
+    authorize: &'a str,
+    access_token: &'a str,
+    upload: &'a str,
+    rest: &'a str,
+}
+
+impl Endpoints<'static> {
+    const LIVE: Endpoints<'static> = Endpoints {
+        request_token: REQUEST_TOKEN_URL,
+        authorize: AUTHORIZE_URL,
+        access_token: ACCESS_TOKEN_URL,
+        upload: UPLOAD_URL,
+        rest: REST_URL,
+    };
+}
+
 // ── Photostream fetch ──────────────────────────────────────────────────────────
 
 /// One photo returned by `flickr.people.getPhotos`.
@@ -92,6 +113,16 @@ pub async fn fetch_photostream(
     token: &str,
     token_secret: &str,
 ) -> Result<Vec<FlickrPhoto>, String> {
+    fetch_photostream_at(&Endpoints::LIVE, key, secret, token, token_secret).await
+}
+
+async fn fetch_photostream_at(
+    ep: &Endpoints<'_>,
+    key: &str,
+    secret: &str,
+    token: &str,
+    token_secret: &str,
+) -> Result<Vec<FlickrPhoto>, String> {
     let mut all: Vec<FlickrPhoto> = Vec::new();
     let mut page: u32 = 1;
     loop {
@@ -107,27 +138,30 @@ pub async fn fetch_photostream(
         ];
         let params = oauth1::signed_params(
             "GET",
-            REST_URL,
+            ep.rest,
             key,
             secret,
             Some(token),
             token_secret,
             &extra_params,
         );
-        let url = format!("{REST_URL}?{}", oauth1::query_string(&params));
-        let body = http_get_text(&url).await?;
-        let resp: GetPhotosResponse = serde_json::from_str(&body)
-            .map_err(|e| format!("Flickr photostream JSON parse failed: {e}\nbody: {body}"))?;
+        let body = signed_get_text(ep.rest, &params).await?;
+        // A reply echoed into an error never carries the access token (a signature-failure
+        // reply can quote the signed request).
+        let scrub = |e: String| oauth1::redact(&e, &[token]);
+        let resp: GetPhotosResponse = serde_json::from_str(&body).map_err(|e| {
+            scrub(format!("Flickr photostream JSON parse failed: {e}\nbody: {body}"))
+        })?;
         if resp.stat != "ok" {
-            return Err(format!(
+            return Err(scrub(format!(
                 "Flickr API error {}: {}",
                 resp.code.unwrap_or(0),
                 resp.message.unwrap_or_else(|| resp.stat.clone())
-            ));
+            )));
         }
         let photos_page = resp
             .photos
-            .ok_or_else(|| format!("Flickr response missing photos field\nbody: {body}"))?;
+            .ok_or_else(|| scrub(format!("Flickr response missing photos field\nbody: {body}")))?;
         let total_pages = photos_page.pages;
         for item in photos_page.photo {
             let date_upload_unix: i64 = item.dateupload.trim().parse().unwrap_or(0);
@@ -645,25 +679,31 @@ pub struct AccessToken {
 
 /// Step 1: get a request token (callback "oob") and the authorize URL (write permission).
 pub async fn begin_auth(key: &str, secret: &str) -> Result<RequestToken, String> {
+    begin_auth_at(&Endpoints::LIVE, key, secret).await
+}
+
+async fn begin_auth_at(ep: &Endpoints<'_>, key: &str, secret: &str) -> Result<RequestToken, String> {
     let params = oauth1::signed_params(
         "GET",
-        REQUEST_TOKEN_URL,
+        ep.request_token,
         key,
         secret,
         None,
         "",
         &[("oauth_callback", "oob")],
     );
-    let url = format!("{REQUEST_TOKEN_URL}?{}", oauth1::query_string(&params));
-    let body = http_get_text(&url).await?;
+    let body = signed_get_text(ep.request_token, &params).await?;
     let kv = oauth1::parse_kv(&body);
     let token = kv
         .get("oauth_token")
         .cloned()
         .ok_or_else(|| format!("Flickr returned no request token: {body}"))?;
     let secret = kv.get("oauth_token_secret").cloned().unwrap_or_default();
+    // The one URL that carries a token: the short-lived request token, which the user's
+    // browser must present to authorize it (RFC 5849 §2.2). Never the access token.
     let authorize_url = format!(
-        "{AUTHORIZE_URL}?oauth_token={}&perms=write",
+        "{}?oauth_token={}&perms=write",
+        ep.authorize,
         oauth1::percent_encode(&token)
     );
     Ok(RequestToken {
@@ -681,22 +721,34 @@ pub async fn complete_auth(
     request_secret: &str,
     verifier: &str,
 ) -> Result<AccessToken, String> {
+    complete_auth_at(&Endpoints::LIVE, key, secret, request_token, request_secret, verifier).await
+}
+
+async fn complete_auth_at(
+    ep: &Endpoints<'_>,
+    key: &str,
+    secret: &str,
+    request_token: &str,
+    request_secret: &str,
+    verifier: &str,
+) -> Result<AccessToken, String> {
     let params = oauth1::signed_params(
         "GET",
-        ACCESS_TOKEN_URL,
+        ep.access_token,
         key,
         secret,
         Some(request_token),
         request_secret,
         &[("oauth_verifier", verifier)],
     );
-    let url = format!("{ACCESS_TOKEN_URL}?{}", oauth1::query_string(&params));
-    let body = http_get_text(&url).await?;
+    let body = signed_get_text(ep.access_token, &params).await?;
     let kv = oauth1::parse_kv(&body);
     let token = kv
         .get("oauth_token")
         .cloned()
-        .ok_or_else(|| format!("Flickr authorization failed: {body}"))?;
+        .ok_or_else(|| {
+            oauth1::redact(&format!("Flickr authorization failed: {body}"), &[request_token, verifier])
+        })?;
     let secret = kv.get("oauth_token_secret").cloned().unwrap_or_default();
     let user_nsid = kv.get("user_nsid").cloned().filter(|s| !s.is_empty());
     Ok(AccessToken { token, secret, user_nsid })
@@ -736,6 +788,21 @@ pub async fn upload(
     description: &str,
     tags: &str,
 ) -> Result<String, String> {
+    upload_at(&Endpoints::LIVE, key, secret, token, token_secret, image, title, description, tags).await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn upload_at(
+    ep: &Endpoints<'_>,
+    key: &str,
+    secret: &str,
+    token: &str,
+    token_secret: &str,
+    image: &Path,
+    title: &str,
+    description: &str,
+    tags: &str,
+) -> Result<String, String> {
     let bytes = std::fs::read(image).map_err(|e| format!("couldn't read render: {e}"))?;
     let filename = image
         .file_name()
@@ -753,7 +820,7 @@ pub async fn upload(
     ];
     let params = oauth1::signed_params(
         "POST",
-        UPLOAD_URL,
+        ep.upload,
         key,
         secret,
         Some(token),
@@ -765,7 +832,7 @@ pub async fn upload(
 
     let client = reqwest::Client::new();
     let resp = client
-        .post(UPLOAD_URL)
+        .post(ep.upload)
         .header("Authorization", oauth1::auth_header(&params))
         .header(
             "Content-Type",
@@ -776,11 +843,19 @@ pub async fn upload(
         .await
         .map_err(|e| format!("Flickr upload request failed: {}", e.without_url()))?;
     let text = resp.text().await.map_err(|e| e.without_url().to_string())?;
-    parse_upload_response(&text)
+    parse_upload_response(&text).map_err(|e| oauth1::redact(&e, &[token]))
 }
 
-async fn http_get_text(url: &str) -> Result<String, String> {
-    reqwest::get(url)
+/// GET `url` with the request params of `params` as its query and the protocol params in the
+/// `Authorization` header (RFC 5849 §3.5.1). Errors drop the URL (`without_url`).
+async fn signed_get_text(
+    url: &str,
+    params: &std::collections::BTreeMap<String, String>,
+) -> Result<String, String> {
+    reqwest::Client::new()
+        .get(oauth1::request_url(url, params))
+        .header("Authorization", oauth1::auth_header(params))
+        .send()
         .await
         .map_err(|e| format!("Flickr request failed: {}", e.without_url()))?
         .text()
@@ -869,6 +944,195 @@ mod tests {
         assert!(s.contains("Hi"));
         assert!(s.contains("filename=\"a.jpg\""));
         assert!(s.contains("--B--"));
+    }
+
+    // ── OAuth on the wire (#190): protocol params in the header, never the URL ──
+    //
+    // Every call goes to a loopback stub (`oauth1::stub`), which records the request and
+    // re-derives the HMAC-SHA1 signature from what was actually sent.
+
+    use crate::oauth1::stub::{assert_oauth_in_header_only, Captured, Server};
+    use std::collections::BTreeMap;
+
+    const KEY: &str = "consumer-key";
+    const SECRET: &str = "consumer-secret";
+    const TOKEN: &str = "72157720000000000-access";
+    const TOKEN_SECRET: &str = "access-secret";
+
+    async fn stub(routes: &[(&str, &str)]) -> Server {
+        Server::start(routes.iter().map(|(p, b)| (p.to_string(), b.to_string())).collect()).await
+    }
+
+    fn endpoints(s: &Server) -> (String, String, String, String, String) {
+        (
+            s.url("/services/oauth/request_token"),
+            s.url("/services/oauth/authorize"),
+            s.url("/services/oauth/access_token"),
+            s.url("/services/upload/"),
+            s.url("/services/rest/"),
+        )
+    }
+
+    fn ep(e: &(String, String, String, String, String)) -> Endpoints<'_> {
+        Endpoints { request_token: &e.0, authorize: &e.1, access_token: &e.2, upload: &e.3, rest: &e.4 }
+    }
+
+    fn only(log: Vec<Captured>) -> Captured {
+        assert_eq!(log.len(), 1, "expected one request: {log:?}");
+        log.into_iter().next().unwrap()
+    }
+
+    #[tokio::test]
+    async fn photostream_call_sends_access_token_in_header_only() {
+        let s = stub(&[(
+            "/services/rest/",
+            r#"{"stat":"ok","photos":{"page":1,"pages":1,"photo":[{"id":"9","owner":"o","title":"t"}]}}"#,
+        )])
+        .await;
+        let e = endpoints(&s);
+        let photos = fetch_photostream_at(&ep(&e), KEY, SECRET, TOKEN, TOKEN_SECRET).await.unwrap();
+        assert_eq!(photos.len(), 1);
+
+        let req = only(s.log());
+        assert_eq!(req.method, "GET");
+        assert_oauth_in_header_only(&req, Some(TOKEN));
+        let q = req.query();
+        assert_eq!(q["method"], "flickr.people.getPhotos");
+        assert_eq!(q["page"], "1");
+        assert!(req.verify_signature(&e.4, &BTreeMap::new(), SECRET, TOKEN_SECRET));
+        // The check has teeth: the wrong token secret does not verify.
+        assert!(!req.verify_signature(&e.4, &BTreeMap::new(), SECRET, "other"));
+    }
+
+    #[tokio::test]
+    async fn token_steps_send_callback_and_verifier_in_header_only() {
+        let s = stub(&[
+            (
+                "/services/oauth/request_token",
+                "oauth_callback_confirmed=true&oauth_token=req-token&oauth_token_secret=req-secret",
+            ),
+            (
+                "/services/oauth/access_token",
+                "fullname=A&oauth_token=acc&oauth_token_secret=acc-secret&user_nsid=1%40N00",
+            ),
+        ])
+        .await;
+        let e = endpoints(&s);
+
+        let rt = begin_auth_at(&ep(&e), KEY, SECRET).await.unwrap();
+        assert_eq!((rt.token.as_str(), rt.secret.as_str()), ("req-token", "req-secret"));
+        // The authorize URL is the one place a (request) token belongs in a URL.
+        assert_eq!(rt.authorize_url, format!("{}?oauth_token=req-token&perms=write", e.1));
+        let req = only(s.log());
+        assert_oauth_in_header_only(&req, None);
+        assert_eq!(req.target, "/services/oauth/request_token");
+        assert_eq!(req.oauth_header()["oauth_callback"], "oob");
+        assert!(req.verify_signature(&e.0, &BTreeMap::new(), SECRET, ""));
+
+        let at = complete_auth_at(&ep(&e), KEY, SECRET, "req-token", "req-secret", "123-456")
+            .await
+            .unwrap();
+        assert_eq!((at.token.as_str(), at.user_nsid.as_deref()), ("acc", Some("1@N00")));
+        let log = s.log();
+        let req = &log[1];
+        assert_oauth_in_header_only(req, Some("req-token"));
+        assert_eq!(req.target, "/services/oauth/access_token");
+        assert_eq!(req.oauth_header()["oauth_verifier"], "123-456");
+        assert!(req.verify_signature(&e.2, &BTreeMap::new(), SECRET, "req-secret"));
+    }
+
+    /// The text parts of a `multipart/form-data` body, by name; the file part (one with a
+    /// `filename`) is returned separately.
+    fn multipart_parts(req: &Captured) -> (BTreeMap<String, String>, Option<(String, Vec<u8>)>) {
+        let ct = &req.headers["content-type"];
+        let boundary = ct.split("boundary=").nth(1).expect("a multipart boundary");
+        let delim = format!("--{boundary}");
+        let body = &req.body;
+        let mut fields = BTreeMap::new();
+        let mut file = None;
+        let positions: Vec<usize> = body
+            .windows(delim.len())
+            .enumerate()
+            .filter(|(_, w)| *w == delim.as_bytes())
+            .map(|(i, _)| i)
+            .collect();
+        for pair in positions.windows(2) {
+            let part = &body[pair[0] + delim.len() + 2..pair[1] - 2];
+            let split = part.windows(4).position(|w| w == b"\r\n\r\n").unwrap();
+            let head = String::from_utf8_lossy(&part[..split]).into_owned();
+            let value = part[split + 4..].to_vec();
+            let name = between(&head, "name=\"", "\"").unwrap();
+            if let Some(fname) = between(&head, "filename=\"", "\"") {
+                file = Some((fname, value));
+            } else {
+                fields.insert(name, String::from_utf8(value).unwrap());
+            }
+        }
+        (fields, file)
+    }
+
+    #[tokio::test]
+    async fn upload_signs_text_fields_but_not_the_photo_and_keeps_oauth_out_of_the_url() {
+        let s = stub(&[("/services/upload/", r#"<rsp stat="ok"><photoid>777</photoid></rsp>"#)]).await;
+        let e = endpoints(&s);
+        let dir = std::env::temp_dir().join(format!("chairphoto-flickr-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let jpeg = dir.join("a.jpg");
+        std::fs::write(&jpeg, b"\xff\xd8 not really a jpeg \xff\xd9").unwrap();
+
+        let id = upload_at(&ep(&e), KEY, SECRET, TOKEN, TOKEN_SECRET, &jpeg, "Fjord & sky", "", "oslo \"new york\"")
+            .await
+            .unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(id, "777");
+
+        let req = only(s.log());
+        assert_eq!(req.method, "POST");
+        assert_eq!(req.target, "/services/upload/");
+        assert_oauth_in_header_only(&req, Some(TOKEN));
+        let (fields, file) = multipart_parts(&req);
+        assert_eq!(fields.keys().collect::<Vec<_>>(), ["description", "tags", "title"]);
+        assert_eq!(fields["title"], "Fjord & sky");
+        assert_eq!(file.unwrap(), ("a.jpg".to_string(), b"\xff\xd8 not really a jpeg \xff\xd9".to_vec()));
+        // Flickr's rule: every non-file param is signed (empty description included)…
+        assert!(req.verify_signature(&e.3, &fields, SECRET, TOKEN_SECRET));
+        // …and the photo is not: leaving out a text field, or adding the file, breaks it.
+        let mut without_title = fields.clone();
+        without_title.remove("title");
+        assert!(!req.verify_signature(&e.3, &without_title, SECRET, TOKEN_SECRET));
+        let mut with_photo = fields.clone();
+        with_photo.insert("photo".into(), "x".into());
+        assert!(!req.verify_signature(&e.3, &with_photo, SECRET, TOKEN_SECRET));
+    }
+
+    #[tokio::test]
+    async fn errors_echoing_a_reply_never_carry_the_token() {
+        // A signature-failure reply that quotes the signed request (as Flickr's debug_sbs does).
+        let echo = format!("oauth_problem=signature_invalid&debug_sbs=GET%26x%26oauth_token%253D{TOKEN}");
+        let upload_reply = format!("<rsp>{TOKEN}</rsp>");
+        let s = stub(&[
+            ("/services/rest/", echo.as_str()),
+            ("/services/oauth/access_token", "oauth_problem=token_rejected&debug=req-token%26123-456"),
+            ("/services/upload/", upload_reply.as_str()),
+        ])
+        .await;
+        let e = endpoints(&s);
+        let err = fetch_photostream_at(&ep(&e), KEY, SECRET, TOKEN, TOKEN_SECRET).await.unwrap_err();
+        assert!(err.contains("[redacted]") && !err.contains(TOKEN), "{err}");
+
+        let err = complete_auth_at(&ep(&e), KEY, SECRET, "req-token", "rs", "123-456")
+            .await
+            .err()
+            .unwrap();
+        assert!(!err.contains("req-token") && !err.contains("123-456"), "{err}");
+
+        let dir = std::env::temp_dir().join(format!("chairphoto-flickr-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let jpeg = dir.join("a.jpg");
+        std::fs::write(&jpeg, b"jpeg").unwrap();
+        let err = upload_at(&ep(&e), KEY, SECRET, TOKEN, TOKEN_SECRET, &jpeg, "t", "", "").await.unwrap_err();
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert!(!err.contains(TOKEN), "{err}");
     }
 
     // ── Fix 1: Flickr error responses deserialise without a `photos` key ──────

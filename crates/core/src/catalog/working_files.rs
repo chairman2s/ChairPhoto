@@ -28,12 +28,11 @@ use std::sync::{Condvar, Mutex};
 /// The tag in the name of a file an offload moved aside.
 pub(crate) const ASIDE_TAG: &str = "chairphoto-offload";
 
-/// The longest file name the filesystems a library lives on take, in bytes (`NAME_MAX`).
-const NAME_MAX: usize = 255;
+use crate::scanner::same_photo::NAME_MAX;
 
 /// What `.<name>.<tag>-<pid>-<n>` adds to a name at most: the two dots, the tag, the dashes,
 /// a 10-digit pid and a 20-digit counter.
-const ASIDE_OVERHEAD: usize = 2 + ASIDE_TAG.len() + 2 + 10 + 20;
+const ASIDE_OVERHEAD: usize = crate::scanner::same_photo::hidden_overhead(ASIDE_TAG);
 
 /// Move `file` to a new hidden name beside it, unique to this call; `None` when there was no
 /// `file` to move. The new name is claimed first by an exclusive create, so the rename only
@@ -602,6 +601,25 @@ mod tests {
     /// A 250-byte name cannot take `.<name>.chairphoto-offload-<pid>-<n>` within 255 bytes.
     /// It is moved under its own name into a hidden folder instead; it goes back, or is
     /// deleted, and the folder goes with it.
+    /// Review relA2, NIT-B: the longest name an offload moves aside by its hidden name is
+    /// exactly the longest `same_photo::create_hidden` leaves whole — one shared budget — so
+    /// an aside name, which recovery reads the original back from, is never cut.
+    #[test]
+    fn the_hidden_name_budget_is_shared() {
+        let longest = NAME_MAX - ASIDE_OVERHEAD;
+        let dir = TestTmpDir::new("working-files-budget");
+        let file = dir.join("L".repeat(longest));
+        std::fs::write(&file, b"x").unwrap();
+        let aside = move_aside(&file).unwrap().unwrap();
+        assert!(aside_folder(&aside).is_none(), "moved by its hidden name");
+        let name = aside.file_name().unwrap().to_str().unwrap();
+        assert_eq!(parse(name, &[ASIDE_TAG]).unwrap().original, "L".repeat(longest), "not cut");
+        assert!(put_back(&aside, &file).unwrap());
+        let longer = dir.join("L".repeat(longest + 1));
+        std::fs::write(&longer, b"y").unwrap();
+        assert!(aside_folder(&move_aside(&longer).unwrap().unwrap()).is_some(), "one byte more: a folder");
+    }
+
     #[test]
     fn a_long_name_moves_aside_into_a_hidden_folder() {
         let dir = TestTmpDir::new("working-files-long");

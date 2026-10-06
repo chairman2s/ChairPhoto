@@ -568,11 +568,15 @@ owner's decision (#257, 2026-10-06), implemented as follows:
   — **home still hashes to what the last carry confirmed** there (`carried_hash`, recorded with
   every carried companion: a copy edited at home since, by another machine or program, is a
   two-sided divergence and waits for Replace backup; a row recorded before the hash was kept
-  has none and counts as changed), the local file carries a `chairphoto:LastWrite` no earlier
+  has none and counts as changed until a check finds both sides byte-identical — the
+  inspector's comparison or a Back up records that hash then, so such rows heal by
+  themselves, and only one whose sides already differ waits for Replace backup), the local file carries a `chairphoto:LastWrite` no earlier
   than that confirmation (`carried_at`, else the backup's `created_at`), and **the two differ
   only in properties ChairPhoto's writers own** (IPTC, GPS, identifier, import batch, face
-  regions, the stamp; `xmp::differs_only_in_chairphoto_fields`, compared by namespace, not by
-  layout or prefix) — the carry of Back up (an existing backup's companion pass, a drained
+  regions, the stamp; `xmp::differs_only_in_chairphoto_fields`, compared as trees by
+  namespace, not by layout or prefix; text is kept exactly, and everything outside the first
+  `rdf:RDF` must match too; foreign content inside an owned property — another tool's
+  `dc:title` alternative or region — counts as ChairPhoto's, and the copy at home is kept) — the carry of Back up (an existing backup's companion pass, a drained
   backup op included) and of Offload copies it home again (`carry_companions_home`). A stamp
   and an mtime alone could not tell ChairPhoto's write from another program's that kept both
   (tools preserve unknown namespaces; `exiftool -P`, `rsync -t` and `touch -r` keep the
@@ -588,7 +592,9 @@ owner's decision (#257, 2026-10-06), implemented as follows:
   reason (`storage::replace_backup_as`). It asks first — the question names the files and
   says the copy at home is kept — and the backend refuses without that confirmation. It
   claims the photo (another storage operation on it is refused, as in progress), keeps each
-  differing file at home as `<name>.chairphoto-prev-<n>`, copies and verifies the local
+  file the check listed at home as `<name>.chairphoto-prev-<n>` — the image only when the
+  local one moved on from its recorded hash, so a sidecar-only Replace neither reads nor
+  touches home's image — copies and verifies the local
   version into its name, carries any companion not yet there, and records the image's new
   verified hash; offload is then allowed. The image goes first; if a companion fails
   afterwards the image's new hash is still recorded (home holds it by then) and the error

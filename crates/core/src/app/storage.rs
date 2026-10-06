@@ -572,7 +572,16 @@ pub fn backup_drift_as(
     let candidates = cat.with(|c| c.plan_replace_candidates(photo_id))?;
     let Some(plan) = crate::catalog::resolve_replace_plan(candidates) else { return Ok(None) };
     match crate::catalog::backup_drift(&plan, stop).map_err(|e| crate::catalog::user_reason(&e))? {
-        Some(drift) => Ok(Some(drift)),
+        Some((drift, adopt)) => {
+            // Rows from before `carried_hash` heal here as the check confirms them (LOW-B);
+            // a failure only means the next check or carry tries again.
+            if !adopt.is_empty() {
+                if let Err(e) = cat.with(|c| c.adopt_carried(plan.backup_location_id, &adopt)) {
+                    eprintln!("storage: could not record the confirmed companions of photo {photo_id}: {e}");
+                }
+            }
+            Ok(Some(drift))
+        }
         None => Err(DRIFT_SUPERSEDED.into()),
     }
 }
@@ -872,6 +881,72 @@ mod stack_tests {
         assert_eq!(report.replaced, [], "home already holds it: recorded, nothing kept again");
         assert!(!dir.join("nas/2026/08/DSC1.ARW.chairphoto-prev-3").exists());
         assert_eq!(offload_photo(&state, master).unwrap().freed, vec![master, frame]);
+    }
+
+    /// Review relA2, LOW-B: a companion row from before `carried_hash` heals when a check
+    /// finds both sides identical — after which ChairPhoto's own rewrite goes home by itself.
+    /// One whose sides already differ stays a divergence, and keeps no hash.
+    #[test]
+    fn a_row_without_a_carried_hash_is_adopted_when_both_sides_match() {
+        let (dir, state, master, _frame, raw, _jpg) = stacked("257-adopt");
+        crate::xmp::write_gps(&raw, 59.9, 10.7).unwrap();
+        backup_photo(&state, master).unwrap();
+        let forget = || with_catalog(&state, |c| Ok(c.conn().execute("UPDATE photo_location_companions SET carried_hash = NULL", [])?)).unwrap();
+        let recorded = || {
+            with_catalog(&state, |c| {
+                Ok(c.conn().query_row("SELECT carried_hash FROM photo_location_companions WHERE name = 'DSC1.ARW.xmp'", [], |r| r.get::<_, Option<String>>(0))?)
+            })
+            .unwrap()
+        };
+        forget();
+
+        assert!(!drift(&state, master).changed());
+        assert_eq!(recorded(), Some(crate::catalog::sha256_file(&crate::xmp::sidecar_path(&raw)).unwrap()), "adopted");
+        crate::xmp::write_gps(&raw, 60.4, 5.3).unwrap();
+        assert_eq!(drift(&state, master).own_sidecars, ["DSC1.ARW.xmp"]);
+        backup_photo(&state, master).unwrap();
+        assert_eq!(std::fs::read(dir.join("nas/2026/08/DSC1.ARW.xmp")).unwrap(), std::fs::read(crate::xmp::sidecar_path(&raw)).unwrap());
+
+        // Sides that differ while the row has no hash: no adoption, a divergence.
+        forget();
+        crate::xmp::write_gps(&raw, 61.0, 6.0).unwrap();
+        assert_eq!(drift(&state, master).companions, ["DSC1.ARW.xmp"]);
+        assert_eq!(recorded(), None);
+    }
+
+    /// Review relA2, LOW-A: a Replace confirmed for a sidecar alone replaces the sidecar
+    /// alone. An unchanged local image leaves home's image as it is (not read, not replaced),
+    /// even when home's differs from the recorded hash.
+    #[test]
+    fn replace_takes_only_what_the_drift_check_listed() {
+        let (dir, state, master, _frame, raw, _jpg) = stacked("257-only-listed");
+        crate::xmp::write_gps(&raw, 59.9, 10.7).unwrap();
+        backup_photo(&state, master).unwrap();
+        let home = dir.join("nas/2026/08/DSC1.ARW");
+        std::fs::write(&home, b"rotten!!!").unwrap();
+        let sidecar = crate::xmp::sidecar_path(&raw);
+        let xml = std::fs::read_to_string(&sidecar).unwrap();
+        std::fs::write(&sidecar, xml.replacen("</rdf:Description>", r#"<dt:x xmlns:dt="http://darktable.sf.net/">1</dt:x></rdf:Description>"#, 1)).unwrap();
+        let d = drift(&state, master);
+        assert_eq!((d.image.clone(), d.companions.clone()), (None, vec!["DSC1.ARW.xmp".to_string()]));
+
+        let report = replace(&state, master, true).unwrap();
+
+        assert_eq!(report.replaced, [("DSC1.ARW.xmp".to_string(), "DSC1.ARW.xmp.chairphoto-prev-1".to_string())]);
+        assert_eq!(std::fs::read(&home).unwrap(), b"rotten!!!", "home's image is not the Replace's business here");
+        assert!(!dir.join("nas/2026/08/DSC1.ARW.chairphoto-prev-1").exists());
+    }
+
+    /// Review relA2, NIT-A: the hint names the newest kept copy, by number — prev-10 over prev-9.
+    #[test]
+    fn the_missing_backup_hint_names_the_highest_numbered_kept_copy() {
+        let dir = crate::test_support::TestTmpDir::new("storage-hint-numeric");
+        let home = dir.join("DSC1.ARW");
+        for n in 1..=10 {
+            std::fs::write(dir.join(format!("DSC1.ARW.chairphoto-prev-{n}")), b"x").unwrap();
+        }
+        let hint = crate::catalog::missing_backup_hint(&home).unwrap();
+        assert!(hint.contains("DSC1.ARW.chairphoto-prev-10)"), "{hint}");
     }
 
     /// A sidecar another program changed after the backup is never taken home by itself:

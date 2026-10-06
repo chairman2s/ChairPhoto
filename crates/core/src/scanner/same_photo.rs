@@ -585,6 +585,17 @@ pub(crate) fn create_part(wanted: &Path) -> std::io::Result<(PathBuf, std::fs::F
     create_hidden(wanted, PART_TAG)
 }
 
+/// The longest file name the filesystems a library lives on take, in bytes (`NAME_MAX`).
+pub(crate) const NAME_MAX: usize = 255;
+
+/// What `.<name>.<tag>-<pid>-<n>` adds to a name at most: the two dots, the tag, the two
+/// dashes, a 10-digit pid and a 20-digit counter. Shared with the offload's own long-name rule
+/// (`catalog::working_files::move_aside`), so a name this cuts is never one an offload moves
+/// aside by its hidden name — recovery reads the original name back from that one.
+pub(crate) const fn hidden_overhead(tag: &str) -> usize {
+    4 + tag.len() + 30
+}
+
 /// A new hidden file beside `wanted`, `.<name>.<tag>-<pid>-<n>`, created exclusively under a
 /// name unique to this process and call — a copy's temporary file ([`PART_TAG`]) or the name
 /// an offload moves a local file to while it checks it (`catalog::working_files`).
@@ -598,7 +609,7 @@ pub(crate) fn create_hidden(wanted: &Path, tag: &str) -> std::io::Result<(PathBu
     // person's eye: what a sweep needs is the tag and the pid, and the exclusive create makes
     // every name unique. (An offload's long names never come here — they keep their own
     // name in a hidden folder, `catalog::working_files::move_aside`.)
-    let budget = 255 - (4 + tag.len() + 30);
+    let budget = NAME_MAX - hidden_overhead(tag);
     let mut cut = name.len().min(budget);
     while !name.is_char_boundary(cut) {
         cut -= 1;

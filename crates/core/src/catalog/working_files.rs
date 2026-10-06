@@ -598,9 +598,6 @@ mod tests {
 
     // ── #256 NIT-4: a name too long for a hidden name ────────────────────────────────
 
-    /// A 250-byte name cannot take `.<name>.chairphoto-offload-<pid>-<n>` within 255 bytes.
-    /// It is moved under its own name into a hidden folder instead; it goes back, or is
-    /// deleted, and the folder goes with it.
     /// Review relA2, NIT-B: the longest name an offload moves aside by its hidden name is
     /// exactly the longest `same_photo::create_hidden` leaves whole — one shared budget — so
     /// an aside name, which recovery reads the original back from, is never cut.
@@ -620,6 +617,9 @@ mod tests {
         assert!(aside_folder(&move_aside(&longer).unwrap().unwrap()).is_some(), "one byte more: a folder");
     }
 
+    /// A 250-byte name cannot take `.<name>.chairphoto-offload-<pid>-<n>` within 255 bytes.
+    /// It is moved under its own name into a hidden folder instead; it goes back, or is
+    /// deleted, and the folder goes with it.
     #[test]
     fn a_long_name_moves_aside_into_a_hidden_folder() {
         let dir = TestTmpDir::new("working-files-long");

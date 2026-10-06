@@ -895,8 +895,13 @@ Two modes over the same core location model:
   whose sidecar could not be written — its name (`<name>.xmp`), or a name the sidecar writer
   makes on the way (its `.<sidecar>.<pid>-<hex>.chairphoto-tmp` temp file, its
   `.chairphoto-backup`), over 255 bytes (`xmp::sidecar_fits`, the writer's own budget) — is
-  not imported at all, no row either: its identity could never be written beside it. The
-  result counts it apart ("name too long for a sidecar"), as it does a file whose name fits
+  not imported at all, no row either: its identity could never be written beside it. Only a
+  name the import must make is held to that budget — a new photo's, or a ` (n)` name. A
+  photo the catalog already has keeps the name it has (relB3): a file found already in the
+  library under such a name (#246), and a row's own photo coming back to the row's name
+  after its file was lost (#247; that row's sidecar exists or is owed), are handled as for
+  any other name, and a bundle photo whose identity has a row here still merges onto that
+  row even when its original is refused. The result counts a refused file apart ("name too long for a sidecar"), as it does a file whose name fits
   but whose ` (n)` names, needed because the name is taken, do not. On a filesystem with neither (exFAT, FAT) the name is claimed by an
   exclusive create and the temporary file copied in: still no overwrite, but without that
   crash guarantee. A name is free only when

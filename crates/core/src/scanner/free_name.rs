@@ -158,7 +158,7 @@ impl<'c> CatalogNames<'c> {
 
     /// The first name — `wanted`, then its ` (n)` names in order of `n` — that `arriving`
     /// re-links ([`Self::relinks`]).
-    fn relink_target(&mut self, wanted: &Path, arriving: &Arriving) -> Option<PathBuf> {
+    pub(crate) fn relink_target(&mut self, wanted: &Path, arriving: &Arriving) -> Option<PathBuf> {
         let dir = wanted.parent()?;
         let base = wanted.file_name()?.to_string_lossy().into_owned();
         let key = (

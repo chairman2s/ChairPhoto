@@ -805,6 +805,19 @@ user to merge by hand. Nothing is deleted, but the photo's own sidecar name now 
 thinner file. A write that lands after the offload's last look is beside a freed image,
 untracked (the photo is recorded archived). Both windows are one small file's hash wide.
 
+**Decided (review of #256, (c)): those three writes stay unclaimed.** A claim never waits, so
+a write that meets an offload must be dropped or remembered. An IPTC write can be refused
+because its fields stay owed and the next save or the repair pass writes them. GPS and
+face-region writes have no such record — they are best-effort and only logged when they
+fail — so a refused one would leave the sidecar without the user's change for good, to close
+a window that loses no byte (every file is kept, and the refusal names the one left under its
+hidden name) and is one small file's hash wide. They also run under the catalog lock in the
+catalog and plugin layers (`map::set_photo_gps`, `faces::write_regions`), which have no
+`AppState` and so no claims to take. The identity write does have a debt the repair pass
+retries, but it writes one element of a photo whose identity is owed, and stays with the
+other two rather than add a third rule. Revisit if GPS or face-region writes gain an owed
+record like IPTC's.
+
 Two guards do not depend on the claim. Offload's commit drops exactly the local location
 rows it planned from, by id, so a row added after the plan (a restore) is never dropped with
 them. And every lifecycle copy (`copy_and_verify`, used for images and companions) writes its

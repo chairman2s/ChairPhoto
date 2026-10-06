@@ -637,7 +637,66 @@ pub(crate) fn place_no_replace_without_copy(part: &Path, to: &Path) -> std::io::
     place(part, to, false).map(drop)
 }
 
+/// Every placement ends here: the file gets its name ([`place_unsynced`]), then the folder
+/// holding that name is synced ([`sync_dir_of`]) before the caller records it anywhere.
 fn place(part: &Path, to: &Path, may_copy: bool) -> std::io::Result<Placed> {
+    let placed = place_unsynced(part, to, may_copy)?;
+    sync_dir_of(to);
+    Ok(placed)
+}
+
+/// Make the name `path` was just given durable: fsync the folder holding it (#231, import
+/// review N-1). A file's own `sync_all` makes its bytes durable, not its name: after a
+/// rename or a link the new directory entry can still be lost to a power cut, while the
+/// catalog row recorded right after it says the file is there. Syncing the folder before
+/// the caller records the row closes that. (On ext4 and XFS a directory fsync commits the
+/// journal, which also carries an earlier `create_dir_all` of that folder; on other
+/// filesystems a just-created folder's own entry in its parent is not synced here.)
+///
+/// Best effort: the file is placed either way, and a filesystem that cannot fsync a
+/// directory (some network and FUSE mounts answer `EINVAL`) is no reason to report the
+/// placement failed — the caller would then remove a temporary name that no longer exists
+/// and leave a placed file unrecorded. Any other failure is logged.
+pub(crate) fn sync_dir_of(path: &Path) {
+    #[cfg(test)]
+    dir_sync::note(path);
+    #[cfg(unix)]
+    {
+        let dir = match path.parent() {
+            Some(dir) if !dir.as_os_str().is_empty() => dir,
+            _ => Path::new("."),
+        };
+        if let Err(e) = std::fs::File::open(dir).and_then(|d| d.sync_all()) {
+            use rustix::io::Errno;
+            if !matches!(Errno::from_io_error(&e), Some(Errno::INVAL | Errno::NOTSUP | Errno::BADF)) {
+                eprintln!("storage: could not sync folder {} after placing a file: {e}", dir.display());
+            }
+        }
+    }
+}
+
+/// Which folders this thread's placements synced ([`sync_dir_of`]) — where a test checks a
+/// placement is made durable before it returns.
+#[cfg(test)]
+pub(crate) mod dir_sync {
+    use std::cell::RefCell;
+    use std::path::{Path, PathBuf};
+
+    thread_local! {
+        static SYNCED: RefCell<Vec<PathBuf>> = const { RefCell::new(Vec::new()) };
+    }
+
+    pub(super) fn note(path: &Path) {
+        SYNCED.with(|s| s.borrow_mut().push(path.to_path_buf()));
+    }
+
+    /// The names whose folders were synced since the last call, in order.
+    pub(crate) fn take() -> Vec<PathBuf> {
+        SYNCED.with(|s| std::mem::take(&mut *s.borrow_mut()))
+    }
+}
+
+fn place_unsynced(part: &Path, to: &Path, may_copy: bool) -> std::io::Result<Placed> {
     #[cfg(test)]
     if copy_fallback::forced() {
         if !may_copy {
@@ -1057,6 +1116,37 @@ mod tests {
             place(&part, &free).unwrap();
             assert_eq!(std::fs::read(&free).unwrap(), b"ours", "{how}");
             assert!(!part.exists(), "{how}: the temporary name is gone");
+        }
+    }
+
+    /// #231 (import review N-1): every placement — a no-replace rename, a link, the copy
+    /// fallback, a put-back — syncs the folder of the name it gave before it returns, so a
+    /// power cut after the caller records the file cannot lose the name; a refused one syncs
+    /// nothing.
+    #[test]
+    fn a_placement_syncs_its_folder_before_it_returns() {
+        let dir = temp("placement-sync");
+        let _ = dir_sync::take();
+        type Place = fn(&Path, &Path) -> std::io::Result<()>;
+        let reporting: Place = |part, to| place_no_replace_reporting(part, to).map(drop);
+        let copied: Place = |part, to| {
+            let _forced = copy_fallback::force(|_| {});
+            place_no_replace(part, to)
+        };
+        for (how, place) in [
+            ("no-replace", place_no_replace as Place),
+            ("reporting", reporting),
+            ("without-copy", place_no_replace_without_copy),
+            ("copy", copied),
+        ] {
+            let part = dir.join(format!(".part-{how}"));
+            std::fs::write(&part, b"ours").unwrap();
+            let to = dir.join(format!("placed-{how}"));
+            place(&part, &to).unwrap();
+            assert_eq!(dir_sync::take(), [to.clone()], "{how}");
+            std::fs::write(&part, b"again").unwrap();
+            assert!(place(&part, &to).is_err(), "{how}");
+            assert!(dir_sync::take().is_empty(), "{how}: a refused placement syncs nothing");
         }
     }
 

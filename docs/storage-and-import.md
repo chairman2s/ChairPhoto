@@ -802,8 +802,13 @@ rows it planned from, by id, so a row added after the plan (a restore) is never 
 them. And every lifecycle copy (`copy_and_verify`, used for images and companions) writes its
 own temp file (`.<name>.chairphoto-part-<pid>-<n>`, created exclusively) and places it
 **without replacing** whatever is at the destination — `renameat2(RENAME_NOREPLACE)`, else a
-hard link, else an exclusive create, the import's own placement. Two writers can never
-write into one file. A destination that already exists is accepted only when it hashes to
+hard link, else an exclusive create, the import's own placement — and then syncs the
+folder (`same_photo::sync_dir_of`), before the copy is recorded: a file's own sync makes its
+bytes durable, not its new name, and a power cut after the row is written must not leave it
+pointing at a name that was lost (#231, import review N-1; the import's placements share the
+helper). On ext4 and XFS a folder's sync commits the journal, which also carries a folder the
+copy just created; elsewhere that folder's own entry is not synced. A filesystem that cannot
+sync a folder is not a failure. Two writers can never write into one file. A destination that already exists is accepted only when it hashes to
 the source (another writer placed the same bytes); otherwise the copy fails and that file is
 left untouched. This also means a Restore no longer overwrites a local file that differs
 from the backup: it fails and names the file instead. On a filesystem with neither a

@@ -40,9 +40,13 @@
 //! the photo was opened under (`with_catalog_as` in core). A switch the UI has not heard of
 //! yet makes them fail closed — the autosave reports "The catalog changed…" and keeps the
 //! change unsaved; `catalog:switched` closes the Darkroom without saving (the photo it shows
-//! belongs to a catalog that is no longer open) and returns to the Library. Frames carry the
-//! catalog epoch (`EditJob::catalog_epoch`), so a render for the old catalog's photo id can
-//! never be adopted by a stage of the new one.
+//! belongs to a catalog that is no longer open) and returns to the Library. Renders are bound
+//! the same way (#251): every frame, the clipping layer, the Duel's and the Proof sheet's
+//! variants and the loupe print carry that identity (`EditJob::catalog`), and the worker
+//! renders one only while its catalog is open, checked under the catalog lock — in a switch's
+//! window it renders nothing (`CATALOG_CHANGED`, dropped like a cancellation), never the new
+//! catalog's photo of that id; and a render for the old catalog's photo id can never be
+//! adopted by a stage of the new one, since the keys differ.
 //!
 //! # The filmstrip (#134)
 //!
@@ -162,10 +166,9 @@ pub struct OpenPhoto {
     /// Bumped per open: a worker's answer for an earlier open is dropped.
     pub seq: u64,
     pub photo: Photo,
-    /// The catalog the photo's row was read from: every read and write here is bound to it.
+    /// The catalog the photo's row was read from: every read and write here, and every
+    /// frame its stages render (`EditJob::catalog`, #251), is bound to it.
     pub from: CatalogIdentity,
-    /// `AppModel::catalog_epoch` at the open: the stage's frames are this catalog's.
-    pub epoch: u64,
     /// The version edited (`None`: the Original — the first change creates one).
     pub version_id: Option<i64>,
     /// A commit created `version_id` but its first write failed: the shell has not been
@@ -498,13 +501,12 @@ impl Darkroom {
     fn open_photo(&mut self, photo: Photo, from: CatalogIdentity, version: Option<PhotoVersion>, cx: &mut Context<Self>) {
         self.seq += 1;
         let seq = self.seq;
-        let epoch = self.model.read(cx).catalog_epoch;
         let version = version.filter(|v| v.photo_id == photo.id);
         let working = parse_edit(version.as_ref().map(|v| v.edit_json.as_str()));
         let engine1_version = version.is_some() && is_engine1_version(&working);
         let photo_id = photo.id;
         let pin = photo.cover_pin;
-        let stage = self.new_stage(photo_id, epoch, SourceToken::Preview, None, cx);
+        let stage = self.new_stage(photo_id, from, SourceToken::Preview, None, cx);
         let _stage_observer = cx.observe(&stage, |_, _, cx| cx.notify());
         let committed_json = working.to_json();
         let active = version.as_ref().map(|v| v.id);
@@ -515,7 +517,6 @@ impl Darkroom {
             seq,
             photo,
             from,
-            epoch,
             version_id: active,
             version_unlisted: false,
             versions_len: 0,
@@ -569,7 +570,7 @@ impl Darkroom {
     fn new_stage(
         &self,
         photo_id: i64,
-        epoch: u64,
+        catalog: CatalogIdentity,
         source: SourceToken,
         clip: Option<String>,
         cx: &mut Context<Self>,
@@ -578,7 +579,7 @@ impl Darkroom {
         let log = self.timing_log;
         cx.new(|cx| {
             let json = clip.clone().unwrap_or_default();
-            let mut stage = DarkroomStage::new(pool, photo_id, epoch, source, json, cx);
+            let mut stage = DarkroomStage::new(pool, photo_id, catalog, source, json, cx);
             stage.set_timing_log(log);
             if clip.is_some() {
                 stage.clip_layer()
@@ -833,8 +834,8 @@ impl Darkroom {
         let after = open.source_token().map(str::to_string);
         if before.0 != after {
             let token = after.as_deref().and_then(SourceToken::parse).unwrap_or(SourceToken::Preview);
-            let (photo_id, epoch) = (open.photo.id, open.epoch);
-            let stage = self.new_stage(photo_id, epoch, token, None, cx);
+            let (photo_id, from) = (open.photo.id, open.from);
+            let stage = self.new_stage(photo_id, from, token, None, cx);
             let open = self.open.as_mut().expect("open");
             let old = std::mem::replace(&mut open.stage, stage.clone());
             open._stage_observer = cx.observe(&stage, |_, _, cx| cx.notify());
@@ -939,11 +940,11 @@ impl Darkroom {
     pub fn set_clipping(&mut self, on: bool, cx: &mut Context<Self>) {
         let Some(open) = self.open.as_ref() else { return };
         let token = open.source_token().and_then(SourceToken::parse);
-        let (photo_id, epoch) = (open.photo.id, open.epoch);
+        let (photo_id, from) = (open.photo.id, open.from);
         let json = open.clip_json();
         let clip_stage = match (on, token) {
             (true, Some(token)) => {
-                let stage = self.new_stage(photo_id, epoch, token, Some(json), cx);
+                let stage = self.new_stage(photo_id, from, token, Some(json), cx);
                 stage.update(cx, |s, cx| {
                     s.request(FrameTier::Full, cx);
                 });

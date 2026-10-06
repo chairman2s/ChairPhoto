@@ -296,7 +296,7 @@ implemented — the crop fixes shape, resize would fix pixels.
 - **Transport — in-process, no encode, no protocol.** Every render — the Darkroom stage, the
   loupe's active version, the Duel's two variants, the Proof sheet and the preset browser —
   is an `EditJob { photo_id, edit_json, max_edge, hi_res, base_only, source, clip,
-  catalog_epoch }` (`crates/core/src/image_pool.rs`) submitted to the same bounded LIFO image
+  catalog }` (`crates/core/src/image_pool.rs`) submitted to the same bounded LIFO image
   pool as thumbnails/previews/zoom, under `JobKey::Edit`: the newest job renders first and
   identical jobs coalesce into one render, which is what makes slider spam safe.
   `media::render_edit_image` runs it and hands GPUI the result directly as a BGRA
@@ -305,9 +305,18 @@ implemented — the crop fixes shape, resize would fix pixels.
   image to render from (the camera preview, or a resident RAW by token), `clip: true` asks for
   the sensor-clipping overlay instead of the render, and `base_only: true` renders the
   geometry only (perspective → straighten, no crop, no look). `hi_res: true` renders from the
-  native-size zoom tier instead of the 2048 px proxy. Every job carries the `catalog_epoch` it
-  was asked under, so a request from before a catalog switch can never merge into, or be
-  handed to, one made after. One render path (`media::render_edit_image`) serves every
+  native-size zoom tier instead of the 2048 px proxy. Every job carries the `CatalogIdentity`
+  its photo id was read from (#251) — the Darkroom's open (`OpenPhoto::from`) for the stage,
+  the Duel, the Proof sheet and the loupe print; the shell's rows (`rows_from`) for the
+  loupe's active version — so a request from before a catalog switch can never merge into,
+  or be handed to, one made after. The worker renders a job only while that catalog is still
+  open, checked under the catalog lock together with the photo's read (`with_catalog_as`'s
+  check): a switch publishes the new catalog before `catalog:switched` reaches the UI, and a
+  job reaching a worker in that window answers `CATALOG_CHANGED` and renders nothing, never
+  the new catalog's photo of that id. The front end drops that answer — the stage like a
+  cancellation, `EditRenders` as `RenderState::Stale` (nothing drawn, no failure, not asked
+  again). An engine-2 render that reuses a resident decode, found by photo id alone, checks
+  again after finding it. One render path (`media::render_edit_image`) serves every
   caller, engine-1 and engine-2 alike: it branches internally on the record's engine and on
   whether a resident RAW working image exists for the job's source token.
 - **Loupe:** shows the active version's render when the module is enabled (`renderForLoupe`):

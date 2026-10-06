@@ -409,7 +409,8 @@ fn the_pop_out_shows_the_darkrooms_print(cx: &mut TestAppContext) {
     let h = open(cx);
     let photo = app.wired.shell.read_with(cx, |s, _| s.library.photos().iter().find(|p| p.id == ids[1]).cloned()).unwrap();
     let source = SourceToken::Working { photo_id: ids[1], generation: 7 };
-    let print = LoupePrint { photo, edit_json: "{\"ev\":1}".into(), source: source.clone() };
+    let from = app.wired.shell.read_with(cx, |s, _| s.rows_from()).unwrap();
+    let print = LoupePrint { photo, from, edit_json: "{\"ev\":1}".into(), source: source.clone() };
     app.wired.shell.update(cx, |s, cx| s.set_loupe_print(Some(print), cx));
     cx.run_until_parked();
     assert_eq!(shown(h, cx), Some(ids[1]), "the print's photo");
@@ -425,7 +426,7 @@ fn the_pop_out_shows_the_darkrooms_print(cx: &mut TestAppContext) {
         })
         .collect();
     let lo = edits.into_iter().find(|j| j.max_edge == 2560).expect("the print's render was asked for");
-    assert_eq!((lo.photo_id, lo.edit_json.as_str(), &lo.source), (ids[1], "{\"ev\":1}", &source));
+    assert_eq!((lo.photo_id, lo.edit_json.as_str(), &lo.source, lo.catalog), (ids[1], "{\"ev\":1}", &source, from));
     pool.finish(&JobKey::Edit(lo.clone()), Ok(pixels(40, 20)));
     cx.run_until_parked();
     render_popout(h, cx);
@@ -439,7 +440,7 @@ fn the_pop_out_shows_the_darkrooms_print(cx: &mut TestAppContext) {
     assert_eq!(popout_zoom(cx).read_with(cx, |z, _| z.drawn()), None, "not the print's render");
 
     let photo = app.wired.shell.read_with(cx, |s, _| s.library.photos()[1].clone());
-    app.wired.shell.update(cx, |s, cx| s.set_loupe_print(Some(LoupePrint { photo, edit_json: "{}".into(), source }), cx));
+    app.wired.shell.update(cx, |s, cx| s.set_loupe_print(Some(LoupePrint { photo, from, edit_json: "{}".into(), source }), cx));
     cx.run_until_parked();
     deliver_switch(&app, cx);
     assert!(app.wired.shell.read_with(cx, |s, _| s.loupe_print().is_none()), "a switch takes it down");
@@ -469,7 +470,7 @@ fn the_pop_out_shows_a_proof_sheets_previewed_candidate(cx: &mut TestAppContext)
     cx.run_until_parked();
 
     let candidate = proof_spread(&VersionEdit::default(), &VersionEdit::default(), &[], None)[1].clone();
-    let source = VariantSource::new(ids[1], 0, SourceToken::Preview);
+    let source = VariantSource::new(ids[1], crate::image_tests::identity(0), SourceToken::Preview);
     let cell_image = pixels(40, 30).image;
     let cell = RenderState::Ready(cell_image.clone());
     // No real `ProofSheet` entity here (as the Darkroom's print test also publishes directly):
@@ -560,7 +561,7 @@ fn a_proof_preview_is_scoped_to_its_own_photo_and_catalog(cx: &mut TestAppContex
     cx.run_until_parked();
 
     let candidate = proof_spread(&VersionEdit::default(), &VersionEdit::default(), &[], None)[1].clone();
-    let source = VariantSource::new(ids[1], 0, SourceToken::Preview);
+    let source = VariantSource::new(ids[1], crate::image_tests::identity(0), SourceToken::Preview);
     let sheet = app.wired.images.entity_id();
     let preview_for = |id: i64| LoupeProofPreview {
         sheet,

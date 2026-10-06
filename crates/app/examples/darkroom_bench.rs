@@ -49,7 +49,7 @@ mod bench_catalog;
 
 use chairphoto_app::darkroom::{failed_frames, fast_wait, frame_outcome, FrameOutcome, FrameTier, SETTLE};
 use chairphoto_app::image_store::Loaded;
-use chairphoto_core::app::{catalog_identity, editing, runtime, with_catalog, AppState};
+use chairphoto_core::app::{catalog_identity, editing, runtime, with_catalog, AppState, CatalogIdentity};
 use chairphoto_core::catalog::PhotoQuery;
 use chairphoto_core::develop_source::DevelopSource;
 use chairphoto_core::image_pool::{self, EditJob, ImagePool, JobKey, Respond};
@@ -116,7 +116,7 @@ fn record(ev: f64, engine2: bool) -> String {
     }
 }
 
-fn drag(pool: &ImagePool<Loaded>, photo: i64, source: SourceToken) -> Vec<FrameSample> {
+fn drag(pool: &ImagePool<Loaded>, catalog: CatalogIdentity, photo: i64, source: SourceToken) -> Vec<FrameSample> {
     let engine2 = source != SourceToken::Preview;
     let (tx, rx) = mpsc::channel::<Answer>();
     let t0 = Instant::now();
@@ -132,7 +132,7 @@ fn drag(pool: &ImagePool<Loaded>, photo: i64, source: SourceToken) -> Vec<FrameS
             base_only: false,
             source: source.clone(),
             clip: false,
-            catalog_epoch: 0,
+            catalog,
         });
         // A newer request cancels the older queued ones (DarkroomStage::cancel_older; every
         // generation's record differs, so none merged into an older request here).
@@ -254,12 +254,14 @@ fn main() {
     let threads = image_pool::default_thread_count();
     println!("catalog {} · {} photos · {threads} workers · build {}", path.display(), ids.len(), if cfg!(debug_assertions) { "debug (not release numbers)" } else { "release" });
     let pool: Arc<ImagePool<Loaded>> = ImagePool::start_with_runner(threads, chairphoto_app::image_store::runner(state.clone()));
+    // Every frame is asked for the photos of the catalog open now (`EditJob::catalog`, #251).
+    let catalog = catalog_identity(&state).expect("a catalog is open");
     let mut failed_total = 0;
     for id in ids {
         let source = source_for(&state, id);
         // Warm the framed-base cache and the proxy decode, as opening the photo does.
-        let warm = drag(&pool, id, source.clone());
-        let samples = drag(&pool, id, source.clone());
+        let warm = drag(&pool, catalog, id, source.clone());
+        let samples = drag(&pool, catalog, id, source.clone());
         let s = summarize(&samples);
         let fast_latency: Vec<f64> =
             samples.iter().filter(|s| s.tier == Tier::Fast).filter_map(|s| s.painted.map(|p| p - s.requested)).collect();

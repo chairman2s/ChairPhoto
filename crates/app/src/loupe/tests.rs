@@ -949,7 +949,7 @@ mod overlays {
     fn the_duel_renders_its_pair_applies_picks_and_closes(cx: &mut TestAppContext) {
         let (app, pool, _dir, ids) = app_with(1, "duel", cx);
         let images = app.wired.images.clone();
-        let source = VariantSource::new(ids[0], 3, SourceToken::Preview);
+        let source = VariantSource::new(ids[0], crate::image_tests::identity(3), SourceToken::Preview);
         let events: Rc<RefCell<Vec<DuelEvent>>> = Rc::default();
         let (handle, duel) = cx
             .update(|cx| {
@@ -964,7 +964,7 @@ mod overlays {
         });
         let first = edits(&pool);
         assert_eq!(first.len(), 2);
-        assert!(first.iter().all(|j| j.max_edge == DUEL_EDGE && j.catalog_epoch == 3 && j.photo_id == ids[0]));
+        assert!(first.iter().all(|j| j.max_edge == DUEL_EDGE && j.catalog == crate::image_tests::identity(3) && j.photo_id == ids[0]));
         let pair = duel.read_with(cx, |d, _| d.pair());
         assert_eq!(first[1].edit_json, pair[1].to_json());
 
@@ -994,7 +994,7 @@ mod overlays {
         let images = app.wired.images.clone();
         let candidates = proof_spread(&VersionEdit::default(), &VersionEdit::default(), &[], None);
         let n = candidates.len();
-        let source = VariantSource::new(ids[0], 0, SourceToken::Preview);
+        let source = VariantSource::new(ids[0], crate::image_tests::identity(0), SourceToken::Preview);
         let events: Rc<RefCell<Vec<ProofEvent>>> = Rc::default();
         let (handle, sheet) = cx
             .update(|cx| {
@@ -1026,7 +1026,7 @@ mod overlays {
             .update(|cx| {
                 let images = app.wired.images.clone();
                 let shell = app.wired.shell.clone();
-                let source = VariantSource::new(ids[0], 0, SourceToken::Preview);
+                let source = VariantSource::new(ids[0], crate::image_tests::identity(0), SourceToken::Preview);
                 gpui_kit::open_window(Default::default(), cx, |window, cx| {
                     cx.new(|cx| ProofSheet::new(&images, shell, source, candidates, window, cx))
                 })
@@ -1057,7 +1057,7 @@ mod overlays {
         let images = app.wired.images.clone();
         let shell = app.wired.shell.clone();
         let candidates = proof_spread(&VersionEdit::default(), &VersionEdit::default(), &[], None);
-        let source = VariantSource::new(ids[0], 0, SourceToken::Preview);
+        let source = VariantSource::new(ids[0], crate::image_tests::identity(0), SourceToken::Preview);
         let (handle, sheet) = cx
             .update(|cx| {
                 let candidates = candidates.clone();
@@ -1113,7 +1113,7 @@ mod overlays {
             .update(|cx| {
                 let candidates = candidates.clone();
                 let shell = shell.clone();
-                let source = VariantSource::new(ids[0], 0, SourceToken::Preview);
+                let source = VariantSource::new(ids[0], crate::image_tests::identity(0), SourceToken::Preview);
                 gpui_kit::open_window(Default::default(), cx, |window, cx| {
                     cx.new(|cx| ProofSheet::new(&images, shell, source, candidates, window, cx))
                 })
@@ -1139,7 +1139,7 @@ mod overlays {
             .update(|cx| {
                 let images = app.wired.images.clone();
                 let shell = shell.clone();
-                let source = VariantSource::new(ids[0], 0, SourceToken::Preview);
+                let source = VariantSource::new(ids[0], crate::image_tests::identity(0), SourceToken::Preview);
                 gpui_kit::open_window(Default::default(), cx, |window, cx| {
                     cx.new(|cx| ProofSheet::new(&images, shell, source, candidates, window, cx))
                 })
@@ -1173,7 +1173,7 @@ mod overlays {
         let images = app.wired.images.clone();
         let shell = app.wired.shell.clone();
         let candidates = proof_spread(&VersionEdit::default(), &VersionEdit::default(), &[], None);
-        let source = VariantSource::new(ids[0], 0, SourceToken::Preview);
+        let source = VariantSource::new(ids[0], crate::image_tests::identity(0), SourceToken::Preview);
         let (handle, sheet) = cx
             .update(|cx| {
                 let candidates = candidates.clone();
@@ -1218,7 +1218,7 @@ mod overlays {
         let images = app.wired.images.clone();
         let shell = app.wired.shell.clone();
         let candidates = proof_spread(&VersionEdit::default(), &VersionEdit::default(), &[], None);
-        let source = VariantSource::new(ids[0], 0, SourceToken::Preview);
+        let source = VariantSource::new(ids[0], crate::image_tests::identity(0), SourceToken::Preview);
         let job = source.job(&candidates[1].record, PROOF_EDGE);
         let (handle, _sheet) = cx
             .update(|cx| {
@@ -1269,7 +1269,7 @@ mod overlays {
                 let images = images.clone();
                 let candidates = candidates.clone();
                 let shell = shell.clone();
-                let source = VariantSource::new(ids[0], 0, SourceToken::Preview);
+                let source = VariantSource::new(ids[0], crate::image_tests::identity(0), SourceToken::Preview);
                 gpui_kit::open_window(Default::default(), cx, |window, cx| {
                     cx.new(|cx| ProofSheet::new(&images, shell, source, candidates, window, cx))
                 })
@@ -1282,7 +1282,7 @@ mod overlays {
             .update(|cx| {
                 let candidates = candidates.clone();
                 let shell = shell.clone();
-                let source = VariantSource::new(ids[0], 0, SourceToken::Preview);
+                let source = VariantSource::new(ids[0], crate::image_tests::identity(0), SourceToken::Preview);
                 gpui_kit::open_window(Default::default(), cx, |window, cx| {
                     cx.new(|cx| ProofSheet::new(&images, shell, source, candidates, window, cx))
                 })
@@ -1321,7 +1321,7 @@ mod overlays {
         let (handle, sheet) = cx
             .update(|cx| {
                 let shell = shell.clone();
-                let source = VariantSource::new(ids[0], 0, SourceToken::Preview);
+                let source = VariantSource::new(ids[0], crate::image_tests::identity(0), SourceToken::Preview);
                 gpui_kit::open_window(Default::default(), cx, |window, cx| {
                     cx.new(|cx| ProofSheet::new(&images, shell, source, candidates, window, cx))
                 })
@@ -1361,7 +1361,7 @@ mod overlays {
         let candidates = proof_spread(&VersionEdit::default(), &VersionEdit::default(), &[], None);
 
         // Sheet A, on a different photo, in its own window, never hovered or focused.
-        let source_a = VariantSource::new(ids[0], 0, SourceToken::Preview);
+        let source_a = VariantSource::new(ids[0], crate::image_tests::identity(0), SourceToken::Preview);
         let a_job = source_a.job(&candidates[0].record, PROOF_EDGE);
         cx.update(|cx| {
             let images = images.clone();
@@ -1378,7 +1378,7 @@ mod overlays {
             .update(|cx| {
                 let candidates = candidates.clone();
                 let shell = shell.clone();
-                let source = VariantSource::new(ids[1], 0, SourceToken::Preview);
+                let source = VariantSource::new(ids[1], crate::image_tests::identity(0), SourceToken::Preview);
                 gpui_kit::open_window(Default::default(), cx, |window, cx| {
                     cx.new(|cx| ProofSheet::new(&images, shell, source, candidates, window, cx))
                 })
@@ -1420,7 +1420,7 @@ mod overlays {
                     let images = images.clone();
                     let candidates = candidates.clone();
                     let shell = shell.clone();
-                    let source = VariantSource::new(ids[k], 0, SourceToken::Preview);
+                    let source = VariantSource::new(ids[k], crate::image_tests::identity(0), SourceToken::Preview);
                     gpui_kit::open_window(Default::default(), cx, |window, cx| {
                         cx.new(|cx| ProofSheet::new(&images, shell, source, candidates, window, cx))
                     })
@@ -1455,7 +1455,7 @@ mod overlays {
         let shell = app.wired.shell.clone();
         let candidates = proof_spread(&VersionEdit::default(), &VersionEdit::default(), &[], None);
         let n = candidates.len();
-        let source = VariantSource::new(ids[0], 0, SourceToken::Preview);
+        let source = VariantSource::new(ids[0], crate::image_tests::identity(0), SourceToken::Preview);
         let events: Rc<RefCell<Vec<ProofEvent>>> = Rc::default();
         let (handle, sheet) = cx
             .update(|cx| {
@@ -1525,7 +1525,7 @@ mod overlays {
         let shell = app.wired.shell.clone();
         let candidates = proof_spread(&VersionEdit::default(), &VersionEdit::default(), &[], None);
         let n = candidates.len();
-        let source = VariantSource::new(ids[0], 0, SourceToken::Preview);
+        let source = VariantSource::new(ids[0], crate::image_tests::identity(0), SourceToken::Preview);
         let (handle, sheet) = cx
             .update(|cx| {
                 let candidates = candidates.clone();
@@ -1605,7 +1605,7 @@ mod overlays {
         let images = app.wired.images.clone();
         let shell = app.wired.shell.clone();
         let candidates = proof_spread(&VersionEdit::default(), &VersionEdit::default(), &[], None);
-        let source = VariantSource::new(ids[0], 0, SourceToken::Preview);
+        let source = VariantSource::new(ids[0], crate::image_tests::identity(0), SourceToken::Preview);
         let (handle, sheet) = cx
             .update(|cx| {
                 let candidates = candidates.clone();
@@ -1649,8 +1649,8 @@ mod overlays {
             let pool: Arc<dyn crate::image_store::Submit> = pool.clone();
             cx.new(|cx| EditRenders::new(pool, cx))
         });
-        let a = crate::loupe::edit_renders::preview_job(1, "{}", 320, false, 0);
-        let b = crate::loupe::edit_renders::preview_job(1, "{\"ev\":1}", 320, false, 0);
+        let a = crate::loupe::edit_renders::preview_job(1, "{}", 320, false, crate::image_tests::identity(0));
+        let b = crate::loupe::edit_renders::preview_job(1, "{\"ev\":1}", 320, false, crate::image_tests::identity(0));
         renders.update(cx, |r, cx| r.want(&[a.clone()], cx));
         pool.start(JobKey::Edit(a.clone())); // running: cannot be cancelled
         renders.update(cx, |r, cx| r.want(&[b.clone()], cx));
@@ -1700,6 +1700,88 @@ mod overlays {
         pool.finish(&preview(ids[1]), Ok(pixels(30, 20)));
         cx.run_until_parked();
         assert_eq!(drawn(&app, cx), Some((ids[1], Drawn::Preview)));
+    }
+
+    // --- the active version's render across a catalog switch (#251) ----------------------
+
+    /// The loupe's active-version render is bound to the catalog its rows were read from. The
+    /// core switches to B — whose photo has the same id and a version with the same record —
+    /// while A's render is on a worker: the real worker body renders nothing for it
+    /// (`CATALOG_CHANGED`), and the loupe draws nothing for it, not asking again — whether or not
+    /// `catalog:switched` reached the UI before that answer. Once B's rows are in, B's version
+    /// is asked for B and renders as usual.
+    fn active_version_across_a_switch(delivered: bool, cx: &mut TestAppContext) {
+        use chairphoto_core::app::CATALOG_CHANGED;
+        let tag = if delivered { "loupe-version-switch-ev" } else { "loupe-version-switch" };
+        let (app, pool, dir, ids) = app_with(2, tag, cx);
+        let version_of = |app: &App, id: i64| {
+            let guard = app.state.catalog.lock().unwrap();
+            guard.as_ref().unwrap().list_versions(id).unwrap().pop().unwrap()
+        };
+        {
+            let guard = app.state.catalog.lock().unwrap();
+            let c = guard.as_ref().unwrap();
+            let v = c.create_version(ids[0], "A's").unwrap();
+            c.set_version_edit(v, "{\"ev\":0.5}").unwrap();
+        }
+        select(&app, ids[0], cx);
+        press(&app, "enter", cx);
+        let in_a = version_of(&app, ids[0]);
+        app.wired.shell.update(cx, |s, cx| s.set_active_version(Some(in_a), cx));
+        cx.run_until_parked();
+        let a = app.wired.shell.read_with(cx, |s, _| s.rows_from()).unwrap();
+        let lo = edits_ever(&pool).into_iter().find(|j| j.max_edge == 2560).expect("A's fit render");
+        assert_eq!((lo.photo_id, lo.catalog), (ids[0], a), "bound to the rows' catalog");
+        pool.finish(&preview(ids[0]), Ok(pixels(30, 20)));
+        let key = JobKey::Edit(lo.clone());
+        pool.start(key.clone()); // on a worker: it cannot be cancelled
+
+        let (b, b_ids) = colliding_catalog(&dir, "b", 2);
+        assert_eq!(b_ids, ids, "the ids collide");
+        let v = b.create_version(b_ids[0], "B's").unwrap();
+        b.set_version_edit(v, "{\"ev\":0.5}").unwrap();
+        core_switch(&app, b);
+        if delivered {
+            deliver_switch(&app, cx);
+        }
+        let run = crate::image_store::runner(app.state.clone());
+        let answer = run(key.clone());
+        assert_eq!(answer.as_ref().map(|_| ()).map_err(String::as_str), Err(CATALOG_CHANGED), "rendered in B");
+        pool.finish(&key, answer);
+        cx.run_until_parked();
+        if !delivered {
+            assert_eq!(drawn(&app, cx), None, "nothing drawn for the version (blank, as while it renders): never B's photo");
+            assert_eq!(edits_ever(&pool).iter().filter(|j| **j == lo).count(), 1, "a stale render is not asked again");
+            deliver_switch(&app, cx);
+        }
+
+        // B's rows are in: B's version, asked for B.
+        let b_from = app.wired.shell.read_with(cx, |s, _| s.rows_from()).expect("B's rows");
+        assert_ne!(b_from, a);
+        select(&app, ids[0], cx);
+        press(&app, "enter", cx);
+        let in_b = version_of(&app, ids[0]);
+        app.wired.shell.update(cx, |s, cx| s.set_active_version(Some(in_b), cx));
+        cx.run_until_parked();
+        let lo_b = edits_ever(&pool).into_iter().filter(|j| j.max_edge == 2560).last().unwrap();
+        assert_eq!((lo_b.photo_id, lo_b.edit_json.as_str(), lo_b.catalog), (ids[0], "{\"ev\":0.5}", b_from));
+        assert_ne!(lo_b, lo, "never one pool job with A's");
+        let e = run(JobKey::Edit(lo_b.clone())).map(|_| ()).unwrap_err();
+        assert!(e.contains("no reachable copy"), "past the check, resolved in B: {e}");
+        pool.finish(&preview(ids[0]), Ok(pixels(30, 20)));
+        pool.finish(&JobKey::Edit(lo_b), Ok(pixels(40, 20)));
+        cx.run_until_parked();
+        assert_eq!(drawn(&app, cx), Some((ids[0], Drawn::OverrideLo)));
+    }
+
+    #[gpui_kit::test]
+    fn an_active_version_render_before_an_unannounced_switch_draws_nothing_of_the_new_catalog(cx: &mut TestAppContext) {
+        active_version_across_a_switch(false, cx);
+    }
+
+    #[gpui_kit::test]
+    fn an_active_version_render_before_an_announced_switch_draws_nothing_of_the_new_catalog(cx: &mut TestAppContext) {
+        active_version_across_a_switch(true, cx);
     }
 
     fn edits_ever(pool: &FakePool) -> Vec<chairphoto_core::image_pool::EditJob> {

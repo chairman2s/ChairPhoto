@@ -232,6 +232,24 @@ pub fn render_edit_image(state: &AppState, job: &crate::image_pool::EditJob) -> 
 }
 
 #[cfg(feature = "edit")]
+/// `f` on the open catalog, only while it is the one `job` was asked for (`EditJob::catalog`,
+/// #251) — `app::with_catalog_as`'s check and read under one lock hold — else
+/// [`CATALOG_CHANGED`](crate::app::CATALOG_CHANGED), the answer a front end drops as stale.
+/// Unlike `with_catalog_as`, no catalog open at all (a switch between its two phases) is the
+/// same answer: the job's catalog is not open either way.
+fn in_job_catalog<T>(
+    state: &AppState,
+    job: &crate::image_pool::EditJob,
+    f: impl FnOnce(&crate::catalog::Catalog) -> crate::catalog::Result<T>,
+) -> Result<T, String> {
+    let guard = state.catalog.lock().map_err(|e| e.to_string())?;
+    match guard.as_ref() {
+        Some(catalog) if job.catalog.is(catalog) => f(catalog).map_err(|e| e.to_string()),
+        _ => Err(crate::app::CATALOG_CHANGED.into()),
+    }
+}
+
+#[cfg(feature = "edit")]
 /// [`render_edit_image`]'s body: a frame, or the clipping overlay as the renderer encoded it.
 fn render_edit(
     state: &AppState,
@@ -239,6 +257,15 @@ fn render_edit(
     t: &mut crate::plugins::edit::timing::Stages,
 ) -> Result<EditOut, String> {
     use crate::plugins::edit::{self, RenderOpts, RenderSource, SourceToken};
+    // The job's photo id is its catalog's (#251): read under the catalog lock only while that
+    // catalog is still the open one, or answer `CATALOG_CHANGED` and render nothing. The check
+    // and the read share one lock hold ([`in_job_catalog`]), so no switch fits between them.
+    // A working-image job reads no row, but its photo belongs to a catalog all the same: it
+    // is checked too, so every edit job of a catalog no longer open is refused alike.
+    let candidates = in_job_catalog(state, job, |c| match &job.source {
+        SourceToken::Working { .. } => Ok(Vec::new()),
+        _ => c.photo_path_candidates(job.photo_id),
+    })?;
     // A working-image token renders from the resident RAW decode, or nothing: a stale
     // token (photo switched, session closed) is a 404, never a fallback to other pixels.
     if let SourceToken::Working { .. } = &job.source {
@@ -261,13 +288,9 @@ fn render_edit(
         t.mark("render");
         return Ok(EditOut::Frame(out));
     }
-    // Gather path candidates under a brief lock (pure SQL), then stat + decode + render
-    // off the lock so a slow/offline NAS can't serialize the app.
-    let candidates = {
-        let guard = state.catalog.lock().map_err(|e| e.to_string())?;
-        let catalog = guard.as_ref().ok_or("No catalog is open")?;
-        catalog.photo_path_candidates(job.photo_id).map_err(|e| e.to_string())?
-    };
+    // The path candidates were gathered above under a brief lock (pure SQL); stat + decode +
+    // render run off the lock so a slow/offline NAS can't serialize the app. The paths are
+    // the job's catalog's photo, so the pixels read from them are too, whatever opens next.
     t.mark("candidates");
     // OriginalRequired: an edit render needs the real original, so a cached-unreachable
     // flag must never stand in for a stat.
@@ -289,6 +312,11 @@ fn render_edit(
     if edit::record_engine(&job.edit_json) == 2 {
         let budget = crate::develop::session::cache_budget_bytes(state);
         let (token, image) = crate::develop::offline::working_image_for(job.photo_id, &path, budget)?;
+        // `working_image_for` reuses a resident decode found by photo id alone, which a switch
+        // landing after the check above could have made another catalog's. The job's catalog
+        // still open now means no switch came between (identities never repeat, and every
+        // switch releases the resident set), so the image is this catalog's photo.
+        in_job_catalog(state, job, |_| Ok(()))?;
         t.mark("working_image");
         let out = edit::render_proxy(RenderSource::Working { token, image }, &job.edit_json, job.max_edge, opts)?;
         t.mark("render");

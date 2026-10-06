@@ -32,7 +32,8 @@ fn catalog_with_files(app: &App, dir: &TempDir, n: usize, cx: &mut TestAppContex
     // `~/.cache` (#228). The `test-hooks` feature is what makes `set_test_frame_root` reach
     // this crate at all: without it `FrameDir::create()` always calls the real
     // `crate::thumbnails::cache_dir()`, since core's own `cfg(test)` override does not exist
-    // when core is an ordinary (non-`cfg(test)`) dependency.
+    // when core is an ordinary (non-`cfg(test)`) dependency. Unix-only, like the hook itself.
+    #[cfg(unix)]
     set_test_frame_root(&dir.0.join("cache"));
     let db = dir.0.join("photos.chairphoto");
     let root = dir.0.join("photos");
@@ -260,11 +261,17 @@ fn render_writes_the_movie_through_the_worker(cx: &mut TestAppContext) {
     }
     // #228: the render's frames went under this test's own TempDir, never the real
     // `~/.cache` `catalog_with_files`'s `set_test_frame_root` call steers them away from.
-    let paths = frame_paths.lock().unwrap();
-    assert_eq!(paths.len(), 2, "one frame per photo");
-    for p in paths.iter() {
-        assert!(p.starts_with(&dir.0), "frame {} is not under this test's TempDir {}", p.display(), dir.0.display());
+    // Unix-only, like that call: elsewhere the frames go to the real cache dir.
+    #[cfg(unix)]
+    {
+        let paths = frame_paths.lock().unwrap();
+        assert_eq!(paths.len(), 2, "one frame per photo");
+        for p in paths.iter() {
+            assert!(p.starts_with(&dir.0), "frame {} is not under this test's TempDir {}", p.display(), dir.0.display());
+        }
     }
+    #[cfg(not(unix))]
+    drop(frame_paths);
 }
 
 /// Progress moves the bar only for this dialog's job; Cancel after the claim trips that job,

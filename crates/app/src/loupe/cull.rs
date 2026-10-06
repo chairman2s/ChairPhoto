@@ -515,10 +515,13 @@ impl Render for CullView {
                 .into_any_element();
         };
         let total = self.state.photos().len();
-        let image = self.images.update(cx, |s, _| match s.get(photo.id, ImageKind::Preview) {
+        // The session's photos were read from `from`: only pixels rendered there are drawn
+        // (#258), so a switch whose event has not arrived never shows the new catalog's photo.
+        let from = Some(self.from);
+        let image = self.images.update(cx, |s, _| match s.get_in(photo.id, ImageKind::Preview, from) {
             ImageState::Ready(l) => Ok(Some(l.image)),
             ImageState::Failed(_) => Err(()),
-            _ => match s.peek(photo.id, ImageKind::Thumb) {
+            _ => match s.peek_in(photo.id, ImageKind::Thumb, from) {
                 ImageState::Ready(l) => Ok(Some(l.image)),
                 _ => Ok(None),
             },

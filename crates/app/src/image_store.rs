@@ -85,6 +85,18 @@
 //!   a Thumb; the People view applies it to both the Thumb and the avatar crop it draws from
 //!   ([`crate::modules::faces::people_view`]), so a crop rendered in a catalog a row no
 //!   longer belongs to is never painted under it either.
+//! - **Where a preview or zoom tier was rendered** (#258). The preview and zoom tiers are
+//!   stamped the same way, and the views that paint them — the loupe's, Compare's and the
+//!   pop-out card's [`ZoomImage`](crate::loupe::zoom::ZoomImage), the cull session, the AI
+//!   Tagging region picker — read them through [`ImageStore::get_in`] /
+//!   [`ImageStore::peek_in`] with the catalog their photo id was read from, so a switch
+//!   whose `catalog:switched` has not arrived never puts the new catalog's photo under the
+//!   old catalog's id. Nothing is bound or refused on the worker (a plain request stays
+//!   unbound, rv134 M1); the painter decides. A view asking through
+//!   [`ImageStore::request_batch_in`] has a tier cached from another catalog rendered again,
+//!   once per tier and catalog: after a re-root (a new identity, nothing cleared) the
+//!   reopened rows get their tiers back instead of refusing the cached ones forever, and a
+//!   view whose catalog has closed asks once and waits for the switch event.
 //!
 //! The pool is behind [`Submit`] so tests can hold responders and deliver them in any order.
 
@@ -124,9 +136,10 @@ pub struct Loaded {
     /// A thumbnail of the photo's cover version, not of the original's frame
     /// (`DecodedImage::cover`): boxes in the original's coordinates do not belong on it.
     pub cover: bool,
-    /// A thumbnail's: the catalog open when its render finished, as the worker's identity
-    /// probe read it (`None`: no catalog open, no probe, or another tier). A look trusts only
-    /// a thumbnail rendered in its row's catalog (see the module docs).
+    /// The catalog open when its render finished, as the worker's identity probe read it
+    /// (`None`: no catalog open, or no probe). A look trusts only a thumbnail rendered in its
+    /// row's catalog, and a painter only a tier rendered in the catalog its photo id came
+    /// from (see the module docs).
     pub rendered_in: Option<CatalogIdentity>,
 }
 
@@ -455,6 +468,10 @@ pub struct ImageStore {
     looks_from: Option<CatalogIdentity>,
     /// Tiers whose render for their look was refused: not asked again until that changes.
     refused: HashSet<ImageKey>,
+    /// Per tier, the catalog a view last had it rendered again for because the cached pixels
+    /// were another catalog's ([`request_batch_in`](Self::request_batch_in)): not again for
+    /// that catalog. Forgotten by a switch.
+    retried: HashMap<(i64, ImageKind), CatalogIdentity>,
     probe: Option<IdentityProbe>,
     done: UnboundedSender<Done>,
     stats: StoreStats,
@@ -516,6 +533,7 @@ impl ImageStore {
             looks: HashMap::new(),
             looks_from: None,
             refused: HashSet::new(),
+            retried: HashMap::new(),
             probe: None,
             done,
             stats: StoreStats::default(),
@@ -558,6 +576,47 @@ impl ImageStore {
     /// nothing was checked when it rendered.
     pub fn foreign(&self, loaded: &Loaded, from: CatalogIdentity) -> bool {
         self.probe.is_some() && loaded.rendered_in != Some(from)
+    }
+
+    /// Whether a view whose photo ids were read from `from` may draw `loaded` (#258): it was
+    /// rendered in that catalog. A view that knows no catalog (`None`) draws nothing checked.
+    /// Everything passes with no identity probe set, since then nothing was stamped.
+    pub fn shows_in(&self, loaded: &Loaded, from: Option<CatalogIdentity>) -> bool {
+        self.probe.is_none() || from.is_some_and(|from| loaded.rendered_in == Some(from))
+    }
+
+    /// [`get`](Self::get) for a view whose photo id was read from the catalog `from` (#258,
+    /// module docs "Where a preview or zoom tier was rendered"): pixels rendered in another
+    /// catalog are `Absent` to it — another photo with this id, or this photo before a re-root.
+    pub fn get_in(&mut self, photo: i64, kind: ImageKind, from: Option<CatalogIdentity>) -> ImageState {
+        let state = self.get(photo, kind);
+        state.filter(|l| self.shows_in(l, from))
+    }
+
+    /// [`get_in`](Self::get_in) without marking it used.
+    pub fn peek_in(&self, photo: i64, kind: ImageKind, from: Option<CatalogIdentity>) -> ImageState {
+        self.peek(photo, kind).filter(|l| self.shows_in(l, from))
+    }
+
+    /// [`request_batch`](Self::request_batch) for a view whose photo ids were read from the
+    /// catalog `from` (#258). A tier cached from another catalog is not this view's, so it is
+    /// rendered again — once per tier and `from`, so a view whose catalog is no longer open (a
+    /// switch whose `catalog:switched` has not arrived) asks once and then waits, rather than
+    /// rendering the open catalog's photo over and over. That one ask is what keeps a re-root
+    /// (a new identity, no `catalog:switched`, nothing cleared) from leaving the reopened
+    /// catalog's rows with a cached tier they refuse forever (review rv134 M1).
+    pub fn request_batch_in(&mut self, from: Option<CatalogIdentity>, wanted: &[(i64, ImageKind)], cx: &mut Context<Self>) {
+        if let Some(from) = from.filter(|_| self.probe.is_some()) {
+            for &(photo, kind) in wanted {
+                let key = self.key(photo, kind);
+                let foreign = self.lru.peek(&key).is_some_and(|l| l.rendered_in != Some(from));
+                if foreign && self.retried.get(&(photo, kind)) != Some(&from) {
+                    self.retried.insert((photo, kind), from);
+                    self.invalidate_tier(photo, kind, cx);
+                }
+            }
+        }
+        self.submit(wanted, false, None);
     }
 
     /// The decode pool this store submits to: edit renders (the loupe's version render, the
@@ -660,12 +719,10 @@ impl ImageStore {
                 epoch: self.epoch,
             });
             let done = self.done.clone();
-            // Every thumbnail records the catalog open when it was rendered; one asked for a
-            // look is bound to the catalog its row came from.
-            let probe = match kind {
-                ImageKind::Thumb => self.probe.clone(),
-                _ => None,
-            };
+            // Every photo tier records the catalog open when it was rendered (a preview or a
+            // zoom tier too, #258: their painters check it); a thumbnail asked for a look is
+            // bound to the catalog its row came from.
+            let probe = self.probe.clone();
             let bound = look.filter(|_| probe.is_some() && kind == ImageKind::Thumb);
             batch.push((
                 job,
@@ -1141,6 +1198,7 @@ impl ImageStore {
         self.looks.clear();
         self.looks_from = None;
         self.refused.clear();
+        self.retried.clear();
         #[cfg(feature = "faces")]
         self.clear_avatars(cx);
         cx.notify();

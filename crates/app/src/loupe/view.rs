@@ -204,6 +204,16 @@ impl LoupeView {
         showing.then(|| shell.loupe_target().cloned()).flatten()
     }
 
+    /// The catalog [`Self::target`]'s photo was read from: the Darkroom's print's, else the
+    /// rows' (`ShellState::rows_from`). Its tiers are drawn only if rendered there (#258).
+    fn target_from(&self, cx: &App) -> Option<CatalogIdentity> {
+        #[cfg(feature = "edit")]
+        if let Some(print) = self.print(cx) {
+            return Some(print.from);
+        }
+        self.shell.read(cx).rows_from()
+    }
+
     /// The Darkroom's proof sheet to route this pop-out's ←/→/↑/↓, Enter and Esc to instead of
     /// stepping the library selection or doing nothing (#250 review follow-up) — `None` for
     /// the inline loupe, which never sits over a Darkroom overlay, and whenever no sheet is
@@ -256,7 +266,8 @@ impl LoupeView {
     /// photo left gives up its full-resolution tier — pending or loaded; the target keeps its.
     fn sync(&mut self, cx: &mut Context<Self>) {
         let target = self.target(cx).map(|p| p.id);
-        self.zoom.update(cx, |z, cx| z.set_photo(target, cx));
+        let from = self.target_from(cx);
+        self.zoom.update(cx, |z, cx| z.set_photo(target, from, cx));
         if target != self.navigated {
             let left = std::mem::replace(&mut self.navigated, target);
             let rows = self.shell.read(cx).library.photo_ids();

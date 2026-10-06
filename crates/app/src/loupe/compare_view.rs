@@ -89,7 +89,7 @@ impl CompareView {
         self.shown.clear();
         self.shared.update(cx, |s, cx| s.set(ZoomView::FIT, cx));
         for pane in &self.panes {
-            pane.update(cx, |z, cx| z.set_photo(None, cx));
+            pane.update(cx, |z, cx| z.set_photo(None, None, cx));
         }
     }
 
@@ -225,6 +225,9 @@ impl Render for CompareView {
             return div().id("compare").into_any_element();
         };
         let soft = shell.soft_threshold;
+        // The panes are rows of the shell's list: their tiers are drawn only if rendered in
+        // the catalog those rows came from (#258).
+        let from = shell.rows_from();
         let ids: Vec<i64> = panes.iter().map(|p| p.id).collect();
         let focused = session.focused(&ids);
         if ids != self.shown {
@@ -234,7 +237,7 @@ impl Render for CompareView {
         }
         for (i, pane) in self.panes.iter().enumerate() {
             let id = ids.get(i).copied();
-            pane.update(cx, |z, cx| z.set_photo(id, cx));
+            pane.update(cx, |z, cx| z.set_photo(id, from, cx));
         }
         let view = self.shared.read(cx).view;
         let duel = session.mode() == CompareMode::Duel;

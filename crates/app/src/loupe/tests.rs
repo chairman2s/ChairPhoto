@@ -2,6 +2,7 @@
 //! the real wiring (`start` → `wire` → the main window), with the decode pool a
 //! [`FakePool`] the tests answer by hand, so every answer order is forced.
 
+use crate::image_store::ImageState;
 use crate::image_tests::{pixels, FakePool};
 use crate::loupe::compare::MODE_PREF;
 use crate::loupe::cull::{CullView, CURSOR_DEBOUNCE, CURSOR_KEY};
@@ -367,6 +368,135 @@ fn a_catalog_switch_closes_the_loupe_and_its_marks_fail_closed(cx: &mut TestAppC
     deliver_switch(&app, cx);
     assert_eq!(stage(&app, cx), StageView::Grid);
     assert!(!app.wired.shell.read_with(cx, |s, _| s.loupe_open));
+}
+
+// --- which catalog a loupe tier was rendered in (#258) ----------------------------------------
+
+/// How many times `key` was sent to the pool.
+fn sent(pool: &FakePool, key: &JobKey) -> usize {
+    pool.batches.lock().unwrap().iter().flatten().filter(|k| *k == key).count()
+}
+
+/// #258: the loupe draws a preview only if it was rendered in the catalog its photo id came
+/// from. The core switches to catalog B, whose ids collide, and the next photo's preview is
+/// rendered — in B, the catalog open on the worker:
+/// - `catalog:switched` withheld: the rows are still A's, so B's photo is never drawn under
+///   A's id (nor is its zoom tier, nor B's thumbnail standing in).
+/// - delivered: the loupe closes with A's rows; opened again on B's rows, B's preview, rendered
+///   in B, is drawn.
+fn loupe_tiers_across_a_switch(delivered: bool, cx: &mut TestAppContext) {
+    let (app, pool, dir, ids) = app_with(3, if delivered { "loupe-tier-switch-ev" } else { "loupe-tier-switch" }, cx);
+    select(&app, ids[0], cx);
+    press(&app, "enter", cx);
+    pool.finish(&preview(ids[0]), Ok(pixels(30, 20)));
+    cx.run_until_parked();
+    assert_eq!(drawn(&app, cx), Some((ids[0], Drawn::Preview)), "rendered in A: drawn");
+
+    let (other, other_ids) = colliding_catalog(&dir, "other", 3);
+    assert_eq!(other_ids, ids, "the ids collide");
+    core_switch(&app, other);
+    if !delivered {
+        press(&app, "right", cx);
+        assert_eq!(active(&app, cx), Some(ids[1]), "still A's rows");
+        pool.finish(&thumb(ids[1]), Ok(pixels(6, 4)));
+        // The first render, and the one asked again for A's rows: both are B's photo.
+        for _ in 0..2 {
+            pool.finish(&preview(ids[1]), Ok(pixels(30, 20)));
+            cx.run_until_parked();
+            assert_eq!(drawn(&app, cx), None, "B's photo {} is not drawn under A's id", ids[1]);
+        }
+        assert!(
+            app.wired.images.read_with(cx, |s, _| matches!(s.peek(ids[1], ImageKind::Preview), ImageState::Ready(_))),
+            "B's preview is cached, and refused by the painter"
+        );
+        // Asked again once, not over and over.
+        let asks = sent(&pool, &preview(ids[1]));
+        for _ in 0..3 {
+            render(&app, cx);
+        }
+        assert_eq!(sent(&pool, &preview(ids[1])), asks, "asked once more, then waits for the switch event");
+        wheel(&app, "loupe-image", true, cx);
+        for _ in 0..2 {
+            pool.finish(&zoom_key(ids[1]), Ok(pixels(300, 200)));
+            cx.run_until_parked();
+            assert_eq!(drawn(&app, cx), None, "nor its zoom tier");
+        }
+        return;
+    }
+    deliver_switch(&app, cx);
+    assert_eq!(stage(&app, cx), StageView::Grid, "the switch closed the loupe");
+    select(&app, ids[1], cx);
+    press(&app, "enter", cx);
+    pool.finish(&preview(ids[1]), Ok(pixels(30, 20)));
+    cx.run_until_parked();
+    assert_eq!(drawn(&app, cx), Some((ids[1], Drawn::Preview)), "B's rows, rendered in B: drawn");
+}
+
+#[gpui_kit::test]
+fn the_loupe_never_draws_the_new_catalogs_tier_before_the_switch_event(cx: &mut TestAppContext) {
+    loupe_tiers_across_a_switch(false, cx);
+}
+
+#[gpui_kit::test]
+fn the_loupe_draws_the_new_catalogs_tier_after_the_switch_event(cx: &mut TestAppContext) {
+    loupe_tiers_across_a_switch(true, cx);
+}
+
+/// Review rv134 M1 for #258: a re-root reopens the catalog under a new identity and sends no
+/// `catalog:switched`, so nothing clears the store. Once the rows are read from the reopened
+/// catalog, the preview cached under the old identity is not theirs to draw — it is rendered
+/// again, once, and drawn; the loupe never stays blank.
+#[gpui_kit::test]
+fn a_reroot_renders_the_loupe_tier_again_rather_than_blanking_it(cx: &mut TestAppContext) {
+    let (app, pool, dir, ids) = app_with(3, "loupe-tier-reroot", cx);
+    select(&app, ids[1], cx);
+    press(&app, "enter", cx);
+    pool.finish(&preview(ids[1]), Ok(pixels(30, 20)));
+    cx.run_until_parked();
+    assert_eq!(drawn(&app, cx), Some((ids[1], Drawn::Preview)));
+    let asks = sent(&pool, &preview(ids[1]));
+
+    let a = app.wired.shell.read_with(cx, |s, _| s.rows_from()).unwrap();
+    chairphoto_core::app::catalogs::reroot_open_catalog_as(&app.state, a, dir.0.join("newroot")).unwrap();
+    app.wired.model.update(cx, |m, cx| m.refresh(cx));
+    cx.run_until_parked();
+    let reopened = app.wired.shell.read_with(cx, |s, _| s.rows_from()).unwrap();
+    assert_ne!(reopened, a, "the rows are the reopened catalog's");
+    if active(&app, cx) != Some(ids[1]) || stage(&app, cx) != StageView::Loupe {
+        // The re-read rows may have dropped the selection: the user picks the photo again.
+        select(&app, ids[1], cx);
+        if stage(&app, cx) != StageView::Loupe {
+            press(&app, "enter", cx);
+        }
+    }
+    render(&app, cx);
+    assert_eq!(sent(&pool, &preview(ids[1])), asks + 1, "the old identity's preview is rendered again");
+    pool.finish(&preview(ids[1]), Ok(pixels(30, 20)));
+    cx.run_until_parked();
+    assert_eq!(drawn(&app, cx), Some((ids[1], Drawn::Preview)), "and drawn: the loupe is not left blank");
+}
+
+/// #258 for the cull session: its photos were read from one catalog, and a preview rendered
+/// after the core switched to a catalog with colliding ids is not drawn under them.
+#[gpui_kit::test]
+fn the_cull_session_never_draws_the_new_catalogs_preview(cx: &mut TestAppContext) {
+    let (app, pool, dir, ids) = app_with(3, "cull-tier-switch", cx);
+    start_cull(&app, cx);
+    let view = cull(&app, cx).expect("a cull session");
+    let current = view.read_with(cx, |v, _| v.state.current().map(|p| p.id)).expect("a current photo");
+    assert!(ids.contains(&current));
+    let (other, _) = colliding_catalog(&dir, "other", 3);
+    core_switch(&app, other);
+    pool.finish(&thumb(current), Ok(pixels(6, 4)));
+    pool.finish(&preview(current), Ok(pixels(30, 20)));
+    cx.run_until_parked();
+    let drew = cx
+        .update_window(app.window(), |_, window, cx| {
+            window.render_frame(cx);
+            window.try_find("cull-image").is_some()
+        })
+        .unwrap();
+    assert!(!drew, "B's photo {current} is not drawn in A's session");
 }
 
 /// A catalog holding one video, `clip.mp4`, under `root` (written to disk, so its path

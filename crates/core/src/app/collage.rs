@@ -370,16 +370,31 @@ pub fn save_to_catalog(
     if placements.is_empty() {
         return Err("No photos in the collage".into());
     }
-    let (identity, (paths, root)) = with_bound(state, expected, |c| {
-        Ok((resolve_all(c, placements.iter().map(|p| p.photo_id))?, c.root().to_path_buf()))
+    let (identity, (paths, held)) = with_bound(state, expected, |c| {
+        let collages_dir = c.root().join("Collages");
+        // The names the catalog's rows hold there, their files gone or not (#247): indexing
+        // matches by path, so a collage saved at one would take that row — its identity, its
+        // rating, its tags. Every case variant is held (#231 F4).
+        let held: std::collections::HashSet<String> = c
+            .names_held_in(&collages_dir)?
+            .into_keys()
+            .map(|name| crate::scanner::free_name::folded(&name))
+            .collect();
+        Ok((resolve_all(c, placements.iter().map(|p| p.photo_id))?, (collages_dir, held)))
     })?;
+    let (collages_dir, held) = held;
     let png = is_png(format);
     let ext = if png { "png" } else { "jpg" };
-    let collages_dir = root.join("Collages");
     std::fs::create_dir_all(&collages_dir).map_err(|e| e.to_string())?;
     // Claimed (not just checked free): two overlapping library saves must each get their own
-    // file, never one truncating the other's still-rendering output (#211).
-    let dest = super::reserve_unique_path(&collages_dir.join(format!("collage.{ext}")))?;
+    // file, never one truncating the other's still-rendering output (#211). Not a name a row
+    // holds, nor one beside a sidecar left by another photo, which indexing would adopt (#231
+    // T1, the #247 rule for imports).
+    let usable = |p: &Path| {
+        let name = p.file_name().map(|n| crate::scanner::free_name::folded(&n.to_string_lossy()));
+        name.is_some_and(|n| !held.contains(&n)) && crate::scanner::same_photo::absent(&crate::xmp::sidecar_path(p))
+    };
+    let dest = super::reserve_unique_path_where(&collages_dir.join(format!("collage.{ext}")), usable)?;
     if let Err(e) = render_freeform(&paths, placements, opts, png, &dest, load) {
         // Our own reservation, never another save's.
         let _ = std::fs::remove_file(&dest);
@@ -571,6 +586,42 @@ mod tests {
         let leaf = tags.iter().find(|t| t.full_path == "Collage/Grid").expect("tagged Collage/Grid");
         let parent = leaf.parent_id.expect("under Collage");
         assert!(!c.tag_exportable(leaf.id).unwrap() && !c.tag_exportable(parent).unwrap());
+    }
+
+    /// #231 T1 (the #247 rule): a collage deleted outside the app keeps its row, and the next
+    /// collage is not saved at that row's name — indexing by path would give it the old row's
+    /// identity and rating. Nor at a case variant of it, nor beside a sidecar left there.
+    #[test]
+    fn a_library_save_never_takes_a_name_a_row_holds() {
+        let (dir, state, ids) = setup("held");
+        let collages = dir.join("library/Collages");
+        std::fs::create_dir_all(&collages).unwrap();
+        let held_id = {
+            let guard = state.catalog.lock().unwrap();
+            let c = guard.as_ref().unwrap();
+            let old = collages.join("collage.jpg");
+            std::fs::write(&old, b"an old collage").unwrap();
+            let id = c.upsert_photo(&old, None, 1, 14).unwrap().id;
+            c.set_culling(id, Some(5), None, None).unwrap();
+            std::fs::remove_file(&old).unwrap();
+            let _ = std::fs::remove_file(crate::xmp::sidecar_path(&old));
+            let variant = collages.join("Collage (2).JPG");
+            std::fs::write(&variant, b"another").unwrap();
+            c.upsert_photo(&variant, None, 1, 7).unwrap();
+            std::fs::remove_file(&variant).unwrap();
+            let _ = std::fs::remove_file(crate::xmp::sidecar_path(&variant));
+            std::fs::write(collages.join("collage (3).jpg.xmp"), b"<x:xmpmeta xmlns:x='adobe:ns:meta/'/>").unwrap();
+            id
+        };
+        let id = save_to_catalog(&state, None, &halves(&ids), &freeform(), "jpeg", "Grid", &direct()).unwrap();
+        assert_ne!(id, held_id);
+        let guard = state.catalog.lock().unwrap();
+        let c = guard.as_ref().unwrap();
+        assert_eq!(c.require_photo_path(id).unwrap(), collages.join("collage (4).jpg"));
+        assert_eq!(c.get_photo(id).unwrap().rating, 0);
+        let held = c.get_photo(held_id).unwrap();
+        assert_eq!((held.path.as_str(), held.rating), ("Collages/collage.jpg", 5), "the old row is as it was");
+        assert!(!collages.join("collage.jpg").exists());
     }
 
     /// **Forced interleaving** (#211). The first library save is held in its preview loader —

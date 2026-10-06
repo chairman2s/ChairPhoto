@@ -169,7 +169,17 @@ where
     let mut since_commit = 0usize;
     for entry in WalkDir::new(folder)
         .into_iter()
-        .filter_entry(|e| !is_hidden(e.path()))
+        .filter_entry(|e| {
+            if !is_hidden(e.path()) {
+                return true;
+            }
+            // A crashed import's or copy's hidden temporary file is swept as the walk meets
+            // it (#231 N-2); every other hidden entry is skipped untouched.
+            if e.file_type().is_file() {
+                crate::catalog::working_files::remove_if_stale_part(e.path());
+            }
+            false
+        })
         .filter_map(|e| e.ok())
     {
         // Cancellation point (e.g. a catalog switch): commit what's durable and bail so
@@ -712,6 +722,13 @@ pub fn copy_from_card_abortable(
             same_photo::stamp_from_metadata(m.entries.iter().map(|e| (e.key.as_str(), e.group_name.as_str(), e.value.as_str())))
         });
         let arriving = free_name::Arriving::Capture(stamp.unwrap_or_default());
+        // The row's photo was offloaded (a verified backup holds it): already imported, and
+        // not copied back to this disk (#231 F5).
+        if names.kept_elsewhere(&dir.join(filename), &arriving).is_some() {
+            result.skipped += 1;
+            in_library.insert(src);
+            continue;
+        }
         let placed = same_photo::create_new_file(&dir.join(filename), &mut names, &arriving, |out| {
             let mut input = std::fs::File::open(src)?;
             std::io::copy(&mut input, out)?;
@@ -1114,6 +1131,51 @@ mod tests {
         assert!(is_supported_image(Path::new("DSC1.ARW")));
     }
 
+    // --- crashed copies' temporary files (#231 N-2) ----------------------------------------
+
+    /// A library scan removes the hidden temporary file a crashed import left — the exact
+    /// pattern, its process gone, unwritten for over an hour, a regular file — and leaves
+    /// every other hidden entry: a fresh one, a running process's, one off the pattern, a
+    /// symlink. The photos beside them are indexed as before.
+    #[test]
+    fn a_scan_sweeps_a_crashed_imports_temporary_files() {
+        use crate::catalog::working_files::{dead_pid, STALE_PART_AGE};
+        if !cfg!(target_os = "linux") {
+            println!("SKIPPED: a_scan_sweeps_a_crashed_imports_temporary_files — needs /proc");
+            return;
+        }
+        let dir = crate::test_support::TestTmpDir::new("scan-sweeps-parts");
+        let root = dir.join("photos");
+        let day = root.join("2026/06/28");
+        std::fs::create_dir_all(&day).unwrap();
+        let catalog = Catalog::open(&dir.join("test.chairphoto"), &root).unwrap();
+        std::fs::write(day.join("DSC1.jpg"), b"a photo").unwrap();
+        let dead = dead_pid();
+        let tag = same_photo::PART_TAG;
+        let part = |name: &str, pid: u32| day.join(format!(".{name}.{tag}-{pid}-3"));
+        let old = std::time::SystemTime::now() - STALE_PART_AGE - std::time::Duration::from_secs(60);
+        let write_old = |path: &Path| {
+            std::fs::write(path, b"partial").unwrap();
+            std::fs::File::options().write(true).open(path).unwrap().set_modified(old).unwrap();
+        };
+        write_old(&part("A.jpg", dead));
+        std::fs::write(part("B.jpg", dead), b"being written").unwrap();
+        write_old(&part("C.jpg", std::process::id()));
+        write_old(&day.join(".D.jpg.notes"));
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(day.join("DSC1.jpg"), part("E.jpg", dead)).unwrap();
+
+        let result = scan_folder(&catalog, &root, &AtomicBool::new(false), &|_| {}).unwrap();
+
+        assert_eq!(result.created, 1, "{result:?}");
+        assert!(!part("A.jpg", dead).exists(), "stale, its process gone: swept");
+        assert!(part("B.jpg", dead).exists(), "recently written: kept");
+        assert!(part("C.jpg", std::process::id()).exists(), "a running process's: kept");
+        assert!(day.join(".D.jpg.notes").exists(), "off the pattern: kept");
+        #[cfg(unix)]
+        assert!(std::fs::symlink_metadata(part("E.jpg", dead)).is_ok(), "a symlink: kept");
+    }
+
     // --- card ingest: same name, same size (#246) ------------------------------------------
 
     use same_photo::test_files::{exiftool_available, stamped_jpeg};
@@ -1365,6 +1427,44 @@ mod tests {
             assert_eq!(row_at(&catalog, "2026/06/28/IMG.jpg"), Some((id, uuid.clone(), 5, 0)), "{sidecar_left}");
             assert_eq!(photos(&catalog).len(), 1, "{sidecar_left}: no second row");
             assert_eq!(crate::xmp::read_identifier(&name).as_deref(), Some(uuid.as_str()), "{sidecar_left}");
+        }
+    }
+
+    /// #231 F5: a photo offloaded to a verified backup (its local file gone on purpose) is
+    /// already imported: importing its card again skips it — not copied back to this disk,
+    /// no row touched — whether or not the backup volume is mounted. Without a verified
+    /// backup the same capture comes back to its row, as before.
+    #[test]
+    fn an_offloaded_photo_on_a_card_again_is_already_imported() {
+        if !exiftool_available("an_offloaded_photo_on_a_card_again_is_already_imported") {
+            return;
+        }
+        for verified in [true, false] {
+            let (catalog, dir, root, card) = ingest_rig(&format!("f5-{verified}"));
+            stamped_jpeg(&card.join("IMG.jpg"), "2026:06:28 12:00:00", "123", "4711");
+            ingest_from_card(&catalog, &card, &root, None).unwrap();
+            let name = root.join("2026/06/28/IMG.jpg");
+            let (id, uuid, _, _) = row_at(&catalog, "2026/06/28/IMG.jpg").unwrap();
+            // Offloaded: a backup copy on an unmounted NAS, then the local file and sidecar gone.
+            let nas = catalog
+                .add_volume("NAS", &dir.join("nas-unmounted"), crate::catalog::VolumeKind::Backup)
+                .unwrap();
+            catalog.add_location(id, nas, "2026/06/28/IMG.jpg", crate::catalog::LocationRole::Backup).unwrap();
+            if verified {
+                catalog.conn().execute("UPDATE photo_locations SET verified_hash = 'abc' WHERE photo_id = ?1 AND volume_id = ?2", [id, nas]).unwrap();
+            }
+            std::fs::remove_file(&name).unwrap();
+            std::fs::remove_file(crate::xmp::sidecar_path(&name)).unwrap();
+
+            let again = ingest_from_card(&catalog, &card, &root, None).unwrap();
+            if verified {
+                assert_eq!((again.skipped, again.created, again.restored), (1, 0, 0), "{again:?}");
+                assert!(!name.exists(), "not copied back to this disk");
+            } else {
+                assert_eq!((again.skipped, again.restored), (0, 1), "{again:?}");
+                assert!(name.exists());
+            }
+            assert_eq!(photos(&catalog), [("2026/06/28/IMG.jpg".to_string(), uuid)], "{verified}: one row");
         }
     }
 

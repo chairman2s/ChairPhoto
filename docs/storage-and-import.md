@@ -887,7 +887,11 @@ Two modes over the same core location model:
   replacing anything — `renameat2(RENAME_NOREPLACE)` on Linux, else a hard link — so a file
   that appears there after the name was found free sends the copy on to the next free name,
   and a crash mid-copy leaves at most the hidden temporary file, never a short original at
-  a library name. On a filesystem with neither (exFAT, FAT) the name is claimed by an
+  a library name. The next library scan of that folder removes such a file (#231 N-2) —
+  only the exact name pattern, a regular file (never a symlink), whose process is no longer
+  running here, unwritten for over an hour (`working_files::remove_if_stale_part`). A name
+  within the temporary name's ~30 bytes of the 255-byte limit is carried shortened in the
+  temporary name (a prefix and a hash, N-4); the file still takes its full name. On a filesystem with neither (exFAT, FAT) the name is claimed by an
   exclusive create and the temporary file copied in: still no overwrite, but without that
   crash guarantee. A name is free only when
   nothing is at it and nothing at its sidecar's name (`<name>.xmp`) either: a sidecar with
@@ -896,7 +900,12 @@ Two modes over the same core location model:
   a name free that a catalog row holds (#247) — by its logical path, or by one of its
   locations (any role) under that location's own volume base, its file there or not
   (missing storage is normal): indexing matches
-  by path, so a new file there would take that row's identity, rating and tags. The catalog
+  by path, so a new file there would take that row's identity, rating and tags. A row
+  holds every case variant of its name (#231 F4): on a case-insensitive library (exFAT,
+  FAT, casefold ext4, APFS) `IMG.jpg` is the gone row's `IMG.JPG`, and rather than probe
+  each folder's filesystem the safe rule applies everywhere — on a case-sensitive one it
+  costs at most a ` (n)` name. (Lowercase only; Unicode normalisation is not compared.) A
+  re-link needs the row's own spelling. The catalog
   is read once per date folder per import (`scanner::free_name::CatalogNames`), on the
   import's own connection to the catalog it started against, never the one open since.
   **One exception re-links instead of minting** (L-f of the third #246 review): a name whose
@@ -913,13 +922,19 @@ Two modes over the same core location model:
   name taken, and is left untouched). The file is placed at that name, even past a free
   plain name, and indexing re-links the row: missing cleared, its rating, tags and edits
   kept, no second row. So a photo deleted outside the app and imported again from its card
-  comes back to its row. Every other arriving file goes on to the next free ` (n)` with a
+  comes back to its row. A photo **offloaded** — the row a file would re-link has a backup
+  copy with a verified hash — is already imported: its card's file (or a bundle's
+  original) is skipped and not copied back to this disk (#231 F5); the record decides, not
+  a look at the backup volume, which may be unmounted. Every other arriving file goes on to the next free ` (n)` with a
   row of its own: a different capture is never attached to an old row. File mtime is never evidence (a
   copy changes it). The ` (n)` names an earlier import gave are checked too (every one in
   the folder, past a gap in the numbers or with the plain name gone), so importing a
   card again skips every file. Each date folder is listed once per import
   (`same_photo::FolderListings`), not once per file: card ingest plans every file before
-  copying any, and a bundle's unpack records each name it places. One photo met twice in a run (the same file in two folders
+  copying any, and a bundle's unpack records each name it places, and lists the folder
+  again right before each copy (#231 N-3), so a ` (n)` another program wrote there during
+  the unpack is a candidate too. A name taken between that look and the placement sends
+  the copy on to the next free name, as above. One photo met twice in a run (the same file in two folders
   of the card) is the same rule against the file already copied: it is copied once. Every
   earlier match counts, so a third meeting is skipped against the second when the first
   failed to copy. The metadata comes from one exiftool pass per 150 colliding

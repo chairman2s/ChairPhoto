@@ -59,7 +59,21 @@ pub struct CatalogNames<'c> {
 struct Folder {
     /// `None` when the catalog could not be read: no name in the folder is free.
     held: Option<HashMap<String, Vec<NameHolder>>>,
+    /// The same holders by [`folded`] name: what decides whether a name is held.
+    folded: HashMap<String, Vec<NameHolder>>,
     stamps: Option<HashMap<i64, CaptureStamp>>,
+}
+
+/// A file name as a case-insensitive filesystem compares it (#231 F4). A library on exFAT,
+/// FAT, a casefolded ext4 folder or APFS holds `IMG.JPG` and `img.jpg` as one file; on a
+/// case-sensitive filesystem they are two. Rather than probe each folder's filesystem, a
+/// row holds every case variant of its name everywhere: on a case-sensitive library that
+/// costs at most a ` (n)` name for a file that differs from a row's name only in case,
+/// while on a case-insensitive one it keeps a new file from landing at a gone row's name
+/// and being indexed onto that row. Simple lowercase only: Unicode normalisation (NFC vs
+/// NFD, which APFS and casefold also ignore) is not applied — camera file names are ASCII.
+pub(crate) fn folded(name: &str) -> String {
+    name.to_lowercase()
 }
 
 impl<'c> CatalogNames<'c> {
@@ -82,11 +96,26 @@ impl<'c> CatalogNames<'c> {
             .find(|c| same_photo::name_free(c) && self.held_by(dir, c).is_some_and(|h| h.is_empty()))
     }
 
-    /// The rows holding `path` (empty: none); `None` when the folder could not be read.
+    /// The row an arriving file would re-link at `wanted` (or a ` (n)` beside it) when that
+    /// row's photo is kept safe elsewhere: it has a backup copy with a verified hash (#231 F5).
+    /// Such a photo was offloaded, not lost — its local file is gone on purpose — so a card or
+    /// bundle bringing it again has nothing to add: it is already imported, and copying it
+    /// back would undo the offload. The record decides, not a look at the backup volume: an
+    /// unmounted NAS is a normal state, and the photo counts as backed up all the same.
+    pub fn kept_elsewhere(&mut self, wanted: &Path, arriving: &Arriving) -> Option<i64> {
+        let path = self.relink_target(wanted, arriving)?;
+        let photo_id = self.held_by(path.parent()?, &path)?.first()?.photo_id;
+        let verified = self.catalog.verified_backup_candidates(photo_id).is_ok_and(|c| !c.is_empty());
+        verified.then_some(photo_id)
+    }
+
+    /// The rows holding `path` or any case variant of its name ([`folded`]; empty: none);
+    /// `None` when the folder could not be read.
     fn held_by(&mut self, dir: &Path, path: &Path) -> Option<&[NameHolder]> {
-        let name = path.file_name()?.to_string_lossy().into_owned();
-        let held = self.folder(dir).held.as_ref()?;
-        Some(held.get(&name).map_or(&[], Vec::as_slice))
+        let name = folded(&path.file_name()?.to_string_lossy());
+        let folder = self.folder(dir);
+        folder.held.as_ref()?;
+        Some(folder.folded.get(&name).map_or(&[], Vec::as_slice))
     }
 
     fn folder(&mut self, dir: &Path) -> &mut Folder {
@@ -96,7 +125,16 @@ impl<'c> CatalogNames<'c> {
                 .names_held_in(dir)
                 .inspect_err(|e| eprintln!("import: couldn't read the names the catalog holds in {}: {e}", dir.display()))
                 .ok();
-            Folder { held, stamps: None }
+            let mut by_folded: HashMap<String, Vec<NameHolder>> = HashMap::new();
+            for (name, holders) in held.iter().flatten() {
+                let entry = by_folded.entry(folded(name)).or_default();
+                for h in holders {
+                    if !entry.iter().any(|e| e.photo_id == h.photo_id) {
+                        entry.push(h.clone());
+                    }
+                }
+            }
+            Folder { held, folded: by_folded, stamps: None }
         })
     }
 
@@ -133,10 +171,16 @@ impl<'c> CatalogNames<'c> {
         }
         let Some(holders) = self.held_by(dir, path) else { return false };
         let [holder] = holders else { return false };
-        if !holder.by_path {
+        let (photo_id, uuid) = (holder.photo_id, holder.uuid.clone());
+        // Held by its logical path under this very spelling: the upsert matches the path
+        // byte for byte, so a row whose path is another case variant is not re-linked here.
+        let exact = path.file_name().map(|n| n.to_string_lossy().into_owned());
+        let by_path = exact.as_ref().and_then(|n| self.folder(dir).held.as_ref()?.get(n)).is_some_and(|hs| {
+            hs.iter().any(|h| h.photo_id == photo_id && h.by_path)
+        });
+        if !by_path {
             return false;
         }
-        let (photo_id, uuid) = (holder.photo_id, holder.uuid.clone());
         if !sidecar_is_the_rows(path, &uuid) {
             return false;
         }
@@ -263,6 +307,25 @@ mod tests {
             Some(day.join("IMG (2).jpg")),
             "a location-only holder is never re-linked"
         );
+    }
+
+    /// #231 F4: a name is held in every case variant, so on a case-insensitive library
+    /// (exFAT, casefold ext4, APFS) a new `IMG.jpg` never lands on a gone row's `IMG.JPG`
+    /// — one file there — and is indexed onto that row. A re-link needs the row's own
+    /// spelling (the upsert matches the path byte for byte).
+    #[test]
+    fn a_name_is_held_in_every_case_variant() {
+        let (_dir, catalog, day) = rig("case");
+        row_whose_file_is_gone(&catalog, &day.join("IMG.JPG"), ROW, T);
+        let mut names = CatalogNames::new(&catalog);
+        assert_eq!(names.destination(&day.join("img.jpg"), &capture(T2)), Some(day.join("img (2).jpg")));
+        assert_eq!(names.destination(&day.join("IMG.jpg"), &Arriving::Identity(Some(OTHER.into()))), Some(day.join("IMG (2).jpg")));
+        assert_eq!(
+            names.destination(&day.join("IMG.jpg"), &capture(T)),
+            Some(day.join("IMG (2).jpg")),
+            "its capture under another spelling is not re-linked"
+        );
+        assert_eq!(names.destination(&day.join("IMG.JPG"), &capture(T)), Some(day.join("IMG.JPG")), "its own spelling is");
     }
 
     /// The folder is read once per run, not once per name asked.

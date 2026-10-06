@@ -233,6 +233,83 @@ mod tests {
         }
     }
 
+    // --- the names an unpack finds taken (#247, #231 F3) -------------------------------------
+
+    /// **Forced interleaving** (AGENTS.md, "Catalog identity"). Catalog A, which the import
+    /// starts against, has a row holding `IMG_1.jpg` under another identity, its file gone.
+    /// As the second original is unpacked the open catalog is swapped for B — whose row has
+    /// A's row's id and holds no name there — once silently (no switch delivered, the import
+    /// not tripped) and once as a real switch (`catalog:switched` sent, the import tripped).
+    /// Either way the unpack decides names by A's rows: `IMG_1.jpg` goes to ` (2)`, never to
+    /// the name A's row holds. The silent swap indexes into A only; the switch merges into
+    /// neither. B's row is untouched.
+    #[test]
+    fn the_names_an_unpack_finds_taken_are_the_started_catalogs() {
+        const HELD: &str = "11111111-1111-4111-8111-111111111111";
+        for switched in [false, true] {
+            let dir = crate::test_support::TestTmpDir::new(&format!("bundle-names-swap-{switched}"));
+            let path = bundle(&dir, 2);
+            let root = dir.join("library");
+            let day = root.join("2026/01/02");
+            std::fs::create_dir_all(&day).unwrap();
+            let a = Catalog::open(&dir.join("a.chairphoto"), &root).unwrap();
+            let held = day.join("IMG_1.jpg");
+            std::fs::write(&held, b"the old capture").unwrap();
+            let held_id = a.upsert_photo_with_identity(&held, None, 1, 15, Some(HELD)).unwrap().id;
+            std::fs::remove_file(&held).unwrap();
+            let _ = std::fs::remove_file(crate::xmp::sidecar_path(&held));
+            let state = AppState::default();
+            *state.catalog.lock().unwrap() = Some(a);
+
+            let b_path = dir.join("b.chairphoto");
+            let b = Catalog::open(&b_path, &dir.join("b")).unwrap();
+            let elsewhere = dir.join("b/elsewhere.jpg");
+            std::fs::create_dir_all(elsewhere.parent().unwrap()).unwrap();
+            std::fs::write(&elsewhere, b"b's photo").unwrap();
+            assert_eq!(b.upsert_photo_with_identity(&elsewhere, None, 1, 9, None).unwrap().id, held_id, "colliding ids");
+
+            struct SwapOnSecond(AppState, std::sync::Mutex<Option<Catalog>>, bool, std::path::PathBuf);
+            impl EventSink for SwapOnSecond {
+                fn send(&self, event: CoreEvent) {
+                    let CoreEvent::ImportProgress(p) = event else { return };
+                    if p.done != 2 {
+                        return;
+                    }
+                    let Some(b) = self.1.lock().unwrap().take() else { return };
+                    if self.2 {
+                        crate::app::catalogs::detach_catalog_and_trip_jobs(&self.0).unwrap();
+                        crate::app::catalogs::publish_catalog_and_reset_jobs(&self.0, b).unwrap();
+                        self.0.send(CoreEvent::CatalogSwitched(self.3.to_string_lossy().into_owned()));
+                    } else {
+                        *self.0.catalog.lock().unwrap() = Some(b);
+                    }
+                }
+            }
+            let worker = AppState { catalog: state.catalog.clone(), jobs: state.jobs.clone(), ..AppState::default() };
+            worker.set_events(Arc::new(SwapOnSecond(state.clone(), std::sync::Mutex::new(Some(b)), switched, b_path.clone())));
+
+            let outcome = import_bundle(&worker, &path);
+            assert!(!held.exists(), "{switched}: the name A's row holds stays empty");
+            assert!(day.join("IMG_1 (2).jpg").exists(), "{switched}");
+            let rows = |c: &Catalog| -> Vec<(i64, String, i64)> {
+                let mut stmt = c.conn().prepare("SELECT id, path, rating FROM photos ORDER BY path").unwrap();
+                stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).unwrap().collect::<Result<_, _>>().unwrap()
+            };
+            let started = Catalog::open_secondary(&dir.join("a.chairphoto"), &root).unwrap();
+            let paths: Vec<String> = rows(&started).into_iter().map(|r| r.1).collect();
+            if switched {
+                assert!(outcome.unwrap_err().starts_with(IMPORT_CANCELLED));
+                assert_eq!(paths, ["2026/01/02/IMG_1.jpg"], "nothing merged into A");
+            } else {
+                let result = outcome.unwrap();
+                assert_eq!(result.merge.photos_added, 2, "{result:?}");
+                assert_eq!(paths, ["2026/01/02/IMG_0.jpg", "2026/01/02/IMG_1 (2).jpg", "2026/01/02/IMG_1.jpg"]);
+            }
+            let in_b = rows(&Catalog::open_secondary(&b_path, &dir.join("b")).unwrap());
+            assert_eq!(in_b, [(held_id, "elsewhere.jpg".to_string(), 0)], "{switched}: B gained nothing, its row untouched");
+        }
+    }
+
     /// **Forced interleaving** (#185, catalog identity). The bundle's photo is already in
     /// catalog A, which the import started against; a switch to catalog B — whose photo has
     /// the very same row id — lands once the photo is indexed. The bundle's data is filled

@@ -258,9 +258,25 @@ pub fn extract_originals_abortable(
         // A same-name, same-size file may be this photo, already imported (#246): decided
         // now, against the bytes in memory.
         let candidates = listings.same_size_candidates(&dest, orig_bytes.len() as u64);
-        let Some(already) = same_photo::find_in_library(&orig_bytes, &candidates, abort) else {
+        let Some(mut already) = same_photo::find_in_library(&orig_bytes, &candidates, abort) else {
             return Ok((extracted, result, true));
         };
+        if already.is_none() {
+            // About to copy: the folder's listing may be older than this original (it is held
+            // for the unpack), so a ` (n)` written there since — by another program or import —
+            // is looked at now, and the same photo there is not copied once more (N-3 of the
+            // third #246 review). One listing per copied original, never per skipped one.
+            listings.relist(&dir);
+            let newer: Vec<PathBuf> = listings
+                .same_size_candidates(&dest, orig_bytes.len() as u64)
+                .into_iter()
+                .filter(|c| !candidates.contains(c))
+                .collect();
+            let Some(found) = same_photo::find_in_library(&orig_bytes, &newer, abort) else {
+                return Ok((extracted, result, true));
+            };
+            already = found;
+        }
         if let Some(existing) = already {
             // The same capture is already in the library: skip the copy. Nothing is written
             // beside it here — not even the bundle's identity into its sidecar: the index
@@ -280,6 +296,13 @@ pub fn extract_originals_abortable(
         // overwritten. The name of a row with this photo's identity is its own: the original
         // goes back there, and indexing re-links the row (#247).
         let arriving = crate::scanner::free_name::Arriving::Identity(crate::catalog::photo_identity_for(&bp.uuid));
+        // The row of this identity was offloaded (a verified backup holds its photo): already
+        // imported, not copied back to this disk (#231 F5). The merge still finds the row by
+        // identity, as for an original the bundle does not carry.
+        if names.kept_elsewhere(&dest, &arriving).is_some() {
+            result.skipped_duplicate += 1;
+            continue;
+        }
         let placed = same_photo::create_new_file(&dest, &mut names, &arriving, |file| {
             use std::io::Write;
             file.write_all(&orig_bytes)
@@ -1176,6 +1199,41 @@ mod tests {
         assert_eq!(std::fs::read(day.join("DSC1 (2).ARW")).unwrap(), b"FAKE RAW TWO");
         assert_eq!(std::fs::read(day.join("DSC1.ARW")).unwrap(), b"FAKE RAW ONE");
         assert!(!day.join("DSC1 (3).ARW").exists());
+    }
+
+    /// N-3 of the third #246 review: the folder is listed once for the unpack, so a ` (n)`
+    /// another program writes there meanwhile used to be no candidate, and the same photo was
+    /// copied once more at the next ` (n)`. The listing is renewed right before a copy: the
+    /// photo written there meanwhile is found and skipped.
+    #[test]
+    fn a_numbered_name_written_during_the_unpack_is_a_candidate() {
+        let src = temp_dir("n3-src");
+        let (first, second) = (src.join("A.ARW"), src.join("DSC1.ARW"));
+        std::fs::write(&first, b"another photo").unwrap();
+        std::fs::write(&second, b"FAKE RAW TWO").unwrap();
+        let bundle_path = bundle_of(
+            "n3",
+            vec![
+                (plain_photo("uuid-n3-1", "2026/06/28/A.ARW"), Some(first)),
+                (plain_photo("uuid-n3-2", "2026/06/28/DSC1.ARW"), Some(second)),
+            ],
+        );
+        let dest_base = temp_dir("n3-dest");
+        let day = dest_base.join("2026/06/28");
+        std::fs::create_dir_all(&day).unwrap();
+        std::fs::write(day.join("DSC1.ARW"), b"FAKE RAW ONE").unwrap();
+        let (manifest, mut archive) = open_bundle(&bundle_path).unwrap();
+        // Before the second original (the folder listed for the first), another import writes
+        // the same photo at ` (2)`.
+        let meanwhile = |done: usize, _| {
+            if done == 2 {
+                std::fs::write(day.join("DSC1 (2).ARW"), b"FAKE RAW TWO").unwrap();
+            }
+        };
+        let (_, partial) = extract_originals(&empty_catalog(&dest_base), &manifest, &mut archive, &dest_base, meanwhile).unwrap();
+        assert_eq!((partial.copied, partial.skipped_duplicate), (1, 1), "{partial:?}");
+        assert!(!day.join("DSC1 (3).ARW").exists(), "not copied a second time");
+        assert_eq!(std::fs::read(day.join("DSC1.ARW")).unwrap(), b"FAKE RAW ONE");
     }
 
     /// A sidecar that appears at the name after the original's place was chosen (another

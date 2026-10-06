@@ -840,6 +840,16 @@ impl Catalog {
         Ok(out)
     }
 
+    /// This catalog's offline thumbnails as the store names them — its UUID and every photo's
+    /// (trashed ones included) — for [`crate::thumbnails::prune_offline_thumbs`]. `None` with
+    /// no catalog UUID minted. One read of every row.
+    pub fn offline_thumb_owner(&self) -> Result<Option<crate::thumbnails::OfflineCatalog>> {
+        let Some(catalog) = read_catalog_uuid(&self.conn)? else { return Ok(None) };
+        let mut stmt = self.conn.prepare("SELECT uuid FROM photos")?;
+        let photos = stmt.query_map([], |r| r.get::<_, String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(crate::thumbnails::OfflineCatalog::new(&catalog, photos))
+    }
+
     pub fn get_setting(&self, key: &str) -> Result<Option<String>> {
         Ok(self
             .conn

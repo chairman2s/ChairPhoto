@@ -95,18 +95,38 @@ pub async fn open_default_catalog(state: &AppState) -> Result<PathBuf, String> {
 }
 
 /// Start the one-time migration of the pre-#258 offline thumbnails to the catalog `from` — the
-/// one the front end opened at start-up ([`open_default_catalog`]) — on the blocking pool;
-/// nothing waits on it, and the outcome is logged. A front end calls it once per process,
-/// after the start-up open (not from tests: it works on the real cache directory).
+/// one the front end opened at start-up ([`open_default_catalog`]) — and then the store's
+/// cleanup ([`prune_offline_thumbnails`]), on the blocking pool; nothing waits on them, and the
+/// outcomes are logged. A front end calls it once per process, after the start-up open (not
+/// from tests: it works on the real cache directory).
 pub fn spawn_offline_thumbnail_migration(state: &AppState, from: CatalogIdentity) {
     let state = state.clone();
-    drop(spawn_blocking(move || match adopt_offline_thumbnails(&state, from) {
-        Ok(done) if done != crate::thumbnails::Adopted::default() => {
-            eprintln!("offline thumbnails: migrated the pre-#258 store: {done:?}")
+    drop(spawn_blocking(move || {
+        match adopt_offline_thumbnails(&state, from) {
+            Ok(done) if done != crate::thumbnails::Adopted::default() => {
+                eprintln!("offline thumbnails: migrated the pre-#258 store: {done:?}")
+            }
+            Ok(_) => {}
+            Err(e) => eprintln!("offline thumbnails: pre-#258 store not migrated, kept for the next start: {e}"),
         }
-        Ok(_) => {}
-        Err(e) => eprintln!("offline thumbnails: pre-#258 store not migrated, kept for the next start: {e}"),
+        match prune_offline_thumbnails(&state, from) {
+            Ok(done) if done != crate::thumbnails::Pruned::default() => {
+                eprintln!("offline thumbnails: cleaned up: {done:?}")
+            }
+            Ok(_) => {}
+            Err(e) => eprintln!("offline thumbnails: not cleaned up: {e}"),
+        }
     }));
+}
+
+/// Clean up the offline thumbnail store for the catalog `from` (`thumbnails::
+/// prune_offline_thumbs`), reading its photos only while it is still the open one; the walk
+/// runs off the catalog lock.
+pub fn prune_offline_thumbnails(state: &AppState, from: CatalogIdentity) -> Result<crate::thumbnails::Pruned, String> {
+    let Some(open) = super::with_catalog_as(state, from, |c| c.offline_thumb_owner())? else {
+        return Ok(crate::thumbnails::Pruned::default());
+    };
+    crate::thumbnails::prune_offline_thumbs(&open).map_err(|e| e.to_string())
 }
 
 /// Migrate the pre-#258 offline thumbnails (`thumbnails::adopt_id_keyed_thumbs`) to the
@@ -304,6 +324,11 @@ pub fn switch_catalog_in(
         std::fs::create_dir_all(root).map_err(|e| e.to_string())?;
     }
     let catalog = Catalog::open(catalog_path, root).map_err(|e| e.to_string())?;
+    // Its offline thumbnails are in use: a start-up cleanup elsewhere must not take them for
+    // an abandoned catalog's (`thumbnails::prune_offline_thumbs`).
+    if let Ok(uuid) = crate::catalog::catalog_uuid(catalog.conn()) {
+        crate::thumbnails::mark_offline_catalog_opened(&uuid);
+    }
 
     // The name for the registry: caller-supplied, else inferred from the filename.
     let catalog_name = name.unwrap_or_else(|| {

@@ -363,6 +363,122 @@ pub fn read_persistent_thumb(key: &OfflineThumbKey) -> Option<Vec<u8>> {
     std::fs::read(persistent_thumb_path(key)).ok()
 }
 
+/// One catalog's offline thumbnails as the store names them: the catalog's UUID and every
+/// photo UUID it has ([`crate::catalog::Catalog::offline_thumb_owner`]).
+#[derive(Clone, Debug)]
+pub struct OfflineCatalog {
+    catalog: uuid::Uuid,
+    photos: std::collections::HashSet<uuid::Uuid>,
+}
+
+impl OfflineCatalog {
+    /// `None` unless `catalog` is a UUID; photo values that are not are left out (they keep
+    /// no offline thumbnail, [`OfflineThumbKey::new`]).
+    pub fn new(catalog: &str, photos: impl IntoIterator<Item = String>) -> Option<Self> {
+        let catalog = uuid::Uuid::parse_str(catalog).ok()?;
+        let photos = photos.into_iter().filter_map(|p| uuid::Uuid::parse_str(&p).ok()).collect();
+        Some(Self { catalog, photos })
+    }
+}
+
+/// What [`prune_offline_thumbs`] removed.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Pruned {
+    /// The open catalog's files for photos it no longer has.
+    pub files: usize,
+    /// Other catalogs' directories, not opened for [`UNOPENED_CATALOG_AGE`].
+    pub catalogs: usize,
+}
+
+/// How long the open catalog keeps the offline thumbnail of a photo it no longer has (removed,
+/// or re-minted under a new UUID) before a prune removes it. A file written since the photo
+/// list was read is never that old, so a photo imported meanwhile keeps its file; and a copy
+/// of this catalog file (which shares its UUID) gets a month to render its own again.
+pub const ORPHAN_AGE: std::time::Duration = std::time::Duration::from_secs(30 * 24 * 3600);
+
+/// How long another catalog's offline thumbnails are kept after it was last opened (its
+/// directory's [`OPENED_MARKER`], else its newest file): a year. Conservative on purpose: an
+/// archive catalog opened once a year whose photos all sit on an unmounted NAS has nothing
+/// else to show, and its files are rewritten on its next open only where an original is
+/// reachable. What it frees is a deleted or trial catalog's directory.
+pub const UNOPENED_CATALOG_AGE: std::time::Duration = std::time::Duration::from_secs(365 * 24 * 3600);
+
+/// The file a prune writes in the open catalog's directory, whose mtime says when the catalog
+/// was last opened.
+const OPENED_MARKER: &str = ".opened";
+
+/// Mark the catalog `catalog_uuid`'s offline thumbnails as in use now (its directory's
+/// [`OPENED_MARKER`]), when it has any: a catalog opened by a switch, not at start-up, is not
+/// pruned then, but must not look abandoned to the next start's [`prune_offline_thumbs`].
+/// Best-effort.
+pub fn mark_offline_catalog_opened(catalog_uuid: &str) {
+    let Ok(catalog) = uuid::Uuid::parse_str(catalog_uuid) else { return };
+    let dir = persistent_thumb_dir().join(catalog.hyphenated().to_string());
+    if is_own_dir(&dir) {
+        let _ = std::fs::write(dir.join(OPENED_MARKER), b"");
+    }
+}
+
+/// Clean up the offline thumbnail store (review of #258, N2) for the catalog `open`, opened
+/// now: its files for photos it no longer has, older than [`ORPHAN_AGE`]; and the directories
+/// of other catalogs not opened for [`UNOPENED_CATALOG_AGE`]. Marks `open`'s directory as
+/// opened now. Never follows a symlink, and touches only names the store writes (UUID
+/// directories, `<uuid>.jpg` files). **Blocking** (walks the store): off the UI thread.
+pub fn prune_offline_thumbs(open: &OfflineCatalog) -> std::io::Result<Pruned> {
+    prune_offline_thumbs_in(&persistent_thumb_dir(), open, std::time::SystemTime::now())
+}
+
+fn prune_offline_thumbs_in(store: &Path, open: &OfflineCatalog, now: std::time::SystemTime) -> std::io::Result<Pruned> {
+    use std::time::SystemTime;
+    let mut pruned = Pruned::default();
+    if !is_own_dir(store) {
+        return Ok(pruned);
+    }
+    let older_than = |at: SystemTime, age| now.duration_since(at).is_ok_and(|d| d > age);
+    let own = store.join(open.catalog.hyphenated().to_string());
+    if is_own_dir(&own) {
+        std::fs::write(own.join(OPENED_MARKER), b"")?;
+        for entry in std::fs::read_dir(&own)? {
+            let entry = entry?;
+            let name = entry.file_name();
+            let Some(photo) = name.to_str().and_then(|n| n.strip_suffix(".jpg")).and_then(|n| uuid::Uuid::parse_str(n).ok())
+            else {
+                continue;
+            };
+            let Ok(meta) = std::fs::symlink_metadata(entry.path()) else { continue };
+            if meta.file_type().is_file()
+                && !open.photos.contains(&photo)
+                && meta.modified().is_ok_and(|m| older_than(m, ORPHAN_AGE))
+                && std::fs::remove_file(entry.path()).is_ok()
+            {
+                pruned.files += 1;
+            }
+        }
+    }
+    for entry in std::fs::read_dir(store)? {
+        let entry = entry?;
+        let Some(catalog) = entry.file_name().to_str().and_then(|n| uuid::Uuid::parse_str(n).ok()) else { continue };
+        let dir = entry.path();
+        if catalog == open.catalog || !is_own_dir(&dir) {
+            continue;
+        }
+        let modified = |p: &Path| std::fs::symlink_metadata(p).and_then(|m| m.modified()).ok();
+        // When it was last opened: its marker, else (a directory from before markers) the
+        // newest of the directory and its files.
+        let last = match modified(&dir.join(OPENED_MARKER)) {
+            Some(at) => Some(at),
+            None => std::fs::read_dir(&dir)?
+                .filter_map(|e| e.ok().and_then(|e| modified(&e.path())))
+                .chain(modified(&dir))
+                .max(),
+        };
+        if last.is_some_and(|at| older_than(at, UNOPENED_CATALOG_AGE)) && std::fs::remove_dir_all(&dir).is_ok() {
+            pruned.catalogs += 1;
+        }
+    }
+    Ok(pruned)
+}
+
 /// Generate a thumbnail from `path` and persist it under `key` — called at offload time so
 /// the grid keeps an image after the original leaves local disk.
 pub fn ensure_persistent_thumb(key: &OfflineThumbKey, path: &Path) -> Result<(), String> {
@@ -1640,6 +1756,78 @@ pub(crate) mod tests {
         assert_eq!(done, Adopted { copied: 0, kept: 0, skipped: 1 });
         assert!(!new_file(&root, &keys[&1]).exists());
         assert_eq!(std::fs::read(elsewhere.join("1.jpg")).unwrap(), b"not ours");
+    }
+
+    // --- the offline store's cleanup (review of #258, N2) ----------------------------------
+
+    /// Set `path`'s mtime `age` before `now`.
+    fn aged(path: &Path, now: std::time::SystemTime, age: std::time::Duration) {
+        let file = std::fs::File::options().read(true).open(path).unwrap();
+        file.set_modified(now - age).unwrap();
+    }
+
+    /// A prune removes the open catalog's files for photos it no longer has once they are
+    /// older than `ORPHAN_AGE` — never a photo's it has, nor a fresh one (a photo imported
+    /// since the list was read); another catalog's directory only once it has not been opened
+    /// for `UNOPENED_CATALOG_AGE`; and nothing that is not the store's own (a non-UUID name, a
+    /// symlink). It marks the open catalog's directory as opened.
+    #[test]
+    fn a_prune_removes_only_gone_photos_and_long_unopened_catalogs() {
+        let tmp = TestTmpDir::new("offline-prune");
+        let store = tmp.path().join(PERSIST_DIR);
+        let now = std::time::SystemTime::now();
+        let day = std::time::Duration::from_secs(24 * 3600);
+        let (open_cat, recent_cat, stale_cat, marked_cat) =
+            (uuid::Uuid::new_v4(), uuid::Uuid::new_v4(), uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
+        let (kept, gone_old, gone_new) = (uuid::Uuid::new_v4(), uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
+        let file = |cat: uuid::Uuid, photo: uuid::Uuid, age: std::time::Duration| {
+            let dir = store.join(cat.hyphenated().to_string());
+            std::fs::create_dir_all(&dir).unwrap();
+            let p = dir.join(format!("{}.jpg", photo.hyphenated()));
+            std::fs::write(&p, b"jpeg").unwrap();
+            aged(&p, now, age);
+            p
+        };
+        let kept_old = file(open_cat, kept, 400 * day);
+        let gone_old = file(open_cat, gone_old, ORPHAN_AGE + day);
+        let gone_new = file(open_cat, gone_new, day);
+        let foreign_name = store.join(open_cat.hyphenated().to_string()).join("notes.jpg");
+        std::fs::write(&foreign_name, b"x").unwrap();
+        aged(&foreign_name, now, 400 * day);
+        // Another catalog browsed last month; one untouched for over a year; one whose files
+        // are old but which was opened lately (its marker).
+        let recent = file(recent_cat, uuid::Uuid::new_v4(), 30 * day);
+        let stale = file(stale_cat, uuid::Uuid::new_v4(), UNOPENED_CATALOG_AGE + day);
+        aged(stale.parent().unwrap(), now, UNOPENED_CATALOG_AGE + day);
+        let marked = file(marked_cat, uuid::Uuid::new_v4(), UNOPENED_CATALOG_AGE + day);
+        std::fs::write(marked.parent().unwrap().join(OPENED_MARKER), b"").unwrap();
+        aged(marked.parent().unwrap(), now, UNOPENED_CATALOG_AGE + day);
+        // Not the store's: a non-UUID directory, and a symlinked "catalog" pointing elsewhere.
+        let other = store.join("not-a-catalog");
+        std::fs::create_dir_all(&other).unwrap();
+        aged(&other, now, UNOPENED_CATALOG_AGE + day);
+        let elsewhere = tmp.path().join("elsewhere");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        std::fs::write(elsewhere.join("keep.jpg"), b"x").unwrap();
+        aged(&elsewhere.join("keep.jpg"), now, UNOPENED_CATALOG_AGE + day);
+        let link = store.join(uuid::Uuid::new_v4().hyphenated().to_string());
+        std::os::unix::fs::symlink(&elsewhere, &link).unwrap();
+
+        let open = OfflineCatalog::new(&open_cat.to_string(), [kept.to_string()]).unwrap();
+        let done = prune_offline_thumbs_in(&store, &open, now).unwrap();
+
+        assert_eq!(done, Pruned { files: 1, catalogs: 1 });
+        assert!(kept_old.is_file(), "a photo the catalog has keeps its file, however old");
+        assert!(!gone_old.exists(), "a gone photo's old file is removed");
+        assert!(gone_new.is_file(), "a fresh file is kept: it may be a photo imported meanwhile");
+        assert!(foreign_name.is_file(), "a name the store never writes is left");
+        assert!(recent.is_file(), "a catalog opened lately keeps its files");
+        assert!(!stale.parent().unwrap().exists(), "one not opened for a year is removed");
+        assert!(marked.is_file(), "its marker says when it was opened, not its files' age");
+        assert!(other.is_dir() && link.exists() && elsewhere.join("keep.jpg").is_file(), "nothing not the store's");
+        assert!(store.join(open_cat.hyphenated().to_string()).join(OPENED_MARKER).is_file(), "the open catalog is marked");
+        // A second prune finds nothing more.
+        assert_eq!(prune_offline_thumbs_in(&store, &open, now).unwrap(), Pruned::default());
     }
 
     /// The offline thumbnail's key (#258) takes UUIDs only, so nothing else ever reaches its

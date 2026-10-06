@@ -606,6 +606,14 @@ impl ImageStore {
     /// (a new identity, no `catalog:switched`, nothing cleared) from leaving the reopened
     /// catalog's rows with a cached tier they refuse forever (review rv134 M1).
     pub fn request_batch_in(&mut self, from: Option<CatalogIdentity>, wanted: &[(i64, ImageKind)], cx: &mut Context<Self>) {
+        self.reask_foreign(from, wanted, cx);
+        self.submit(wanted, false, None);
+    }
+
+    /// Of `wanted`, invalidate each tier cached from another catalog than `from`, once per
+    /// tier and `from` ([`request_batch_in`](Self::request_batch_in)), so the submit that
+    /// follows renders it again.
+    fn reask_foreign(&mut self, from: Option<CatalogIdentity>, wanted: &[(i64, ImageKind)], cx: &mut Context<Self>) {
         if let Some(from) = from.filter(|_| self.probe.is_some()) {
             for &(photo, kind) in wanted {
                 let key = self.key(photo, kind);
@@ -616,7 +624,6 @@ impl ImageStore {
                 }
             }
         }
-        self.submit(wanted, false, None);
     }
 
     /// The decode pool this store submits to: edit renders (the loupe's version render, the
@@ -1038,6 +1045,30 @@ impl ImageStore {
         let wanted = window_of(photos, index, kind, ahead, behind);
         self.set_claim(owner, wanted.iter().chain(also).copied());
         self.submit(&wanted, true, None);
+    }
+
+    /// [`navigate_window_as`](Self::navigate_window_as) for a view whose photo ids were read
+    /// from the catalog `from` (#258): a tier of the window cached from another catalog —
+    /// preloaded before a re-root, which reopens the catalog under a new identity and clears
+    /// nothing — is rendered again now, once per tier and `from`
+    /// ([`request_batch_in`](Self::request_batch_in)), so stepping onto it is not a cold
+    /// render with nothing drawn (review of #258, L1).
+    #[allow(clippy::too_many_arguments)]
+    pub fn navigate_window_in(
+        &mut self,
+        owner: ClaimId,
+        from: Option<CatalogIdentity>,
+        photos: &[i64],
+        index: usize,
+        kind: ImageKind,
+        ahead: usize,
+        behind: usize,
+        also: &[(i64, ImageKind)],
+        cx: &mut Context<Self>,
+    ) {
+        let wanted = window_of(photos, index, kind, ahead, behind);
+        self.reask_foreign(from, &wanted, cx);
+        self.navigate_window_as(owner, photos, index, kind, ahead, behind, also);
     }
 
     /// The Darkroom filmstrip's frames (#134): `owner` holds exactly `wanted`'s thumbnail

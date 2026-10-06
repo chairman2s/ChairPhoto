@@ -1283,7 +1283,14 @@ fn unique_tmp_dir(path: &Path) -> PathBuf {
 
 /// Resolve the user cache dir (XDG_CACHE_HOME or ~/.cache), with a temp fallback.
 pub(crate) fn cache_dir() -> PathBuf {
-    cache_dir_from(std::env::var_os("XDG_CACHE_HOME"), std::env::var_os("HOME"))
+    // This crate's unit tests: isolated before the first resolution, whichever test it is.
+    #[cfg(test)]
+    crate::test_home::isolate();
+    let dir = cache_dir_from(std::env::var_os("XDG_CACHE_HOME"), std::env::var_os("HOME"));
+    // Tests never use the real one (`test_home`).
+    #[cfg(any(test, feature = "test-hooks"))]
+    crate::test_home::check(&dir.join("chairphoto"), ".cache", "XDG_CACHE_HOME");
+    dir
 }
 
 /// [`cache_dir`] from the two variables. An empty or relative `XDG_CACHE_HOME` is ignored,
@@ -1639,6 +1646,7 @@ pub(crate) mod tests {
 
     impl TestTmpDir {
         pub(crate) fn new(name: &str) -> Self {
+            crate::test_home::isolate();
             let dir = std::env::temp_dir()
                 .join(format!("cp-thumb-{name}-{}", std::process::id()));
             let _ = std::fs::remove_dir_all(&dir);

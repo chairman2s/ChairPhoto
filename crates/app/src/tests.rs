@@ -35,6 +35,9 @@ pub(crate) struct TempDir(pub(crate) PathBuf);
 
 impl TempDir {
     pub(crate) fn new(tag: &str) -> Self {
+        // Every test with a temp dir of its own keeps out of the real cache and data
+        // directories (`chairphoto_core::test_home`).
+        chairphoto_core::test_home::isolate();
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -83,6 +86,8 @@ fn start_with(cx: &mut TestAppContext, pool: Option<Arc<dyn crate::image_store::
 /// [`start`] with the headless [`WireOptions`] changed by `options` (say, a per-machine
 /// preference store read from a file).
 pub(crate) fn start_with_options(cx: &mut TestAppContext, options: impl FnOnce(WireOptions) -> WireOptions) -> App {
+    // No test reaches the real cache or data directory (`chairphoto_core::test_home`).
+    chairphoto_core::test_home::isolate();
     // Storage jobs queue until a test runs them (`Runner::manual`): the core runtime's
     // threads could not wake GPUI's deterministic test scheduler.
     cx.update(|cx| cx.set_global(crate::storage::Runner::manual()));

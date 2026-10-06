@@ -453,13 +453,31 @@ pub fn decode_cache_clear() -> u64 {
 /// The app's data dir (`$XDG_DATA_HOME/chairphoto` or `~/.local/share/chairphoto`) —
 /// home of the default catalog DB and the user's LUT folder.
 pub fn app_data_dir() -> Result<PathBuf, String> {
+    // This crate's unit tests: isolated before the first resolution, whichever test it is.
+    #[cfg(test)]
+    crate::test_home::isolate();
     let home = std::env::var_os("HOME")
         .map(PathBuf::from)
         .ok_or("HOME is not set")?;
-    Ok(std::env::var_os("XDG_DATA_HOME")
+    let dir = std::env::var_os("XDG_DATA_HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|| home.join(".local/share"))
-        .join("chairphoto"))
+        .join("chairphoto");
+    // Tests never use the real one (`test_home`).
+    #[cfg(any(test, feature = "test-hooks"))]
+    crate::test_home::check(&dir, ".local/share", "XDG_DATA_HOME");
+    Ok(dir)
+}
+
+/// The directory the downloaded models live under (face and Smart Tagging): [`app_data_dir`].
+/// In a test build, the data directory as it was before `test_home::isolate` moved it, so
+/// tests find the models the developer downloaded, as they did before (`test_home`).
+pub fn models_base_dir() -> Result<PathBuf, String> {
+    #[cfg(any(test, feature = "test-hooks"))]
+    if let Some(home) = crate::test_home::models_data_home() {
+        return Ok(home.join("chairphoto"));
+    }
+    app_data_dir()
 }
 
 /// The folder holding user-supplied `.cube` LUTs (created on first use). Edit records

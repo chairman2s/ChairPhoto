@@ -101,7 +101,7 @@ pub const MODEL_PATH_SETTING: &str = "smarttags.model_path";
 /// The directory holding the pinned default model (`<app_data_dir>/models/smarttags`).
 /// Created lazily.
 pub fn models_dir() -> Result<PathBuf, ModelError> {
-    let base = crate::app::app_data_dir().map_err(ModelError::Dir)?;
+    let base = crate::app::models_base_dir().map_err(ModelError::Dir)?;
     let dir = base.join("models").join("smarttags");
     std::fs::create_dir_all(&dir).map_err(|e| ModelError::Dir(e.to_string()))?;
     Ok(dir)

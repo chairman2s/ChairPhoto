@@ -762,7 +762,11 @@ next drain. The claim is per photo rather than one global gate because a drain c
 hours, and a user's Offload of an unrelated photo must not wait behind it. Its mutex is a
 leaf in the `app::jobs` lock order. The inspector also disables its storage buttons for a
 photo while one of them runs, so a double-click starts one run. The `Catalog::*_photo` sync
-wrappers do not claim; they are for tests and single-threaded callers.
+wrappers do not claim; they are for tests and single-threaded callers. The service verbs
+without `_as` (`storage::backup_photo`, `offload_photo`, `restore_photo`, `backup_to`,
+`restore_to`) bind to the catalog open when they are called and run on a connection of their
+own to it too (#231): no step of any verb plans or records through the shared handle, which
+is whichever catalog is open at that step.
 
 Empty Trash and Relocate claim too (#256). Emptying the trash claims each photo just before
 its delete, reads where its copies are under that claim (not when the run listed the

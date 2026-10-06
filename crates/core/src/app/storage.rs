@@ -20,21 +20,17 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
-/// Where a lifecycle step plans and records: the shared handle (`AppState` — whichever
-/// catalog is open at each step) or one bound connection (a drain, which must never apply
-/// one catalog's photo and operation ids to another's rows).
+/// Where a lifecycle step plans and records: one connection bound to one catalog — a verb's
+/// ([`bound`]) or a drain's ([`ReconcileClaim`]) — so no step can apply one catalog's photo
+/// ids to another's rows. There is deliberately no implementation for the shared `AppState`
+/// handle, which is whichever catalog is open at each step: a switch between a plan and its
+/// record would record catalog A's ids into B (review of #253, #231 c).
 trait CatalogAccess {
     fn with<T>(&self, f: impl FnOnce(&Catalog) -> crate::catalog::Result<T>) -> Result<T, String>;
 }
 
-/// Both report a catalog error as its user reads it ([`crate::catalog::user_reason`]): a
-/// storage verb's refusal reaches the inspector's status line and a queued op's error.
-impl CatalogAccess for AppState {
-    fn with<T>(&self, f: impl FnOnce(&Catalog) -> crate::catalog::Result<T>) -> Result<T, String> {
-        with_catalog(self, |c| Ok(f(c)))?.map_err(|e| crate::catalog::user_reason(&e))
-    }
-}
-
+/// Reports a catalog error as its user reads it ([`crate::catalog::user_reason`]): a storage
+/// verb's refusal reaches the inspector's status line and a queued op's error.
 impl CatalogAccess for Catalog {
     fn with<T>(&self, f: impl FnOnce(&Catalog) -> crate::catalog::Result<T>) -> Result<T, String> {
         f(self).map_err(|e| crate::catalog::user_reason(&e))
@@ -184,8 +180,12 @@ fn superseded(abort: Option<&AtomicBool>) -> bool {
 ///
 /// The named photo's failure is the call's failure; a frame that fails is reported and the
 /// rest continue, because the master is already at home by then.
+///
+/// Bound, like every verb, to the catalog open when it is called ([`bound`]): a switch
+/// mid-copy cannot record it into the catalog switched to.
 pub fn backup_to(state: &AppState, photo_id: i64, backup_id: i64) -> Result<BackupReport, String> {
-    backup_in(state, &state.storage_claims, photo_id, backup_id, None)
+    let cat = bound(state, super::catalog_identity(state)?)?;
+    backup_in(&cat, &state.storage_claims, photo_id, backup_id, None)
 }
 
 /// `abort`: the reconcile claim a drain runs this under. The named photo — the op in flight,
@@ -300,8 +300,11 @@ pub fn restore_photo_as(
 /// local and why, and how many sidecar backups it deliberately left on disk. Persists an
 /// id-keyed thumbnail from a local copy of every member first, so each stays visible once
 /// only the NAS copy remains (frames are what the inspector's Stack section shows).
+///
+/// Bound to the catalog open when it is called ([`bound`]); a front end that read the id
+/// earlier passes that catalog's identity to [`offload_photo_as`] instead.
 pub fn offload_photo(state: &AppState, photo_id: i64) -> Result<OffloadReport, String> {
-    offload_in(state, &state.storage_claims, photo_id, None)
+    offload_photo_as(state, super::catalog_identity(state)?, photo_id)
 }
 
 /// `abort`: as [`backup_in`]'s, but stricter, because this is the verb that deletes: the
@@ -362,8 +365,11 @@ fn offload_until(
 /// included (a restored photo arrives with the edit state an offload moved home) — **and the
 /// frames stacked under it that are away** (#82): offload frees the moment, so restore brings
 /// it back. A frame already local is left alone rather than overwritten.
+///
+/// Bound to the catalog open when it is called ([`bound`]).
 pub fn restore_to(state: &AppState, photo_id: i64, local_id: i64) -> Result<RestoreReport, String> {
-    restore_in(state, &state.storage_claims, photo_id, local_id, None)
+    let cat = bound(state, super::catalog_identity(state)?)?;
+    restore_in(&cat, &state.storage_claims, photo_id, local_id, None)
 }
 
 /// `abort` and `claims`: as [`backup_in`]'s.
@@ -406,16 +412,15 @@ fn restore_one(cat: &impl CatalogAccess, plan: PhotoRestore) -> Result<(), Strin
 }
 
 /// Back up to the single backup volume. Errors when the NAS is offline; the UI queues a
-/// backup op instead (drained on reconcile).
+/// backup op instead (drained on reconcile). Bound to the catalog open when it is called,
+/// as [`backup_photo_as`] is to the one it names.
 pub fn backup_photo(state: &AppState, photo_id: i64) -> Result<BackupReport, String> {
-    let backup_id = with_catalog(state, |c| single_volume_of_kind(c, VolumeKind::Backup, "backup"))?;
-    backup_to(state, photo_id, backup_id)
+    backup_photo_as(state, super::catalog_identity(state)?, photo_id)
 }
 
-/// Restore to the single local volume.
+/// Restore to the single local volume. Bound as [`backup_photo`] is.
 pub fn restore_photo(state: &AppState, photo_id: i64) -> Result<RestoreReport, String> {
-    let local_id = with_catalog(state, |c| single_volume_of_kind(c, VolumeKind::Local, "local"))?;
-    restore_to(state, photo_id, local_id)
+    restore_photo_as(state, super::catalog_identity(state)?, photo_id)
 }
 
 // --- the storage verbs take the moment (#82) ---------------------------------------------
@@ -447,6 +452,50 @@ mod stack_tests {
         let state = AppState::default();
         *state.catalog.lock().unwrap() = Some(c);
         (dir, state, master, frame, raw, jpg)
+    }
+
+    /// A connection of its own to the open catalog — what every verb plans and records on.
+    fn on(state: &AppState) -> Catalog {
+        bound(state, super::super::catalog_identity(state).unwrap()).unwrap()
+    }
+
+    // ── #231 c: the AppState verbs are bound to one catalog ──────────────────────────
+
+    /// A switch landing between a verb's plan and its record (here: while the offload checks
+    /// its files) must not record catalog A's photo into B, whose photo of the same id is
+    /// another photo. The `AppState` verbs plan and record on a connection bound to the
+    /// catalog open when they were called, as the `_as` verbs do.
+    #[test]
+    fn an_appstate_verb_records_into_the_catalog_it_started_on() {
+        use crate::catalog::offload_hook::{self, Step};
+        let (dir, state, master, _frame, raw, _jpg) = stacked("bound-verbs");
+        backup_photo(&state, master).unwrap();
+        // Catalog B: same ids, its own local photo at the same id.
+        let b_root = dir.join("b-photos");
+        std::fs::create_dir_all(&b_root).unwrap();
+        let b = Catalog::open(&dir.join("b.chairphoto"), &b_root).unwrap();
+        let b_raw = b_root.join("B1.ARW");
+        std::fs::write(&b_raw, b"b-raw").unwrap();
+        let b_id = b.upsert_photo(&b_raw, None, 1, 9).unwrap().id;
+        assert_eq!(b_id, master, "the ids collide");
+        let switched = std::rc::Rc::new(std::cell::Cell::new(false));
+        let _hook = offload_hook::set({
+            let (state, switched, mut b) = (state.clone(), switched.clone(), Some(b));
+            move |step, _| {
+                if step == Step::BeforeMove && !switched.replace(true) {
+                    *state.catalog.lock().unwrap() = b.take();
+                }
+            }
+        });
+
+        offload_photo(&state, master).unwrap();
+
+        assert!(switched.get(), "the switch landed mid-offload");
+        assert!(!raw.exists(), "A's photo was freed");
+        let b_locals = with_catalog(&state, |c| c.photo_locations(b_id)).unwrap();
+        assert!(!b_locals.is_empty(), "B's photo keeps its local row: {b_locals:?}");
+        let a = Catalog::open(&dir.join("c.chairphoto"), &dir.join("photos")).unwrap();
+        assert_eq!(a.photo_storage_status(master).unwrap(), StorageStatus::Archived, "recorded into A");
     }
 
     #[test]
@@ -585,7 +634,7 @@ mod stack_tests {
         let (_dir, state, master, _frame, raw, jpg) = stacked("tripped");
         backup_photo(&state, master).unwrap();
         let tripped = AtomicBool::new(true);
-        let err = offload_in(&state, &state.storage_claims, master, Some(&tripped)).unwrap_err();
+        let err = offload_in(&on(&state), &state.storage_claims, master, Some(&tripped)).unwrap_err();
         assert!(err.contains("catalog switched"), "{err}");
         assert!(raw.exists() && jpg.exists(), "nothing was freed");
     }
@@ -698,7 +747,7 @@ mod stack_tests {
         let (_dir, state, master, frame, _raw, _jpg) = stacked("tripped-backup");
         let nas = with_catalog(&state, |c| single_volume_of_kind(c, VolumeKind::Backup, "backup")).unwrap();
         let tripped = AtomicBool::new(true);
-        let report = backup_in(&state, &state.storage_claims, master, nas, Some(&tripped)).unwrap();
+        let report = backup_in(&on(&state), &state.storage_claims, master, nas, Some(&tripped)).unwrap();
         assert_eq!(report.backed_up, vec![master]);
         assert_eq!(report.skipped.len(), 1);
         assert_eq!((report.skipped[0].photo_id, report.skipped[0].kind), (frame, crate::catalog::SkipKind::Superseded));
@@ -1047,7 +1096,7 @@ mod stack_tests {
             false
         };
 
-        let report = offload_until(&state, &state.storage_claims, master, &during).unwrap();
+        let report = offload_until(&on(&state), &state.storage_claims, master, &during).unwrap();
 
         let tried = tried.into_inner();
         assert_eq!(tried.len(), 6, "the second verbs ran while the offload held the moment");

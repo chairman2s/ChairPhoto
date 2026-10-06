@@ -187,7 +187,10 @@ fn clean_stale_handler(data_home: &Path, config_home: &Path) {
             Err(_) => false,
         },
         Ok(_) => false, // present but not a plain file (e.g. a symlink): not confirmed ours
-        Err(_) => true, // absent: nothing foreign to protect, the stale default can go too
+        // Only a confirmed absence clears the default too; any other error (a permission
+        // error on the folder, say) means we do not actually know, so the default is left
+        // alone rather than assumed clearable.
+        Err(e) => e.kind() == io::ErrorKind::NotFound,
     };
     if !stale_is_own_or_absent {
         return;
@@ -206,13 +209,30 @@ fn clean_stale_handler(data_home: &Path, config_home: &Path) {
 /// plain truncating `fs::write`). If `path` is a symlink, the real destination is resolved
 /// through it first, so the rename lands on the symlink's *target* and the symlink itself is
 /// left exactly as it was — the same "edit the target" behaviour `xdg-mime` itself has.
+///
+/// The real file's mode is carried over to the temp file before the rename (a 0600
+/// `mimeapps.list` must not come back 0644, the new file's default mode), when it has one to
+/// read; a file that does not exist yet gets whatever mode `fs::write` gives it, same as
+/// before. The temp file is removed if the write or the rename fails, rather than left behind
+/// under a name nothing else ever cleans up.
 fn write_mimeapps(path: &Path, content: &str) -> io::Result<()> {
     let real = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
     let dir = real.parent().map(Path::to_path_buf).unwrap_or_else(|| PathBuf::from("."));
     let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos();
     let tmp = dir.join(format!(".mimeapps.list.chairphoto-tmp-{}-{nanos}", std::process::id()));
-    std::fs::write(&tmp, content)?;
-    std::fs::rename(&tmp, &real)
+    let mode = std::fs::metadata(&real).ok().map(|m| m.permissions());
+    let write_and_rename = || -> io::Result<()> {
+        std::fs::write(&tmp, content)?;
+        if let Some(mode) = mode.clone() {
+            std::fs::set_permissions(&tmp, mode)?;
+        }
+        std::fs::rename(&tmp, &real)
+    };
+    let result = write_and_rename();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result
 }
 
 /// Whether a desktop-entry's content is recognisably ChairPhoto's own dev handler: either the
@@ -441,6 +461,69 @@ mod tests {
         assert!(!updated.contains(STALE_HANDLER_FILE), "the stale default line is removed:\n{updated}");
         assert!(updated.contains("text/plain=kate.desktop;"), "other associations survive:\n{updated}");
         assert!(updated.contains("text/html=firefox.desktop"), "other defaults survive:\n{updated}");
+    }
+
+    /// #231 nit (from the #167 fix review): `write_mimeapps`'s temp-then-rename must not
+    /// reset the real file's mode to whatever the process's default is — a 0600
+    /// `mimeapps.list` must still be 0600 afterwards.
+    #[cfg(unix)]
+    #[test]
+    fn write_mimeapps_keeps_the_files_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let home = Home::new("mimeapps-mode");
+        std::fs::create_dir_all(&home.0).unwrap();
+        let path = home.0.join("mimeapps.list");
+        std::fs::write(&path, "[Default Applications]\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        write_mimeapps(&path, "[Default Applications]\nx=y.desktop\n").unwrap();
+
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "the file's mode must survive the rewrite");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "[Default Applications]\nx=y.desktop\n");
+    }
+
+    /// #231 nit: a rename failure must not leave the temp file behind — nothing else ever
+    /// cleans up a `.mimeapps.list.chairphoto-tmp-*` name. Forced by pointing the destination
+    /// at an existing *directory*: renaming the temp (a plain file) over it fails.
+    #[test]
+    fn write_mimeapps_removes_its_temp_file_when_the_rename_fails() {
+        let home = Home::new("mimeapps-tmp-cleanup");
+        std::fs::create_dir_all(&home.0).unwrap();
+        let path = home.0.join("mimeapps.list");
+        std::fs::create_dir_all(&path).unwrap();
+
+        let result = write_mimeapps(&path, "[Default Applications]\n");
+        assert!(result.is_err(), "the rename of a file over an existing directory must fail");
+
+        let leftovers: Vec<_> = std::fs::read_dir(&home.0)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains("chairphoto-tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "a temp file was left behind: {leftovers:?}");
+    }
+
+    /// #231 nit (from the #167 fix review): only a *confirmed* absence of the stale handler
+    /// file (`ErrorKind::NotFound`) lets `clean_stale_handler` clear the `mimeapps.list`
+    /// default too; any other error — here `NotADirectory`, since `applications` is a plain
+    /// file — means it does not actually know, so the default is left alone rather than
+    /// assumed clearable.
+    #[test]
+    fn an_unreadable_applications_folder_leaves_the_default_alone() {
+        let home = Home::new("stale-unreadable");
+        std::fs::create_dir_all(&home.0).unwrap();
+        std::fs::write(home.0.join("applications"), b"not a directory").unwrap();
+        let config = home.0.join("config");
+        std::fs::create_dir_all(&config).unwrap();
+        let mimeapps = config.join("mimeapps.list");
+        let original = "[Default Applications]\nx-scheme-handler/chairphoto=chairphoto-gpui-handler.desktop\n";
+        std::fs::write(&mimeapps, original).unwrap();
+
+        clean_stale_handler(&home.0, &config);
+
+        assert_eq!(std::fs::read_to_string(&mimeapps).unwrap(), original, "left alone: absence was never confirmed");
     }
 
     /// A same-named file that is not ChairPhoto's own entry (no recognisable content) is

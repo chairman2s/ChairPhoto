@@ -29,6 +29,11 @@ pub struct BundlePreview {
     /// Photos already present in the catalog (the merge keeps their values and fills only
     /// their blanks, #185).
     pub existing: usize,
+    /// Photos whose identity is not in the catalog while a photo of another identity holds
+    /// their path: likely the same capture imported on both machines (#249). The import
+    /// merges each onto that photo when the capture is proven, else keeps it apart — so they
+    /// are not counted as new. (The proof needs the originals' stamps, read on import.)
+    pub here_under_another_identity: usize,
 }
 
 /// Peek at a bundle: parse its manifest (no catalog lock) and count its photos by UUID
@@ -36,17 +41,33 @@ pub struct BundlePreview {
 pub fn preview_bundle(state: &AppState, bundle_path: &Path) -> Result<BundlePreview, String> {
     let (manifest, _archive) = crate::bundle::importer::open_bundle(bundle_path)?;
     let uuids: Vec<String> = manifest.photos.iter().map(|bp| bp.uuid.clone()).collect();
-    let existing = {
+    let (existing, elsewhere) = {
+        use rusqlite::OptionalExtension;
         let guard = state.catalog.lock().map_err(|e| e.to_string())?;
         let catalog = guard.as_ref().ok_or("No catalog is open")?;
-        catalog.count_existing_uuids(&uuids).map_err(|e| e.to_string())?
+        let existing = catalog.count_existing_uuids(&uuids).map_err(|e| e.to_string())?;
+        let mut elsewhere = 0;
+        for bp in &manifest.photos {
+            let Some(identity) = crate::catalog::photo_identity_for(&bp.uuid) else { continue };
+            let held: Option<String> = catalog
+                .conn()
+                .query_row("SELECT uuid FROM photos WHERE path = ?1", [&bp.relative_path], |r| r.get(0))
+                .optional()
+                .map_err(|e| e.to_string())?;
+            let known = catalog.count_existing_uuids(std::slice::from_ref(&identity)).map_err(|e| e.to_string())? > 0;
+            if !known && held.is_some_and(|uuid| uuid != identity) {
+                elsewhere += 1;
+            }
+        }
+        (existing, elsewhere)
     };
     Ok(BundlePreview {
         batch_label: manifest.batch.source_label.clone(),
         batch_uuid: manifest.batch.uuid.clone(),
         total: manifest.photos.len(),
-        new_count: uuids.len().saturating_sub(existing),
+        new_count: uuids.len().saturating_sub(existing).saturating_sub(elsewhere),
         existing,
+        here_under_another_identity: elsewhere,
     })
 }
 
@@ -140,8 +161,14 @@ mod tests {
     use crate::catalog::Catalog;
     use std::sync::Arc;
 
-    /// A bundle of `n` photos, each with a small original.
+    /// A bundle of `n` photos, each with a small original, all in one date folder.
     fn bundle(dir: &Path, n: usize) -> std::path::PathBuf {
+        bundle_in(dir, &vec!["2026/01/02"; n])
+    }
+
+    /// A bundle of one photo per entry of `days`, `IMG_<i>.jpg` in that date folder.
+    fn bundle_in(dir: &Path, days: &[&str]) -> std::path::PathBuf {
+        let n = days.len();
         let orig = dir.join("orig");
         std::fs::create_dir_all(&orig).unwrap();
         let mut manifest = BundleManifest::new(
@@ -155,7 +182,7 @@ mod tests {
             std::fs::write(&f, format!("original {i}")).unwrap();
             manifest.photos.push(BundlePhoto {
                 uuid: uuid.clone(),
-                relative_path: format!("2026/01/02/IMG_{i}.jpg"),
+                relative_path: format!("{}/IMG_{i}.jpg", days[i]),
                 rating: 0,
                 label: String::new(),
                 pick_state: crate::catalog::PickState::None,
@@ -233,11 +260,37 @@ mod tests {
         }
     }
 
+    // --- the preview (#249, review NIT-2) -----------------------------------------------------
+
+    /// A bundle photo whose identity the catalog lacks, at a path a photo of another identity
+    /// holds, is not counted as new: the import will merge it onto that photo (proven
+    /// capture) or keep it apart.
+    #[test]
+    fn the_preview_counts_photos_here_under_another_identity_apart_from_new_ones() {
+        let dir = crate::test_support::TestTmpDir::new("bundle-preview-elsewhere");
+        let path = bundle(&dir, 3);
+        let root = dir.join("library");
+        let day = root.join("2026/01/02");
+        std::fs::create_dir_all(&day).unwrap();
+        let c = Catalog::open(&dir.join("a.chairphoto"), &root).unwrap();
+        // IMG_0 is here as the bundle's photo; IMG_1's path is held under another identity.
+        for (i, uuid) in [(0, "00000000-0000-4000-8000-000000000000"), (1, "11111111-1111-4111-8111-111111111111")] {
+            let f = day.join(format!("IMG_{i}.jpg"));
+            std::fs::write(&f, b"x").unwrap();
+            c.upsert_photo_with_identity(&f, None, 1, 1, Some(uuid)).unwrap();
+        }
+        let state = AppState::default();
+        *state.catalog.lock().unwrap() = Some(c);
+        let p = preview_bundle(&state, &path).unwrap();
+        assert_eq!((p.total, p.existing, p.here_under_another_identity, p.new_count), (3, 1, 1, 1));
+    }
+
     // --- the names an unpack finds taken (#247, #231 F3) -------------------------------------
 
     /// **Forced interleaving** (AGENTS.md, "Catalog identity"). Catalog A, which the import
     /// starts against, has a row holding `IMG_1.jpg` under another identity, its file gone.
-    /// As the second original is unpacked the open catalog is swapped for B — whose row has
+    /// `IMG_1.jpg` is in a date folder of its own, so its names are first read after the swap
+    /// (review LOW-3). As the second original is unpacked the open catalog is swapped for B — whose row has
     /// A's row's id and holds no name there — once silently (no switch delivered, the import
     /// not tripped) and once as a real switch (`catalog:switched` sent, the import tripped).
     /// Either way the unpack decides names by A's rows: `IMG_1.jpg` goes to ` (2)`, never to
@@ -248,9 +301,9 @@ mod tests {
         const HELD: &str = "11111111-1111-4111-8111-111111111111";
         for switched in [false, true] {
             let dir = crate::test_support::TestTmpDir::new(&format!("bundle-names-swap-{switched}"));
-            let path = bundle(&dir, 2);
+            let path = bundle_in(&dir, &["2026/01/02", "2026/01/03"]);
             let root = dir.join("library");
-            let day = root.join("2026/01/02");
+            let day = root.join("2026/01/03");
             std::fs::create_dir_all(&day).unwrap();
             let a = Catalog::open(&dir.join("a.chairphoto"), &root).unwrap();
             let held = day.join("IMG_1.jpg");
@@ -299,11 +352,11 @@ mod tests {
             let paths: Vec<String> = rows(&started).into_iter().map(|r| r.1).collect();
             if switched {
                 assert!(outcome.unwrap_err().starts_with(IMPORT_CANCELLED));
-                assert_eq!(paths, ["2026/01/02/IMG_1.jpg"], "nothing merged into A");
+                assert_eq!(paths, ["2026/01/03/IMG_1.jpg"], "nothing merged into A");
             } else {
                 let result = outcome.unwrap();
                 assert_eq!(result.merge.photos_added, 2, "{result:?}");
-                assert_eq!(paths, ["2026/01/02/IMG_0.jpg", "2026/01/02/IMG_1 (2).jpg", "2026/01/02/IMG_1.jpg"]);
+                assert_eq!(paths, ["2026/01/02/IMG_0.jpg", "2026/01/03/IMG_1 (2).jpg", "2026/01/03/IMG_1.jpg"]);
             }
             let in_b = rows(&Catalog::open_secondary(&b_path, &dir.join("b")).unwrap());
             assert_eq!(in_b, [(held_id, "elsewhere.jpg".to_string(), 0)], "{switched}: B gained nothing, its row untouched");

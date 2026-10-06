@@ -215,6 +215,9 @@ impl Render for BundleImport {
             if p.existing > 0 {
                 counts += &format!(" · {} already in catalog", p.existing);
             }
+            if p.here_under_another_identity > 0 {
+                counts += &format!(" · {} likely here under another identity", p.here_under_another_identity);
+            }
             body = body.child(ui::sub(format!("Batch: {label}"), colors)).child(div().id("bundle-counts").child(ui::sub(counts, colors)).test_support());
             if p.new_count == 0 && p.existing > 0 {
                 body = body.child(ui::sub("All photos are already present — importing only fills in what they lack (safe to run).", colors));

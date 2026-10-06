@@ -339,7 +339,7 @@ impl Render for ImportPanel {
                                 })
                                 .when(c.is_duplicate, |d| {
                                     d.child(
-                                        div().absolute().top(px(3.)).right(px(5.)).text_size(px(10.)).text_color(colors.mute).child("dup"),
+                                        div().absolute().top(px(3.)).right(px(5.)).text_size(px(10.)).text_color(colors.mute).child(if c.offloaded { "offloaded" } else { "dup" }),
                                     )
                                 })
                                 .child(

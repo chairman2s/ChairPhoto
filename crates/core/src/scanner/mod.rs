@@ -56,6 +56,12 @@ pub struct ScanResult {
     /// the trash (so the photo stays hidden there).
     pub restored: usize,
     pub restored_trashed: usize,
+    /// Ingest only: card files whose photo was offloaded — its row has no local location
+    /// left and a verified backup (#231 F5): already imported, not copied back.
+    pub offloaded: usize,
+    /// Ingest only: card files whose name is too long for a sidecar beside it (`<name>.xmp`
+    /// over 255 bytes): not imported, since the photo's identity could never be written.
+    pub name_too_long: usize,
 }
 
 /// Live progress of a scan, streamed to the UI via the `scan:progress` event. `total = 0`
@@ -577,15 +583,19 @@ pub struct CardPhoto {
     pub size: i64,
     pub capture_time: Option<String>,
     /// The library already holds this photo at its computed destination: a file of the same
-    /// name and size there is the same capture (#246, [`same_photo`]).
+    /// name and size there is the same capture (#246, [`same_photo`]), or it is offloaded.
     pub is_duplicate: bool,
+    /// Its catalog row's photo was offloaded (#231 F5): the copy skips it as already
+    /// imported, and does not copy it back. Set only when the listing was given the catalog.
+    pub offloaded: bool,
 }
 
 /// List the importable photos on a card/source folder, flagging each as a duplicate when the
 /// library already holds it at its computed date-tree destination under `dest_base`, by the
-/// same rule the copy uses (#246, [`same_photo`]). Filesystem + metadata only — no catalog
-/// access; call off the UI thread.
-pub fn list_card_photos(source: &Path, dest_base: &Path) -> Result<Vec<CardPhoto>, String> {
+/// same rule the copy uses (#246, [`same_photo`]). With `catalog` (the catalog the import
+/// would index into, on its own connection) a file whose row's photo was offloaded is flagged
+/// too, as the copy will skip it (#231 F5). Call off the UI thread.
+pub fn list_card_photos(source: &Path, dest_base: &Path, catalog: Option<&Catalog>) -> Result<Vec<CardPhoto>, String> {
     if !source.is_dir() {
         return Err(format!("Not a directory: {}", source.display()));
     }
@@ -602,19 +612,32 @@ pub fn list_card_photos(source: &Path, dest_base: &Path) -> Result<Vec<CardPhoto
     let planned = plan_card(&sources, &meta, dest_base);
     let duplicates = already_imported(&sources, planned.iter().map(|p| &p.candidates), &AtomicBool::new(false))
         .unwrap_or_default();
+    let mut names = catalog.map(free_name::CatalogNames::new);
     let mut out: Vec<CardPhoto> = sources
         .iter()
         .zip(planned)
         .enumerate()
-        .map(|(i, (src, CardPlan { capture, size, .. }))| CardPhoto {
-            path: src.to_string_lossy().into_owned(),
-            name: src
-                .file_name()
-                .map(|f| f.to_string_lossy().into_owned())
-                .unwrap_or_default(),
-            size: size as i64,
-            capture_time: capture,
-            is_duplicate: duplicates.get(i).is_some_and(|found| !found.is_empty()),
+        .map(|(i, (src, CardPlan { dir, capture, size, .. }))| {
+            let duplicate = duplicates.get(i).is_some_and(|found| !found.is_empty());
+            // The copy's F5 rule, asked only of a file it would not skip as a duplicate.
+            let offloaded = !duplicate
+                && names.as_mut().zip(src.file_name()).is_some_and(|(names, file)| {
+                    let stamp = meta.get(src).map(|m| {
+                        same_photo::stamp_from_metadata(
+                            m.entries.iter().map(|e| (e.key.as_str(), e.group_name.as_str(), e.value.as_str())),
+                        )
+                    });
+                    let arriving = free_name::Arriving::Capture(stamp.unwrap_or_default());
+                    names.kept_elsewhere(&dir.join(file), &arriving).is_some()
+                });
+            CardPhoto {
+                path: src.to_string_lossy().into_owned(),
+                name: src.file_name().map(|f| f.to_string_lossy().into_owned()).unwrap_or_default(),
+                size: size as i64,
+                capture_time: capture,
+                is_duplicate: duplicate || offloaded,
+                offloaded,
+            }
         })
         .collect();
     out.sort_by(|a, b| a.name.cmp(&b.name));
@@ -722,10 +745,15 @@ pub fn copy_from_card_abortable(
             same_photo::stamp_from_metadata(m.entries.iter().map(|e| (e.key.as_str(), e.group_name.as_str(), e.value.as_str())))
         });
         let arriving = free_name::Arriving::Capture(stamp.unwrap_or_default());
+        if !same_photo::sidecar_name_fits(&dir.join(filename)) {
+            eprintln!("ingest: {} not imported: its name is too long for a sidecar beside it", src.display());
+            result.name_too_long += 1;
+            continue;
+        }
         // The row's photo was offloaded (a verified backup holds it): already imported, and
         // not copied back to this disk (#231 F5).
         if names.kept_elsewhere(&dir.join(filename), &arriving).is_some() {
-            result.skipped += 1;
+            result.offloaded += 1;
             in_library.insert(src);
             continue;
         }
@@ -1237,7 +1265,7 @@ mod tests {
         assert!(!root.join("2026/06/28/DSC1 (4).jpg").exists());
 
         // The card listing says the same.
-        let listed = list_card_photos(&card, &root).unwrap();
+        let listed = list_card_photos(&card, &root, None).unwrap();
         assert!(listed.iter().all(|p| p.is_duplicate), "all listed as imported");
     }
 
@@ -1430,41 +1458,72 @@ mod tests {
         }
     }
 
-    /// #231 F5: a photo offloaded to a verified backup (its local file gone on purpose) is
-    /// already imported: importing its card again skips it — not copied back to this disk,
-    /// no row touched — whether or not the backup volume is mounted. Without a verified
-    /// backup the same capture comes back to its row, as before.
+    /// #231 F5 (narrowed after the release review, MEDIUM-1 / probe P4): only a photo that was
+    /// really **offloaded** — no local location row left, and a backup with a verified hash —
+    /// is already imported: its card's file is skipped, counted as offloaded, not copied back,
+    /// and the import dialog's listing flags it the same way. A photo whose local file was
+    /// lost while its local location row stays (P4: deleted outside the app, the backup
+    /// record verified) may have its last copy on the card: it is restored to its row. So is
+    /// one offloaded to a backup never verified. Whether the backup volume is mounted plays
+    /// no part.
     #[test]
-    fn an_offloaded_photo_on_a_card_again_is_already_imported() {
-        if !exiftool_available("an_offloaded_photo_on_a_card_again_is_already_imported") {
+    fn only_an_offloaded_photo_on_a_card_again_is_skipped() {
+        if !exiftool_available("only_an_offloaded_photo_on_a_card_again_is_skipped") {
             return;
         }
-        for verified in [true, false] {
-            let (catalog, dir, root, card) = ingest_rig(&format!("f5-{verified}"));
+        for case in ["offloaded", "lost-locally", "unverified"] {
+            let (catalog, dir, root, card) = ingest_rig(&format!("f5-{case}"));
             stamped_jpeg(&card.join("IMG.jpg"), "2026:06:28 12:00:00", "123", "4711");
             ingest_from_card(&catalog, &card, &root, None).unwrap();
             let name = root.join("2026/06/28/IMG.jpg");
             let (id, uuid, _, _) = row_at(&catalog, "2026/06/28/IMG.jpg").unwrap();
-            // Offloaded: a backup copy on an unmounted NAS, then the local file and sidecar gone.
-            let nas = catalog
-                .add_volume("NAS", &dir.join("nas-unmounted"), crate::catalog::VolumeKind::Backup)
-                .unwrap();
+            let local_rows = || -> i64 {
+                catalog
+                    .conn()
+                    .query_row(
+                        "SELECT COUNT(*) FROM photo_locations l JOIN volumes v ON v.id = l.volume_id
+                          WHERE l.photo_id = ?1 AND v.kind = 'local'",
+                        [id],
+                        |r| r.get(0),
+                    )
+                    .unwrap()
+            };
+            assert_eq!(local_rows(), 1, "{case}: the ingest recorded its local location");
+            // A backup copy on a NAS that is not mounted.
+            let nas = catalog.add_volume("NAS", &dir.join("nas-unmounted"), crate::catalog::VolumeKind::Backup).unwrap();
             catalog.add_location(id, nas, "2026/06/28/IMG.jpg", crate::catalog::LocationRole::Backup).unwrap();
-            if verified {
-                catalog.conn().execute("UPDATE photo_locations SET verified_hash = 'abc' WHERE photo_id = ?1 AND volume_id = ?2", [id, nas]).unwrap();
+            if case != "unverified" {
+                catalog
+                    .conn()
+                    .execute("UPDATE photo_locations SET verified_hash = 'abc' WHERE photo_id = ?1 AND volume_id = ?2", [id, nas])
+                    .unwrap();
+            }
+            if case != "lost-locally" {
+                // What an offload commits: the local location rows go.
+                catalog
+                    .conn()
+                    .execute(
+                        "DELETE FROM photo_locations WHERE photo_id = ?1
+                            AND volume_id IN (SELECT id FROM volumes WHERE kind = 'local')",
+                        [id],
+                    )
+                    .unwrap();
             }
             std::fs::remove_file(&name).unwrap();
             std::fs::remove_file(crate::xmp::sidecar_path(&name)).unwrap();
 
+            let listed = list_card_photos(&card, &root, Some(&catalog)).unwrap();
             let again = ingest_from_card(&catalog, &card, &root, None).unwrap();
-            if verified {
-                assert_eq!((again.skipped, again.created, again.restored), (1, 0, 0), "{again:?}");
+            if case == "offloaded" {
+                assert_eq!((again.offloaded, again.skipped, again.created, again.restored), (1, 0, 0, 0), "{again:?}");
                 assert!(!name.exists(), "not copied back to this disk");
+                assert!(listed[0].offloaded && listed[0].is_duplicate, "the dialog agrees: {}", listed[0].offloaded);
             } else {
-                assert_eq!((again.skipped, again.restored), (0, 1), "{again:?}");
-                assert!(name.exists());
+                assert_eq!((again.offloaded, again.restored), (0, 1), "{case}: {again:?}");
+                assert!(name.exists(), "{case}: the card's copy is back");
+                assert!(!listed[0].offloaded && !listed[0].is_duplicate, "{case}: the dialog offers it");
             }
-            assert_eq!(photos(&catalog), [("2026/06/28/IMG.jpg".to_string(), uuid)], "{verified}: one row");
+            assert_eq!(photos(&catalog), [("2026/06/28/IMG.jpg".to_string(), uuid)], "{case}: one row");
         }
     }
 
@@ -1552,7 +1611,7 @@ mod tests {
             std::fs::write(card.join(folder).join("IMG.jpg"), b"\xff\xd8one").unwrap();
         }
         let flagged: Vec<String> =
-            list_card_photos(&card, &root).unwrap().into_iter().filter(|p| p.is_duplicate).map(|p| p.path).collect();
+            list_card_photos(&card, &root, None).unwrap().into_iter().filter(|p| p.is_duplicate).map(|p| p.path).collect();
         assert_eq!(flagged.len(), 1, "{flagged:?}");
         let (result, copied) = copy_from_card(&catalog, &card, &root, None, |_, _| {}).unwrap();
         assert_eq!((result.skipped, copied.len()), (1, 1));

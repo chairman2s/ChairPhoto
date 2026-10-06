@@ -538,17 +538,18 @@ pub(crate) fn name_free(path: &Path) -> bool {
     absent(path) && absent(&crate::xmp::sidecar_path(path))
 }
 
-/// Nothing at `path`, not even a dangling symlink. A name too long for the filesystem has
-/// nothing at it either: the sidecar name of a 252-to-255-byte file name is such a name
-/// (N-4 of the third #246 review), and no file can be there.
+/// Nothing at `path`, not even a dangling symlink.
 pub(crate) fn absent(path: &Path) -> bool {
-    std::fs::symlink_metadata(path).is_err_and(|e| {
-        #[cfg(unix)]
-        if e.raw_os_error() == Some(rustix::io::Errno::NAMETOOLONG.raw_os_error()) {
-            return true;
-        }
-        e.kind() == std::io::ErrorKind::NotFound
-    })
+    std::fs::symlink_metadata(path).is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound)
+}
+
+/// Whether a photo named like `path` can have its sidecar, `<name>.xmp`, beside it: the
+/// sidecar's name fits in [`NAME_MAX`] bytes. A photo whose sidecar can never be written
+/// could never carry its identity (`xmp:Identifier`), so card ingest and bundle import
+/// refuse such a file with that reason rather than import it with a debt no repair can pay
+/// (review of #231 N-4, LOW-5).
+pub fn sidecar_name_fits(path: &Path) -> bool {
+    path.file_name().is_some_and(|n| n.len() + ".xmp".len() <= NAME_MAX)
 }
 
 /// Create a new file at `wanted`, or at the next free ` (n)` name beside it, and fill it with
@@ -1114,8 +1115,8 @@ mod tests {
     #[test]
     fn a_name_near_the_length_limit_is_still_placed() {
         let dir = temp("long-name");
-        for name in [format!("{}.ARW", "D".repeat(246)), format!("{}é{}.ARW", "D".repeat(188), "x".repeat(60))] {
-            assert!(name.len() > 240 && name.len() <= 255, "{}", name.len());
+        for name in [format!("{}.ARW", "D".repeat(246)), format!("{}é{}.ARW", "D".repeat(188), "x".repeat(57))] {
+            assert!(name.len() > 240 && sidecar_name_fits(&dir.join(&name)), "{}", name.len());
             let wanted = dir.join(&name);
             let placed = create_new_with(&wanted, unique_dest, |f| {
                 use std::io::Write;

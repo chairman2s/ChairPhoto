@@ -891,7 +891,10 @@ Two modes over the same core location model:
   only the exact name pattern, a regular file (never a symlink), whose process is no longer
   running here, unwritten for over an hour (`working_files::remove_if_stale_part`). A name
   within the temporary name's ~30 bytes of the 255-byte limit is carried shortened in the
-  temporary name (a prefix and a hash, N-4); the file still takes its full name. On a filesystem with neither (exFAT, FAT) the name is claimed by an
+  temporary name (a prefix and a hash, N-4); the file still takes its full name. A file
+  whose sidecar's name (`<name>.xmp`) would be over 255 bytes is not imported at all — its
+  identity could never be written beside it — and the result counts it apart ("name too
+  long for a sidecar"). On a filesystem with neither (exFAT, FAT) the name is claimed by an
   exclusive create and the temporary file copied in: still no overwrite, but without that
   crash guarantee. A name is free only when
   nothing is at it and nothing at its sidecar's name (`<name>.xmp`) either: a sidecar with
@@ -922,10 +925,15 @@ Two modes over the same core location model:
   name taken, and is left untouched). The file is placed at that name, even past a free
   plain name, and indexing re-links the row: missing cleared, its rating, tags and edits
   kept, no second row. So a photo deleted outside the app and imported again from its card
-  comes back to its row. A photo **offloaded** — the row a file would re-link has a backup
-  copy with a verified hash — is already imported: its card's file (or a bundle's
-  original) is skipped and not copied back to this disk (#231 F5); the record decides, not
-  a look at the backup volume, which may be unmounted. Every other arriving file goes on to the next free ` (n)` with a
+  comes back to its row. A photo **offloaded** — the row a file would re-link has no
+  location on a local volume left (an offload drops those once the backup is verified)
+  and a backup location with a verified hash — is already imported: its card's file (or a
+  bundle's original) is skipped, counted apart ("already offloaded, not copied back"), and
+  not copied back to this disk (#231 F5). The record decides, not a look at the backup
+  volume, which may be unmounted. A photo that still has a local location row lost its file
+  some other way, and the card may hold its last copy: it is restored to its row; when
+  unsure, the file is copied. The import dialog's listing flags an offloaded photo the same
+  way. Every other arriving file goes on to the next free ` (n)` with a
   row of its own: a different capture is never attached to an old row. File mtime is never evidence (a
   copy changes it). The ` (n)` names an earlier import gave are checked too (every one in
   the folder, past a gap in the numbers or with the plain name gone), so importing a
@@ -1052,7 +1060,7 @@ The merge engine (`catalog/merge.rs`) is **pure-DB, no file I/O**:
 | Tag taxonomy | Resolve by tag uuid first, then normalized full_path; create missing ancestors; never overwrite existing uuid / exportable flag |
 | Tag terms | `INSERT … ON CONFLICT DO NOTHING` — adds missing terms, never modifies existing |
 | Photo (new) | Insert with full state (rating, label, pick, IPTC, edit record, versions) |
-| Photo (existing) | **Its own values win; blanks are filled** (owner decision on #185, 2026-10-04). Rating 0, an empty label and a pick of "none" take the bundle's. The bundle's edit record (as a version named "Imported edit"; a blank one is no edit and adds none) and its versions are added as **new versions** after the photo's own, unless the photo already has those settings (its edit record or a version with an equal JSON value), so a re-merge adds none; the photo's edit record and versions are not changed. Blank IPTC fields are filled by the importer, not the pure-DB merge (below). A row the importer created for this bundle moments before is not filled again. **Once per bundle** (#248, decision 2026-10-06): every photo a bundle's photo is merged into — inserted, created by the importer, or filled — is recorded with the bundle's batch uuid (`bundle_merges`, schema v27, local to the catalog); merging that batch into it again fills nothing and adds no version, so a value the user cleared or a version they deleted after the first import stays gone (counted in `MergeSummary::photos_merged_before`). Its tags still union. Another batch fills the blanks as before. |
+| Photo (existing) | **Its own values win; blanks are filled** (owner decision on #185, 2026-10-04). Rating 0, an empty label and a pick of "none" take the bundle's. The bundle's edit record (as a version named "Imported edit"; a blank one is no edit and adds none) and its versions are added as **new versions** after the photo's own, unless the photo already has those settings (its edit record or a version with an equal JSON value), so a re-merge adds none; the photo's edit record and versions are not changed. Blank IPTC fields are filled by the importer, not the pure-DB merge (below). A row the importer created for this bundle moments before is not filled again. **Once per bundle** (#248, decisions 2026-10-06): every photo a bundle's photo is merged into — inserted, created by the importer, or filled — is recorded with the bundle, its batch uuid and the time it was written (`BundleManifest::created_at`; `bundle_merges`, schema v27, local to the catalog). Merging that same bundle into it again applies nothing — no fill, no version, no tag — so a value the user cleared, a version they deleted or a tag they removed after the first import stays so (counted in `MergeSummary::photos_merged_before`). A later export of the same batch, carrying work done since, is another bundle: it fills the blanks and adds its new versions as before. |
 | Photo (new identity, path taken) | **Kept apart** — no row holds its identity but another photo, under another identity, holds its path (the same capture imported separately on each side, #246): neither inserted (`photos.path` is UNIQUE; before #185 the whole merge failed here) nor merged onto that photo. Counted in `MergeSummary::photos_kept_apart`. The same holds when the importer found the photo's original in the library at another name (a ` (n)` one) under another identity and its own path is free: the importer passes those identities to `merge_bundle_into`, so no metadata-only row is inserted at a path where no file of the photo is. Each one is named in `MergeSummary::kept_apart_names` (the bundle's relative paths), and the import line lists them (#249). |
 | Photo (same capture, another identity, proven) | **Merged onto that row** (#249, decision 2026-10-06): the importer found the original in the library as the same capture under another identity — both machines imported the card, each minting its own UUID — and the stamps prove it by the strict re-link rule (`same_photo::same_capture_without_contents`: the same capture, and a sub-second or a serial present and equal on both sides), and no row holds the bundle's identity. The bundle's data goes onto the library's row as onto any existing photo — blanks filled, versions added, once per bundle (#248), tags unioned — and the row keeps its own identity, in the catalog and in its sidecar. Counted in `MergeSummary::photos_matched_by_capture`. Anything weaker (the same second with no sub-second or serial on both sides, or identical bytes with no capture time) stays kept apart. |
 | Tag assignments | `INSERT OR IGNORE` union — new assignments added, none removed |
@@ -1265,9 +1273,10 @@ runs the same transition — it replaces the catalog handle exactly as a switch 
   truth. A non-zero `dismissed_at` is a human's "stop retrying this copy" (see Resolving a
   conflict): the row stays for the record, and leaves both the repair pass and the debt
   count.
-- `bundle_merges` (v27) — photo_id, batch_uuid, merged_at: which bundle batch has been
-  merged into which photo, so importing the same bundle again fills nothing (#248; see
-  Bundle format). Local to the catalog; never exported or merged.
+- `bundle_merges` (v27) — photo_id, batch_uuid, bundle_created_at, merged_at: which bundle
+  (a batch as exported at a time) has been merged into which photo, so importing the same
+  bundle again applies nothing (#248; see Bundle format). Local to the catalog; never
+  exported or merged.
 
 ## Storage model
 

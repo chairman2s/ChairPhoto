@@ -666,6 +666,12 @@ pub fn card_import_line(r: &ScanResult) -> String {
     if r.restored > 0 {
         line += &format!(", {}", restored_clause(r.restored, r.restored_trashed));
     }
+    if r.offloaded > 0 {
+        line += &format!(", {} already offloaded, not copied back", r.offloaded);
+    }
+    if r.name_too_long > 0 {
+        line += &format!(", {} not imported (name too long for a sidecar)", r.name_too_long);
+    }
     if r.errors > 0 {
         line += &format!(", {} errors", r.errors);
     }
@@ -751,6 +757,12 @@ pub fn bundle_import_line(r: &BundleImportResult) -> String {
     if r.restored > 0 {
         line += &format!(" {}.", restored_clause(r.restored, r.restored_trashed));
     }
+    if r.offloaded > 0 {
+        line += &format!(" {} already offloaded, not copied back.", r.offloaded);
+    }
+    if r.name_too_long > 0 {
+        line += &format!(" {} not unpacked (name too long for a sidecar).", r.name_too_long);
+    }
     if r.merge.photos_filled > 0 {
         line += &format!(
             " {} already in the catalog filled in ({} new {}).",
@@ -819,12 +831,20 @@ mod tests {
         );
         assert_eq!(card_import_line(&card(2, 0)), "Imported 2 new of 4 on card, 2 restored to their old rows");
         assert_eq!(card_import_line(&card(1, 1)), "Imported 3 new of 4 on card, 1 restored to its old row, in the trash");
+        // #231 F5 and LOW-5: offloaded photos and refused names have their own counts.
+        let other = ScanResult { scanned: 3, offloaded: 2, name_too_long: 1, ..Default::default() };
+        assert_eq!(
+            card_import_line(&other),
+            "Imported 0 new of 3 on card, 2 already offloaded, not copied back, 1 not imported (name too long for a sidecar)"
+        );
         let bundle = BundleImportResult {
             copied: 2,
             skipped_duplicate: 0,
             errors: 0,
             restored: 2,
             restored_trashed: 2,
+            offloaded: 0,
+            name_too_long: 0,
             merge: Default::default(),
         };
         assert_eq!(
@@ -862,6 +882,8 @@ mod tests {
             errors: 0,
             restored: 0,
             restored_trashed: 0,
+            offloaded: 0,
+            name_too_long: 0,
             merge: chairphoto_core::catalog::MergeSummary {
                 photos_existing: 2,
                 photos_matched_by_capture: 2,
@@ -888,6 +910,8 @@ mod tests {
             errors: 0,
             restored: 0,
             restored_trashed: 0,
+            offloaded: 0,
+            name_too_long: 0,
             merge: chairphoto_core::catalog::MergeSummary {
                 photos_existing: 2,
                 photos_filled: 1,

@@ -572,19 +572,23 @@ CREATE TABLE IF NOT EXISTS pending_sidecar_iptc (
 );
 CREATE INDEX IF NOT EXISTS idx_pending_sidecar_iptc_owed ON pending_sidecar_iptc(photo_id) WHERE owed != 0;
 
--- Schema v27 (#248). Which bundle import batch (`import_batches.uuid` as the bundle's
--- manifest carries it) has already been merged into which photo. A bundle fills only an
--- existing photo's blanks, and cannot tell "never set" from "the user cleared it": without
--- this, importing the same bundle again would bring back a rating, label, pick or IPTC value
--- the user cleared, and a version the user deleted. `Catalog::merge_bundle_into` records
--- every photo it merges a bundle's photo into — inserted, created by the importer for the
--- bundle, or filled in — and skips the fill and the versions for a pair already recorded
--- (tags still union, which is idempotent). Local to this catalog: never exported or merged.
--- No backfill: which bundles earlier imports merged is not recorded anywhere.
+-- Schema v27 (#248). Which bundle has already been merged into which photo. A bundle is its
+-- import batch (`import_batches.uuid`, as the manifest carries it) exported at a time
+-- (`BundleManifest::created_at`, Unix seconds): a later export of the same batch carries the
+-- work done since and is another bundle. A bundle fills only an existing photo's blanks, and
+-- cannot tell "never set" from "the user cleared it": without this, importing the same bundle
+-- again would bring back a rating, label, pick, IPTC value or tag the user removed, and a
+-- version the user deleted. `Catalog::merge_bundle_into` records every photo it merges a
+-- bundle's photo into — inserted, created by the importer for the bundle, or filled in — and
+-- applies nothing of that bundle to a photo already recorded (no fill, no version, no tag).
+-- Local to this catalog: never exported or merged. No backfill: which bundles earlier
+-- imports merged is not recorded anywhere. (An unreleased first shape keyed on the batch
+-- alone is dropped and recreated by `Catalog::migrate_locked`.)
 CREATE TABLE IF NOT EXISTS bundle_merges (
-    photo_id   INTEGER NOT NULL REFERENCES photos(id) ON DELETE CASCADE,
-    batch_uuid TEXT NOT NULL,
-    merged_at  INTEGER NOT NULL,
-    PRIMARY KEY (photo_id, batch_uuid)
+    photo_id          INTEGER NOT NULL REFERENCES photos(id) ON DELETE CASCADE,
+    batch_uuid        TEXT NOT NULL,
+    bundle_created_at INTEGER NOT NULL,
+    merged_at         INTEGER NOT NULL,
+    PRIMARY KEY (photo_id, batch_uuid, bundle_created_at)
 ) WITHOUT ROWID;
 "#;

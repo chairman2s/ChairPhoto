@@ -97,16 +97,31 @@ impl<'c> CatalogNames<'c> {
     }
 
     /// The row an arriving file would re-link at `wanted` (or a ` (n)` beside it) when that
-    /// row's photo is kept safe elsewhere: it has a backup copy with a verified hash (#231 F5).
-    /// Such a photo was offloaded, not lost — its local file is gone on purpose — so a card or
-    /// bundle bringing it again has nothing to add: it is already imported, and copying it
-    /// back would undo the offload. The record decides, not a look at the backup volume: an
-    /// unmounted NAS is a normal state, and the photo counts as backed up all the same.
+    /// row's photo was **offloaded** (#231 F5): it has no location on a local volume left —
+    /// an offload drops those rows once the backup is verified — and a backup location with a
+    /// verified hash. Such a photo's local file is gone on purpose, so a card or bundle
+    /// bringing it again has nothing to add, and copying it back would undo the offload. The
+    /// record decides, not a look at the backup volume: an unmounted NAS is normal.
+    ///
+    /// A photo that still has a local location row lost its file some other way (deleted
+    /// outside the app, a failed disk): the arriving file may be its last copy, so it is
+    /// re-linked as before. When the catalog cannot say, the answer is `None` — copy.
     pub fn kept_elsewhere(&mut self, wanted: &Path, arriving: &Arriving) -> Option<i64> {
         let path = self.relink_target(wanted, arriving)?;
         let photo_id = self.held_by(path.parent()?, &path)?.first()?.photo_id;
-        let verified = self.catalog.verified_backup_candidates(photo_id).is_ok_and(|c| !c.is_empty());
-        verified.then_some(photo_id)
+        let offloaded: bool = self
+            .catalog
+            .conn()
+            .query_row(
+                "SELECT NOT EXISTS(SELECT 1 FROM photo_locations l JOIN volumes v ON v.id = l.volume_id
+                                    WHERE l.photo_id = ?1 AND v.kind = 'local')
+                        AND EXISTS(SELECT 1 FROM photo_locations l JOIN volumes v ON v.id = l.volume_id
+                                    WHERE l.photo_id = ?1 AND v.kind = 'backup' AND l.verified_hash IS NOT NULL)",
+                [photo_id],
+                |r| r.get(0),
+            )
+            .unwrap_or(false);
+        offloaded.then_some(photo_id)
     }
 
     /// The rows holding `path` or any case variant of its name ([`folded`]; empty: none);

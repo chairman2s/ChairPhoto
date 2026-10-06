@@ -192,6 +192,7 @@ fn card_thumbnails_fill_their_cell(cx: &mut TestAppContext) {
             size: 1,
             capture_time: None,
             is_duplicate: false,
+            offloaded: false,
         })
         .collect();
     panel.update(cx, |p, cx| {

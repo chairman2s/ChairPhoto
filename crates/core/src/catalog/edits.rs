@@ -530,6 +530,13 @@ pub(crate) fn settings_written(conn: &Connection, version_id: i64) -> Result<()>
 /// whose settings were written last in this catalog, else the original. A version whose
 /// settings were never written here (`changed_seq` 0: merged into an existing photo from a
 /// bundle, #252) is not a candidate until it is.
+///
+/// **Merged versions are 0 on purpose and must never be healed.** `catalog::merge`
+/// (`fill_existing`) stores every version a bundle or catalog merge adds to an EXISTING photo
+/// with `changed_seq` 0, so it does not move that photo's face (decision on #252,
+/// 2026-10-06). Any pass that repairs `changed_seq` (for example one promoting 0s left by an
+/// older build) must skip these versions; promoting them would move faces against that
+/// decision. Only an edit made here (`settings_written`) lifts one above 0.
 fn face_under(conn: &Connection, photo_id: i64, pin: CoverPin) -> Result<Option<i64>> {
     Ok(match pin {
         CoverPin::Version(v) => Some(v),

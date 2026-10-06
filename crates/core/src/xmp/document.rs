@@ -765,12 +765,11 @@ fn sweeper_idle_timeout(device: Option<u64>) -> std::time::Duration {
 /// A thread idle for [`SWEEPER_IDLE_TIMEOUT`] exits and drops its own entry from this map
 /// (#221 review), so a device touched once early in a long session does not hold a thread for
 /// the rest of it; the next folder on that device spins up a fresh one. The drop happens under
-/// this function's own lock, and a last non-blocking drain follows it before the thread
-/// actually returns, so a `try_send` that lands while the entry is still present is still
-/// swept. A `try_send` that instead lands in the sliver between that drain and the closure's
-/// return — after the entry is gone, before the receiver is actually dropped — is not; that
-/// folder is not marked swept ([`sweep_later`] sees the disconnected send and leaves `SWEPT`
-/// alone), so a later write to it queues it again. Vanishingly rare, and self-correcting.
+/// this function's own lock, so no new sender is handed out after it; the thread then drains
+/// its queue with a *blocking* receive until the channel disconnects — until every sender
+/// handed out before the drop is gone — so a `try_send` that returns `Ok` is always swept,
+/// however late it lands (relD L1). Each such sender is a short-lived clone ([`sweep_later`]
+/// drops it right after its one `try_send`), so the drain ends promptly.
 fn sweeper_for(device: Option<u64>) -> Option<std::sync::mpsc::SyncSender<Folder>> {
     type Sweepers = std::collections::HashMap<Option<u64>, std::sync::mpsc::SyncSender<Folder>>;
     static SWEEPERS: std::sync::OnceLock<std::sync::Mutex<Sweepers>> = std::sync::OnceLock::new();
@@ -790,9 +789,15 @@ fn sweeper_for(device: Option<u64>) -> Option<std::sync::mpsc::SyncSender<Folder
                     let mut sweepers = registry.lock().unwrap_or_else(|e| e.into_inner());
                     sweepers.remove(&device);
                     drop(sweepers);
-                    while let Ok(folder) = rx.try_recv() {
+                    #[cfg(test)]
+                    sweeper_exit_point(device, "removed");
+                    // Blocking, until every sender is gone: a `sweep_later` that got its sender
+                    // before the removal may still `try_send` (and see `Ok`) until it drops it.
+                    while let Ok(folder) = rx.recv() {
                         folder.sweep_stale_temps();
                     }
+                    #[cfg(test)]
+                    sweeper_exit_point(device, "drained");
                     break;
                 }
                 Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
@@ -801,6 +806,26 @@ fn sweeper_for(device: Option<u64>) -> Option<std::sync::mpsc::SyncSender<Folder
         .ok()?;
     sweepers.insert(device, tx.clone());
     Some(tx)
+}
+
+/// Test-only: pause one device key's idle-exiting sweeper thread at a named point of its exit
+/// ([`sweeper_exit_point`]): the thread reports the point on the first channel and waits (5 s
+/// at most) for the test's go on the second, so a test can land a send exactly there.
+#[cfg(test)]
+type SweeperExitHook = (std::sync::mpsc::Sender<&'static str>, std::sync::mpsc::Receiver<()>);
+
+#[cfg(test)]
+static SWEEPER_EXIT_HOOKS: std::sync::Mutex<std::collections::BTreeMap<Option<u64>, SweeperExitHook>> =
+    std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+#[cfg(test)]
+fn sweeper_exit_point(device: Option<u64>, point: &'static str) {
+    let hook = SWEEPER_EXIT_HOOKS.lock().unwrap_or_else(|e| e.into_inner()).remove(&device);
+    if let Some((events, go)) = hook {
+        let _ = events.send(point);
+        let _ = go.recv_timeout(std::time::Duration::from_secs(5));
+        SWEEPER_EXIT_HOOKS.lock().unwrap_or_else(|e| e.into_inner()).insert(device, (events, go));
+    }
 }
 
 #[cfg(test)]
@@ -1604,6 +1629,53 @@ mod tests {
         let thread_first = wait_swept(&first);
         std::thread::sleep(Duration::from_millis(300)); // outlive the override, were it applied
         assert_eq!(wait_swept(&send_to("second")), thread_first, "OTHER's thread kept the production timeout");
+    }
+
+    /// Review relD L1: a `try_send` through a sender `sweep_later` got while the device's entry
+    /// still existed, landing after the idle-exiting thread removed that entry and drained its
+    /// queue but before the receiver dropped, must still be swept — or `try_send` returns `Ok`,
+    /// the folder is dropped unswept, and `SWEPT` keeps it marked for the rest of the run.
+    /// The thread is paused at its exit points ([`sweeper_exit_point`]); the send lands after
+    /// the drain when the thread reaches one before the sender is dropped.
+    #[test]
+    fn a_send_landing_while_an_idle_sweeper_exits_is_still_swept() {
+        const DEVICE: Option<u64> = Some(0x7e1d_0001); // unique to this test
+        let dir = crate::test_support::TestTmpDir::new("doc-reld-l1-late-send");
+        let late = dir.join("late");
+        std::fs::create_dir_all(&late).unwrap();
+        let (events_tx, events) = std::sync::mpsc::channel();
+        let (go, go_rx) = std::sync::mpsc::channel();
+        SWEEPER_EXIT_HOOKS.lock().unwrap().insert(DEVICE, (events_tx, go_rx));
+
+        set_idle_timeout_override(DEVICE, Some(Duration::from_millis(50)));
+        let tx = sweeper_for(DEVICE).unwrap(); // as sweep_later holds it, between lookup and send
+        set_idle_timeout_override(DEVICE, None);
+
+        assert_eq!(events.recv_timeout(Duration::from_secs(5)), Ok("removed"), "the idle thread dropped its entry");
+        go.send(()).unwrap();
+        // Before the fix the drain finishes now; after it, the drain waits for this sender.
+        let drained_first = events.recv_timeout(Duration::from_millis(500)).is_ok();
+
+        assert!(SWEPT.lock().unwrap().insert(late.clone()));
+        let queued = tx.try_send(Folder::open_dir(&late).unwrap()).is_ok();
+        if !queued {
+            SWEPT.lock().unwrap().remove(&late); // sweep_later's own handling of a failed send
+        }
+        drop(tx);
+        go.send(()).unwrap();
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while sweeps_of(&late).is_empty() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let swept = !sweeps_of(&late).is_empty();
+        let marked = SWEPT.lock().unwrap().contains(&late);
+        SWEEPER_EXIT_HOOKS.lock().unwrap().remove(&DEVICE);
+        assert!(
+            swept || !marked,
+            "lost: queued={queued}, drained before the send={drained_first}, never swept, still marked swept"
+        );
+        assert!(!drained_first, "the exiting thread waits for every sender before it stops draining");
     }
 
     /// #155 review L3: a write that commits under the catalog lock (here a GPS write, as

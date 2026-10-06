@@ -116,8 +116,10 @@ in memory (docs/plans/raw-foundation, slice 4), so a step shows the RAW at once.
 **Cover (the Library face).** A photo's face in the Library grid, the Bench and the
 filmstrip is the look of its **most recently changed version** — the one whose settings were
 written last: a settled edit, a proof adopted, a history step (undo/redo included), a new or
-duplicated version, a version merged in from a bundle. Opening or renaming a version is not a
-change. With no versions it is the original (owner decision, #252). A Duel's "What-if"
+duplicated version, a version a bundle brings with a new photo. Opening or renaming a version
+is not a change, and neither is a version merged into an existing photo from a bundle or
+another catalog: it is set aside (`catalog::edits::set_aside`), like a What-if below
+(#252 decision 2). With no versions it is the original (owner decision, #252). A Duel's "What-if"
 variant is a side branch, not a change: it is banked beside the version being edited and the
 face stays where it was — on another version or on the original — until the variant itself is
 edited ("+ New version" does move it, as editing continues there; #252 decision 2026-10-06,

@@ -103,7 +103,8 @@ answers' own value (`"#mergedCatalogs": {<uuid>: <cleared>, …}`) and therefore
 write as the merged answers; a later read of a recorded catalog not yet confirmed emptied
 merges nothing and only retries the emptying, so its old Deny never undoes an Allow given
 since (#229). A build before #231 drops that record when it saves an answer; such a catalog
-may then be merged again, which can only turn an answer to Deny. Once a read finds the copy
+may then be merged again in full: denied wins over an answer here, and a host with no answer
+takes the catalog's (an Allow included, as at its first merge). Once a read finds the copy
 actually empty, `cleared` is set; a *later* read that finds the copy non-empty again is then
 treated as new content — a pre-#231 build writing into it again — and only its Denies are
 folded in, never an Allow (#231), and only for hosts this machine has no answer for: new
@@ -111,7 +112,11 @@ content with no known provenance can only block a host that had no answer, never
 allow one, and never override an Allow. `cleared` is kept per UUID, not per file, so a file
 copy sharing the UUID may still hold the very answers already merged after another copy's
 empty read set it; since the UUID's first merge already folded its Denies in, an Allow
-standing afterwards was given since, and no re-merge undoes it. "Ask again" is stored as an
+standing afterwards was given since, and no re-merge undoes it. The price, accepted
+(2026-10-06, review relD2 LOW-1): a Block of a host this machine Allows, made after the first
+merge in a build that still writes the catalog's copy or in a copy whose content diverged, is
+not applied here — the host stays Allowed until the user blocks it in this build. Such
+content can block only a host with no answer here. "Ask again" is stored as an
 explicit `"ask"` entry that no catalog's old answer overrides, never as a deleted one that a
 re-merge could refill.
 

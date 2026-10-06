@@ -49,7 +49,11 @@ remembered as `smugmug.last_album` and pre-selected next time.
 
 All network I/O is in Rust. OAuth 1.0a signing lives in `crates/core/src/oauth1.rs` — RFC 5849
 HMAC-SHA1, pure and unit-tested against a reference vector, and shared with the Flickr
-module.
+module. Every signed request (token steps, API calls, upload) sends the OAuth params, the
+access token and signature included, in the `Authorization: OAuth` header; only request
+params go in the URL (#190). The one URL with a token is the browser authorize URL, which
+carries the short-lived request token. Header OAuth on the token steps still needs a live
+check with a real account.
 
 `crates/core/src/smugmug/mod.rs` handles the request/access token exchange, listing the user's
 albums against `api.smugmug.com` (API v2), and the raw-binary upload to

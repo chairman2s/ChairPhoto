@@ -72,7 +72,11 @@ publications.
 
 All network I/O is in Rust. OAuth 1.0a signing lives in `crates/core/src/oauth1.rs` — RFC 5849
 HMAC-SHA1, pure and unit-tested against a reference vector, and shared with the SmugMug
-module.
+module. Every signed request (token steps, REST calls, upload) sends the OAuth params, the
+access token and signature included, in the `Authorization: OAuth` header; only request
+params go in the URL (#190). The one URL with a token is the browser authorize URL, which
+carries the short-lived request token. Header OAuth on Flickr's REST and token endpoints
+still needs a live check with a real account.
 
 `crates/core/src/flickr/mod.rs` handles the request/access token exchange, the photostream
 fetch and matching, and the `up.flickr.com` upload. The multipart body is built by hand to

@@ -947,7 +947,8 @@ async fn send_counting(
             .body(bytes)
             .send();
         let resp = tokio::select! {
-            resp = upload => resp.map_err(|e| format!("LocalSend upload failed ({}): {e}", meta.file_name))?,
+            // The URL carries the session's upload token; keep it out of the error.
+            resp = upload => resp.map_err(|e| format!("LocalSend upload failed ({}): {}", meta.file_name, e.without_url()))?,
             _ = until_aborted(abort) => {
                 cancel_session(&client, &base, &session.session_id).await;
                 return Err(SEND_CANCELLED.into());
@@ -1009,17 +1010,21 @@ async fn prepare_upload(
         .json(body)
         .send()
         .await
-        .map_err(|e| format!("LocalSend prepare-upload request failed: {e}"))?;
+        .map_err(|e| format!("LocalSend prepare-upload request failed: {}", e.without_url()))?;
 
     if resp.status().as_u16() == 401 {
         let pin = pin.ok_or("LocalSend: receiver requires a PIN")?;
+        // The protocol puts the PIN in the query; reqwest's error text would quote the URL,
+        // so every error from here on drops it (`without_url`).
         let url = format!("{base}/prepare-upload?pin={}", urlencode(pin));
         let resp = client
             .post(&url)
             .json(body)
             .send()
             .await
-            .map_err(|e| format!("LocalSend prepare-upload (pin) request failed: {e}"))?;
+            .map_err(|e| {
+                format!("LocalSend prepare-upload (pin) request failed: {}", e.without_url())
+            })?;
         if resp.status().as_u16() == 401 {
             return Err("LocalSend: incorrect PIN".into());
         }
@@ -1028,7 +1033,7 @@ async fn prepare_upload(
             let text = resp.text().await.unwrap_or_default();
             return Err(format!("LocalSend prepare-upload failed ({status}): {text}"));
         }
-        let text = resp.text().await.map_err(|e| e.to_string())?;
+        let text = resp.text().await.map_err(|e| e.without_url().to_string())?;
         return parse_prepare_response(&text);
     }
 
@@ -1037,7 +1042,7 @@ async fn prepare_upload(
         let text = resp.text().await.unwrap_or_default();
         return Err(format!("LocalSend prepare-upload failed ({status}): {text}"));
     }
-    let text = resp.text().await.map_err(|e| e.to_string())?;
+    let text = resp.text().await.map_err(|e| e.without_url().to_string())?;
     parse_prepare_response(&text)
 }
 
@@ -2263,6 +2268,55 @@ mod tests {
             fingerprint: "f".into(),
         };
         assert_eq!(base_url(&dev), "http://10.0.0.9:8080/api/localsend/v2");
+    }
+
+    // ── The PIN never reaches error text (review claude-fix190 Low-5) ─────────
+
+    // A receiver that answers the first prepare-upload with 401 and then drops the PIN retry
+    // without replying, so the retry fails in the transport, the error reqwest would print
+    // with its URL (and so the `?pin=`).
+    #[tokio::test]
+    async fn pin_retry_transport_error_does_not_quote_the_pin() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            let mut answered = false;
+            while let Ok((mut s, _)) = listener.accept().await {
+                let answer = !answered;
+                answered = true;
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 65536];
+                    loop {
+                        match s.read(&mut buf).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => {
+                                let req = String::from_utf8_lossy(&buf[..n]).into_owned();
+                                if !req.starts_with("POST ") {
+                                    continue;
+                                }
+                                if req.contains("?pin=") || !answer {
+                                    return; // drop the connection unanswered
+                                }
+                                let _ = s
+                                    .write_all(b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                                    .await;
+                                return;
+                            }
+                        }
+                    }
+                });
+            }
+        });
+        let client = reqwest::Client::new();
+        let base = format!("http://127.0.0.1:{port}/api/localsend/v2");
+        let err = prepare_upload(&client, &base, &serde_json::json!({}), Some("839201"))
+            .await
+            .err()
+            .expect("the PIN retry fails");
+        server.abort();
+        assert!(err.contains("(pin) request failed"), "{err}");
+        assert!(!err.contains("839201") && !err.contains("pin="), "{err}");
     }
 
     #[test]

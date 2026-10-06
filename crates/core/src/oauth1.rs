@@ -5,8 +5,12 @@
 //! reference vector used to validate HMAC-SHA1 OAuth implementations).
 //!
 //! Everything here is pure: no network, no global state. Callers assemble request params,
-//! call [`signed_params`], then send the oauth_* values as an `Authorization` header
-//! ([`auth_header`]) or as a query string ([`query_string`]).
+//! call [`signed_params`], then send the oauth_* protocol values in an `Authorization: OAuth`
+//! header ([`auth_header`], RFC 5849 §3.5.1) and only the request params in the URL or body
+//! ([`request_url`], [`request_params`]). Protocol params — the access token and signature
+//! among them — never go in a URL (#190): a URL lands in proxy and request logs where a
+//! header usually does not. The one exception is the authorize URL the user opens in a
+//! browser, which carries the short-lived request token by protocol (RFC 5849 §2.2).
 
 use base64::Engine;
 use hmac::{Hmac, Mac};
@@ -78,11 +82,37 @@ pub fn signed_params(
     token_secret: &str,
     extra: &[(&str, &str)],
 ) -> BTreeMap<String, String> {
+    signed_params_with(
+        method,
+        url,
+        consumer_key,
+        consumer_secret,
+        token,
+        token_secret,
+        extra,
+        &nonce(),
+        &timestamp(),
+    )
+}
+
+/// [`signed_params`] with a fixed nonce and timestamp (tests pin them to a known vector).
+#[allow(clippy::too_many_arguments)]
+fn signed_params_with(
+    method: &str,
+    url: &str,
+    consumer_key: &str,
+    consumer_secret: &str,
+    token: Option<&str>,
+    token_secret: &str,
+    extra: &[(&str, &str)],
+    nonce: &str,
+    timestamp: &str,
+) -> BTreeMap<String, String> {
     let mut params: BTreeMap<String, String> = BTreeMap::new();
     params.insert("oauth_consumer_key".into(), consumer_key.into());
-    params.insert("oauth_nonce".into(), nonce());
+    params.insert("oauth_nonce".into(), nonce.into());
     params.insert("oauth_signature_method".into(), "HMAC-SHA1".into());
-    params.insert("oauth_timestamp".into(), timestamp());
+    params.insert("oauth_timestamp".into(), timestamp.into());
     params.insert("oauth_version".into(), "1.0".into());
     if let Some(t) = token {
         params.insert("oauth_token".into(), t.into());
@@ -96,7 +126,8 @@ pub fn signed_params(
 }
 
 /// An `Authorization: OAuth …` header value from the oauth_* entries of a signed param set
-/// (request params are sent in the URL/body, not the header).
+/// (RFC 5849 §3.5.1). Request params are sent in the URL/body, not the header; the protocol
+/// params (`oauth_callback` and `oauth_verifier` included) go only here.
 pub fn auth_header(params: &BTreeMap<String, String>) -> String {
     let inner = params
         .iter()
@@ -107,6 +138,27 @@ pub fn auth_header(params: &BTreeMap<String, String>) -> String {
     format!("OAuth {inner}")
 }
 
+/// The request (non-`oauth_`) entries of a signed param set: what goes in the URL query or
+/// the body. Never carries a protocol param, so never the token or signature.
+pub fn request_params(params: &BTreeMap<String, String>) -> BTreeMap<String, String> {
+    params
+        .iter()
+        .filter(|(k, _)| !k.starts_with("oauth_"))
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect()
+}
+
+/// `base_url` with the request params of a signed param set as its query (oauth_* left out;
+/// they belong in [`auth_header`]). The bare `base_url` when there are none.
+pub fn request_url(base_url: &str, params: &BTreeMap<String, String>) -> String {
+    let query = request_params(params);
+    if query.is_empty() {
+        base_url.to_string()
+    } else {
+        format!("{base_url}?{}", query_string(&query))
+    }
+}
+
 /// A `key=value&…` query/body string (percent-encoded) for the given params.
 pub fn query_string(params: &BTreeMap<String, String>) -> String {
     params
@@ -114,6 +166,66 @@ pub fn query_string(params: &BTreeMap<String, String>) -> String {
         .map(|(k, v)| format!("{}={}", percent_encode(k), percent_encode(v)))
         .collect::<Vec<_>>()
         .join("&")
+}
+
+/// Secrets shorter than this are not redacted: a one-letter verifier would shred every word
+/// it occurs in, and a secret that short protects nothing anyway.
+const REDACT_MIN_CHARS: usize = 4;
+
+/// `text` with every occurrence of each `secret` replaced by `[redacted]`. For error text
+/// that echoes a service reply: a signature-failure reply can quote the signed request.
+///
+/// Each secret is matched raw, percent-encoded and double-encoded (as a signature base
+/// string quotes it), with upper- or lowercase hex, and form-encoded (space as `+`). One
+/// left-to-right pass, longest form first, never rescanning what it wrote, so one secret
+/// can't match inside another's replacement. Secrets under [`REDACT_MIN_CHARS`] are skipped.
+pub fn redact(text: &str, secrets: &[&str]) -> String {
+    fn lower_hex(s: &str) -> String {
+        let mut out = String::with_capacity(s.len());
+        let mut chars = s.chars();
+        while let Some(c) = chars.next() {
+            out.push(c);
+            if c == '%' {
+                for h in chars.by_ref().take(2) {
+                    out.push(h.to_ascii_lowercase());
+                }
+            }
+        }
+        out
+    }
+    let mut forms: Vec<String> = Vec::new();
+    for s in secrets.iter().filter(|s| s.chars().count() >= REDACT_MIN_CHARS) {
+        forms.push(s.to_string());
+        forms.push(s.replace(' ', "+"));
+        let once = percent_encode(s);
+        let plus = once.replace("%20", "+");
+        // Single-encoded in either hex case, then each of those encoded again (the outer
+        // `%25` has no letters, so case only matters on the inner layer).
+        for f in [lower_hex(&once), lower_hex(&plus), once, plus] {
+            forms.push(percent_encode(&f));
+            forms.push(f);
+        }
+    }
+    forms.sort_by(|a, b| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
+    forms.dedup();
+    if forms.is_empty() {
+        return text.to_string();
+    }
+
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0;
+    while i < text.len() {
+        let rest = &text[i..];
+        if let Some(f) = forms.iter().find(|f| rest.starts_with(f.as_str())) {
+            out.push_str("[redacted]");
+            i += f.len();
+        } else {
+            let c = rest.chars().next().expect("i is on a char boundary");
+            out.push(c);
+            i += c.len_utf8();
+        }
+    }
+    out
 }
 
 /// Parse an `oauth_token=…&oauth_token_secret=…` form-encoded token response into a map.
@@ -159,6 +271,197 @@ fn timestamp() -> String {
 }
 
 #[cfg(test)]
+pub(crate) mod stub {
+    //! Test-only HTTP/1.1 stub for the Flickr and SmugMug transports: an ephemeral loopback
+    //! port that records every request (method, target, headers, body) and answers each path
+    //! with a scripted body. Never the network. [`Captured::verify_signature`] re-derives the
+    //! OAuth signature from what actually went on the wire.
+
+    use super::*;
+    use std::sync::{Arc, Mutex};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpListener, TcpStream};
+
+    /// One request the stub received.
+    #[derive(Debug, Clone)]
+    pub(crate) struct Captured {
+        pub method: String,
+        /// Path and query, e.g. `/services/rest/?method=…`.
+        pub target: String,
+        /// Header names lowercased.
+        pub headers: BTreeMap<String, String>,
+        pub body: Vec<u8>,
+    }
+
+    impl Captured {
+        pub fn path(&self) -> &str {
+            self.target.split('?').next().unwrap_or("")
+        }
+
+        /// The decoded URL query params.
+        pub fn query(&self) -> BTreeMap<String, String> {
+            match self.target.split_once('?') {
+                Some((_, q)) => parse_kv(q),
+                None => BTreeMap::new(),
+            }
+        }
+
+        /// The decoded `Authorization: OAuth k="v", …` params (empty when absent).
+        pub fn oauth_header(&self) -> BTreeMap<String, String> {
+            let Some(h) = self.headers.get("authorization") else { return BTreeMap::new() };
+            let inner = h.strip_prefix("OAuth ").expect("an OAuth authorization header");
+            inner
+                .split(", ")
+                .map(|kv| {
+                    let (k, v) = kv.split_once('=').expect("k=\"v\"");
+                    let v = v
+                        .strip_prefix('"')
+                        .and_then(|v| v.strip_suffix('"'))
+                        .expect("a quoted value");
+                    (decode(k), decode(v))
+                })
+                .collect()
+        }
+
+        /// Recompute the HMAC-SHA1 signature from the header's protocol params plus the URL
+        /// query and the extra signed `body_params` (form fields), and check it against the
+        /// header's `oauth_signature`. `base_url` is the scheme/host/path the client signed.
+        pub fn verify_signature(
+            &self,
+            base_url: &str,
+            body_params: &BTreeMap<String, String>,
+            consumer_secret: &str,
+            token_secret: &str,
+        ) -> bool {
+            let mut params = self.oauth_header();
+            let Some(sig) = params.remove("oauth_signature") else { return false };
+            params.extend(self.query());
+            params.extend(body_params.clone());
+            signature(&self.method, base_url, &params, consumer_secret, token_secret) == sig
+        }
+    }
+
+    pub(crate) struct Server {
+        pub port: u16,
+        log: Arc<Mutex<Vec<Captured>>>,
+        task: tokio::task::JoinHandle<()>,
+    }
+
+    impl Server {
+        /// Bind `127.0.0.1:0`; answer a request whose path is a key of `routes` with `200`
+        /// and that body, anything else with `404`.
+        pub async fn start(routes: Vec<(String, String)>) -> Server {
+            let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind a loopback port");
+            let port = listener.local_addr().unwrap().port();
+            let log: Arc<Mutex<Vec<Captured>>> = Arc::default();
+            let routes = Arc::new(routes);
+            let task = {
+                let log = log.clone();
+                tokio::spawn(async move {
+                    while let Ok((stream, _)) = listener.accept().await {
+                        tokio::spawn(serve(stream, routes.clone(), log.clone()));
+                    }
+                })
+            };
+            Server { port, log, task }
+        }
+
+        pub fn url(&self, path: &str) -> String {
+            format!("http://127.0.0.1:{}{path}", self.port)
+        }
+
+        pub fn log(&self) -> Vec<Captured> {
+            self.log.lock().unwrap().clone()
+        }
+    }
+
+    impl Drop for Server {
+        fn drop(&mut self) {
+            self.task.abort();
+        }
+    }
+
+    async fn serve(
+        mut stream: TcpStream,
+        routes: Arc<Vec<(String, String)>>,
+        log: Arc<Mutex<Vec<Captured>>>,
+    ) {
+        let mut buf: Vec<u8> = Vec::new();
+        loop {
+            let head_end = loop {
+                if let Some(i) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                    break i;
+                }
+                let mut chunk = [0u8; 8192];
+                match stream.read(&mut chunk).await {
+                    Ok(0) | Err(_) => return,
+                    Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                }
+            };
+            let head = String::from_utf8_lossy(&buf[..head_end]).into_owned();
+            let mut lines = head.split("\r\n");
+            let mut start = lines.next().unwrap_or("").split(' ');
+            let method = start.next().unwrap_or("").to_string();
+            let target = start.next().unwrap_or("").to_string();
+            let headers: BTreeMap<String, String> = lines
+                .filter_map(|l| l.split_once(':'))
+                .map(|(k, v)| (k.trim().to_ascii_lowercase(), v.trim().to_string()))
+                .collect();
+            let len: usize = headers
+                .get("content-length")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0);
+            let body_start = head_end + 4;
+            while buf.len() < body_start + len {
+                let mut chunk = [0u8; 65536];
+                match stream.read(&mut chunk).await {
+                    Ok(0) | Err(_) => return,
+                    Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                }
+            }
+            let body = buf[body_start..body_start + len].to_vec();
+            buf.drain(..body_start + len);
+            let path = target.split('?').next().unwrap_or("").to_string();
+            log.lock().unwrap().push(Captured { method, target, headers, body });
+
+            let (status, reply) = match routes.iter().find(|(p, _)| *p == path) {
+                Some((_, b)) => ("200 OK", b.clone()),
+                None => ("404 Not Found", String::new()),
+            };
+            let resp = format!(
+                "HTTP/1.1 {status}\r\nContent-Length: {}\r\nContent-Type: text/plain\r\n\r\n{reply}",
+                reply.len()
+            );
+            if stream.write_all(resp.as_bytes()).await.is_err() {
+                return;
+            }
+        }
+    }
+
+    /// Assert the #190 contract on one captured request: no protocol param anywhere in the
+    /// URL, and the `Authorization` header carries the signature and, for a token-bearing
+    /// call, exactly `token`.
+    pub(crate) fn assert_oauth_in_header_only(req: &Captured, token: Option<&str>) {
+        assert!(
+            !req.target.contains("oauth_"),
+            "a protocol param leaked into the URL: {}",
+            req.target
+        );
+        if let Some(t) = token {
+            assert!(!req.target.contains(t), "the token leaked into the URL: {}", req.target);
+        }
+        let h = req.oauth_header();
+        assert!(
+            h.contains_key("oauth_signature"),
+            "no signature in the Authorization header: {:?}",
+            req.headers
+        );
+        assert!(h.contains_key("oauth_consumer_key"));
+        assert_eq!(h.get("oauth_token").map(String::as_str), token);
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -197,6 +500,122 @@ mod tests {
             "LswwdoUaIVS3lIvBJ8u8Yuf6vnjbW7Q1d3hRzqJ8XQ",
         );
         assert_eq!(sig, "SWuLigt7Lt7fOv3HyQS8HZdEeFg=");
+    }
+
+    // ── RFC 5849 vectors and the header/URL split (#190) ──────────────────────
+
+    // RFC 5849 §1.2 (the photos.example.net request): its `oauth_signature`
+    // "MdpQcU8iPSUjWoN/UDMsK2sui9I=" is the RFC's own; Python's hmac/hashlib computes the
+    // same value for that base string and key.
+    #[test]
+    fn signature_matches_rfc5849_example() {
+        let mut p = BTreeMap::new();
+        p.insert("file".into(), "vacation.jpg".into());
+        p.insert("size".into(), "original".into());
+        p.insert("oauth_consumer_key".into(), "dpf43f3p2l4k3l03".into());
+        p.insert("oauth_token".into(), "nnch734d00sl2jdk".into());
+        p.insert("oauth_signature_method".into(), "HMAC-SHA1".into());
+        p.insert("oauth_timestamp".into(), "137131202".into());
+        p.insert("oauth_nonce".into(), "chapoH".into());
+        let sig = signature(
+            "GET",
+            "http://photos.example.net/photos",
+            &p,
+            "kd94hf93k423kf44",
+            "pfkkdhi9sl3r4s00",
+        );
+        assert_eq!(sig, "MdpQcU8iPSUjWoN/UDMsK2sui9I=");
+    }
+
+    // The same request through `signed_params_with`, split for the wire: the header carries
+    // every protocol param (the token and signature included), the URL only the request
+    // params. With oauth_version=1.0 (which `signed_params` always adds) and nonce/timestamp
+    // "kllo9940pd9333jh"/"1191242096" this is the OAuth Core 1.0 Appendix A.5 request, whose
+    // published signature is "tR3+Ty81lMeYAr/Fid0kMTYa/WM=" (also cross-checked with Python).
+    #[test]
+    fn signed_request_splits_protocol_params_into_the_header() {
+        let p = signed_params_with(
+            "GET",
+            "http://photos.example.net/photos",
+            "dpf43f3p2l4k3l03",
+            "kd94hf93k423kf44",
+            Some("nnch734d00sl2jdk"),
+            "pfkkdhi9sl3r4s00",
+            &[("file", "vacation.jpg"), ("size", "original")],
+            "kllo9940pd9333jh",
+            "1191242096",
+        );
+        assert_eq!(p["oauth_signature"], "tR3+Ty81lMeYAr/Fid0kMTYa/WM=");
+
+        assert_eq!(
+            auth_header(&p),
+            "OAuth oauth_consumer_key=\"dpf43f3p2l4k3l03\", oauth_nonce=\"kllo9940pd9333jh\", \
+             oauth_signature=\"tR3%2BTy81lMeYAr%2FFid0kMTYa%2FWM%3D\", \
+             oauth_signature_method=\"HMAC-SHA1\", oauth_timestamp=\"1191242096\", \
+             oauth_token=\"nnch734d00sl2jdk\", oauth_version=\"1.0\""
+        );
+        assert_eq!(
+            request_url("http://photos.example.net/photos", &p),
+            "http://photos.example.net/photos?file=vacation.jpg&size=original"
+        );
+
+        // A token step: oauth_callback is a protocol param, so the URL stays bare.
+        let step = signed_params_with(
+            "GET",
+            "http://x/",
+            "k",
+            "s",
+            None,
+            "",
+            &[("oauth_callback", "oob")],
+            "n",
+            "1",
+        );
+        assert_eq!(request_url("http://x/", &step), "http://x/");
+        assert!(auth_header(&step).contains("oauth_callback=\"oob\""));
+    }
+
+    #[test]
+    fn redact_hides_raw_and_encoded_secrets() {
+        let t = "72157-ab/c+d";
+        let text = format!(
+            "oauth_problem=signature_invalid&debug_sbs=GET&x&oauth_token%253D{}%26 raw={t} once={}",
+            percent_encode(&percent_encode(t)),
+            percent_encode(t)
+        );
+        let r = redact(&text, &[t, ""]);
+        assert!(!r.contains(t) && !r.contains(&percent_encode(t)), "{r}");
+        assert!(!r.contains(&percent_encode(&percent_encode(t))), "{r}");
+        assert_eq!(r.matches("[redacted]").count(), 3, "{r}");
+        assert_eq!(redact("no secrets here", &[""]), "no secrets here");
+    }
+
+    // The review's examples (claude-fix190 Low-1): short secrets and a secret that occurs in
+    // "[redacted]" must not shred the message.
+    #[test]
+    fn redact_skips_short_secrets_and_never_rescans_its_output() {
+        assert_eq!(redact("tok=T1", &["T1", "act"]), "tok=T1");
+        assert_eq!(
+            redact("oauth_problem=authorization_failed", &["a"]),
+            "oauth_problem=authorization_failed"
+        );
+        // One pass: "redacted" (a secret here) is not found inside the replacement text.
+        assert_eq!(
+            redact("x token-1234 y", &["token-1234", "redacted"]),
+            "x [redacted] y"
+        );
+        // Longest form first: a secret that contains another is hidden whole.
+        assert_eq!(redact("abcd-efgh", &["abcd", "abcd-efgh"]), "[redacted]");
+    }
+
+    // Low-2: lowercase-hex percent-encoding and form-encoding ('+' for space) are covered.
+    #[test]
+    fn redact_covers_lowercase_hex_and_plus_for_space() {
+        let t = "ab/c d+e";
+        for form in ["ab%2fc%20d%2be", "ab%2Fc+d%2Be", "ab%2fc+d%2be", "ab%252fc%2520d%252be", "ab/c+d+e"] {
+            let r = redact(&format!("<{form}>"), &[t]);
+            assert_eq!(r, "<[redacted]>", "form {form}");
+        }
     }
 
     #[test]

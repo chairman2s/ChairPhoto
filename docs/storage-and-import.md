@@ -498,7 +498,13 @@ Three rules govern carrying:
   reference point for answering "has the local file moved on since we copied it".
 - **Offload carries before it deletes.** Invariant 1 covers edit state too: freeing the
   local image must not strand the history beside it. Companions go home first, then the
-  local ones are freed with the image, and `restore` brings them back.
+  local ones are freed with the image, and `restore` brings them back. A basename companion
+  another image beside it shares — darktable's `DSC1.xmp` is the sidecar of `DSC1.ARW` and
+  of `DSC1.JPG` alike — is carried home but not freed while that image is still there
+  (#231 d): offloading the RAW master of a RAW+JPEG stack whose JPEG frame stays local (no
+  backup of its own, or held by another operation) leaves the frame its sidecar, and the
+  offload of the last image naming it frees it. A folder that cannot be listed counts as
+  shared.
 - **Offload deletes only what home holds byte for byte (#255).** Re-hashing the backup
   proves home is intact, not that it holds what is here. So offload checks each local file
   **after moving it to a hidden name** in its folder (`.<name>.chairphoto-offload-<pid>-<n>`,

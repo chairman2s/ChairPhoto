@@ -620,6 +620,33 @@ mod stack_tests {
         assert_eq!(a.photo_storage_status(master).unwrap(), StorageStatus::Archived, "recorded into A");
     }
 
+    // ── #231 d: a basename sidecar two images share ───────────────────────────────────
+
+    /// darktable's basename sidecar `DSC1.xmp` belongs to the RAW master and to the JPEG frame
+    /// alike. Offloading the master while the frame stays local (held by another operation
+    /// here) carries the sidecar home and leaves it beside the frame; offloading the frame
+    /// later frees it.
+    #[test]
+    fn offloading_a_master_keeps_a_basename_sidecar_its_local_frame_shares() {
+        let (dir, state, master, frame, raw, jpg) = stacked("shared-basename");
+        let xmp = raw.with_extension("xmp");
+        std::fs::write(&xmp, b"<darktable history/>").unwrap();
+        backup_photo(&state, master).unwrap();
+        let held = state.storage_claims.claim(&db_of(&state), frame, &[]).unwrap();
+
+        let report = offload_photo(&state, master).unwrap();
+
+        assert_eq!(report.freed, vec![master]);
+        assert!(!raw.exists(), "the master was freed");
+        assert!(jpg.exists(), "the held frame stayed");
+        assert_eq!(std::fs::read(&xmp).unwrap(), b"<darktable history/>", "its sidecar stayed with it");
+        assert_eq!(std::fs::read(dir.join("nas/2026/08/DSC1.xmp")).unwrap(), b"<darktable history/>", "and is home");
+
+        drop(held);
+        assert_eq!(offload_photo(&state, frame).unwrap().freed, vec![frame]);
+        assert!(!jpg.exists() && !xmp.exists(), "the last image naming it frees it");
+    }
+
     #[test]
     fn the_service_verbs_take_the_whole_stack_and_say_so() {
         let (_dir, state, master, frame, raw, jpg) = stacked("verbs");

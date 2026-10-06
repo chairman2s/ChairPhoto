@@ -1451,10 +1451,10 @@ fn free_local_copies(photo: &PhotoOffload, stopped: &dyn Fn() -> bool) -> std::r
     if stopped() {
         return Err(Stop::Superseded);
     }
-    let to_free = companions_to_free(photo, &carried)?;
+    let ToFree { companions: to_free, shared } = companions_to_free(photo, &carried)?;
 
     let mut aside = Aside::default();
-    if let Err(e) = move_aside_confirmed(photo, &to_free, &carried, stopped, &mut aside) {
+    if let Err(e) = move_aside_confirmed(photo, &to_free, &shared, &carried, stopped, &mut aside) {
         return Err(aside.put_back(e.into()));
     }
     // Every file is now confirmed and under a hidden name; nothing has been deleted. Unlink
@@ -1508,6 +1508,7 @@ fn free_local_copies(photo: &PhotoOffload, stopped: &dyn Fn() -> bool) -> std::r
 fn move_aside_confirmed(
     photo: &PhotoOffload,
     to_free: &[Vec<PathBuf>],
+    shared: &[PathBuf],
     carried: &[CarriedCompanion],
     stopped: &dyn Fn() -> bool,
     aside: &mut Aside,
@@ -1531,11 +1532,12 @@ fn move_aside_confirmed(
         aside.take(file, &photo.expected_hash, LOCAL_CHANGED_REASON)?;
     }
     // A name emptied above that holds a file again was written after its file was moved: a
-    // newer image, or a companion nobody carried. It is kept, and so is everything else.
+    // newer image, or a companion nobody carried. It is kept, and so is everything else. A
+    // basename companion another image still shares was never emptied ([`ToFree::shared`]).
     for file in &photo.local_files {
         let appeared = std::iter::once(file.clone())
             .filter(|f| std::fs::symlink_metadata(f).is_ok())
-            .chain(crate::companions::carried_beside(file).into_iter().map(|c| c.path))
+            .chain(crate::companions::carried_beside(file).into_iter().map(|c| c.path).filter(|p| !shared.contains(p)))
             .next();
         if let Some(path) = appeared {
             return Err(CatalogError::Validation(format!(
@@ -1629,14 +1631,34 @@ fn put_back_or_why(hidden: &Path, file: &Path) -> Option<String> {
         Err(e) => Some(format!("it could not be put back: {e}")),
     }
 }
+/// What an offload frees beside each local file ([`companions_to_free`]).
+struct ToFree {
+    /// Per local file, the companions freed with it.
+    companions: Vec<Vec<PathBuf>>,
+    /// Basename companions left in place because another image beside the photo still
+    /// names them ([`shared_with_another_image`]).
+    shared: Vec<PathBuf>,
+}
+
 /// Which companions beside each local file an offload frees with it: exactly the ones the
 /// carry confirmed at home. One the carry did not take (it appeared after the carry) refuses
 /// the photo. Content is checked later, on the moved file ([`move_aside_confirmed`]).
-fn companions_to_free(photo: &PhotoOffload, carried: &[CarriedCompanion]) -> Result<Vec<Vec<PathBuf>>> {
+///
+/// A **basename** companion another image beside it shares is left in place (#231 d):
+/// darktable's `DSC1.xmp` is the sidecar of `DSC1.ARW` and of `DSC1.JPG` alike, so freeing
+/// the RAW master of a RAW+JPEG stack whose JPEG frame stays local (no backup of its own, or
+/// held by another operation) must not take the frame's sidecar. It is still carried home
+/// with the master; the offload of the last image naming it frees it.
+fn companions_to_free(photo: &PhotoOffload, carried: &[CarriedCompanion]) -> Result<ToFree> {
     let mut to_free = Vec::with_capacity(photo.local_files.len());
+    let mut shared = Vec::new();
     for file in &photo.local_files {
         let mut companions = Vec::new();
         for found in crate::companions::carried_beside(file) {
+            if found.form == crate::companions::Form::Basename && shared_with_another_image(file, &found.path) {
+                shared.push(found.path);
+                continue;
+            }
             if !carried.iter().any(|c| c.source == found.path) {
                 return Err(CatalogError::Validation(format!(
                     "{} appeared after its companions were carried home — refusing to offload",
@@ -1647,7 +1669,23 @@ fn companions_to_free(photo: &PhotoOffload, carried: &[CarriedCompanion]) -> Res
         }
         to_free.push(companions);
     }
-    Ok(to_free)
+    Ok(ToFree { companions: to_free, shared })
+}
+
+/// Whether an image other than `image` sits beside it under the same basename — so it names
+/// the basename companion `companion` too. A folder that cannot be listed counts as shared:
+/// keeping a sidecar costs a few KB, deleting one another photo uses costs its edits.
+fn shared_with_another_image(image: &Path, companion: &Path) -> bool {
+    let (Some(dir), Some(stem)) = (image.parent(), image.file_stem()) else { return false };
+    let Ok(entries) = std::fs::read_dir(dir) else { return true };
+    entries.flatten().any(|entry| {
+        let path = entry.path();
+        path != image
+            && path != companion
+            && path.file_stem() == Some(stem)
+            && crate::scanner::is_supported_image(&path)
+            && entry.file_type().is_ok_and(|t| t.is_file())
+    })
 }
 
 /// Why offload left a photo whose local copy no longer matches its verified backup (#255).

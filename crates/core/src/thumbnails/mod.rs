@@ -22,7 +22,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 const THUMB_MAX: u32 = 512;
-const PREVIEW_MAX: u32 = 2048;
+/// The preview tier's long edge. Before #245 a decode smaller than this was enlarged to it,
+/// which is what makes a sharpness score from then stale (`sharpness_indexer`).
+pub(crate) const PREVIEW_MAX: u32 = 2048;
 /// Zoom uses the embedded preview at native resolution (no downscale below this);
 /// Sony's full embedded preview is ~9984px, so this keeps it intact.
 const ZOOM_MAX: u32 = 10000;

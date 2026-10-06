@@ -352,8 +352,10 @@ CREATE TABLE IF NOT EXISTS photo_location_companions (
 -- a commit, a history step, a new or duplicated version) — not a rename or a reorder, which
 -- bump `updated_at`. Each write sets it one past the photo's highest, so the most recently
 -- changed version has the largest; the automatic Library face is that version (#252,
--- `photo_cover`). A counter, not a time: two writes in one second still order. Added to
--- older catalogs by `ensure_column` and backfilled from `updated_at` there.
+-- `photo_cover`). A counter, not a time: two writes in one second still order. 0 = never
+-- written in this catalog: a version a bundle or catalog merge added to an existing photo,
+-- which the automatic face passes over until it is edited here (#252). Added to older
+-- catalogs by `ensure_column` and backfilled from `updated_at` there (from 1).
 CREATE TABLE IF NOT EXISTS photo_versions (
     id         INTEGER PRIMARY KEY,
     photo_id   INTEGER NOT NULL REFERENCES photos(id) ON DELETE CASCADE,

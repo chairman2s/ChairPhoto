@@ -546,8 +546,10 @@ impl MergeCtx<'_> {
                         ?4, ?4)",
                 params![photo_id, name, value, ts],
             )?;
-            // A version written into this catalog: the automatic face moves to it (#252).
-            super::edits::settings_written(self.tx, self.tx.last_insert_rowid())?;
+            // Not a change made here: an existing photo's face stays where it is (#252,
+            // decision 2026-10-06). The version keeps `changed_seq` 0 — never written in this
+            // catalog — which the automatic face passes over until it is edited here
+            // (`edits::face_under`). A stale bundle never regresses the face to an older look.
             has.push(parsed);
             added += 1;
         }
@@ -845,7 +847,7 @@ mod tests {
     /// An existing photo keeps every value it has — culling, IPTC, its edit record and its
     /// version — and gains the bundle's edit record and version as new versions after its
     /// own; its tags union. Merging again adds nothing more.
-    // --- the Library face (#252): `photo_cover` is local, versions merged in move it ------
+    // --- the Library face (#252): `photo_cover` is local; a new photo's merged versions move it
 
     #[test]
     fn merged_versions_give_a_new_photo_its_face_and_leave_a_pin_alone() {
@@ -865,6 +867,51 @@ mod tests {
         cat.merge_bundle(&more).unwrap();
         assert_eq!(cat.list_versions(photo.id).unwrap().len(), versions.len() + 1, "a version was added");
         assert_eq!(cat.cover_of(photo.id).unwrap(), None, "the pinned original stays the face");
+    }
+
+    /// #252 (decision 2026-10-06; the merge test the #252 review found missing): versions
+    /// merged into an EXISTING photo do not move its face. A photo showing its own edited
+    /// version keeps showing it, rev unchanged; a photo with no versions keeps its original,
+    /// even when a later face refresh runs. Editing a merged version here makes it the face.
+    #[test]
+    fn versions_merged_into_an_existing_photo_leave_its_face_alone() {
+        let face = |cat: &Catalog, id: i64| cat.cover_of(id).unwrap().map(|f| (f.0, f.1));
+        let insert = |cat: &Catalog| {
+            cat.conn()
+                .execute(
+                    "INSERT INTO photos(uuid, path, mtime_ns, size, extension, created_at, updated_at)
+                     VALUES(?1, 'existing/local.ARW', 1, 1, 'arw', 1, 1)",
+                    params![crate::catalog::photo_identity_for("photo-a").unwrap()],
+                )
+                .unwrap();
+            cat.conn().last_insert_rowid()
+        };
+
+        // Its own edited version is the face, and stays so.
+        let (cat, _root) = temp_catalog("face-existing");
+        let id = insert(&cat);
+        let mine = cat.create_version(id, "Mine").unwrap();
+        cat.set_version_edit(mine, r#"{"local":1}"#).unwrap();
+        let before = face(&cat, id);
+        assert_eq!(before.map(|f| f.0), Some(mine));
+        let out = cat.merge_bundle_into(&sample_manifest(), &HashSet::new(), &HashSet::new()).unwrap();
+        assert_eq!(out.summary.versions_added, 2);
+        assert_eq!(face(&cat, id), before, "the face and its rev are unchanged");
+
+        // No versions of its own: the original stays the face, through a later refresh too.
+        let (cat, _root) = temp_catalog("face-original");
+        let id = insert(&cat);
+        cat.merge_bundle_into(&sample_manifest(), &HashSet::new(), &HashSet::new()).unwrap();
+        let merged = cat.list_versions(id).unwrap();
+        assert_eq!(merged.len(), 2);
+        assert_eq!(face(&cat, id), None, "the original is still the face");
+        cat.delete_version(merged[0].id).unwrap();
+        assert_eq!(face(&cat, id), None, "a refresh does not pick a merged version");
+        assert_eq!(cat.cover_pin(id).unwrap(), crate::catalog::CoverPin::Auto, "and nothing was pinned");
+
+        // An edit here is a change here: the face follows it.
+        cat.set_version_edit(merged[1].id, r#"{"crop":"4:5"}"#).unwrap();
+        assert_eq!(face(&cat, id).map(|f| f.0), Some(merged[1].id));
     }
 
     #[test]

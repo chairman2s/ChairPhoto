@@ -29,6 +29,7 @@ use crate::image_store::{ClaimId, ImageState, ImageStore};
 use crate::shell::actions::{RelocatePhoto, RemoveFromCatalog, RetrieveFromNas};
 use crate::shell::style::Colors;
 use crate::storage::ui;
+use chairphoto_core::app::CatalogIdentity;
 use chairphoto_core::image_pool::ImageKind;
 use gpui_kit::prelude::*;
 use gpui_kit::{
@@ -242,6 +243,8 @@ pub struct ZoomImage {
     /// a Compare pane leaves that to Compare.
     owns_view: bool,
     photo: Option<i64>,
+    /// The catalog `photo` was read from: only tiers rendered in it are drawn (#258).
+    from: Option<CatalogIdentity>,
     over: Option<Override>,
     /// Zoomed in at least once since the photo changed: use the full-resolution source.
     hi: bool,
@@ -291,6 +294,7 @@ impl ZoomImage {
             shared,
             owns_view,
             photo: None,
+            from: None,
             over: None,
             hi: false,
             want_hundred: false,
@@ -352,9 +356,16 @@ impl ZoomImage {
         self.unavailable_actions = on;
     }
 
-    /// Show `photo`. A change resets the tier to the preview, and — when this image owns its
-    /// view — the transform to fit; the override goes with the photo it belonged to.
-    pub fn set_photo(&mut self, photo: Option<i64>, cx: &mut Context<Self>) {
+    /// Show `photo`, read from the catalog `from`. A change of photo resets the tier to the
+    /// preview, and — when this image owns its view — the transform to fit; the override goes
+    /// with the photo it belonged to. Only tiers rendered in `from` are drawn (#258, the
+    /// `image_store` docs): a new `from` for the same id (rows re-read after a re-root, or
+    /// after a switch) keeps the view and draws only what was rendered in it.
+    pub fn set_photo(&mut self, photo: Option<i64>, from: Option<CatalogIdentity>, cx: &mut Context<Self>) {
+        if self.from != from {
+            self.from = from;
+            cx.notify();
+        }
         if self.photo == photo {
             return;
         }
@@ -444,24 +455,26 @@ impl ZoomImage {
             return Shown { failed: image.is_none() && over.failed.is_some(), image, drawn, hires };
         }
         let Some(photo) = self.photo else { return Shown { image: None, drawn: None, hires: None, failed: false } };
-        let wanted = self.held();
-        self.images.update(cx, |store, _| {
+        let (wanted, from) = (self.held(), self.from);
+        self.images.update(cx, |store, cx| {
             if let Some(claim) = self.claim {
                 store.set_claim(claim, wanted.iter().copied());
             }
-            store.request_batch(&wanted);
-            let zoom = match store.get(photo, ImageKind::Zoom) {
+            // Only what was rendered in the photo's own catalog is drawn (#258); a tier cached
+            // from another is asked for again, once.
+            store.request_batch_in(from, &wanted, cx);
+            let zoom = match store.get_in(photo, ImageKind::Zoom, from) {
                 ImageState::Ready(l) if !l.video_tile => Some(l.image),
                 _ => None,
             };
-            let preview = store.get(photo, ImageKind::Preview);
+            let preview = store.get_in(photo, ImageKind::Preview, from);
             let hires = zoom.as_ref().map(|i| natural(i));
             let failed = matches!(preview, ImageState::Failed(_));
             let (image, drawn) = match (self.hi, zoom, preview) {
                 (true, Some(z), _) => (Some(z), Some(Drawn::Zoom)),
                 (_, _, ImageState::Ready(l)) => (Some(l.image), Some(Drawn::Preview)),
                 // The same photo's grid thumbnail while its preview is on the way.
-                _ => match store.peek(photo, ImageKind::Thumb) {
+                _ => match store.peek_in(photo, ImageKind::Thumb, from) {
                     ImageState::Ready(l) => (Some(l.image), Some(Drawn::Thumb)),
                     _ => (None, None),
                 },

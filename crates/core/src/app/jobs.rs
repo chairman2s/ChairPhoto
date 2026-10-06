@@ -1392,7 +1392,7 @@ mod tests {
             .begin(&catalog, |job| super::super::DevelopStatus { job, photo_id: 7, generation: job, resident: false })
             .unwrap();
         let token = SourceToken::Working { photo_id: 7, generation: claim.job };
-        assert_eq!(session::publish(&claim, 7, &token, test_image(8, 8)), session::Published::Resident);
+        assert_eq!(session::publish(&claim, crate::app::CatalogIdentity::unopened(1), 7, &token, test_image(8, 8)), session::Published::Resident);
         assert!(resident(&token).is_some());
 
         registry.lock_for_detach().unwrap().trip_and_clear_all();
@@ -1402,7 +1402,7 @@ mod tests {
         assert!(resident(&token).is_none(), "the image is released with the slot");
         assert_eq!(resident_bytes(), 0);
         // A straggler that decoded across the switch cannot make itself resident either.
-        assert_eq!(session::publish(&claim, 7, &token, test_image(8, 8)), session::Published::Superseded);
+        assert_eq!(session::publish(&claim, crate::app::CatalogIdentity::unopened(1), 7, &token, test_image(8, 8)), session::Published::Superseded);
         assert!(resident(&token).is_none());
     }
 
@@ -1425,7 +1425,7 @@ mod tests {
             .begin(&catalog, |job| super::super::DevelopStatus { job, photo_id: 7, generation: job, resident: false })
             .unwrap();
         let token = SourceToken::Working { photo_id: 7, generation: claim.job };
-        assert_eq!(session::publish(&claim, 7, &token, test_image(8, 8)), session::Published::Resident);
+        assert_eq!(session::publish(&claim, crate::app::CatalogIdentity::unopened(1), 7, &token, test_image(8, 8)), session::Published::Resident);
         let switch = std::thread::spawn(|| {
             let state = crate::app::AppState::default();
             crate::app::catalogs::detach_catalog_and_trip_jobs(&state).unwrap();

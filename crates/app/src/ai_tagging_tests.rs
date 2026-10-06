@@ -163,10 +163,24 @@ struct Ai {
 /// The app with `n` photos, `settings` stored (`ai.<key>`), the fake provider side and the
 /// module enabled.
 fn open_ai(n: usize, settings: &[(&str, &str)], tag: &str, cx: &mut TestAppContext) -> Ai {
+    open_ai_with(n, settings, tag, None, cx)
+}
+
+/// [`open_ai`], with the decode pool `pool` answered by hand (none: every image fails at once).
+fn open_ai_with(
+    n: usize,
+    settings: &[(&str, &str)],
+    tag: &str,
+    pool: Option<Arc<crate::image_tests::FakePool>>,
+    cx: &mut TestAppContext,
+) -> Ai {
     let fake = Arc::new(FakeAi::default());
     cx.update(|cx| cx.set_global(AiBackendGlobal(fake.clone())));
     let dir = TempDir::new(tag);
-    let app = start(cx);
+    let app = match pool {
+        Some(pool) => start_with_pool(cx, pool),
+        None => start(cx),
+    };
     let ids = open_catalog_with_photos(&app, &dir, n, cx);
     with_cat(&app, |c| {
         plugin_ai::ensure_schema(c.conn()).unwrap();
@@ -670,6 +684,34 @@ fn region_and_question_ride_with_the_run(cx: &mut TestAppContext) {
 
     a.select(a.ids[1], cx);
     state.read_with(cx, |s, _| assert_eq!(s.region, None, "the box carried to the next photo"));
+}
+
+/// #258: the region picker draws the active photo's preview only if it was rendered in the
+/// catalog the row came from. After the core switches to a catalog whose ids collide (the event
+/// withheld), the preview rendered next is the new catalog's photo: not drawn.
+#[gpui_kit::test]
+fn the_region_picker_never_draws_another_catalogs_preview(cx: &mut TestAppContext) {
+    use crate::image_tests::{pixels, FakePool};
+    use chairphoto_core::image_pool::{ImageKind, JobKey};
+    let pool = Arc::new(FakePool::default());
+    let a = open_ai_with(1, &[], "ai-region-switch", Some(pool.clone()), cx);
+    let photo = a.ids[0];
+    a.select(photo, cx);
+    a.state(cx).update(cx, |s, cx| s.toggle_region_mode(cx));
+    work(&a.app, cx);
+    let preview = JobKey::photo(photo, ImageKind::Preview);
+    pool.finish(&preview, Ok(pixels(30, 20)));
+    work(&a.app, cx);
+    assert!(a.present("ai-region-wrap", cx), "rendered in the row's catalog: drawn");
+
+    let (b, b_ids) = colliding_catalog(&a.dir, "b", 1);
+    assert_eq!(b_ids[0], photo, "the ids collide");
+    core_switch(&a.app, b);
+    a.app.wired.images.update(cx, |s, cx| s.invalidate(photo, cx));
+    a.app.wired.images.update(cx, |s, _| s.request(photo, ImageKind::Preview));
+    pool.finish(&preview, Ok(pixels(30, 20)));
+    work(&a.app, cx);
+    assert!(!a.present("ai-region-wrap", cx), "the new catalog's photo {photo} is not drawn");
 }
 
 /// Catalog identity: an accept keyed by the old catalog's photo id, after a switch the UI has

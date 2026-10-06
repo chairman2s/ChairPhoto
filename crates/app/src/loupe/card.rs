@@ -241,7 +241,9 @@ impl CardView {
                 s.evict(|k| k.kind == ImageKind::Zoom && k.photo == left, cx);
             }
         });
-        self.zoom.update(cx, |z, cx| z.set_photo(photo, cx));
+        // The wall's photos were read from the card's catalog (#258).
+        let from = self.wall.key.as_ref().and_then(|(_, from)| *from);
+        self.zoom.update(cx, |z, cx| z.set_photo(photo, from, cx));
         cx.notify();
     }
 

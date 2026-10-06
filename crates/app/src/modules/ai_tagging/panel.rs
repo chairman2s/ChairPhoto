@@ -84,11 +84,15 @@ impl AiPanel {
     fn sync_claim(&mut self, cx: &mut Context<Self>) {
         let (Some(images), Some(claim)) = (self.images.clone(), self.claim) else { return };
         let s = self.state.read(cx);
-        let want = s.region_mode.then(|| s.shell().read(cx).library.selection().active_id).flatten();
-        images.update(cx, |st, _| match want {
+        let shell = s.shell().read(cx);
+        let want = s.region_mode.then(|| shell.library.selection().active_id).flatten();
+        let from = shell.rows_from();
+        images.update(cx, |st, cx| match want {
             Some(id) => {
                 st.set_claim(claim, [(id, ImageKind::Preview)]);
-                st.request(id, ImageKind::Preview);
+                // Asked for the row's catalog (#258): a preview cached from another (before a
+                // re-root) is rendered again rather than left undrawn.
+                st.request_batch_in(from, &[(id, ImageKind::Preview)], cx);
             }
             None => st.set_claim(claim, []),
         });
@@ -171,10 +175,12 @@ impl AiPanel {
 
     fn render_region(&self, colors: Colors, cx: &mut Context<Self>) -> AnyElement {
         let s = self.state.read(cx);
-        let active = s.shell().read(cx).library.selection().active_id;
+        let shell = s.shell().read(cx);
+        let (active, from) = (shell.library.selection().active_id, shell.rows_from());
         let region = s.region;
+        // The active photo's preview, only if rendered in the catalog its row came from (#258).
         let image = match (&self.images, active) {
-            (Some(images), Some(id)) => match images.read(cx).peek(id, ImageKind::Preview) {
+            (Some(images), Some(id)) => match images.read(cx).peek_in(id, ImageKind::Preview, from) {
                 ImageState::Ready(l) => Some(l.image),
                 _ => None,
             },

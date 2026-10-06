@@ -15,7 +15,7 @@ use crate::app::{CoreEvent, EventSink};
 use super::{release_all, with_resident};
 use crate::app::jobs::{JobClaim, JobStatus};
 use crate::app::editing::{DevelopTicket, DEVELOP_SUPERSEDED};
-use crate::app::AppState;
+use crate::app::{AppState, CatalogIdentity};
 use crate::develop_source::{DevelopSource, LensInfo};
 use crate::plugins::edit::{SourceToken, WorkingImage};
 use std::path::PathBuf;
@@ -94,8 +94,14 @@ pub(crate) enum Claimed {
 /// its `neighbours` (re-keyed to the new claim) and releasing the rest — or answer from the
 /// current claim when it is already for this photo and resident. Every path that returns
 /// without a claim has still released the previous photo's image.
+///
+/// `catalog` is the catalog `photo_id` (and `neighbours`) were read from: the claim is taken
+/// only while it is still the open one (`JobFamily::begin_as`, else
+/// [`CATALOG_CHANGED`](crate::app::CATALOG_CHANGED) before anything is tripped), and only
+/// that catalog's resident images are answered from or kept (#259).
 pub(crate) fn claim(
     state: &AppState,
+    catalog: CatalogIdentity,
     photo_id: i64,
     probe: DevelopSource,
     neighbours: &[i64],
@@ -111,12 +117,12 @@ pub(crate) fn claim(
     if let Ok(Some(status)) = state.jobs.develop.status() {
         if status.photo_id == photo_id && status.resident {
             let token = SourceToken::Working { photo_id, generation: status.generation };
-            if super::resident(&token).is_some() {
+            if resident_in(catalog, &token) {
                 return Ok(Claimed::Ready(with_token(probe, &token)));
             }
         }
     }
-    let claim = state.jobs.develop.begin(&state.catalog, |job| DevelopStatus {
+    let claim = state.jobs.develop.begin_as(&state.catalog, Some(catalog), |job| DevelopStatus {
         job,
         photo_id,
         generation: job,
@@ -124,12 +130,13 @@ pub(crate) fn claim(
     })?;
     // Everything not about this photo or its neighbours is unreachable from now on: drop it
     // before any load starts, so memory never holds a stale photo alongside a new decode.
-    // What stays is re-keyed to this claim — the previous claim's tokens name nothing. Its
-    // worker, if still running, was tripped by `begin`; a late insert it makes is removed by
-    // its own owner check.
+    // What stays is re-keyed to this claim — the previous claim's tokens name nothing — and
+    // only if it is this catalog's photo: another catalog's image of a kept id is another
+    // photo (#259). The previous claim's worker, if still running, was tripped by `begin_as`
+    // before this, so it inserts nothing from now on (`publish`, `preload_insert`).
     let mut keep = vec![photo_id];
     keep.extend(neighbours.iter().copied().filter(|&n| n != photo_id));
-    let kept = with_resident(|r| r.retain_rekey(&keep, claim.job));
+    let kept = with_resident(|r| r.retain_rekey(catalog, &keep, claim.job));
     if kept.contains(&photo_id) {
         let token = SourceToken::Working { photo_id, generation: claim.job };
         claim.slot.publish(|job| DevelopStatus { job, photo_id, generation: job, resident: true });
@@ -146,9 +153,12 @@ pub(crate) fn claim(
 /// The claim takes effect only if `ticket` is newer than every open or close that already
 /// has (`editing::DevelopOrder`); a stale open claims nothing and answers
 /// [`DEVELOP_SUPERSEDED`](crate::app::editing::DEVELOP_SUPERSEDED).
+///
+/// `catalog` is the catalog `photo_id`, `path` and `neighbours` were read from (#259).
 pub fn open(
     state: &AppState,
     ticket: DevelopTicket,
+    catalog: CatalogIdentity,
     photo_id: i64,
     path: PathBuf,
     probe: DevelopSource,
@@ -156,7 +166,7 @@ pub fn open(
 ) -> Result<DevelopSource, String> {
     let prep = prep_settings(state);
     let ids: Vec<i64> = if prep.preload { neighbours.iter().map(|(id, _)| *id).collect() } else { Vec::new() };
-    let claimed = state.jobs.develop_order.apply(ticket, || claim(state, photo_id, probe.clone(), &ids))?;
+    let claimed = state.jobs.develop_order.apply(ticket, || claim(state, catalog, photo_id, probe.clone(), &ids))?;
     let Some(claimed) = claimed else {
         return Err(DEVELOP_SUPERSEDED.into());
     };
@@ -169,7 +179,7 @@ pub fn open(
     let state = state.clone();
     std::thread::Builder::new()
         .name(format!("develop-decode-{photo_id}"))
-        .spawn(move || prepare(claim, state, photo_id, path, probe, current_ready, neighbours, prep))
+        .spawn(move || prepare(claim, state, catalog, photo_id, path, probe, current_ready, neighbours, prep))
         .map_err(|e| format!("could not start the decode thread: {e}"))?;
     Ok(answer)
 }
@@ -187,14 +197,20 @@ fn release(state: &AppState) -> Result<(), String> {
     Ok(())
 }
 
-/// The source state right now for `photo_id`, from the slot and the resident set.
-pub fn current(state: &AppState, photo_id: i64, probe: DevelopSource) -> DevelopSource {
+/// Whether `token` names a resident image of `catalog`'s photo.
+fn resident_in(catalog: CatalogIdentity, token: &SourceToken) -> bool {
+    with_resident(|r| r.get_in(catalog, token).is_some())
+}
+
+/// The source state right now for `photo_id` of `catalog`, from the slot and the resident
+/// set.
+pub fn current(state: &AppState, catalog: CatalogIdentity, photo_id: i64, probe: DevelopSource) -> DevelopSource {
     match state.jobs.develop.status() {
         Ok(Some(s)) if s.photo_id == photo_id => {
             let token = SourceToken::Working { photo_id, generation: s.generation };
             if !s.resident {
                 DevelopSource::Preview { preparing: true }
-            } else if super::resident(&token).is_some() {
+            } else if resident_in(catalog, &token) {
                 with_token(probe, &token)
             } else {
                 // The session outlived its image (Develop was closed after the worker
@@ -270,6 +286,7 @@ fn load_linear_in(
 fn prepare(
     claim: JobClaim<DevelopStatus>,
     state: AppState,
+    catalog: CatalogIdentity,
     photo_id: i64,
     path: PathBuf,
     probe: DevelopSource,
@@ -312,7 +329,7 @@ fn prepare(
         }
         eprintln!("develop: photo {photo_id} ready from {from} in {:.2?}", t.elapsed());
         let token = SourceToken::Working { photo_id, generation };
-        match publish(&claim, photo_id, &token, image) {
+        match publish(&claim, catalog, photo_id, &token, image) {
             Published::Resident => emit(with_token(probe, &token)),
             Published::OverBudget => {
                 fail();
@@ -322,16 +339,17 @@ fn prepare(
             Published::Superseded => return,
         }
     }
-    preload_neighbours(&claim, &neighbours, prep.cache_budget_bytes);
+    preload_neighbours(&claim, catalog, &neighbours, prep.cache_budget_bytes);
 }
 
-/// Prepare each neighbour into the claim's budget, silently: nothing is emitted, the slot is
-/// not touched, and a neighbour that fails is simply not preloaded. Stops at the first
-/// neighbour the budget refuses — the current photo is never evicted for one — and at any
-/// trip. The same insert-then-check as [`publish`]: an insert that lands after a newer claim
-/// has released everything takes itself back out.
+/// Prepare each neighbour (of `catalog`) into the claim's budget, silently: nothing is
+/// emitted, the slot is not touched, and a neighbour that fails is simply not preloaded.
+/// Stops at the first neighbour the budget refuses — the current photo is never evicted for
+/// one — and at any trip. The same ownership checks as [`publish`]: a tripped claim inserts
+/// nothing, and an insert the slot no longer owns takes itself back out.
 pub(crate) fn preload_neighbours(
     claim: &JobClaim<DevelopStatus>,
+    catalog: CatalogIdentity,
     neighbours: &[(i64, PathBuf)],
     cache_budget_bytes: u64,
 ) {
@@ -342,7 +360,7 @@ pub(crate) fn preload_neighbours(
             return;
         }
         let token = SourceToken::Working { photo_id: *nid, generation };
-        if super::resident(&token).is_some() {
+        if resident_in(catalog, &token) {
             continue; // kept from the previous claim
         }
         if !matches!(crate::raw::probe(npath), crate::raw::RawSupport::Supported(_)) {
@@ -355,17 +373,23 @@ pub(crate) fn preload_neighbours(
         }
         let mut image = working_image_from(decoded);
         image.camera_ev = measure_camera_ev(npath, &image);
-        if !preload_insert(claim, &token, Arc::new(image)) {
+        if !preload_insert(claim, catalog, &token, Arc::new(image)) {
             return;
         }
         eprintln!("develop: neighbour {nid} preloaded from {from} in {:.2?}", t.elapsed());
     }
 }
 
-/// Insert a neighbour's image under this claim; `false` when refused (budget) or taken back
-/// out because the claim was superseded meanwhile — either way, stop preloading.
-pub(crate) fn preload_insert(claim: &JobClaim<DevelopStatus>, token: &SourceToken, image: Arc<WorkingImage>) -> bool {
-    if !with_resident(|r| r.insert(token.clone(), image)) {
+/// Insert a neighbour's image under this claim, as `catalog`'s photo; `false` when the claim
+/// was tripped (nothing is inserted: [`insert_unless_tripped`]), refused (budget), or taken
+/// back out because the claim was superseded meanwhile — either way, stop preloading.
+pub(crate) fn preload_insert(
+    claim: &JobClaim<DevelopStatus>,
+    catalog: CatalogIdentity,
+    token: &SourceToken,
+    image: Arc<WorkingImage>,
+) -> bool {
+    if insert_unless_tripped(claim, catalog, token, image) != Some(true) {
         return false;
     }
     if claim.abort.load(Ordering::Relaxed) || !claim.slot.owns() {
@@ -373,6 +397,28 @@ pub(crate) fn preload_insert(claim: &JobClaim<DevelopStatus>, token: &SourceToke
         return false;
     }
     true
+}
+
+/// Make `image` resident under `token` as `catalog`'s photo, unless `claim` is tripped:
+/// `None` then, and nothing is inserted; else whether the budget took it.
+///
+/// The ownership check comes **before** the insert, under the set's own lock (#259). Every
+/// ownership change — a newer claim (`begin_as` trips, then [`claim`] re-keys), a close, a
+/// catalog switch (`trip_and_clear_all` trips, then releases) — trips the old claim's flag
+/// before it takes this lock to release or re-key. So either this insert's hold comes first
+/// and that release removes the image, or it comes after and sees the flag: a tripped
+/// worker's decode is never resident after the release meant to remove it, not even for an
+/// instant. Only the flag is read under the lock: the set stays a leaf (no slot lock).
+fn insert_unless_tripped(
+    claim: &JobClaim<DevelopStatus>,
+    catalog: CatalogIdentity,
+    token: &SourceToken,
+    image: Arc<WorkingImage>,
+) -> Option<bool> {
+    let inserted = with_resident(|r| (!claim.abort.load(Ordering::Relaxed)).then(|| r.insert(catalog, token.clone(), image)));
+    #[cfg(test)]
+    tests::after_insert();
+    inserted
 }
 
 /// The outcome of a worker's publish step.
@@ -387,21 +433,24 @@ pub(crate) enum Published {
     Superseded,
 }
 
-/// Make a decoded image resident under this claim's token and say so in the slot — or, if
-/// the claim was superseded meanwhile, take the image back out. Insert-then-check rather
-/// than check-then-insert, because the slot lock and the resident lock are never held
-/// together (the set is a leaf): an insert after a newer `claim` has already released
-/// everything would otherwise leave a stale image nothing owns.
+/// Make a decoded image resident under this claim's token, as `catalog`'s photo, and say so
+/// in the slot — or, if the claim was superseded, leave it out or take it back out. A
+/// tripped claim inserts nothing ([`insert_unless_tripped`], #259). The slot is checked
+/// after the insert as well, because the slot lock and the resident lock are never held
+/// together (the set is a leaf): whatever took the slot without tripping this claim's flag
+/// first still finds no stale image left behind.
 pub(crate) fn publish(
     claim: &JobClaim<DevelopStatus>,
+    catalog: CatalogIdentity,
     photo_id: i64,
     token: &SourceToken,
     image: Arc<WorkingImage>,
 ) -> Published {
     let generation = claim.job;
-    let inserted = with_resident(|r| r.insert(token.clone(), image));
-    if !inserted {
-        return Published::OverBudget;
+    match insert_unless_tripped(claim, catalog, token, image) {
+        None => return Published::Superseded,
+        Some(false) => return Published::OverBudget,
+        Some(true) => {}
     }
     claim.slot.publish(|job| DevelopStatus { job, photo_id, generation, resident: true });
     if claim.slot.owns() {
@@ -476,12 +525,17 @@ mod tests {
         DevelopSource::Raw { camera: "Test".into(), megapixels: 1.0, bits: 16, decoder: "test".into(), token: None, camera_ev: None, as_shot_wb: None, lens: None }
     }
 
+    /// The open catalog's identity: the one the tests' photo ids are read from.
+    fn cat(state: &AppState) -> CatalogIdentity {
+        crate::app::catalog_identity(state).unwrap()
+    }
+
     fn decode_claim(state: &AppState, photo_id: i64) -> JobClaim<DevelopStatus> {
         decode_claim_with(state, photo_id, &[])
     }
 
     fn decode_claim_with(state: &AppState, photo_id: i64, neighbours: &[i64]) -> JobClaim<DevelopStatus> {
-        match claim(state, photo_id, raw_probe(), neighbours).unwrap() {
+        match claim(state, cat(state), photo_id, raw_probe(), neighbours).unwrap() {
             Claimed::Decode(c) => c,
             Claimed::Adopted(_, t) => panic!("expected a decode claim, got an adoption of {t:?}"),
             Claimed::Ready(s) => panic!("expected a decode claim, got {s:?}"),
@@ -500,9 +554,9 @@ mod tests {
         let (state, _dir) = state();
         let a = decode_claim(&state, 1);
         let ta = token_of(&a, 1);
-        assert_eq!(publish(&a, 1, &ta, test_image(8, 8)), Published::Resident);
+        assert_eq!(publish(&a, cat(&state), 1, &ta, test_image(8, 8)), Published::Resident);
         assert!(resident(&ta).is_some());
-        assert!(matches!(current(&state, 1, raw_probe()), DevelopSource::Raw { token: Some(_), .. }));
+        assert!(matches!(current(&state, cat(&state), 1, raw_probe()), DevelopSource::Raw { token: Some(_), .. }));
 
         let b = decode_claim(&state, 2);
 
@@ -514,8 +568,8 @@ mod tests {
         let status = state.jobs.develop.status().unwrap().unwrap();
         assert_eq!((status.photo_id, status.resident), (2, false));
         // The first photo now reads as "not this claim": the probe without a token.
-        assert!(matches!(current(&state, 1, raw_probe()), DevelopSource::Raw { token: None, .. }));
-        assert!(matches!(current(&state, 2, raw_probe()), DevelopSource::Preview { preparing: true }));
+        assert!(matches!(current(&state, cat(&state), 1, raw_probe()), DevelopSource::Raw { token: None, .. }));
+        assert!(matches!(current(&state, cat(&state), 2, raw_probe()), DevelopSource::Preview { preparing: true }));
     }
 
     /// **Forced.** A decode that finishes after a newer open has claimed the family must not
@@ -528,9 +582,9 @@ mod tests {
         let b = decode_claim(&state, 2);
         let (ta, tb) = (token_of(&a, 1), token_of(&b, 2));
         // B is fast (a cached decode, later) and publishes first.
-        assert_eq!(publish(&b, 2, &tb, test_image(8, 8)), Published::Resident);
+        assert_eq!(publish(&b, cat(&state), 2, &tb, test_image(8, 8)), Published::Resident);
         // A's straggler arrives with its 800 MB.
-        assert_eq!(publish(&a, 1, &ta, test_image(8, 8)), Published::Superseded);
+        assert_eq!(publish(&a, cat(&state), 1, &ta, test_image(8, 8)), Published::Superseded);
 
         assert!(resident(&ta).is_none(), "the superseded image is gone again");
         assert!(resident(&tb).is_some(), "and the owner's image was not touched");
@@ -556,8 +610,8 @@ mod tests {
             distortion: None,
             chromatic: None,
         });
-        assert_eq!(publish(&a, 1, &ta, Arc::new(img)), Published::Resident);
-        match current(&state, 1, raw_probe()) {
+        assert_eq!(publish(&a, cat(&state), 1, &ta, Arc::new(img)), Published::Resident);
+        match current(&state, cat(&state), 1, raw_probe()) {
             DevelopSource::Raw { token: Some(_), lens, .. } => assert_eq!(
                 lens,
                 Some(LensInfo { source: "Sony built-in".into(), vignetting: true, distortion: false, chromatic: false })
@@ -576,12 +630,12 @@ mod tests {
         let ta = token_of(&a, 1);
         let mut img = WorkingImage::clone_for_test(&test_image(8, 8));
         img.camera_ev = Some(-1.5);
-        assert_eq!(publish(&a, 1, &ta, Arc::new(img)), Published::Resident);
-        match current(&state, 1, raw_probe()) {
+        assert_eq!(publish(&a, cat(&state), 1, &ta, Arc::new(img)), Published::Resident);
+        match current(&state, cat(&state), 1, raw_probe()) {
             DevelopSource::Raw { token: Some(_), camera_ev, .. } => assert_eq!(camera_ev, Some(-1.5)),
             other => panic!("{other:?}"),
         }
-        let json = serde_json::to_value(current(&state, 1, raw_probe())).unwrap();
+        let json = serde_json::to_value(current(&state, cat(&state), 1, raw_probe())).unwrap();
         assert_eq!(json["cameraEv"], -1.5);
         close(&state, crate::app::editing::develop_ticket(&state)).unwrap();
         a.slot.clear();
@@ -595,7 +649,7 @@ mod tests {
         let (state, _dir) = state();
         let a = decode_claim(&state, 1);
         let ta = token_of(&a, 1);
-        assert_eq!(publish(&a, 1, &ta, test_image(8, 8)), Published::Resident);
+        assert_eq!(publish(&a, cat(&state), 1, &ta, test_image(8, 8)), Published::Resident);
 
         close(&state, crate::app::editing::develop_ticket(&state)).unwrap();
 
@@ -606,7 +660,7 @@ mod tests {
         // The slot is still the worker's to clear (close trips; it does not unpublish), and
         // the photo reads as preparing until it does — the frontend has left anyway.
         a.slot.clear();
-        assert!(matches!(current(&state, 1, raw_probe()), DevelopSource::Raw { token: None, .. }));
+        assert!(matches!(current(&state, cat(&state), 1, raw_probe()), DevelopSource::Raw { token: None, .. }));
     }
 
     /// The same photo opened again while resident answers from the current claim without
@@ -617,9 +671,9 @@ mod tests {
         let (state, _dir) = state();
         let a = decode_claim(&state, 1);
         let ta = token_of(&a, 1);
-        assert_eq!(publish(&a, 1, &ta, test_image(8, 8)), Published::Resident);
+        assert_eq!(publish(&a, cat(&state), 1, &ta, test_image(8, 8)), Published::Resident);
 
-        match claim(&state, 1, raw_probe(), &[]).unwrap() {
+        match claim(&state, cat(&state), 1, raw_probe(), &[]).unwrap() {
             Claimed::Ready(DevelopSource::Raw { token: Some(t), .. }) => assert_eq!(t, ta.to_query()),
             other => panic!("expected the resident token, got {:?}", matches!(other, Claimed::Decode(_))),
         }
@@ -635,9 +689,9 @@ mod tests {
         let (state, _dir) = state();
         let a = decode_claim(&state, 1);
         let ta = token_of(&a, 1);
-        assert_eq!(publish(&a, 1, &ta, test_image(8, 8)), Published::Resident);
+        assert_eq!(publish(&a, cat(&state), 1, &ta, test_image(8, 8)), Published::Resident);
 
-        assert!(matches!(claim(&state, 2, DevelopSource::Jpeg, &[]).unwrap(), Claimed::Ready(DevelopSource::Jpeg)));
+        assert!(matches!(claim(&state, cat(&state), 2, DevelopSource::Jpeg, &[]).unwrap(), Claimed::Ready(DevelopSource::Jpeg)));
         assert!(a.abort.load(Ordering::Relaxed));
         assert!(resident(&ta).is_none());
     }
@@ -652,12 +706,12 @@ mod tests {
         let (state, _dir) = state();
         let a = decode_claim_with(&state, 1, &[2, 3]);
         let (t1, t2, t3) = (token_of(&a, 1), token_of(&a, 2), token_of(&a, 3));
-        assert_eq!(publish(&a, 1, &t1, test_image(8, 8)), Published::Resident);
-        assert!(preload_insert(&a, &t2, test_image(8, 8)));
-        assert!(preload_insert(&a, &t3, test_image(8, 8)));
+        assert_eq!(publish(&a, cat(&state), 1, &t1, test_image(8, 8)), Published::Resident);
+        assert!(preload_insert(&a, cat(&state), &t2, test_image(8, 8)));
+        assert!(preload_insert(&a, cat(&state), &t3, test_image(8, 8)));
 
         // The user steps to photo 2, whose neighbours are 1 and 4 (3 is no longer adjacent).
-        let (b, token) = match claim(&state, 2, raw_probe(), &[1, 4]).unwrap() {
+        let (b, token) = match claim(&state, cat(&state), 2, raw_probe(), &[1, 4]).unwrap() {
             Claimed::Adopted(b, token) => (b, token),
             _ => panic!("a preloaded neighbour must be adopted, not decoded again"),
         };
@@ -671,7 +725,7 @@ mod tests {
         assert!(resident(&token_of(&b, 3)).is_none(), "photo 3 is no longer adjacent: released");
         let status = state.jobs.develop.status().unwrap().unwrap();
         assert_eq!((status.photo_id, status.resident), (2, true));
-        assert!(matches!(current(&state, 2, raw_probe()), DevelopSource::Raw { token: Some(_), .. }));
+        assert!(matches!(current(&state, cat(&state), 2, raw_probe()), DevelopSource::Raw { token: Some(_), .. }));
     }
 
     /// **Forced.** A tripped worker that finishes a neighbour after a newer claim took the
@@ -683,9 +737,94 @@ mod tests {
         let a = decode_claim_with(&state, 1, &[2]);
         let _b = decode_claim(&state, 5);
         let late = token_of(&a, 2);
-        assert!(!preload_insert(&a, &late, test_image(8, 8)), "refused: the claim is gone");
+        assert!(!preload_insert(&a, cat(&state), &late, test_image(8, 8)), "refused: the claim is gone");
         assert!(resident(&late).is_none());
         assert_eq!(resident_bytes(), 0);
+    }
+
+    // --- ownership before insert, and the catalog (#259) ----------------------------------
+
+    thread_local! {
+        /// Run by every insert attempt right after the resident set's lock is released
+        /// (`insert_unless_tripped`): where a test looks at the set between a worker's insert
+        /// and its own ownership checks.
+        static AFTER_INSERT: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+    }
+
+    pub(super) fn after_insert() {
+        if let Some(hook) = AFTER_INSERT.with(|h| h.borrow_mut().take()) {
+            hook();
+        }
+    }
+
+    /// Run `f` at the next insert attempt on this thread; returns whether it ran.
+    fn at_next_insert(f: impl FnOnce() + 'static) -> impl Fn() -> bool {
+        let ran = std::rc::Rc::new(std::cell::Cell::new(false));
+        let mark = ran.clone();
+        AFTER_INSERT.with(|h| {
+            *h.borrow_mut() = Some(Box::new(move || {
+                mark.set(true);
+                f();
+            }))
+        });
+        move || ran.get()
+    }
+
+    /// **Forced.** A worker whose claim a catalog switch tripped publishes afterwards: its
+    /// decode is never resident, not even between its insert and its slot check — the instant
+    /// in which, before #259, a new catalog's render or claim for the same id could take it
+    /// (review L1). The check comes before the insert, under the set's lock.
+    #[test]
+    fn a_tripped_worker_never_makes_its_decode_resident() {
+        let _serial = serial();
+        let (state, _dir) = state();
+        let a = decode_claim(&state, 1);
+        let ta = token_of(&a, 1);
+        crate::app::catalogs::detach_catalog_and_trip_jobs(&state).unwrap();
+        let seen: std::rc::Rc<std::cell::Cell<Option<bool>>> = std::rc::Rc::default();
+        let look = seen.clone();
+        let probe = ta.clone();
+        let ran = at_next_insert(move || look.set(Some(resident(&probe).is_some())));
+        assert_eq!(publish(&a, crate::app::CatalogIdentity::unopened(9), 1, &ta, test_image(8, 8)), Published::Superseded);
+        assert!(ran(), "the insert was attempted");
+        assert_eq!(seen.get(), Some(false), "resident between the insert and the slot check");
+        assert_eq!(resident_bytes(), 0);
+
+        // The same for a neighbour's preload.
+        let tn = token_of(&a, 2);
+        let look = seen.clone();
+        let probe = tn.clone();
+        let _ran = at_next_insert(move || look.set(Some(resident(&probe).is_some())));
+        assert!(!preload_insert(&a, crate::app::CatalogIdentity::unopened(9), &tn, test_image(8, 8)));
+        assert_eq!(seen.get(), Some(false), "a tripped preload resident between insert and check");
+    }
+
+    /// A develop claim belongs to the catalog its photo was read from: one made for a catalog
+    /// no longer open fails closed before it trips anything, and a claim in another catalog
+    /// adopts nothing of a decode resident for the first catalog's photo with the same id.
+    #[test]
+    fn a_claim_is_its_catalogs_and_adopts_only_its_catalogs_decodes() {
+        let _serial = serial();
+        let (state, dir) = state();
+        let a = cat(&state);
+        let running = decode_claim(&state, 1);
+        let ta = token_of(&running, 1);
+        assert_eq!(publish(&running, a, 1, &ta, test_image(37, 23)), Published::Resident);
+
+        // B opens (its photo 1 is another photo); A's view, not yet told, steps to photo 2.
+        let b_catalog = Catalog::open(&dir.join("b.chairphoto"), &dir.join("b")).unwrap();
+        *state.catalog.lock().unwrap() = Some(b_catalog);
+        let b = cat(&state);
+        assert!(matches!(claim(&state, a, 2, raw_probe(), &[1]), Err(e) if e == crate::app::CATALOG_CHANGED));
+        assert!(!running.abort.load(Ordering::Relaxed), "the refused claim tripped nothing");
+
+        // B's own open of its photo 1 adopts nothing of A's decode: it decodes, and A's goes.
+        match claim(&state, b, 1, raw_probe(), &[]).unwrap() {
+            Claimed::Decode(_) => {}
+            Claimed::Adopted(_, t) => panic!("B adopted A's decode of photo 1 as {t:?}"),
+            Claimed::Ready(s) => panic!("B answered from A's decode: {s:?}"),
+        }
+        assert_eq!(resident_bytes(), 0, "A's decode was released, not kept for B");
     }
 
     // --- the order of opens and closes (#203, #225) ---------------------------------------
@@ -699,12 +838,12 @@ mod tests {
         let (state, _dir) = state();
         let order = &state.jobs.develop_order;
         let (t_close, t_open) = (order.ticket(), order.ticket());
-        let b = match order.apply(t_open, || claim(&state, 2, raw_probe(), &[])).unwrap() {
+        let b = match order.apply(t_open, || claim(&state, cat(&state), 2, raw_probe(), &[])).unwrap() {
             Some(Claimed::Decode(b)) => b,
             _ => panic!("the open claims"),
         };
         let tb = token_of(&b, 2);
-        assert_eq!(publish(&b, 2, &tb, test_image(8, 8)), Published::Resident);
+        assert_eq!(publish(&b, cat(&state), 2, &tb, test_image(8, 8)), Published::Resident);
 
         close(&state, t_close).unwrap();
 
@@ -728,12 +867,12 @@ mod tests {
         let (state, dir) = state();
         let order = &state.jobs.develop_order;
         let (t2, t3) = (order.ticket(), order.ticket());
-        let b = match order.apply(t3, || claim(&state, 3, raw_probe(), &[])).unwrap() {
+        let b = match order.apply(t3, || claim(&state, cat(&state), 3, raw_probe(), &[])).unwrap() {
             Some(Claimed::Decode(b)) => b,
             _ => panic!("the newer open claims"),
         };
 
-        let late = open(&state, t2, 2, dir.join("photos/2.ARW"), raw_probe(), Vec::new());
+        let late = open(&state, t2, cat(&state), 2, dir.join("photos/2.ARW"), raw_probe(), Vec::new());
 
         assert_eq!(late.unwrap_err(), DEVELOP_SUPERSEDED);
         assert!(!b.abort.load(Ordering::Relaxed), "photo 3's worker runs on");
@@ -743,7 +882,7 @@ mod tests {
         let (t_open, t_close) = (order.ticket(), order.ticket());
         close(&state, t_close).unwrap();
         assert!(b.abort.load(Ordering::Relaxed), "the close took effect");
-        let late = open(&state, t_open, 4, dir.join("photos/4.ARW"), raw_probe(), Vec::new());
+        let late = open(&state, t_open, cat(&state), 4, dir.join("photos/4.ARW"), raw_probe(), Vec::new());
         assert_eq!(late.unwrap_err(), DEVELOP_SUPERSEDED);
         let status = state.jobs.develop.status().unwrap().unwrap();
         assert_eq!(status.photo_id, 3, "no claim was made for photo 4");
@@ -759,15 +898,15 @@ mod tests {
         let (state, _dir) = state();
         let a = decode_claim(&state, 1);
         let t = token_of(&a, 1);
-        assert_eq!(publish(&a, 1, &t, test_image(8, 8)), Published::Resident);
+        assert_eq!(publish(&a, cat(&state), 1, &t, test_image(8, 8)), Published::Resident);
         // The worker ends here on success — it does not clear the slot.
-        assert!(matches!(current(&state, 1, raw_probe()), DevelopSource::Raw { token: Some(_), .. }));
-        match claim(&state, 1, raw_probe(), &[]).unwrap() {
+        assert!(matches!(current(&state, cat(&state), 1, raw_probe()), DevelopSource::Raw { token: Some(_), .. }));
+        match claim(&state, cat(&state), 1, raw_probe(), &[]).unwrap() {
             Claimed::Ready(DevelopSource::Raw { token: Some(q), .. }) => assert_eq!(q, t.to_query()),
             _ => panic!("reopening the resident photo must answer at once"),
         }
         close(&state, crate::app::editing::develop_ticket(&state)).unwrap();
-        assert!(matches!(current(&state, 1, raw_probe()), DevelopSource::Raw { token: None, .. }));
+        assert!(matches!(current(&state, cat(&state), 1, raw_probe()), DevelopSource::Raw { token: None, .. }));
     }
 
     /// A photo the decode cache holds loads from it without calling LibRaw: the "file" here

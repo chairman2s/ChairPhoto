@@ -185,8 +185,17 @@ impl AppModel {
         self.status = "Opening catalog…".into();
         cx.notify();
         let state = self.state.clone();
-        let opened = chairphoto_core::app::runtime()
-            .spawn(async move { chairphoto_core::app::open_default_catalog(&state).await });
+        let opened = chairphoto_core::app::runtime().spawn(async move {
+            let opened = chairphoto_core::app::open_default_catalog(&state).await;
+            // The pre-#258 offline thumbnails go to the catalog opened at start-up, once, on
+            // the blocking pool (review fix258 M1).
+            if opened.is_ok() {
+                if let Ok(from) = chairphoto_core::app::catalog_identity(&state) {
+                    chairphoto_core::app::catalogs::spawn_offline_thumbnail_migration(&state, from);
+                }
+            }
+            opened
+        });
         cx.spawn(async move |this, cx| {
             let result = match opened.await {
                 Ok(result) => result,

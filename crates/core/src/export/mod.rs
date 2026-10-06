@@ -20,6 +20,7 @@
 //! [`resolve_originals`] runs under the lock (DB + path resolution); [`write_exports`]
 //! is pure filesystem work and is called from `spawn_blocking`.
 
+use crate::app::CatalogIdentity;
 use crate::catalog::{Catalog, ExportKeywords, IptcFields};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -58,6 +59,9 @@ pub struct ExportResult {
 pub struct ResolvedItem {
     /// The catalog photo (the develop session and the offline loader key on it).
     pub photo_id: i64,
+    /// The catalog `photo_id` was read from (#259): an engine-2 export reuses a resident
+    /// decode only if it is that catalog's photo.
+    pub catalog: CatalogIdentity,
     pub original: PathBuf,
     pub keywords: ExportKeywords,
     /// The selected version's edit record (`None` = export the unedited original).
@@ -121,6 +125,7 @@ pub fn resolve_originals(
                 let iptc = catalog.get_iptc(id).unwrap_or_default();
                 out.items.push(ResolvedItem {
                     photo_id: id,
+                    catalog: crate::app::identity_of(catalog),
                     original,
                     keywords,
                     edit_json,
@@ -372,7 +377,7 @@ fn export_jpeg(
         let t = edit_json.trim();
         !t.is_empty() && t != "{}"
     };
-    let jpeg = render_export_jpeg(original, item.photo_id, edit_json, has_edit, max_width)?;
+    let jpeg = render_export_jpeg(original, item.catalog, item.photo_id, edit_json, has_edit, max_width)?;
 
     let stem = original
         .file_stem()
@@ -419,7 +424,7 @@ pub fn write_item_jpeg(
         let t = edit_json.trim();
         !t.is_empty() && t != "{}"
     };
-    let jpeg = render_export_jpeg(&item.original, item.photo_id, edit_json, has_edit, max_width)?;
+    let jpeg = render_export_jpeg(&item.original, item.catalog, item.photo_id, edit_json, has_edit, max_width)?;
     if let Some(parent) = out_path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
@@ -451,7 +456,7 @@ pub fn write_item_jpeg_with_long_edge(
     let jpeg = if !has_edit && limit == 0 {
         crate::thumbnails::zoom_bytes(&item.original)?
     } else {
-        let mut img = decode_export_source(&item.original, item.photo_id, edit_json, has_edit)?;
+        let mut img = decode_export_source(&item.original, item.catalog, item.photo_id, edit_json, has_edit)?;
         if limit > 0 {
             img = downscale_to_long_edge(img, limit);
         }
@@ -579,6 +584,7 @@ fn run_exiftool(mut cmd: Command) -> Result<(), String> {
 /// apply the crop + tone, optionally downscale to `max_width`, and encode.
 fn render_export_jpeg(
     original: &Path,
+    catalog: CatalogIdentity,
     photo_id: i64,
     edit_json: &str,
     has_edit: bool,
@@ -591,7 +597,7 @@ fn render_export_jpeg(
     }
 
     // Otherwise we need pixels in hand (to crop and/or resize).
-    let mut img = decode_export_source(original, photo_id, edit_json, has_edit)?;
+    let mut img = decode_export_source(original, catalog, photo_id, edit_json, has_edit)?;
     if let Some(w) = max_width {
         img = downscale_to_width(img, w);
     }
@@ -600,9 +606,11 @@ fn render_export_jpeg(
 
 /// The image to export: the edited render of the full-res source when there's an edit,
 /// else the decoded embedded preview. Falls back to the embedded preview if the `edit`
-/// engine is compiled out.
+/// engine is compiled out. `photo_id` is `catalog`'s (#259: an engine-2 export reuses only
+/// that catalog's resident decode).
 fn decode_export_source(
     original: &Path,
+    catalog: CatalogIdentity,
     photo_id: i64,
     edit_json: &str,
     has_edit: bool,
@@ -614,7 +622,7 @@ fn decode_export_source(
         if crate::plugins::edit::record_engine(edit_json) == 2 {
             #[cfg(feature = "raw")]
             {
-                return export_engine2(original, photo_id, edit_json);
+                return export_engine2(original, catalog, photo_id, edit_json);
             }
             #[cfg(not(feature = "raw"))]
             {
@@ -627,7 +635,7 @@ fn decode_export_source(
         let source = full_res_source(original)?;
         return crate::plugins::edit::render_image(source, edit_json, 0);
     }
-    let _ = (edit_json, has_edit, photo_id);
+    let _ = (edit_json, has_edit, catalog, photo_id);
     let jpeg = crate::thumbnails::zoom_bytes(original)?;
     image::load_from_memory(&jpeg).map_err(|e| e.to_string())
 }
@@ -637,10 +645,15 @@ fn decode_export_source(
 /// pipeline at full size — no tone matching — then checked against the view at Fit and
 /// tallied (`plugins::edit::parity`). A failed check is logged, never a failed export.
 #[cfg(all(feature = "edit", feature = "raw"))]
-fn export_engine2(original: &Path, photo_id: i64, edit_json: &str) -> Result<image::DynamicImage, String> {
+fn export_engine2(
+    original: &Path,
+    catalog: CatalogIdentity,
+    photo_id: i64,
+    edit_json: &str,
+) -> Result<image::DynamicImage, String> {
     use crate::plugins::edit::{parity, render_image_opts, RenderOpts, RenderSource};
     let budget = crate::develop::cache::DEFAULT_BUDGET_GB * 1024 * 1024 * 1024;
-    let (token, image) = crate::develop::offline::working_image_for(photo_id, original, budget)?;
+    let (token, image) = crate::develop::offline::working_image_for(catalog, photo_id, original, budget)?;
     let out = render_image_opts(
         RenderSource::Working { token: token.clone(), image: image.clone() },
         edit_json,
@@ -1083,7 +1096,7 @@ mod tone_match_tests {
         // decodes the JPEG we just wrote, then the same `render_image` runs, so any tonal
         // divergence between the two callers would show up here.
         let source = write_temp_jpeg("tone-match", &jpeg);
-        let export = render_export_jpeg(source.path(), 0, edit_json, true, None).unwrap();
+        let export = render_export_jpeg(source.path(), crate::app::CatalogIdentity::unopened(1), 0, edit_json, true, None).unwrap();
 
         let diff = mean_abs_diff(&preview, &export);
         assert!(
@@ -1143,7 +1156,7 @@ mod tone_match_tests {
         let edit = r#"{"crop":{"x":0.0,"y":0.0,"w":0.5,"h":0.6,"aspect":"1:1"}}"#;
         let preview = crate::plugins::edit::render_jpeg(&jpeg, edit, 0).unwrap();
         let source = write_temp_jpeg("geometry-match", &jpeg);
-        let export = render_export_jpeg(source.path(), 0, edit, true, None).unwrap();
+        let export = render_export_jpeg(source.path(), crate::app::CatalogIdentity::unopened(1), 0, edit, true, None).unwrap();
         let dp = image::load_from_memory(&preview).unwrap().dimensions();
         let de = image::load_from_memory(&export).unwrap().dimensions();
         assert_eq!(dp, de, "preview {dp:?} and export {de:?} geometry must match");
@@ -1273,8 +1286,8 @@ mod engine2_export_tests {
         let path = std::path::Path::new(&fixture);
         let json = r#"{"engine":2,"display":"camera.2","cameraEv":-0.3,"tone":{"contrast":0.2}}"#;
         let _ = crate::plugins::edit::parity::take();
-        let img = super::decode_export_source(path, 424242, json, true).unwrap();
-        let (token, image) = crate::develop::offline::working_image_for(424242, path, 0).unwrap();
+        let img = super::decode_export_source(path, crate::app::CatalogIdentity::unopened(1), 424242, json, true).unwrap();
+        let (token, image) = crate::develop::offline::working_image_for(crate::app::CatalogIdentity::unopened(1), 424242, path, 0).unwrap();
         let _ = token;
         assert_eq!((img.width(), img.height()), (image.width, image.height), "full size");
         let tally = crate::plugins::edit::parity::take();
@@ -1295,6 +1308,7 @@ mod overlap_tests {
     fn item(original: PathBuf) -> ResolvedItem {
         ResolvedItem {
             photo_id: 1,
+            catalog: crate::app::CatalogIdentity::unopened(1),
             original,
             keywords: ExportKeywords::default(),
             edit_json: None,

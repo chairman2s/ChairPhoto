@@ -772,6 +772,44 @@ impl Catalog {
         Ok(catalog_uuid(&self.conn)?)
     }
 
+    /// What `photo_id`'s offline thumbnail is kept under (#258): this catalog's identity and
+    /// the photo's UUID, read together. A read only — it never mints the catalog's identity,
+    /// so it costs a grid tile no write. `None` when the photo is not in the catalog or either
+    /// value is not a UUID ([`crate::thumbnails::OfflineThumbKey::new`]).
+    pub fn offline_thumb_key(&self, photo_id: i64) -> Result<Option<crate::thumbnails::OfflineThumbKey>> {
+        let row: Option<(String, Option<String>)> = self
+            .conn
+            .query_row(
+                "SELECT p.uuid, (SELECT value FROM settings WHERE key = ?2) FROM photos p WHERE p.id = ?1",
+                params![photo_id, CATALOG_UUID_KEY],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        Ok(row.and_then(|(photo, catalog)| crate::thumbnails::OfflineThumbKey::new(catalog.as_deref()?, &photo)))
+    }
+
+    /// [`Self::offline_thumb_key`] for each of `ids` this catalog has (one chunked read): the
+    /// keys the pre-#258 thumbnails are migrated to (`thumbnails::adopt_id_keyed_thumbs`).
+    pub fn offline_thumb_keys(
+        &self,
+        ids: &[i64],
+    ) -> Result<std::collections::HashMap<i64, crate::thumbnails::OfflineThumbKey>> {
+        let mut out = std::collections::HashMap::new();
+        let Some(catalog) = read_catalog_uuid(&self.conn)? else { return Ok(out) };
+        for chunk in ids.chunks(SQLITE_PARAM_CHUNK) {
+            let marks = vec!["?"; chunk.len()].join(",");
+            let mut stmt = self.conn.prepare(&format!("SELECT id, uuid FROM photos WHERE id IN ({marks})"))?;
+            let rows = stmt.query_map(rusqlite::params_from_iter(chunk), |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?;
+            for row in rows {
+                let (id, photo) = row?;
+                if let Some(key) = crate::thumbnails::OfflineThumbKey::new(&catalog, &photo) {
+                    out.insert(id, key);
+                }
+            }
+        }
+        Ok(out)
+    }
+
     pub fn get_setting(&self, key: &str) -> Result<Option<String>> {
         Ok(self
             .conn

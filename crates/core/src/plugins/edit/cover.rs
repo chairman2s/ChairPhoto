@@ -45,9 +45,17 @@ fn cache_path(root: &Path, path: &Path, edit_json: &str) -> Result<PathBuf, Stri
 
 /// The cover thumbnail JPEG for `path` rendered with `edit_json`: from the disk cache, or
 /// rendered and cached. Not rotated — the caller applies the user rotation like it does
-/// for the plain thumbnail.
-pub fn cover_thumb(path: &Path, photo_id: i64, edit_json: &str) -> Result<Vec<u8>, String> {
-    cover_thumb_in(&crate::thumbnails::cache_dir().join("chairphoto"), path, photo_id, edit_json, render)
+/// for the plain thumbnail. `photo_id` is `catalog`'s (#259: an engine-2 cover reuses only
+/// that catalog's resident decode).
+pub fn cover_thumb(
+    path: &Path,
+    catalog: crate::app::CatalogIdentity,
+    photo_id: i64,
+    edit_json: &str,
+) -> Result<Vec<u8>, String> {
+    cover_thumb_in(&crate::thumbnails::cache_dir().join("chairphoto"), path, photo_id, edit_json, |p, id, json| {
+        render(p, catalog, id, json)
+    })
 }
 
 fn cover_thumb_in(
@@ -74,26 +82,26 @@ fn cover_thumb_in(
     Ok(bytes)
 }
 
-fn render(path: &Path, photo_id: i64, edit_json: &str) -> Result<Vec<u8>, String> {
+fn render(path: &Path, catalog: crate::app::CatalogIdentity, photo_id: i64, edit_json: &str) -> Result<Vec<u8>, String> {
     if super::record_engine(edit_json) == 2 {
-        return render_engine2(path, photo_id, edit_json);
+        return render_engine2(path, catalog, photo_id, edit_json);
     }
     let preview = crate::thumbnails::preview_bytes(path)?;
     super::render_jpeg(&preview, edit_json, COVER_EDGE)
 }
 
 #[cfg(feature = "raw")]
-fn render_engine2(path: &Path, photo_id: i64, edit_json: &str) -> Result<Vec<u8>, String> {
+fn render_engine2(path: &Path, catalog: crate::app::CatalogIdentity, photo_id: i64, edit_json: &str) -> Result<Vec<u8>, String> {
     use super::{render_image_opts, RenderOpts, RenderSource};
     let budget = crate::develop::cache::DEFAULT_BUDGET_GB * 1024 * 1024 * 1024;
-    // The session's image when it holds this photo, else one bounded offline load.
-    let (token, image) = crate::develop::offline::working_image_for(photo_id, path, budget)?;
+    // The session's image when it holds this catalog's photo, else one bounded offline load.
+    let (token, image) = crate::develop::offline::working_image_for(catalog, photo_id, path, budget)?;
     let out = render_image_opts(RenderSource::Working { token, image }, edit_json, COVER_EDGE, RenderOpts::default())?;
     super::encode_jpeg(&out, 85)
 }
 
 #[cfg(not(feature = "raw"))]
-fn render_engine2(_path: &Path, _photo_id: i64, _edit_json: &str) -> Result<Vec<u8>, String> {
+fn render_engine2(_path: &Path, _catalog: crate::app::CatalogIdentity, _photo_id: i64, _edit_json: &str) -> Result<Vec<u8>, String> {
     Err("this cover was developed on the RAW engine, which this build lacks".into())
 }
 

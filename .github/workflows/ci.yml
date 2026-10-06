@@ -76,6 +76,12 @@ jobs:
           RUSTFLAGS: "-D warnings"
         run: cargo check -p chairphoto-app --no-default-features --features tag-graph --all-targets
 
+      # dev-module is also app-only (crates/app/Cargo.toml, AGENTS.md), same as tag-graph.
+      - name: Check the app-only dev-module feature
+        env:
+          RUSTFLAGS: "-D warnings"
+        run: cargo check -p chairphoto-app --no-default-features --features dev-module --all-targets
+
       # The tree is rustc-warning-clean and should stay that way.
       - name: Deny rustc warnings
         env:

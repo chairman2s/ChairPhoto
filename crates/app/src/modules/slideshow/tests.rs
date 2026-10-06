@@ -9,6 +9,10 @@ use crate::modules::dialog::DialogHost;
 use crate::modules::ModuleRegistry;
 use crate::storage::Runner;
 use crate::tests::{colliding_catalog, core_switch, deliver_switch, start, App, TempDir};
+// `test_hooks` is `cfg(unix)` in core (#228); gated here too, so a non-Unix test build still
+// compiles — it just falls back to the real cache dir in `catalog_with_files` below, same as
+// before #228 fixed this isolation on the platform that runs these tests today.
+#[cfg(unix)]
 use chairphoto_core::app::slideshow::test_hooks::set_test_frame_root;
 use chairphoto_core::app::slideshow::{FrameWriter, FFMPEG_MISSING, SLIDESHOW_CANCELLED};
 use chairphoto_core::app::{CoreEvent, EventSink as _, SlideshowProgress, CATALOG_CHANGED};
@@ -28,7 +32,8 @@ fn catalog_with_files(app: &App, dir: &TempDir, n: usize, cx: &mut TestAppContex
     // `~/.cache` (#228). The `test-hooks` feature is what makes `set_test_frame_root` reach
     // this crate at all: without it `FrameDir::create()` always calls the real
     // `crate::thumbnails::cache_dir()`, since core's own `cfg(test)` override does not exist
-    // when core is an ordinary (non-`cfg(test)`) dependency.
+    // when core is an ordinary (non-`cfg(test)`) dependency. Unix-only, like the hook itself.
+    #[cfg(unix)]
     set_test_frame_root(&dir.0.join("cache"));
     let db = dir.0.join("photos.chairphoto");
     let root = dir.0.join("photos");
@@ -82,6 +87,21 @@ fn fake_ffmpeg() -> PathBuf {
 /// A frame writer that copies the original (no thumbnail cache, no exiftool).
 fn copy_frames() -> FrameWriter {
     Arc::new(|item, _, out| std::fs::copy(&item.original, out).map(|_| ()).map_err(|e| e.to_string()))
+}
+
+/// [`copy_frames`], and also records every frame path it is given: without this, nothing in
+/// this crate's own suite checks that a render actually lands its frames under the scratch
+/// root `catalog_with_files` points it at, rather than the real `~/.cache` — removing its
+/// `set_test_frame_root` call used to pass every app-crate slideshow test regardless (#228
+/// review).
+fn recording_copy_frames() -> (FrameWriter, Arc<std::sync::Mutex<Vec<PathBuf>>>) {
+    let paths = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let recorded = paths.clone();
+    let writer: FrameWriter = Arc::new(move |item, _, out| {
+        recorded.lock().unwrap().push(out.to_path_buf());
+        std::fs::copy(&item.original, out).map(|_| ()).map_err(|e| e.to_string())
+    });
+    (writer, paths)
 }
 
 fn backend(ffmpeg: Option<PathBuf>) -> SlideshowBackend {
@@ -207,7 +227,9 @@ fn render_writes_the_movie_through_the_worker(cx: &mut TestAppContext) {
     let out = dir.0.join("out");
     std::fs::create_dir_all(&out).unwrap();
     std::fs::write(out.join("slideshow.mp4"), b"earlier").unwrap();
-    let view = open(&app, backend(Some(fake_ffmpeg())), &out, cx);
+    let (frames, frame_paths) = recording_copy_frames();
+    let ffmpeg = fake_ffmpeg();
+    let view = open(&app, SlideshowBackend { ffmpeg: Arc::new(move || Some(ffmpeg.clone())), frames }, &out, cx);
     view.read_with(cx, |d, _| assert_eq!(d.order.iter().map(|p| p.id).collect::<Vec<_>>(), ids));
 
     // Drag the second tile onto the first.
@@ -237,6 +259,19 @@ fn render_writes_the_movie_through_the_worker(cx: &mut TestAppContext) {
     for i in 0..2 {
         assert_eq!(std::fs::read(dir.0.join(format!("photos/2026/p{i}.jpg"))).unwrap(), format!("jpeg {i}").as_bytes());
     }
+    // #228: the render's frames went under this test's own TempDir, never the real
+    // `~/.cache` `catalog_with_files`'s `set_test_frame_root` call steers them away from.
+    // Unix-only, like that call: elsewhere the frames go to the real cache dir.
+    #[cfg(unix)]
+    {
+        let paths = frame_paths.lock().unwrap();
+        assert_eq!(paths.len(), 2, "one frame per photo");
+        for p in paths.iter() {
+            assert!(p.starts_with(&dir.0), "frame {} is not under this test's TempDir {}", p.display(), dir.0.display());
+        }
+    }
+    #[cfg(not(unix))]
+    drop(frame_paths);
 }
 
 /// Progress moves the bar only for this dialog's job; Cancel after the claim trips that job,

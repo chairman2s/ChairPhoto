@@ -99,12 +99,21 @@ only allowed/denied entries; where they disagree with the machine's or another c
 denied wins — and the catalog's copy is then emptied, so a later Allow is not undone. It is
 emptied only once the machine's copy is saved, and a switch can interrupt the emptying. So
 the merge also records the catalog as merged, by its `settings.catalog_uuid`, in the
-answers' own value (`"#mergedCatalogs": [<uuid>, …]`) and therefore in the same write as the
-merged answers; a later read of a recorded catalog merges nothing and only retries the
-emptying, so its old Deny never undoes an Allow given since (#229). A build before #229
-drops that record when it saves an answer; such a catalog may then be merged again, which
-can only turn an answer to Deny. "Ask again" is stored as an explicit `"ask"` entry that no
-catalog's old answer overrides, never as a deleted one that a re-merge could refill.
+answers' own value (`"#mergedCatalogs": {<uuid>: <cleared>, …}`) and therefore in the same
+write as the merged answers; a later read of a recorded catalog not yet confirmed emptied
+merges nothing and only retries the emptying, so its old Deny never undoes an Allow given
+since (#229). A build before #231 drops that record when it saves an answer; such a catalog
+may then be merged again, which can only turn an answer to Deny. Once a read finds the copy
+actually empty, `cleared` is set; a *later* read that finds the copy non-empty again is then
+treated as new content — a pre-#231 build writing into it again — and only its Denies are
+folded in, never an Allow (#231), and only for hosts this machine has no answer for: new
+content with no known provenance can only block a host that had no answer, never silently
+allow one, and never override an Allow. `cleared` is kept per UUID, not per file, so a file
+copy sharing the UUID may still hold the very answers already merged after another copy's
+empty read set it; since the UUID's first merge already folded its Denies in, an Allow
+standing afterwards was given since, and no re-merge undoes it. "Ask again" is stored as an
+explicit `"ask"` entry that no catalog's old answer overrides, never as a deleted one that a
+re-merge could refill.
 
 The merge is saved before it is shown (a durable change, `MachinePrefs::modify_durably`): on
 a store that cannot be written it never applies, and an answer the user gives while it is

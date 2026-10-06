@@ -369,11 +369,22 @@ fn hosts_only(stored: Option<String>) -> Option<String> {
     Some(serde_json::to_string(&map).unwrap())
 }
 
-/// The catalogs this machine records as merged, as the file at `prefs` holds them (#229).
+/// The catalogs this machine records as merged, as the file at `prefs` holds them (#229),
+/// regardless of whether their copy is confirmed cleared yet (#231; see [`cleared_catalogs`]).
 fn merged_catalogs(prefs: &std::path::Path) -> Vec<String> {
+    cleared_catalogs(prefs).into_keys().collect()
+}
+
+/// [`merged_catalogs`], with each catalog's confirmed-cleared state (#231).
+fn cleared_catalogs(prefs: &std::path::Path) -> std::collections::BTreeMap<String, bool> {
     let stored = MachinePrefs::load(prefs.to_path_buf()).get(MACHINE_TILE_HOSTS).unwrap_or_default();
     let map: std::collections::BTreeMap<String, serde_json::Value> = serde_json::from_str(&stored).unwrap_or_default();
-    serde_json::from_value(map.get(MERGED_CATALOGS).cloned().unwrap_or_default()).unwrap_or_default()
+    match map.get(MERGED_CATALOGS) {
+        Some(serde_json::Value::Object(record)) => {
+            record.iter().map(|(uuid, v)| (uuid.clone(), matches!(v, serde_json::Value::Bool(true)))).collect()
+        }
+        _ => Default::default(),
+    }
 }
 
 /// Gate #119, and #214's fail-closed fix. Here every write fails (the store's directory is
@@ -946,6 +957,105 @@ fn a_catalog_whose_clear_was_refused_is_not_merged_again(cx: &mut TestAppContext
     assert_eq!(b_consent(&app, cx), Consent::Allowed, "A's old Deny is not merged over the user's Allow");
     assert_eq!(disk_hosts(&prefs).as_deref(), Some(r#"{"b.example":true}"#));
     assert_eq!(open_a().get_setting(LEGACY_HOSTS).unwrap().as_deref(), Some("{}"), "and the clear went through now");
+}
+
+/// **#231**: catalog A's legacy copy Allows `b.example`; it merges and its clear runs,
+/// uninterrupted, and a later read confirms the clear (`cleared_catalogs` turns `true`). Only
+/// then does something write into A's old per-catalog setting again — a file copy sharing the
+/// UUID, or a pre-#231 build using its old consent UI on a host it has not seen — Denying a
+/// new host `c.example` and (harmlessly) repeating the Allow for `b.example`. The repopulated
+/// Deny merges (blocking a host with no answer); the repopulated Allow never does, so a stale
+/// copy can only block a host, never silently allow one.
+#[gpui_kit::test]
+fn a_cleared_catalogs_repopulated_deny_still_merges(cx: &mut TestAppContext) {
+    let dir = TempDir::new("repop");
+    let (app, _fake, prefs) = migration_queued(&dir, r#"{"b.example":true}"#, cx);
+    work(&app, cx); // nothing interrupts this merge: it lands, and so does the clear
+    assert_eq!(b_consent(&app, cx), Consent::Allowed, "the legacy Allow merged");
+    let open_a = || chairphoto_core::catalog::Catalog::open(&dir.0.join("photos.chairphoto"), &dir.0.join("photos")).unwrap();
+    assert_eq!(open_a().get_setting(LEGACY_HOSTS).unwrap().as_deref(), Some("{}"), "cleared");
+    let a_uuid = open_a().catalog_uuid().unwrap();
+    assert_eq!(cleared_catalogs(&prefs).get(&a_uuid), Some(&false), "not yet confirmed: no read has seen it empty");
+
+    // A fresh read confirms the clear, before anything repopulates the copy.
+    reload_module(&app, cx);
+    work(&app, cx);
+    assert_eq!(cleared_catalogs(&prefs).get(&a_uuid), Some(&true), "the clear is confirmed");
+
+    {
+        let guard = app.state.catalog.lock().unwrap();
+        guard.as_ref().unwrap().set_setting(LEGACY_HOSTS, r#"{"b.example":true,"c.example":false}"#).unwrap();
+    }
+    reload_module(&app, cx);
+    work(&app, cx);
+    assert_eq!(b_consent(&app, cx), Consent::Allowed, "legacy's repopulated Allow is never merged");
+    let state = map_state_via_settings(&app, cx);
+    assert_eq!(
+        state.read_with(cx, |s, cx| s.host_consent(cx).get("c.example")),
+        Consent::Denied,
+        "legacy's repopulated Deny merges"
+    );
+    assert_eq!(open_a().get_setting(LEGACY_HOSTS).unwrap().as_deref(), Some("{}"), "cleared again");
+    assert_eq!(cleared_catalogs(&prefs).get(&a_uuid), Some(&false), "pending again until that clear is confirmed");
+}
+
+/// **relD M1**: a file copy A' shares A's `catalog_uuid`, and both hold the legacy Deny for
+/// `b.example`. A merges it and its clear is confirmed; A' is read (a denies-only re-merge,
+/// #231) but a switch refuses its clear, so A' keeps its copy; an empty read of A confirms the
+/// UUID's clear again; the user then Allows `b.example`. Reopening A' must not undo that
+/// Allow with the same old Deny: once a UUID's first merge is done, none of its legacy Denies
+/// overrides an Allow.
+#[gpui_kit::test]
+fn a_copys_legacy_deny_never_undoes_an_allow_given_after_the_first_merge(cx: &mut TestAppContext) {
+    let dir = TempDir::new("copy-redeny");
+    let (app, _fake, prefs) = migration_queued(&dir, r#"{"b.example":false}"#, cx);
+    let a_uuid = app.state.catalog.lock().unwrap().as_ref().unwrap().read_catalog_uuid().unwrap().unwrap();
+    let copy = TempDir::new("copy-redeny-prime");
+    let open_copy = || chairphoto_core::catalog::Catalog::open(&copy.0.join("photos.chairphoto"), &copy.0.join("photos")).unwrap();
+    {
+        let c = open_copy();
+        c.set_setting(LEGACY_HOSTS, r#"{"b.example":false}"#).unwrap();
+        c.set_setting("catalog_uuid", &a_uuid).unwrap();
+        c.set_setting(&format!("{MAP_MODULE_ID}.tileUrl"), B_URL).unwrap();
+    }
+    work(&app, cx);
+    assert_eq!(b_consent(&app, cx), Consent::Denied, "1: A merged its Deny");
+    reload_module(&app, cx);
+    work(&app, cx);
+    assert_eq!(cleared_catalogs(&prefs).get(&a_uuid), Some(&true), "2: A's clear confirmed");
+
+    // 3: open A'; its reads land and its denies-only merge queues; switch away before its clear.
+    open_catalog_with_photos(&app, &copy, 1, cx);
+    cx.update(|cx| Runner::get(cx).run_pending());
+    cx.run_until_parked();
+    let (other, _) = colliding_catalog(&dir, "other", 1);
+    core_switch(&app, other);
+    work(&app, cx);
+    deliver_switch(&app, cx);
+    work(&app, cx);
+    assert_eq!(
+        open_copy().get_setting(LEGACY_HOSTS).unwrap().as_deref(),
+        Some(r#"{"b.example":false}"#),
+        "3: the switch refused the copy's clear"
+    );
+
+    // 4: back to A, whose copy is empty: the UUID's clear is confirmed again.
+    open_catalog_with_photos(&app, &dir, 1, cx);
+    work(&app, cx);
+    assert_eq!(cleared_catalogs(&prefs).get(&a_uuid), Some(&true), "4: confirmed by A's empty read");
+
+    // 5: the user Allows b.example.
+    let state = map_state_via_settings(&app, cx);
+    state.update(cx, |s, cx| s.set_consent("b.example", Some(true), cx));
+    work(&app, cx);
+    assert_eq!(b_consent(&app, cx), Consent::Allowed);
+
+    // 6: reopen A'.
+    open_catalog_with_photos(&app, &copy, 1, cx);
+    work(&app, cx);
+    assert_eq!(b_consent(&app, cx), Consent::Allowed, "6: the copy's old Deny does not undo the user's Allow");
+    assert_eq!(disk_hosts(&prefs).as_deref(), Some(r#"{"b.example":true}"#), "and the Allow is on disk");
+    assert_eq!(open_copy().get_setting(LEGACY_HOSTS).unwrap().as_deref(), Some("{}"), "the copy's clear went through now");
 }
 
 /// **#198**, the success path: the machine's copy is saved, but the core switches to

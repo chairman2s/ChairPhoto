@@ -53,8 +53,8 @@ use chairphoto_core::image_pool::EditJob;
 use chairphoto_model::darkroom::spreads::{ProofCandidate, ProofGroup};
 use gpui_kit::prelude::*;
 use gpui_kit::{
-    canvas, div, px, App, Bounds, ClickEvent, Context, Entity, EntityId, EventEmitter, FocusHandle, ObjectFit, Pixels,
-    SharedString, Subscription, TestSupportExt as _, Window,
+    canvas, div, px, App, Bounds, ClickEvent, Context, Entity, EntityId, EventEmitter, FocusHandle, MouseButton,
+    ObjectFit, Pixels, SharedString, Subscription, TestSupportExt as _, Window,
 };
 use std::cell::Cell;
 use std::rc::Rc;
@@ -472,13 +472,12 @@ impl Render for ProofSheet {
             })
             .collect();
         let n = self.candidates.len();
-        div()
+        // The absolute positioning (escaping the Darkroom's own flex flow to fill the window)
+        // moved to the wrapper below it; this one just fills that wrapper.
+        let backdrop = div()
             .id("proof-backdrop")
             .key_context(contexts::PROOF_SHEET)
             .track_focus(&self.focus)
-            .absolute()
-            .top_0()
-            .left_0()
             .size_full()
             .flex()
             .items_center()
@@ -506,6 +505,11 @@ impl Render for ProofSheet {
                     .id("proof-sheet")
                     .flex()
                     .flex_col()
+                    // Without this, the panel's own auto width floors at its widest child's
+                    // unwrapped content width instead of shrinking to the window (#231
+                    // review): the footer caption below is the usual culprit, but the header
+                    // row and the cell grid get the same treatment for the same reason.
+                    .min_w(px(0.))
                     .gap(px(10.))
                     .p(px(16.))
                     .max_w(px(1100.))
@@ -523,10 +527,12 @@ impl Render for ProofSheet {
                         div()
                             .flex()
                             .items_center()
+                            .min_w(px(0.))
                             .gap(px(10.))
                             .child(div().text_size(px(15.)).child("Proof sheet"))
                             .child(
                                 div()
+                                    .min_w(px(0.))
                                     .text_size(px(12.))
                                     .text_color(colors.mute)
                                     .child(format!("your photo, developed {n} ways — real renders")),
@@ -551,12 +557,34 @@ impl Render for ProofSheet {
                         // settled on — not a guess independent of it (#250 follow-up).
                         let bounds = self.grid_bounds.clone();
                         let measure = canvas(move |b, _, _| bounds.set(Some(b)), |_, _, _, _| {}).absolute().size_full();
-                        div().relative().flex().flex_wrap().gap(px(CELL_GAP)).child(measure).children(cells)
+                        div().relative().flex().flex_wrap().min_w(px(0.)).gap(px(CELL_GAP)).child(measure).children(cells)
                     })
-                    .child(div().text_size(px(11.)).text_color(colors.mute).child(SharedString::from(
+                    .child(div().min_w(px(0.)).text_size(px(11.)).text_color(colors.mute).child(SharedString::from(
                         "Click a proof to adopt it · the current state is always dealt, so declining is a click · framing never changes on a proof",
                     ))),
             )
-            .test_support()
+            .test_support();
+        // A wrapper around the whole backdrop, filling the window the same way
+        // `#proof-backdrop` used to on its own: `#proof-backdrop`'s own `track_focus`
+        // focus-on-mousedown (above) is this element's own default behaviour, which fires as
+        // part of its own handling, *before* the event bubbles any further — stopping
+        // propagation on `#proof-backdrop` itself would suppress that default behaviour too,
+        // not just stop ancestors from seeing it (confirmed by the #250 review's own
+        // `a_click_on_the_panels_padding_clears_a_tab_focused_preview`, which failed when
+        // that was tried). Stopping it one level up instead, after `#proof-backdrop` has
+        // already had its turn, protects only against whatever this sheet is mounted *over*
+        // — the Darkroom root's own catch-all `on_mouse_down` grabs focus for itself on any
+        // left mouse-down it sees (`view.rs`), and nothing between it and a click inside this
+        // panel but off a cell used to stop that at the mouse-down phase; only the later
+        // *click* phase was guarded, on `#proof-backdrop` and `#proof-sheet`'s own handlers
+        // above (#231 review).
+        div()
+            .id("proof-overlay")
+            .absolute()
+            .top_0()
+            .left_0()
+            .size_full()
+            .on_mouse_down(MouseButton::Left, cx.listener(|_, _, _, cx| cx.stop_propagation()))
+            .child(backdrop)
     }
 }

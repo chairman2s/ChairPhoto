@@ -2599,6 +2599,64 @@ fn the_pop_out_gives_up_down_real_rows_and_swallows_extend_select_all_and_compar
     assert!(rig.view(cx).read_with(cx, |v, _| v.overlay().is_none()), "Esc from the pop-out declined the sheet");
 }
 
+/// **#231 review**: the proof sheet's panel must shrink in a narrow window rather than
+/// overflow it.
+#[gpui_kit::test]
+fn the_panel_shrinks_to_fit_a_narrow_window_instead_of_overflowing_it(cx: &mut TestAppContext) {
+    let rig = rig("dk-proof-narrow", 1, cx);
+    cx.simulate_window_resize(rig.app.window(), gpui_kit::size(gpui_kit::px(420.), gpui_kit::px(700.)));
+    cx.run_until_parked();
+    rig.with_view(cx, |v, window, cx| v.open_proof_sheet(window, cx));
+    rig.render(cx);
+    cx.update_window(rig.app.window(), |_, window, _| {
+        let panel = window.find("proof-sheet").bounds();
+        assert!(panel.size.width <= gpui_kit::px(420.), "the panel overflows its 420 px window: {panel:?}");
+    })
+    .unwrap();
+}
+
+/// **#231 review**: Darkroom's root grabs focus on any left mouse-down within its bounds
+/// (`view.rs`'s own `on_mouse_down`, ~line 1126) — a catch-all for a click that lands nowhere
+/// more specific. A click inside the proof sheet's own panel that is not on a cell (the
+/// header, say) has nothing between it and that handler stopping the *mouse-down* event
+/// specifically (only `#proof-sheet`'s `on_click` stops the later *click* event), so it risks
+/// bubbling all the way up and moving focus to the Darkroom root instead of leaving it on the
+/// backdrop — silently breaking the sheet's own ↑ / ↓ / ← / → navigation afterward.
+#[gpui_kit::test]
+fn a_click_inside_the_panel_off_a_cell_leaves_the_backdrop_focused(cx: &mut TestAppContext) {
+    use super::view::Overlay;
+    use crate::loupe::proof_sheet::ProofSheet;
+    let rig = rig("dk-proof-panel-click", 2, cx);
+    work(cx);
+    let sheet_of = |rig: &Rig, cx: &mut TestAppContext| {
+        rig.view(cx).read_with(cx, |v, _| match v.overlay() {
+            Some(Overlay::Proof(p)) => Some(p.clone()),
+            _ => None,
+        })
+    };
+    let focused = |rig: &Rig, sheet: &Entity<ProofSheet>, cx: &mut TestAppContext| {
+        cx.update_window(rig.app.window(), |_, window, cx| sheet.read(cx).focused(window)).unwrap()
+    };
+    rig.with_view(cx, |v, window, cx| v.open_proof_sheet(window, cx));
+    let sheet = sheet_of(&rig, cx).expect("the proof sheet is mounted");
+    assert_eq!(focused(&rig, &sheet, cx), None, "nothing focused yet, as dealt");
+
+    // The header row — well inside the panel's own padding, nowhere near a proof cell.
+    let header = gpui_kit::point(gpui_kit::px(20.), gpui_kit::px(20.));
+    cx.update_window(rig.app.window(), |_, window, cx| window.click_at("proof-sheet", header, cx)).unwrap();
+    cx.run_until_parked();
+    assert!(sheet_of(&rig, cx).is_some(), "the sheet stays up: this click is not the backdrop's decline");
+
+    // If focus is still on the backdrop (correct), ↓ starts the sheet's own cell focus at 0 —
+    // the same convention `enter_on_the_proof_sheet_adopts_the_focused_proof_and_the_backdrop_
+    // click_declines` already pins for ↓ from a freshly opened, unclicked sheet. If Darkroom's
+    // root stole focus instead, this is a no-op: Darkroom's own `on_key` returns early whenever
+    // any overlay is open (`self.rails.overlay_open()`), so neither the filmstrip nor the
+    // sheet's cell focus moves, and `focused` stays `None`.
+    rig.press("down", cx);
+    assert_eq!(focused(&rig, &sheet, cx), Some(0), "the backdrop, not the Darkroom root, kept focus");
+}
+
 /// The proof sheet's keys, as React's proof cells were buttons: Enter on the sheet as dealt
 /// (the backdrop focused, no proof) neither declines nor adopts; Tab / Shift+Tab move focus
 /// through the proofs, wrapping; Enter adopts the focused proof. A pointer click on the

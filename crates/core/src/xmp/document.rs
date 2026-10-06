@@ -337,6 +337,11 @@ struct Folder {
     /// Linux: enough for `openat`/`renameat`/`unlinkat`/`fstatat`, not for listing or fsync,
     /// so it is never swept and its sync is skipped (#155 review, L2).
     listable: bool,
+    /// This folder's device, cached from the `fstat` [`Self::require_original`] already does
+    /// (#221 review): [`Self::device_id`] reads this instead of doing its own `fstat`, so
+    /// `sweep_later` never blocks on a hung mount's handle just to learn its device.
+    #[cfg(unix)]
+    device: std::cell::Cell<Option<u64>>,
 }
 
 impl Folder {
@@ -360,11 +365,14 @@ impl Folder {
             use rustix::fs::{Mode, OFlags};
             let open = |flags: OFlags| rustix::fs::open(dir, flags | OFlags::DIRECTORY | OFlags::CLOEXEC, Mode::empty());
             match open(OFlags::RDONLY) {
-                Ok(fd) => Ok(Self { path: dir.to_path_buf(), fd, listable: true }),
+                Ok(fd) => Ok(Self { path: dir.to_path_buf(), fd, listable: true, device: std::cell::Cell::new(None) }),
                 #[cfg(any(target_os = "linux", target_os = "android"))]
-                Err(rustix::io::Errno::ACCESS) => {
-                    Ok(Self { path: dir.to_path_buf(), fd: open(OFlags::PATH)?, listable: false })
-                }
+                Err(rustix::io::Errno::ACCESS) => Ok(Self {
+                    path: dir.to_path_buf(),
+                    fd: open(OFlags::PATH)?,
+                    listable: false,
+                    device: std::cell::Cell::new(None),
+                }),
                 Err(e) => Err(e.into()),
             }
         }
@@ -397,6 +405,7 @@ impl Folder {
         let (in_place, is_file) = {
             let same = |a: &rustix::fs::Stat, b: &rustix::fs::Stat| a.st_dev == b.st_dev && a.st_ino == b.st_ino;
             let here = rustix::fs::fstat(&self.fd).map_err(|e| e.to_string())?;
+            self.device.set(Some(here.st_dev as u64)); // #221: device_id() reads this, no second fstat
             let in_place = rustix::fs::stat(&self.path).is_ok_and(|at_path| same(&at_path, &here));
             let is_file = match rustix::fs::statat(&self.fd, name, rustix::fs::AtFlags::empty()) {
                 Ok(st) => rustix::fs::FileType::from_raw_mode(st.st_mode) == rustix::fs::FileType::RegularFile,
@@ -517,9 +526,21 @@ impl Folder {
     /// its own thread and queue ([`sweeper_for`], #221 L3). `None` when the platform cannot
     /// report one cheaply from the handle already open (non-Unix), which then shares the
     /// fallback queue keyed by `None`.
+    ///
+    /// Reads the device [`Self::require_original`] already cached from its own `fstat`, when
+    /// it ran on this folder: a *second* `fstat` here would be on this very handle, which a
+    /// folder whose mount is hung may block indefinitely — and that call would run on whatever
+    /// thread calls `sweep_later`, which may hold the catalog lock. [`SidecarDocument::commit`]
+    /// sweeps the photo's own folder, which [`write_atomically`] ran `require_original` on, so
+    /// that common case has it cached. Not every sweep does: for a symlinked sidecar the temp
+    /// is made in the link target's folder (`linked`, opened by `write_atomically` itself),
+    /// which `require_original` never sees, so it falls back to a fresh `fstat` on the
+    /// committing thread — right after that thread created, wrote, synced and renamed the temp
+    /// through the same handle, so it adds no handle the write had not just used (review
+    /// relD L2). Tests calling this directly fall back the same way.
     fn device_id(&self) -> Option<u64> {
         #[cfg(unix)]
-        return rustix::fs::fstat(&self.fd).ok().map(|st| st.st_dev as u64);
+        return self.device.get().or_else(|| rustix::fs::fstat(&self.fd).ok().map(|st| st.st_dev as u64));
         #[cfg(not(unix))]
         return None;
     }
@@ -728,6 +749,33 @@ fn sweep_later(folder: Folder) {
     }
 }
 
+/// How long a device's sweeper thread waits for the next folder before exiting (#221 review):
+/// without this, one thread per distinct `st_dev` ever seen — a btrfs subvolume, an NFS/FUSE
+/// remount, a USB re-plug — would sit blocked on its channel for the life of the process,
+/// however briefly that device was ever touched. Shrunk in test builds
+/// ([`sweeper_idle_timeout`]) so a test can wait one out without a minute-long sleep.
+const SWEEPER_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+#[cfg(not(test))]
+fn sweeper_idle_timeout(_device: Option<u64>) -> std::time::Duration {
+    SWEEPER_IDLE_TIMEOUT
+}
+
+/// Test-only overrides, per device key, read once per thread *creation* (never mid-wait):
+/// a test sets one for a device key it alone uses, so it only ever shrinks the timeout of the
+/// thread it spins up for that key — never a thread another, concurrently executing test
+/// creates for its own key meanwhile (relD L4). A key with no entry uses the production
+/// timeout.
+#[cfg(test)]
+static SWEEPER_IDLE_TIMEOUT_OVERRIDES: std::sync::Mutex<std::collections::BTreeMap<Option<u64>, std::time::Duration>> =
+    std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+#[cfg(test)]
+fn sweeper_idle_timeout(device: Option<u64>) -> std::time::Duration {
+    let overrides = SWEEPER_IDLE_TIMEOUT_OVERRIDES.lock().unwrap_or_else(|e| e.into_inner());
+    overrides.get(&device).copied().unwrap_or(SWEEPER_IDLE_TIMEOUT)
+}
+
 /// One sweeper thread and queue per device (#221 L3), keyed by [`Folder::device_id`] (`None`
 /// on a platform that cannot report one, which then shares a single queue).
 ///
@@ -742,24 +790,71 @@ fn sweep_later(folder: Folder) {
 /// that is actually hung — its own queue can still fill and its own unmount can still wait on
 /// it (a residual, not a regression: before 96d0d8f the same hang blocked the committing
 /// writer, which was worse), but every other volume's sweeps keep running.
+///
+/// A thread idle for [`SWEEPER_IDLE_TIMEOUT`] exits and drops its own entry from this map
+/// (#221 review), so a device touched once early in a long session does not hold a thread for
+/// the rest of it; the next folder on that device spins up a fresh one. The drop happens under
+/// this function's own lock, so no new sender is handed out after it; the thread then drains
+/// its queue with a *blocking* receive until the channel disconnects — until every sender
+/// handed out before the drop is gone — so a `try_send` that returns `Ok` is always swept,
+/// however late it lands (relD L1). Each such sender is a short-lived clone ([`sweep_later`]
+/// drops it right after its one `try_send`), so the drain ends promptly.
 fn sweeper_for(device: Option<u64>) -> Option<std::sync::mpsc::SyncSender<Folder>> {
     type Sweepers = std::collections::HashMap<Option<u64>, std::sync::mpsc::SyncSender<Folder>>;
     static SWEEPERS: std::sync::OnceLock<std::sync::Mutex<Sweepers>> = std::sync::OnceLock::new();
-    let mut sweepers = SWEEPERS.get_or_init(|| std::sync::Mutex::new(Sweepers::new())).lock().unwrap_or_else(|e| e.into_inner());
+    let registry = SWEEPERS.get_or_init(|| std::sync::Mutex::new(Sweepers::new()));
+    let mut sweepers = registry.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(tx) = sweepers.get(&device) {
         return Some(tx.clone());
     }
     let (tx, rx) = std::sync::mpsc::sync_channel::<Folder>(SWEEP_QUEUE);
+    let idle = sweeper_idle_timeout(device);
     std::thread::Builder::new()
         .name("sidecar-temp-sweep".into())
-        .spawn(move || {
-            for folder in rx {
-                folder.sweep_stale_temps();
+        .spawn(move || loop {
+            match rx.recv_timeout(idle) {
+                Ok(folder) => folder.sweep_stale_temps(),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    let mut sweepers = registry.lock().unwrap_or_else(|e| e.into_inner());
+                    sweepers.remove(&device);
+                    drop(sweepers);
+                    #[cfg(test)]
+                    sweeper_exit_point(device, "removed");
+                    // Blocking, until every sender is gone: a `sweep_later` that got its sender
+                    // before the removal may still `try_send` (and see `Ok`) until it drops it.
+                    while let Ok(folder) = rx.recv() {
+                        folder.sweep_stale_temps();
+                    }
+                    #[cfg(test)]
+                    sweeper_exit_point(device, "drained");
+                    break;
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
             }
         })
         .ok()?;
     sweepers.insert(device, tx.clone());
     Some(tx)
+}
+
+/// Test-only: pause one device key's idle-exiting sweeper thread at a named point of its exit
+/// ([`sweeper_exit_point`]): the thread reports the point on the first channel and waits (5 s
+/// at most) for the test's go on the second, so a test can land a send exactly there.
+#[cfg(test)]
+type SweeperExitHook = (std::sync::mpsc::Sender<&'static str>, std::sync::mpsc::Receiver<()>);
+
+#[cfg(test)]
+static SWEEPER_EXIT_HOOKS: std::sync::Mutex<std::collections::BTreeMap<Option<u64>, SweeperExitHook>> =
+    std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+#[cfg(test)]
+fn sweeper_exit_point(device: Option<u64>, point: &'static str) {
+    let hook = SWEEPER_EXIT_HOOKS.lock().unwrap_or_else(|e| e.into_inner()).remove(&device);
+    if let Some((events, go)) = hook {
+        let _ = events.send(point);
+        let _ = go.recv_timeout(std::time::Duration::from_secs(5));
+        SWEEPER_EXIT_HOOKS.lock().unwrap_or_else(|e| e.into_inner()).insert(device, (events, go));
+    }
 }
 
 #[cfg(test)]
@@ -1469,6 +1564,16 @@ mod tests {
         assert!(later.exists(), "the folder was listed again");
     }
 
+    /// Shrink (`Some`) or restore (`None`) the idle timeout of threads created from now on for
+    /// `device` — a key the calling test alone uses ([`sweeper_idle_timeout`]).
+    fn set_idle_timeout_override(device: Option<u64>, timeout: Option<Duration>) {
+        let mut overrides = SWEEPER_IDLE_TIMEOUT_OVERRIDES.lock().unwrap();
+        match timeout {
+            Some(t) => overrides.insert(device, t),
+            None => overrides.remove(&device),
+        };
+    }
+
     /// The sweeps of `folder` done so far, with the thread that listed it.
     fn sweeps_of(folder: &Path) -> Vec<std::thread::ThreadId> {
         SWEEPS_DONE.lock().unwrap().iter().filter(|(p, _)| p == folder).map(|(_, t)| *t).collect()
@@ -1490,8 +1595,8 @@ mod tests {
     /// listing cannot stall another's. Two distinct device keys land their folders' sweeps on
     /// two distinct threads; the same device key reuses the thread it already has. Goes
     /// straight at `sweeper_for` (real multiple mounts are not available to a test), which is
-    /// the entire isolation decision — `sweep_later` only ever forwards `Folder::device_id()`
-    /// to it.
+    /// the isolation decision itself; [`sweep_later_forwards_the_folders_device`] separately
+    /// pins that `sweep_later` is what actually feeds it `Folder::device_id()`.
     #[test]
     fn each_device_gets_its_own_sweeper_thread() {
         let dir = crate::test_support::TestTmpDir::new("doc-221-sweeper-devices");
@@ -1511,6 +1616,137 @@ mod tests {
 
         let a2 = send_to(Some(101), "a2");
         assert_eq!(wait_swept(&a2), thread_a, "the same device reuses its sweeper thread");
+    }
+
+    /// Review relD L2, pinning what `device_id`'s doc says: a folder `write_atomically` opens
+    /// itself (a symlinked sidecar's `linked` target folder) never had `require_original` run
+    /// on it, so it has no cached device and `device_id` falls back to a fresh `fstat`.
+    #[cfg(unix)]
+    #[test]
+    fn a_folder_without_require_original_falls_back_to_fstat_for_its_device() {
+        use std::os::unix::fs::MetadataExt as _;
+        let dir = crate::test_support::TestTmpDir::new("doc-reld-l2-linked");
+        let folder = Folder::open_dir(&dir).unwrap();
+        assert!(folder.device.get().is_none(), "open_dir caches nothing; only require_original does");
+        assert_eq!(folder.device_id(), Some(std::fs::metadata(&*dir).unwrap().dev()));
+    }
+
+    /// #221 review coverage gap: the test above goes straight at `sweeper_for`, so a mutation
+    /// making `sweep_later` pass `None` instead of `folder.device_id()` passes every existing
+    /// test. Proven environment-agnostically (a test machine has one real device, not several
+    /// to compare): a folder swept through `sweep_later` — which must report a real device id
+    /// on `cfg(unix)`, never `None` — lands on a thread distinct from `None`'s own queue.
+    #[test]
+    fn sweep_later_forwards_the_folders_device() {
+        let dir = crate::test_support::TestTmpDir::new("doc-221-sweep-later-device");
+        let real = dir.join("real");
+        std::fs::create_dir_all(&real).unwrap();
+        let folder = Folder::open_dir(&real).unwrap();
+        assert!(folder.device_id().is_some(), "precondition: this platform reports a device id");
+        sweep_later(folder);
+        let thread_real = wait_swept(&real);
+
+        let none_dir = dir.join("none-queue");
+        std::fs::create_dir_all(&none_dir).unwrap();
+        sweeper_for(None).unwrap().send(Folder::open_dir(&none_dir).unwrap()).unwrap();
+        let thread_none = wait_swept(&none_dir);
+
+        assert_ne!(thread_real, thread_none, "sweep_later used the folder's real device, not None's queue");
+    }
+
+    /// #221 review: a device's sweeper thread exits once idle, rather than sitting blocked on
+    /// its channel for the life of the process. The test-only override shrinks the wait so
+    /// this does not take the real `SWEEPER_IDLE_TIMEOUT`; it is set for a device key no other
+    /// test uses, and read when that key's thread is created, so it cannot shrink a thread
+    /// another, concurrently executing test creates for its own key (relD L4).
+    #[test]
+    fn an_idle_sweeper_thread_exits_and_a_later_folder_gets_a_fresh_one() {
+        const DEVICE: Option<u64> = Some(0x2214_0d1e); // unique to this test
+        set_idle_timeout_override(DEVICE, Some(Duration::from_millis(50)));
+        let dir = crate::test_support::TestTmpDir::new("doc-221-idle-exit");
+        let send_to = |name: &str| {
+            let sub = dir.join(name);
+            std::fs::create_dir_all(&sub).unwrap();
+            sweeper_for(DEVICE).unwrap().send(Folder::open_dir(&sub).unwrap()).unwrap();
+            sub
+        };
+        let first = send_to("first");
+        let thread_first = wait_swept(&first);
+
+        std::thread::sleep(Duration::from_millis(300)); // outlive the shrunk idle timeout
+        set_idle_timeout_override(DEVICE, None); // the fresh thread below keeps the production timeout
+
+        let second = send_to("second");
+        assert_ne!(wait_swept(&second), thread_first, "the idle thread exited; a fresh one took the next folder");
+    }
+
+    /// Review relD L4: a test's idle-timeout override is its own device key's, so it never
+    /// shrinks the thread another test creates for another key while it is set (which made
+    /// that thread exit between two of its sends, failing "reuses its sweeper thread").
+    #[test]
+    fn an_idle_timeout_override_reaches_only_its_own_device() {
+        const OVERRIDDEN: Option<u64> = Some(0x7e1d_0004); // unique to this test
+        const OTHER: Option<u64> = Some(0x7e1d_0005); // unique to this test
+        let dir = crate::test_support::TestTmpDir::new("doc-reld-l4-override");
+        let send_to = |name: &str| {
+            let sub = dir.join(name);
+            std::fs::create_dir_all(&sub).unwrap();
+            sweeper_for(OTHER).unwrap().send(Folder::open_dir(&sub).unwrap()).unwrap();
+            sub
+        };
+        set_idle_timeout_override(OVERRIDDEN, Some(Duration::from_millis(50)));
+        let first = send_to("first"); // OTHER's thread is created while OVERRIDDEN's override is set
+        set_idle_timeout_override(OVERRIDDEN, None);
+        let thread_first = wait_swept(&first);
+        std::thread::sleep(Duration::from_millis(300)); // outlive the override, were it applied
+        assert_eq!(wait_swept(&send_to("second")), thread_first, "OTHER's thread kept the production timeout");
+    }
+
+    /// Review relD L1: a `try_send` through a sender `sweep_later` got while the device's entry
+    /// still existed, landing after the idle-exiting thread removed that entry and drained its
+    /// queue but before the receiver dropped, must still be swept — or `try_send` returns `Ok`,
+    /// the folder is dropped unswept, and `SWEPT` keeps it marked for the rest of the run.
+    /// The thread is paused at its exit points ([`sweeper_exit_point`]); the send lands after
+    /// the drain when the thread reaches one before the sender is dropped.
+    #[test]
+    fn a_send_landing_while_an_idle_sweeper_exits_is_still_swept() {
+        const DEVICE: Option<u64> = Some(0x7e1d_0001); // unique to this test
+        let dir = crate::test_support::TestTmpDir::new("doc-reld-l1-late-send");
+        let late = dir.join("late");
+        std::fs::create_dir_all(&late).unwrap();
+        let (events_tx, events) = std::sync::mpsc::channel();
+        let (go, go_rx) = std::sync::mpsc::channel();
+        SWEEPER_EXIT_HOOKS.lock().unwrap().insert(DEVICE, (events_tx, go_rx));
+
+        set_idle_timeout_override(DEVICE, Some(Duration::from_millis(50)));
+        let tx = sweeper_for(DEVICE).unwrap(); // as sweep_later holds it, between lookup and send
+        set_idle_timeout_override(DEVICE, None);
+
+        assert_eq!(events.recv_timeout(Duration::from_secs(5)), Ok("removed"), "the idle thread dropped its entry");
+        go.send(()).unwrap();
+        // Before the fix the drain finishes now; after it, the drain waits for this sender.
+        let drained_first = events.recv_timeout(Duration::from_millis(500)).is_ok();
+
+        assert!(SWEPT.lock().unwrap().insert(late.clone()));
+        let queued = tx.try_send(Folder::open_dir(&late).unwrap()).is_ok();
+        if !queued {
+            SWEPT.lock().unwrap().remove(&late); // sweep_later's own handling of a failed send
+        }
+        drop(tx);
+        go.send(()).unwrap();
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while sweeps_of(&late).is_empty() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let swept = !sweeps_of(&late).is_empty();
+        let marked = SWEPT.lock().unwrap().contains(&late);
+        SWEEPER_EXIT_HOOKS.lock().unwrap().remove(&DEVICE);
+        assert!(
+            swept || !marked,
+            "lost: queued={queued}, drained before the send={drained_first}, never swept, still marked swept"
+        );
+        assert!(!drained_first, "the exiting thread waits for every sender before it stops draining");
     }
 
     /// #155 review L3: a write that commits under the catalog lock (here a GPS write, as

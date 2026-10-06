@@ -1518,6 +1518,34 @@ mod tests {
         assert_eq!(count, 1);
     }
 
+    /// #248: values the user clears after a bundle import — culling and IPTC the bundle gave
+    /// a new photo — stay cleared when the same bundle is imported again.
+    #[test]
+    fn a_second_import_of_a_bundle_brings_back_nothing_the_user_cleared() {
+        use crate::catalog::{IptcFields, PickState};
+        let bundle_path = make_test_bundle("248", "6f1c1f0e-2b7a-4c3d-9e8f-0a1b2c3d4e5f", "2026/06/28/DSC01234.ARW");
+        let (catalog, root) = temp_catalog("248");
+        let import = || {
+            let (manifest, mut archive) = open_bundle(&bundle_path).unwrap();
+            let (extracted, partial) = extract_originals(&catalog, &manifest, &mut archive, &root, |_, _| {}).unwrap();
+            index_bundle(&catalog, &manifest, &extracted, &root, partial).unwrap()
+        };
+        import();
+        let id = catalog.get_photo_by_uuid("6f1c1f0e-2b7a-4c3d-9e8f-0a1b2c3d4e5f").unwrap().id;
+        assert_eq!(catalog.get_photo(id).unwrap().rating, 3);
+        assert_eq!(catalog.get_iptc(id).unwrap().headline, "Test sunset");
+
+        catalog.set_culling(id, Some(0), Some(""), Some(PickState::None)).unwrap();
+        catalog.set_iptc(id, &IptcFields::default()).unwrap();
+        catalog.write_owed_iptc(id).unwrap();
+
+        let again = import();
+        assert_eq!((again.merge.photos_merged_before, again.merge.photos_filled), (1, 0), "{:?}", again.merge);
+        let after = catalog.get_photo(id).unwrap();
+        assert_eq!((after.rating, after.label.as_str(), after.pick_state), (0, "", PickState::None));
+        assert_eq!(catalog.get_iptc(id).unwrap(), IptcFields::default(), "the cleared headline stays cleared");
+    }
+
     // --- identity re-homes (#150) ------------------------------------------------------
 
     /// #150 (review N2 of #146): a bundle carrying a photo this catalog already has, at

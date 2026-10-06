@@ -487,6 +487,8 @@ impl Catalog {
         // Schema v25 (#148): `pending_sidecar_iptc`, created by SCHEMA_SQL above. No backfill:
         // which earlier writes failed is unknown, and owing every photo's IPTC would rewrite
         // every sidecar in the library on the next repair pass.
+        // Schema v27 (#248): `bundle_merges`, created by SCHEMA_SQL above. No backfill: which
+        // bundle an earlier import merged into which photo was never recorded.
         if prior_version < EXIF_ORIENTATION_SINCE {
             // #136: a rescan extracts only new or changed files, so a catalog scanned before
             // the column existed would never get it. Every earlier scan stored exiftool's

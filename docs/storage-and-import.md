@@ -1037,7 +1037,7 @@ The merge engine (`catalog/merge.rs`) is **pure-DB, no file I/O**:
 | Tag taxonomy | Resolve by tag uuid first, then normalized full_path; create missing ancestors; never overwrite existing uuid / exportable flag |
 | Tag terms | `INSERT … ON CONFLICT DO NOTHING` — adds missing terms, never modifies existing |
 | Photo (new) | Insert with full state (rating, label, pick, IPTC, edit record, versions) |
-| Photo (existing) | **Its own values win; blanks are filled** (owner decision on #185, 2026-10-04). Rating 0, an empty label and a pick of "none" take the bundle's. The bundle's edit record (as a version named "Imported edit"; a blank one is no edit and adds none) and its versions are added as **new versions** after the photo's own, unless the photo already has those settings (its edit record or a version with an equal JSON value), so a re-merge adds none; the photo's edit record and versions are not changed. Blank IPTC fields are filled by the importer, not the pure-DB merge (below). A row the importer created for this bundle moments before is not filled again. |
+| Photo (existing) | **Its own values win; blanks are filled** (owner decision on #185, 2026-10-04). Rating 0, an empty label and a pick of "none" take the bundle's. The bundle's edit record (as a version named "Imported edit"; a blank one is no edit and adds none) and its versions are added as **new versions** after the photo's own, unless the photo already has those settings (its edit record or a version with an equal JSON value), so a re-merge adds none; the photo's edit record and versions are not changed. Blank IPTC fields are filled by the importer, not the pure-DB merge (below). A row the importer created for this bundle moments before is not filled again. **Once per bundle** (#248, decision 2026-10-06): every photo a bundle's photo is merged into — inserted, created by the importer, or filled — is recorded with the bundle's batch uuid (`bundle_merges`, schema v27, local to the catalog); merging that batch into it again fills nothing and adds no version, so a value the user cleared or a version they deleted after the first import stays gone (counted in `MergeSummary::photos_merged_before`). Its tags still union. Another batch fills the blanks as before. |
 | Photo (new identity, path taken) | **Kept apart** — no row holds its identity but another photo, under another identity, holds its path (the same capture imported separately on each side, #246): neither inserted (`photos.path` is UNIQUE; before #185 the whole merge failed here) nor merged onto that photo. Counted in `MergeSummary::photos_kept_apart`. The same holds when the importer found the photo's original in the library at another name (a ` (n)` one) under another identity and its own path is free: the importer passes those identities to `merge_bundle_into`, so no metadata-only row is inserted at a path where no file of the photo is. |
 | Tag assignments | `INSERT OR IGNORE` union — new assignments added, none removed |
 
@@ -1247,6 +1247,9 @@ runs the same transition — it replaces the catalog handle exactly as a switch 
   truth. A non-zero `dismissed_at` is a human's "stop retrying this copy" (see Resolving a
   conflict): the row stays for the record, and leaves both the repair pass and the debt
   count.
+- `bundle_merges` (v27) — photo_id, batch_uuid, merged_at: which bundle batch has been
+  merged into which photo, so importing the same bundle again fills nothing (#248; see
+  Bundle format). Local to the catalog; never exported or merged.
 
 ## Storage model
 

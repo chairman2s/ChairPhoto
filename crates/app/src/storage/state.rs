@@ -746,6 +746,12 @@ pub fn bundle_import_line(r: &BundleImportResult) -> String {
             plural(r.merge.versions_added, "version", "versions")
         );
     }
+    if r.merge.photos_merged_before > 0 {
+        line += &format!(
+            " {} merged from this bundle before (left as they are).",
+            r.merge.photos_merged_before
+        );
+    }
     if r.merge.photos_kept_apart > 0 {
         line += &format!(
             " {} kept apart (the same file is here under another identity).",
@@ -840,13 +846,15 @@ mod tests {
                 photos_filled: 1,
                 versions_added: 2,
                 photos_kept_apart: 1,
+                photos_merged_before: 3,
                 ..Default::default()
             },
         };
         assert_eq!(
             bundle_import_line(&r),
             "Import complete. No new photos. 2 already present (skipped). 1 already in the catalog filled in \
-             (2 new versions). 1 kept apart (the same file is here under another identity)."
+             (2 new versions). 3 merged from this bundle before (left as they are). 1 kept apart (the same \
+             file is here under another identity)."
         );
     }
 }

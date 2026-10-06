@@ -89,6 +89,14 @@ pub struct MergeSummary {
     /// holds their path — the same capture imported separately on each side (#246): kept
     /// apart, neither inserted nor merged.
     pub photos_kept_apart: usize,
+    /// The names (the bundle's relative paths) of the photos kept apart, in bundle order, so
+    /// the import result can say which they are (#249).
+    pub kept_apart_names: Vec<String>,
+    /// Bundle photos found in the library as the same capture under another identity, proven
+    /// by the strict re-link rule (#249), and merged onto that row, which keeps its identity.
+    /// Set by the importer (`bundle::importer`), which decides the match; counted in
+    /// `photos_existing` too.
+    pub photos_matched_by_capture: usize,
     /// Existing photos this bundle's batch was merged into by an earlier import (#248): not
     /// filled again and given no versions, so a value the user cleared since stays cleared.
     /// Their tags still union.
@@ -426,6 +434,7 @@ impl MergeCtx<'_> {
                     photo.relative_path
                 );
                 self.outcome.summary.photos_kept_apart += 1;
+                self.outcome.summary.kept_apart_names.push(photo.relative_path.clone());
                 return Ok(());
             }
             None => {

@@ -720,6 +720,19 @@ pub fn drain_status(s: &chairphoto_core::catalog::DrainSummary) -> String {
     line
 }
 
+/// The photos a bundle import kept apart, by file name (#249): `": A.ARW, B.ARW"`, the first
+/// five and how many more; empty when none were named.
+fn kept_apart_names(paths: &[String]) -> String {
+    const SHOWN: usize = 5;
+    if paths.is_empty() {
+        return String::new();
+    }
+    let names: Vec<&str> = paths.iter().take(SHOWN).map(|p| p.rsplit('/').next().unwrap_or(p)).collect();
+    let more = paths.len().saturating_sub(SHOWN);
+    let tail = if more > 0 { format!(" and {more} more") } else { String::new() };
+    format!(": {}{tail}", names.join(", "))
+}
+
 /// BundleImportDialog's result line.
 pub fn bundle_import_line(r: &BundleImportResult) -> String {
     let plural = |n: usize, one: &str, many: &str| if n == 1 { one.to_string() } else { many.to_string() };
@@ -752,10 +765,17 @@ pub fn bundle_import_line(r: &BundleImportResult) -> String {
             r.merge.photos_merged_before
         );
     }
+    if r.merge.photos_matched_by_capture > 0 {
+        line += &format!(
+            " {} matched to the same capture here under another identity (filled in, identity kept).",
+            r.merge.photos_matched_by_capture
+        );
+    }
     if r.merge.photos_kept_apart > 0 {
         line += &format!(
-            " {} kept apart (the same file is here under another identity).",
-            r.merge.photos_kept_apart
+            " {} kept apart (the same file is here under another identity){}.",
+            r.merge.photos_kept_apart,
+            kept_apart_names(&r.merge.kept_apart_names)
         );
     }
     if r.merge.tags_created > 0 {
@@ -829,6 +849,33 @@ mod tests {
         // #254: an op whose photo another storage operation held is still queued.
         let busy = DrainSummary { ran: 1, busy: 2, ..Default::default() };
         assert_eq!(drain_status(&busy), "Storage queue: 1 done, 2 waiting (photo in use)");
+    }
+
+    /// #249: the bundle line names the photos kept apart (the first five, then how many more)
+    /// and counts those matched to the same capture under another identity.
+    #[test]
+    fn the_bundle_line_names_the_photos_kept_apart() {
+        let names: Vec<String> = (1..=7).map(|i| format!("2026/06/28/DSC{i}.ARW")).collect();
+        let r = BundleImportResult {
+            copied: 0,
+            skipped_duplicate: 9,
+            errors: 0,
+            restored: 0,
+            restored_trashed: 0,
+            merge: chairphoto_core::catalog::MergeSummary {
+                photos_existing: 2,
+                photos_matched_by_capture: 2,
+                photos_kept_apart: 7,
+                kept_apart_names: names,
+                ..Default::default()
+            },
+        };
+        assert_eq!(
+            bundle_import_line(&r),
+            "Import complete. No new photos. 9 already present (skipped). 2 matched to the same capture here \
+             under another identity (filled in, identity kept). 7 kept apart (the same file is here under \
+             another identity): DSC1.ARW, DSC2.ARW, DSC3.ARW, DSC4.ARW, DSC5.ARW and 2 more."
+        );
     }
 
     /// #185: the bundle line says what an import filled in on photos already in the catalog,

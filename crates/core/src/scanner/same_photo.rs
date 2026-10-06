@@ -323,6 +323,23 @@ fn is_same_photo(a: &Path, sa: &CaptureStamp, b: &Path, sb: &CaptureStamp) -> bo
 /// against a read that failed on one side only, and stops within the first bytes for two
 /// genuinely different captures, whose headers differ.
 pub fn find_in_library(bytes: &[u8], candidates: &[PathBuf], abort: &AtomicBool) -> Option<Option<PathBuf>> {
+    Some(find_in_library_proving(bytes, candidates, abort)?.map(|found| found.path))
+}
+
+/// A library file [`find_in_library_proving`] found to be the arriving photo.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Found {
+    pub path: PathBuf,
+    /// The stamps prove the same capture by the strict rule a re-link needs
+    /// ([`same_capture_without_contents`]: a sub-second or a serial on both sides, equal) —
+    /// enough to treat a library row of another identity holding this file as the same photo
+    /// (#249). `false` when only #246's rule or identical contents matched.
+    pub proven: bool,
+}
+
+/// [`find_in_library`], saying whether the match is proven by the strict rule ([`Found`]).
+/// A candidate that proves it is preferred over one that only matches.
+pub fn find_in_library_proving(bytes: &[u8], candidates: &[PathBuf], abort: &AtomicBool) -> Option<Option<Found>> {
     // No collision is no decision: there is nothing for a stop to interrupt (the caller reads
     // `abort` between originals).
     if candidates.is_empty() {
@@ -333,16 +350,19 @@ pub fn find_in_library(bytes: &[u8], candidates: &[PathBuf], abort: &AtomicBool)
     }
     let (arriving, stamps) = read_stamps_with_bytes(bytes, candidates);
     let none = CaptureStamp::default();
-    let verdict = |c: &PathBuf| same_capture(&arriving, stamps.get(c).unwrap_or(&none));
-    if let Some(c) = candidates.iter().find(|c| verdict(c) == Some(true)) {
-        return Some(Some(c.clone()));
+    let stamp = |c: &PathBuf| stamps.get(c).unwrap_or(&none);
+    if let Some(c) = candidates.iter().find(|c| same_capture_without_contents(&arriving, stamp(c))) {
+        return Some(Some(Found { path: c.clone(), proven: true }));
+    }
+    if let Some(c) = candidates.iter().find(|c| same_capture(&arriving, stamp(c)) == Some(true)) {
+        return Some(Some(Found { path: c.clone(), proven: false }));
     }
     for c in candidates {
         if abort.load(Ordering::Relaxed) {
             return None;
         }
         if holds_bytes(c, bytes) {
-            return Some(Some(c.clone()));
+            return Some(Some(Found { path: c.clone(), proven: false }));
         }
     }
     Some(None)

@@ -149,9 +149,11 @@ impl HostConsent {
     /// record (unknown history, read as still pending): a later non-empty read of it is then
     /// a retry of the very clear that has not landed yet, and must not be re-merged — that
     /// would undo, "denied wins", an Allow the user gave since (#229). Once `true`, a later
-    /// non-empty read is new content instead — a file copy sharing the UUID, or a
-    /// pre-#231 build, writing into the copy again — and [`Self::merge_legacy_denies_except`]
-    /// folds in only its Denies (#231).
+    /// non-empty read is treated as new content — a pre-#231 build writing into the copy
+    /// again — and [`Self::merge_legacy_denies_except`] folds in only its Denies, and only for
+    /// hosts with no answer (#231). The flag is per UUID, not per file: a file copy sharing
+    /// the UUID may still hold the content already merged, which is why that re-merge never
+    /// overrides an Allow (relD M1).
     pub fn is_cleared(&self, catalog_uuid: &str) -> bool {
         self.merged.get(catalog_uuid).copied().unwrap_or(false)
     }
@@ -179,16 +181,20 @@ impl HostConsent {
     }
 
     /// [`merge_legacy_except`](Self::merge_legacy_except), but folds in only `legacy`'s
-    /// denied entries, never an allowed one — the safe direction when the catalog's legacy
-    /// copy reappeared with content after being confirmed emptied (#231): new information is
-    /// not assumed to be an Allow, only ever a Deny. Returns whether anything changed.
+    /// denied entries, never an allowed one, and only for a host this machine has no answer
+    /// for — the re-merge of a catalog whose legacy copy reappeared with content after being
+    /// confirmed emptied (#231). New information is not assumed to be an Allow, only ever a
+    /// Deny. Nor does it override an Allow: that catalog's (UUID's) first merge already folded
+    /// in its Denies, denied winning, so an Allow standing now was given since — and a file
+    /// copy sharing the UUID still holds those same old Denies, which must not undo it (relD
+    /// M1). Returns whether anything changed.
     pub fn merge_legacy_denies_except(&mut self, legacy: &HostConsent, users: impl Fn(&str) -> bool) -> bool {
         let mut changed = false;
         for (host, &allowed) in &legacy.answers {
             if allowed || self.ask.contains(host) || users(host) {
                 continue;
             }
-            if self.answers.get(host) != Some(&false) {
+            if !self.answers.contains_key(host) {
                 self.answers.insert(host.clone(), false);
                 changed = true;
             }
@@ -495,6 +501,23 @@ mod tests {
         let legacy = HostConsent::parse(Some(r#"{"b.example":false}"#));
         assert!(!machine.merge_legacy_denies_except(&legacy, |h| h == "b.example"), "left out, so nothing changed");
         assert_eq!(machine.get("b.example"), Consent::Allowed, "the user's answer stands");
+    }
+
+    /// relD M1: a repopulated Deny never overrides an Allow — the first merge already folded
+    /// that catalog's Denies in, so an Allow standing now was given since (a file copy sharing
+    /// the UUID still holds the same old Deny). It only blocks a host with no answer, and
+    /// never turns anything into an Allow.
+    #[test]
+    fn a_repopulated_deny_never_overrides_an_allow() {
+        let mut machine = HostConsent::parse(Some(r#"{"b.example":true,"d.example":false}"#));
+        machine.record_merged("cat-a");
+        machine.confirm_cleared("cat-a");
+        let legacy = HostConsent::parse(Some(r#"{"b.example":false,"c.example":false,"d.example":true}"#));
+        assert!(machine.merge_legacy_denies_except(&legacy, |_| false), "c is new");
+        assert_eq!(machine.get("b.example"), Consent::Allowed, "the standing Allow is not undone");
+        assert_eq!(machine.get("c.example"), Consent::Denied, "a host with no answer is blocked");
+        assert_eq!(machine.get("d.example"), Consent::Denied, "nothing becomes Allowed");
+        assert!(!machine.merge_legacy_denies_except(&legacy, |_| false), "a second re-merge is a no-op");
     }
 
     #[test]

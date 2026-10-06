@@ -37,7 +37,8 @@
 //! emptied only after the merge is on disk, and the merge records the catalog as merged in
 //! that same write, so a copy whose emptying failed is not merged again (#229) — until a read
 //! confirms the emptying landed, after which a copy that reappears with content is new, and
-//! only its Denies are folded in (#231). A host the user answers while a merge is in flight
+//! only its Denies are folded in, for hosts with no answer — never over an Allow (#231, relD
+//! M1). A host the user answers while a merge is in flight
 //! is left out of it ([`ConsentAnswers`]), so the user's answer wins. A write that fails is
 //! surfaced: [`MapState::consent_write_error`], which Preferences' Map tab shows.
 
@@ -473,10 +474,14 @@ impl MapState {
     /// has not run yet — merges nothing and only retries the clear: merging it again would let
     /// its old Deny win over an Allow the user gave in between. Once an empty read confirms
     /// the clear ([`Self::confirm_clear`], [`HostConsent::confirm_cleared`]), a *later*
-    /// non-empty read of the same catalog is new content instead — a file copy sharing the
-    /// UUID, or a pre-#231 build, writing into the copy again — so its Denies are folded in,
-    /// never an Allow (the safe direction for content with no known provenance), and the
-    /// catalog goes back to pending for the clear this content now needs.
+    /// non-empty read of the same UUID is treated as new content — a pre-#231 build writing
+    /// into the copy again — so its Denies are folded in, never an Allow (the safe direction
+    /// for content with no known provenance), and the catalog goes back to pending for the
+    /// clear this content now needs. Those Denies only block a host with no answer; they never
+    /// override an Allow. The cleared state is per UUID, not per file: a file copy sharing the
+    /// UUID can still hold the very content already merged after another copy's empty read
+    /// confirmed the clear, and its old Deny must not undo an Allow given since the first
+    /// merge (relD M1).
     ///
     /// A host the user answered since this merge started ([`Self::set_consent`], recorded in
     /// [`ConsentAnswers`]) is left out of it, so the user's Allow, Block or Ask again wins —

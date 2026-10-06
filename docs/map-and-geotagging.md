@@ -105,9 +105,13 @@ merges nothing and only retries the emptying, so its old Deny never undoes an Al
 since (#229). A build before #231 drops that record when it saves an answer; such a catalog
 may then be merged again, which can only turn an answer to Deny. Once a read finds the copy
 actually empty, `cleared` is set; a *later* read that finds the copy non-empty again is then
-new content — a file copy sharing the UUID, or a pre-#231 build, writing into it again — and
-only its Denies are folded in, never an Allow (#231): new content with no known provenance
-can only make a host ask again, never silently allow one. "Ask again" is stored as an
+treated as new content — a pre-#231 build writing into it again — and only its Denies are
+folded in, never an Allow (#231), and only for hosts this machine has no answer for: new
+content with no known provenance can only block a host that had no answer, never silently
+allow one, and never override an Allow. `cleared` is kept per UUID, not per file, so a file
+copy sharing the UUID may still hold the very answers already merged after another copy's
+empty read set it; since the UUID's first merge already folded its Denies in, an Allow
+standing afterwards was given since, and no re-merge undoes it. "Ask again" is stored as an
 explicit `"ask"` entry that no catalog's old answer overrides, never as a deleted one that a
 re-merge could refill.
 

@@ -153,6 +153,32 @@ until it is written. Covers set before #252 migrate
 as pinned. Local to this catalog like the history: catalog merge and bundle export do not
 carry it.
 
+**An older build on the same catalog** (review of #252, L1; schema v27). A trigger in the
+catalog file keeps `changed_seq` true whichever build changes a version's settings
+(`Catalog::ensure_face_trigger`): the version becomes the photo's latest change, and the
+face's `rev` rises when its own settings change. A version a build that does not know the
+column creates is left at `changed_seq` 0, no candidate; when an open finds the catalog
+stamped below v27 since this build last opened it (every build stamps its own schema on
+open), those versions become their photos' latest changes, in `updated_at` order — after
+everything else that build did, whatever the order it did it in. Every open then moves each
+face left behind (`Catalog::heal_faces`: an automatic face that is not the latest change, a
+version pin whose version is gone). What older builds do with a v27 catalog:
+
+- The packaged **2026.8.0** (schema 19, the Tauri shell) opens it without complaint — it has
+  no newer-schema check — and stamps it back to 19. It knows nothing of faces: it never reads
+  or writes `photo_cover`, so it shows the original everywhere. Its edits are ordered by the
+  trigger, its new, duplicated and merged versions by the next open; its deletion of a face's
+  version leaves a NULL face (`ON DELETE SET NULL`). The next open by this build heals the faces. Because of
+  the stamp, that open also re-runs the backfills gated on v23, v24 and v26, each of which
+  touches only rows not yet migrated.
+- A **pre-#252 GPUI build** (schema 26) does the same, and its "Use as cover" writes
+  `photo_cover.version_id` without `pin`: on a photo that had no row, or an automatic one,
+  that cover reads as automatic and the next open moves it to the latest change. A cover it
+  sets on a photo already pinned stays pinned.
+- From this build on, a catalog stamped with a **newer** schema than the build knows is
+  refused on open (`CatalogError::NewerSchema`), nothing written; a later build that changes
+  what an older one would misread bumps `SCHEMA_VERSION`.
+
 Storage: core tables `photo_version_history` and `photo_version_history_head`
 (`catalog/schema.rs`), both cascading with their version. They are local to the catalog:
 catalog merge and bundle export carry versions but not their history. Every write that

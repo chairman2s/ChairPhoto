@@ -102,6 +102,13 @@ pub enum CatalogError {
     OutsideRoot(String),
     #[error("failed to enable WAL mode; SQLite reported journal_mode={0}")]
     JournalMode(String),
+    /// The catalog was last opened by a newer ChairPhoto, whose schema this build does not
+    /// know (`schema::SCHEMA_VERSION`): refused, nothing written.
+    #[error(
+        "this catalog was last opened by a newer version of ChairPhoto (catalog schema {found}; \
+         this version knows up to {known}) — open it with that version or a newer one"
+    )]
+    NewerSchema { found: i64, known: i64 },
 }
 
 // Match the 60-second migration lock wait; catalog opens run on blocking workers.
@@ -112,6 +119,11 @@ const WAL_BUSY_RETRY_DELAY: Duration = Duration::from_millis(10);
 /// the `prior_version` gate in `migrate_locked`; renumbering the migration is changing this
 /// and [`schema::SCHEMA_VERSION`] together.
 pub(crate) const EXIF_ORIENTATION_SINCE: i64 = 26;
+
+/// The schema version of the automatic Library face's heal (#252 review L1): a catalog
+/// stamped below it once the face columns exist was opened by an older build since this one
+/// last opened it (`Catalog::heal_faces`).
+pub(crate) const AUTO_FACES_SINCE: i64 = 27;
 
 /// The `settings` key holding the catalog's own identity: a UUID v4 minted once, the first
 /// time a catalog is opened by a build that knows it, and never changed. It survives reopening,
@@ -279,6 +291,18 @@ impl Catalog {
 
     fn migrate_locked(&mut self) -> Result<()> {
         self.conn.execute_batch(schema::SCHEMA_SQL)?;
+        // The schema the catalog was last stamped with, read BEFORE this open stamps its own.
+        // Every build stamps its own on open — an older one included, downwards — so a value
+        // below ours also says an older build has opened the catalog since we last did.
+        let prior_version: i64 = self
+            .get_setting("schema_version")?
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
+        if prior_version > schema::SCHEMA_VERSION {
+            // A newer build's catalog: its schema may hold what this build would misread or
+            // corrupt. Refused before anything is written (the transaction rolls back).
+            return Err(CatalogError::NewerSchema { found: prior_version, known: schema::SCHEMA_VERSION });
+        }
         // Mint the catalog's identity once (a no-op on every later open).
         catalog_uuid(&self.conn)?;
         // Additive columns for catalogs created before the column existed.
@@ -429,7 +453,7 @@ impl Catalog {
         ] {
             self.ensure_column("photos", col, "TEXT NOT NULL DEFAULT ''")?;
         }
-        self.migrate_auto_faces()?;
+        self.migrate_auto_faces(prior_version)?;
 
         // Persist the root the first time; keep any existing value otherwise.
         let root_str = self.root.to_string_lossy().to_string();
@@ -443,11 +467,7 @@ impl Catalog {
             self.root = PathBuf::from(stored);
         }
 
-        // Versioned migrations. Read the prior version BEFORE stamping the new one.
-        let prior_version: i64 = self
-            .get_setting("schema_version")?
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(0);
+        // Versioned migrations, gated on `prior_version` (read above, before the stamp).
         self.migrate_sidecar_identity_fields()?;
         // Schema v22 (#33): a dismissed conflict stops being retried and stops counting as
         // debt. Must run AFTER `migrate_sidecar_identity_fields`, whose v20→v21 rebuild
@@ -596,11 +616,20 @@ impl Catalog {
     ///   cleared one (NULL) becomes automatic;
     /// - then every face is brought up to date, so a photo edited before this shows its
     ///   latest version at once.
-    fn migrate_auto_faces(&self) -> Result<()> {
+    ///
+    /// On every open after that, the faces are healed from what an older build wrote
+    /// meanwhile (schema v27, review of #252 L1): the trigger keeps `changed_seq` true for
+    /// its settings changes ([`Catalog::ensure_face_trigger`]), and [`Catalog::heal_faces`]
+    /// orders the versions it created and moves each face it left behind. `prior_version` is
+    /// the schema the catalog was stamped with before this open.
+    fn migrate_auto_faces(&self, prior_version: i64) -> Result<()> {
         let had_seq = has_column(&self.conn, "photo_versions", "changed_seq")?;
         let had_pin = has_column(&self.conn, "photo_cover", "pin")?;
         if had_seq && had_pin {
-            return Ok(());
+            self.ensure_face_trigger()?;
+            // Below v27 with the columns already there: an older build has opened the
+            // catalog since this one last did (every build stamps its own on open).
+            return self.heal_faces(prior_version < AUTO_FACES_SINCE);
         }
         self.ensure_column("photo_versions", "changed_seq", "INTEGER NOT NULL DEFAULT 0")?;
         self.ensure_column("photo_cover", "pin", "INTEGER NOT NULL DEFAULT 0")?;
@@ -617,6 +646,7 @@ impl Catalog {
             self.conn
                 .execute_batch("UPDATE photo_cover SET pin = 1 WHERE version_id IS NOT NULL;")?;
         }
+        self.ensure_face_trigger()?;
         self.refresh_all_faces()
     }
 

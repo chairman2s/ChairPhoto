@@ -5,7 +5,12 @@
 //!  2. Photo `path` is stored RELATIVE to the catalog root (see the
 //!     `catalog_root` setting), so a catalog can be remapped on import.
 
-pub const SCHEMA_VERSION: i64 = 26;
+/// The catalog schema this build writes. A catalog stamped with a higher one was last opened by a
+/// newer build, and `Catalog::open` refuses it (`CatalogError::NewerSchema`) rather than write
+/// into a schema it does not know. Bump it whenever an older build would misread or corrupt
+/// what a change stores. v27 (#252): the automatic Library face (`photo_versions.changed_seq`,
+/// `photo_cover.pin`, the `photo_versions_settings_changed` trigger).
+pub const SCHEMA_VERSION: i64 = 27;
 
 pub const SCHEMA_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS settings (

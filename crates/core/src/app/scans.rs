@@ -145,8 +145,9 @@ pub const IMPORT_CANCELLED: &str = "Import cancelled";
 /// the catalog lock and streams `import:progress`; it stops before the next file once the
 /// generation is tripped, and then the copies are **not** indexed: the error names how many
 /// files are already in the library folder (a rescan picks them up; nothing is deleted). The
-/// index phase runs on a secondary connection to the catalog the import started against,
-/// and ends with the terminal `scan:progress {phase:"done"}`.
+/// copy (for the names the catalog's rows hold, #247) and the index phase read and write
+/// through a secondary connection to the catalog the import started against, and the import
+/// ends with the terminal `scan:progress {phase:"done"}`.
 pub fn ingest_from_card(
     state: &AppState,
     source: &Path,
@@ -208,9 +209,13 @@ fn ingest_claimed_with(
         let catalog = guard.as_ref().ok_or("No catalog is open")?;
         (catalog.db_path().to_path_buf(), catalog.root().to_path_buf())
     };
+    // The import's own connection to the catalog it started against, opened before the copy:
+    // the copy reads the names its rows hold (#247), and the index phase writes through it.
+    // A switch meanwhile never redirects either to the catalog opened since.
+    let catalog = Catalog::open_secondary(&db_path, &dest).map_err(|e| e.to_string())?;
     let (result, copied, aborted) = {
         let events = state.clone();
-        crate::scanner::copy_from_card_abortable(source, &dest, selected.as_ref(), abort, move |done, total| {
+        crate::scanner::copy_from_card_abortable(&catalog, source, &dest, selected.as_ref(), abort, move |done, total| {
             events.send(CoreEvent::ImportProgress(ImportProgress { job, done, total }))
         })?
     };
@@ -236,7 +241,6 @@ fn ingest_claimed_with(
         if abort.load(Ordering::Relaxed) {
             return Err(cancelled_message(copied.len()));
         }
-        let catalog = Catalog::open_secondary(&db_path, &dest).map_err(|e| e.to_string())?;
         let total = copied.len();
         let indexed = crate::scanner::index_ingested_with(&catalog, &dest, source, copied, name, result, abort, after_indexed)?;
         if indexed.aborted() {
@@ -331,6 +335,65 @@ mod tests {
         let names = names.0.lock().unwrap();
         assert_eq!(names.iter().filter(|n| *n == "import:progress").count(), 3);
         assert_eq!(names.last().map(String::as_str), Some("scan:progress"), "the terminal done");
+    }
+
+    // --- the names a copy finds taken (#247) ----------------------------------------------
+
+    /// **Forced interleaving** (AGENTS.md, "Catalog identity"). The names a card's copy finds
+    /// taken by catalog rows are read from the catalog the import started against, on its
+    /// own connection. As the copy starts, the open catalog is swapped for one whose ids
+    /// collide and which holds no row at `IMG_1.jpg` (no switch delivered, the import not
+    /// tripped): the copy still sees the first catalog's row holding that name — its file
+    /// gone — and puts the card's `IMG_1.jpg` at ` (2)`; the copies are indexed into the
+    /// first catalog, and the second gains nothing.
+    #[test]
+    fn the_names_a_copy_finds_taken_are_the_started_catalogs() {
+        const HELD: &str = "11111111-1111-4111-8111-111111111111";
+        let (dir, state, _names, card) = setup("247-swap", 2);
+        let secs = 1_782_648_000;
+        let mtime = std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs);
+        for i in 0..2 {
+            let f = std::fs::File::options().write(true).open(card.join(format!("IMG_{i}.jpg"))).unwrap();
+            f.set_modified(mtime).unwrap();
+        }
+        let root = dir.join("library");
+        let day = root.join(chrono::DateTime::from_timestamp(secs as i64, 0).unwrap().format("%Y/%m/%d").to_string());
+        std::fs::create_dir_all(&day).unwrap();
+        let held = day.join("IMG_1.jpg");
+        std::fs::write(&held, b"the old capture").unwrap();
+        let held_id = {
+            let guard = state.catalog.lock().unwrap();
+            guard.as_ref().unwrap().upsert_photo_with_identity(&held, None, 1, 15, Some(HELD)).unwrap().id
+        };
+        std::fs::remove_file(&held).unwrap();
+        let b = Catalog::open(&dir.join("b.chairphoto"), &root).unwrap();
+        let elsewhere = day.join("elsewhere.jpg");
+        std::fs::write(&elsewhere, b"b's photo").unwrap();
+        assert_eq!(b.upsert_photo_with_identity(&elsewhere, None, 1, 9, None).unwrap().id, held_id, "colliding ids");
+
+        struct SwapOnFirst(AppState, Mutex<Option<Catalog>>);
+        impl EventSink for SwapOnFirst {
+            fn send(&self, event: CoreEvent) {
+                if matches!(event, CoreEvent::ImportProgress(_)) {
+                    if let Some(b) = self.1.lock().unwrap().take() {
+                        *self.0.catalog.lock().unwrap() = Some(b);
+                    }
+                }
+            }
+        }
+        let swapping = AppState { catalog: state.catalog.clone(), jobs: state.jobs.clone(), ..AppState::default() };
+        swapping.set_events(Arc::new(SwapOnFirst(state.clone(), Mutex::new(Some(b)))));
+        let result = ingest_from_card(&swapping, &card, None, None).unwrap();
+        assert_eq!(result.created, 2, "{result:?}");
+        assert!(!held.exists(), "the name the started catalog's row holds stays empty");
+        assert!(day.join("IMG_1 (2).jpg").exists());
+
+        let started = Catalog::open_secondary(&dir.join("c.chairphoto"), &root).unwrap();
+        let mut paths: Vec<String> = started.list_photos(&Default::default()).unwrap().into_iter().map(|p| p.path).collect();
+        paths.sort();
+        let rel = |name: &str| format!("{}/{name}", day.strip_prefix(&root).unwrap().to_string_lossy());
+        assert_eq!(paths, [rel("IMG_0.jpg"), rel("IMG_1 (2).jpg"), rel("IMG_1.jpg")]);
+        assert_eq!(photos(&state), 1, "the swapped-in catalog gained nothing");
     }
 
     /// **Forced interleaving.** A Cancel between the first and second file: the copy stops,

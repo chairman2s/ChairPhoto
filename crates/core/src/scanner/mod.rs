@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use walkdir::WalkDir;
 
+pub mod free_name;
 pub mod same_photo;
 pub mod sidecars;
 
@@ -548,7 +549,7 @@ pub fn ingest_from_card(
     dest_base: &Path,
     batch_label: Option<&str>,
 ) -> Result<ScanResult, String> {
-    let (result, copied) = copy_from_card(source, dest_base, None, |_, _| {})?;
+    let (result, copied) = copy_from_card(catalog, source, dest_base, None, |_, _| {})?;
     index_ingested(catalog, dest_base, source, copied, batch_label, result)
 }
 
@@ -606,20 +607,25 @@ pub fn list_card_photos(source: &Path, dest_base: &Path) -> Result<Vec<CardPhoto
 }
 
 /// Phase 1 of import: walk the card, extract metadata, and COPY files into the local
-/// date tree. Touches the filesystem only — NO catalog access — so it can run on a
+/// date tree. Writes the filesystem only. It reads `catalog` — the catalog the copies will be
+/// indexed into, on the import's own connection, never the main one under its lock — for the
+/// names its rows hold, once per date folder: a name a row holds is not free even when its
+/// file is gone, unless the card's file is that row's capture coming back, which then takes
+/// the name and re-links the row when indexed (#247, [`free_name`]). So it can run on a
 /// worker thread without holding the catalog lock (the copy is the slow part). Returns
 /// the partial counts (scanned/skipped/errors) and the list of files actually copied.
 ///
 /// `progress(done, total)` is called as each source file is processed, so the caller can
 /// stream progress to the UI. Pass `|_, _| {}` if not needed.
 pub fn copy_from_card(
+    catalog: &Catalog,
     source: &Path,
     dest_base: &Path,
     selected: Option<&std::collections::HashSet<String>>,
     progress: impl Fn(usize, usize),
 ) -> Result<(ScanResult, Vec<CopiedItem>), String> {
     let never = AtomicBool::new(false);
-    let (result, copied, _) = copy_from_card_abortable(source, dest_base, selected, &never, progress)?;
+    let (result, copied, _) = copy_from_card_abortable(catalog, source, dest_base, selected, &never, progress)?;
     Ok((result, copied))
 }
 
@@ -628,6 +634,7 @@ pub fn copy_from_card(
 /// until then are returned, and are already in the library folder — a caller that does not
 /// index them leaves them for the next rescan, never deletes them.
 pub fn copy_from_card_abortable(
+    catalog: &Catalog,
     source: &Path,
     dest_base: &Path,
     selected: Option<&std::collections::HashSet<String>>,
@@ -661,6 +668,8 @@ pub fn copy_from_card_abortable(
 
     let mut result = ScanResult::default();
     let mut copied: Vec<CopiedItem> = Vec::new();
+    // The names the catalog's rows hold, read once per date folder (#247).
+    let mut names = free_name::CatalogNames::new(catalog);
     // The files of this run that are in the library now: copied, or found there already.
     let mut in_library: HashSet<&PathBuf> = HashSet::new();
     let this_run: HashSet<&PathBuf> = sources.iter().collect();
@@ -689,11 +698,16 @@ pub fn copy_from_card_abortable(
             result.errors += 1;
             continue;
         };
-        // A different photo under a name already used is kept beside it as ` (n)`, or an
-        // error if no free name is found — never an overwrite, even of a file placed there
-        // after the name was found free. The copy keeps the source's permissions, as
-        // `fs::copy` did.
-        let placed = same_photo::create_new_file(&dir.join(filename), |out| {
+        // A different photo under a name already used — by a file, or by a catalog row whose
+        // file is gone — is kept beside it as ` (n)`, or an error if no free name is found:
+        // never an overwrite, even of a file placed there after the name was found free. A
+        // row's own capture coming back takes the row's name, and indexing re-links the row
+        // (#247). The copy keeps the source's permissions, as `fs::copy` did.
+        let stamp = m.as_ref().map(|m| {
+            same_photo::stamp_from_metadata(m.entries.iter().map(|e| (e.key.as_str(), e.group_name.as_str(), e.value.as_str())))
+        });
+        let arriving = free_name::Arriving::Capture(stamp.unwrap_or_default());
+        let placed = same_photo::create_new_file(&dir.join(filename), &mut names, &arriving, |out| {
             let mut input = std::fs::File::open(src)?;
             std::io::copy(&mut input, out)?;
             out.set_permissions(input.metadata()?.permissions())
@@ -1128,7 +1142,7 @@ mod tests {
         // The first body's photo is in the library already.
         let only_first: std::collections::HashSet<String> =
             [first.to_string_lossy().into_owned()].into_iter().collect();
-        let (r, copied) = copy_from_card(&card, &root, Some(&only_first), |_, _| {}).unwrap();
+        let (r, copied) = copy_from_card(&catalog, &card, &root, Some(&only_first), |_, _| {}).unwrap();
         index_ingested(&catalog, &root, &card, copied, None, r).unwrap();
         let library = root.join("2026/06/28/DSC1.jpg");
         let before = std::fs::read(&library).unwrap();
@@ -1236,6 +1250,135 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&orphan).unwrap(), orphan_xml);
     }
 
+    // --- card ingest: a name a catalog row holds (#247) -------------------------------------
+
+    fn row_at(catalog: &Catalog, rel: &str) -> Option<(i64, String, i64, i64)> {
+        catalog
+            .conn()
+            .query_row("SELECT id, uuid, rating, missing FROM photos WHERE path = ?1", [rel], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+            })
+            .ok()
+    }
+
+    fn rate(catalog: &Catalog, id: i64, rating: i64) {
+        catalog.conn().execute("UPDATE photos SET rating = ?1 WHERE id = ?2", rusqlite::params![rating, id]).unwrap();
+    }
+
+    /// The date folder a card file with no capture time goes to: from a fixed mtime.
+    fn fixed_day(src: &Path, root: &Path) -> PathBuf {
+        let mtime = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_782_648_000);
+        std::fs::File::options().write(true).open(src).unwrap().set_modified(mtime).unwrap();
+        root.join(date_subdir(None, mtime_secs(std::fs::metadata(src).ok().as_ref())))
+    }
+
+    /// #247: `IMG (2).jpg`, rated, is deleted outside the app with its sidecar; its row stays
+    /// (missing storage is normal). A different `IMG.jpg` arriving from a card does not take
+    /// the name the row holds — it would be indexed onto that row, the old photo's identity
+    /// and rating on another capture — but the next one no row holds, with a row of its own.
+    #[test]
+    fn a_different_capture_never_takes_the_name_of_a_row_whose_file_is_gone() {
+        let (catalog, _dir, root, card) = ingest_rig("247");
+        for (folder, bytes) in [("A", b"\xff\xd8one"), ("B", b"\xff\xd8two")] {
+            std::fs::create_dir_all(card.join(folder)).unwrap();
+            std::fs::write(card.join(folder).join("IMG.jpg"), bytes).unwrap();
+        }
+        let day = fixed_day(&card.join("A/IMG.jpg"), &root);
+        fixed_day(&card.join("B/IMG.jpg"), &root);
+        ingest_from_card(&catalog, &card, &root, None).unwrap();
+        let rel = |name: &str| format!("{}/{name}", day.strip_prefix(&root).unwrap().to_string_lossy());
+        let (old_id, old_uuid, _, _) = row_at(&catalog, &rel("IMG (2).jpg")).unwrap();
+        rate(&catalog, old_id, 5);
+        let gone = day.join("IMG (2).jpg");
+        let old_bytes = std::fs::read(&gone).unwrap();
+        std::fs::remove_file(&gone).unwrap();
+        std::fs::remove_file(crate::xmp::sidecar_path(&gone)).unwrap();
+        catalog.reconcile_missing_for(&[old_id]).unwrap();
+
+        let second = dir_of_one(&card, "second", b"\xff\xd8six");
+        fixed_day(&second.join("IMG.jpg"), &root);
+        let result = ingest_from_card(&catalog, &second, &root, None).unwrap();
+        assert_eq!((result.created, result.errors), (1, 0), "{result:?}");
+        assert!(!gone.exists(), "the name the row holds stays empty");
+        assert_eq!(std::fs::read(day.join("IMG (3).jpg")).unwrap(), b"\xff\xd8six");
+        let (new_id, new_uuid, new_rating, _) = row_at(&catalog, &rel("IMG (3).jpg")).unwrap();
+        assert_ne!(new_id, old_id);
+        assert_ne!(new_uuid, old_uuid);
+        assert_eq!(new_rating, 0);
+        assert_eq!(row_at(&catalog, &rel("IMG (2).jpg")), Some((old_id, old_uuid, 5, 1)), "the old row is as it was");
+        assert_ne!(old_bytes, b"\xff\xd8six");
+    }
+
+    /// A card folder `card/<name>` holding one `IMG.jpg` of `bytes`.
+    fn dir_of_one(card: &Path, name: &str, bytes: &[u8]) -> PathBuf {
+        let dir = card.with_file_name(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("IMG.jpg"), bytes).unwrap();
+        dir
+    }
+
+    /// L-f of the third #246 review: a photo deleted outside the app (its row kept, missing)
+    /// and imported again from the same card goes back to its name and its row — rating
+    /// kept, no second row — whether its own sidecar was left behind or went with it.
+    #[test]
+    fn a_photo_deleted_outside_the_app_comes_back_to_its_row() {
+        if !exiftool_available("a_photo_deleted_outside_the_app_comes_back_to_its_row") {
+            return;
+        }
+        for sidecar_left in [true, false] {
+            let (catalog, _dir, root, card) = ingest_rig(&format!("lf-{sidecar_left}"));
+            stamped_jpeg(&card.join("IMG.jpg"), "2026:06:28 12:00:00", "123", "4711");
+            ingest_from_card(&catalog, &card, &root, None).unwrap();
+            let name = root.join("2026/06/28/IMG.jpg");
+            let (id, uuid, _, _) = row_at(&catalog, "2026/06/28/IMG.jpg").unwrap();
+            rate(&catalog, id, 5);
+            std::fs::remove_file(&name).unwrap();
+            if !sidecar_left {
+                std::fs::remove_file(crate::xmp::sidecar_path(&name)).unwrap();
+            }
+            catalog.reconcile_missing_for(&[id]).unwrap();
+            assert_eq!(row_at(&catalog, "2026/06/28/IMG.jpg").unwrap().3, 1, "missing before");
+
+            let again = ingest_from_card(&catalog, &card, &root, None).unwrap();
+            assert_eq!((again.created, again.skipped, again.imported), (0, 0, 1), "{sidecar_left}: {again:?}");
+            assert!(name.exists(), "{sidecar_left}: back at its name");
+            assert!(!root.join("2026/06/28/IMG (2).jpg").exists(), "{sidecar_left}");
+            assert_eq!(row_at(&catalog, "2026/06/28/IMG.jpg"), Some((id, uuid.clone(), 5, 0)), "{sidecar_left}");
+            assert_eq!(photos(&catalog).len(), 1, "{sidecar_left}: no second row");
+            assert_eq!(crate::xmp::read_identifier(&name).as_deref(), Some(uuid.as_str()), "{sidecar_left}");
+        }
+    }
+
+    /// The same capture comes back, but the sidecar at its name now carries another identity
+    /// (or none): the name stays taken — the sidecar is not adopted, not rewritten — and the
+    /// file lands at ` (2)` with a row of its own.
+    #[test]
+    fn a_sidecar_of_another_identity_keeps_the_name_taken() {
+        if !exiftool_available("a_sidecar_of_another_identity_keeps_the_name_taken") {
+            return;
+        }
+        const OTHER: &str = "22222222-2222-4222-8222-222222222222";
+        let (catalog, _dir, root, card) = ingest_rig("lf-other");
+        stamped_jpeg(&card.join("IMG.jpg"), "2026:06:28 12:00:00", "123", "4711");
+        ingest_from_card(&catalog, &card, &root, None).unwrap();
+        let name = root.join("2026/06/28/IMG.jpg");
+        let (id, uuid, _, _) = row_at(&catalog, "2026/06/28/IMG.jpg").unwrap();
+        std::fs::remove_file(&name).unwrap();
+        let sidecar = crate::xmp::sidecar_path(&name);
+        std::fs::remove_file(&sidecar).unwrap();
+        same_photo::test_files::orphan_sidecar(&name, OTHER);
+        let foreign = std::fs::read(&sidecar).unwrap();
+
+        let again = ingest_from_card(&catalog, &card, &root, None).unwrap();
+        assert_eq!(again.created, 1, "{again:?}");
+        assert!(!name.exists());
+        assert_eq!(std::fs::read(&sidecar).unwrap(), foreign, "the sidecar is untouched");
+        let (new_id, new_uuid, _, _) = row_at(&catalog, "2026/06/28/IMG (2).jpg").unwrap();
+        assert_ne!(new_id, id);
+        assert!(new_uuid != uuid && new_uuid != OTHER, "{new_uuid}");
+        assert_eq!(row_at(&catalog, "2026/06/28/IMG.jpg").unwrap().0, id);
+    }
+
     /// L-e of the second #246 review: one photo met three times in a run, the first copy
     /// failing. The second is copied (the first is not in the library), and the third is
     /// skipped against the second — not copied again because the first match it meets is the
@@ -1244,7 +1387,7 @@ mod tests {
     #[test]
     fn a_photo_met_again_after_a_failed_copy_is_skipped_against_the_copy_that_landed() {
         use std::os::unix::fs::PermissionsExt;
-        let (_catalog, _dir, root, card) = ingest_rig("failed-first");
+        let (catalog, _dir, root, card) = ingest_rig("failed-first");
         let mtime = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_782_648_000);
         let files: Vec<PathBuf> = ["A", "B", "D"].iter().map(|f| card.join(f).join("IMG.jpg")).collect();
         for f in &files {
@@ -1259,7 +1402,7 @@ mod tests {
         };
         // Whichever file the walk meets first cannot be read when it is copied (after the
         // plan read them all); the others can.
-        let (result, copied, _) = copy_from_card_abortable(&card, &root, None, &AtomicBool::new(false), |done, _| {
+        let (result, copied, _) = copy_from_card_abortable(&catalog, &card, &root, None, &AtomicBool::new(false), |done, _| {
             match done {
                 1 => set_mode(0o000),
                 2 => set_mode(0o644),
@@ -1284,7 +1427,7 @@ mod tests {
     /// `plan_card`).
     #[test]
     fn the_listing_flags_what_the_copy_skips() {
-        let (_catalog, _dir, root, card) = ingest_rig("listing");
+        let (catalog, _dir, root, card) = ingest_rig("listing");
         for folder in ["A", "B"] {
             std::fs::create_dir_all(card.join(folder)).unwrap();
             std::fs::write(card.join(folder).join("IMG.jpg"), b"\xff\xd8one").unwrap();
@@ -1292,18 +1435,18 @@ mod tests {
         let flagged: Vec<String> =
             list_card_photos(&card, &root).unwrap().into_iter().filter(|p| p.is_duplicate).map(|p| p.path).collect();
         assert_eq!(flagged.len(), 1, "{flagged:?}");
-        let (result, copied) = copy_from_card(&card, &root, None, |_, _| {}).unwrap();
+        let (result, copied) = copy_from_card(&catalog, &card, &root, None, |_, _| {}).unwrap();
         assert_eq!((result.skipped, copied.len()), (1, 1));
     }
 
     /// An abort while the collisions are being read copies nothing.
     #[test]
     fn an_abort_before_the_copy_copies_nothing() {
-        let (_catalog, _dir, root, card) = ingest_rig("abort");
+        let (catalog, _dir, root, card) = ingest_rig("abort");
         std::fs::create_dir_all(&card).unwrap();
         std::fs::write(card.join("IMG.jpg"), b"\xff\xd8one").unwrap();
         let (_, copied, aborted) =
-            copy_from_card_abortable(&card, &root, None, &AtomicBool::new(true), |_, _| {}).unwrap();
+            copy_from_card_abortable(&catalog, &card, &root, None, &AtomicBool::new(true), |_, _| {}).unwrap();
         assert!(aborted && copied.is_empty());
     }
 }

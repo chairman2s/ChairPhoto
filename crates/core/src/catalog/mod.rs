@@ -47,7 +47,7 @@ pub use identity::{
     PendingIdentityRow, PendingIdentitySummary, SidecarIdentity,
 };
 pub use iptc_owed::{IptcMask, IptcSettled, IptcSidecarState, IptcSidecarWrite, OwedDismissal, OwedIptc};
-pub use locations::{PathCandidate, ResolveMode};
+pub use locations::{NameHolder, PathCandidate, ResolveMode};
 pub use lifecycle::{
     any_backup_present, carry_companions, copy_and_verify, copy_with_companions, filter_offload_eligible,
     resolve_backup_plan, resolve_offload_plan, resolve_restore_plan, sha256_file, verify_and_delete_locals,

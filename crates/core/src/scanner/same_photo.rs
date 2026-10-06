@@ -190,15 +190,44 @@ fn read_stamps_with_bytes(bytes: &[u8], paths: &[PathBuf]) -> (CaptureStamp, Has
 }
 
 fn parse_stamp(obj: &serde_json::Map<String, serde_json::Value>) -> CaptureStamp {
-    let text = |key: &str| {
-        obj.get(key)
-            .and_then(|v| match v {
-                serde_json::Value::String(s) => Some(s.trim().to_string()),
-                serde_json::Value::Number(n) => Some(n.to_string()),
-                _ => None,
-            })
-            .filter(|s| !s.is_empty())
-    };
+    stamp_from(|key| {
+        obj.get(key).and_then(|v| match v {
+            serde_json::Value::String(s) => Some(s.clone()),
+            serde_json::Value::Number(n) => Some(n.to_string()),
+            _ => None,
+        })
+    })
+}
+
+/// The [`CaptureStamp`] in metadata the catalog extracted (`metadata::extract_batch`, which
+/// prints the same values as [`stamp_command`], each under its group): what a card's file
+/// was read as, and what a catalog row stores of the file it was indexed from — so one
+/// capture gives one stamp on both sides (#247). As [`stamp_command`] reads them:
+/// `CreateDate` from the QuickTime group only; every other tag from the EXIF group where it
+/// is there, else from the first other group (by name) that has it.
+pub fn stamp_from_metadata<'a>(entries: impl IntoIterator<Item = (&'a str, &'a str, &'a str)>) -> CaptureStamp {
+    let mut by_tag: HashMap<&str, Vec<(&str, &str)>> = HashMap::new();
+    for (key, group, value) in entries {
+        by_tag.entry(key).or_default().push((group, value));
+    }
+    for values in by_tag.values_mut() {
+        values.sort_by_key(|(group, _)| (*group != "EXIF", *group));
+    }
+    stamp_from(|key| {
+        let values = by_tag.get(key)?;
+        let found = if key == "CreateDate" {
+            values.iter().find(|(group, _)| *group == "QuickTime")
+        } else {
+            values.first()
+        };
+        found.map(|(_, value)| value.to_string())
+    })
+}
+
+/// A [`CaptureStamp`] from what `value` gives for each tag (by the name exiftool prints with
+/// no group): trimmed, and an empty value is none.
+fn stamp_from(value: impl Fn(&str) -> Option<String>) -> CaptureStamp {
+    let text = |key: &str| value(key).map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
     let serials = SERIAL_TAGS
         .iter()
         .filter_map(|tag| text(tag).map(|v| (tag.to_string(), v)))
@@ -338,7 +367,7 @@ fn holds_bytes(path: &Path, bytes: &[u8]) -> bool {
 }
 
 /// `dir/stem (n).ext`, the name a collision is renamed to.
-fn numbered(path: &Path, n: u32) -> PathBuf {
+pub(crate) fn numbered(path: &Path, n: u32) -> PathBuf {
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
     let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("file");
     let mut name = format!("{stem} ({n})");
@@ -377,7 +406,7 @@ pub struct FolderListings {
 }
 
 /// A file name's stem and extension, as [`numbered`] splits them.
-type NameKey = (String, Option<String>);
+pub(crate) type NameKey = (String, Option<String>);
 
 impl FolderListings {
     /// [`same_size_candidates`], from this run's listing of `dest`'s folder.
@@ -431,7 +460,7 @@ impl FolderListings {
 
 /// The base name's `(stem, extension)` and `n` when `name` is `stem (n).ext` or `stem (n)`
 /// ([`numbered`]'s form, `n` ≥ 2 written without leading zeros), else `None`.
-fn numbered_parts(name: &str) -> Option<(NameKey, u32)> {
+pub(crate) fn numbered_parts(name: &str) -> Option<(NameKey, u32)> {
     let path = Path::new(name);
     let stem = path.file_stem()?.to_str()?;
     let ext = path.extension().and_then(|s| s.to_str());
@@ -444,28 +473,37 @@ fn numbered_parts(name: &str) -> Option<(NameKey, u32)> {
     Some(((stem[..open].to_string(), ext.map(str::to_string)), n))
 }
 
-/// A destination path that is free ([`name_free`]): `path`, or `name (2).ext`, …, or `None`
-/// if no free name was found — the caller must then NOT copy (never overwrite an existing
-/// file).
-pub fn unique_dest(path: &Path) -> Option<PathBuf> {
+/// The first name free on disk ([`name_free`]): `path`, or `name (2).ext`, … — disk only, no
+/// catalog: what the tests of placing a file search with.
+#[cfg(test)]
+fn unique_dest(path: &Path) -> Option<PathBuf> {
     std::iter::once(path.to_path_buf())
         .chain((2..10_000).map(|n| numbered(path, n)))
         .find(|c| name_free(c))
 }
 
-/// Whether a new original may take `path`: nothing is there — a dangling symlink counts as
-/// something — and nothing is at its sidecar's name (`<name>.xmp`) either. A sidecar with no
-/// original beside it (another tool's, or one whose original was removed) belongs to some
-/// other photo: a new original placed beside it would adopt its identity and metadata, and a
-/// bundle's sidecar written there would destroy it.
-fn name_free(path: &Path) -> bool {
-    let absent = |p: &Path| std::fs::symlink_metadata(p).is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound);
+/// Whether nothing is on disk at `path` for a new original to take: nothing is there — a
+/// dangling symlink counts as something — and nothing is at its sidecar's name
+/// (`<name>.xmp`) either. A sidecar with no original beside it (another tool's, or one whose
+/// original was removed) belongs to some other photo: a new original placed beside it would
+/// adopt its identity and metadata, and a bundle's sidecar written there would destroy it.
+/// Only half of whether the name is free: a catalog row may hold it with no file there
+/// ([`CatalogNames`](super::free_name::CatalogNames), #247).
+pub(crate) fn name_free(path: &Path) -> bool {
     absent(path) && absent(&crate::xmp::sidecar_path(path))
 }
 
+/// Nothing at `path`, not even a dangling symlink.
+pub(crate) fn absent(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound)
+}
+
 /// Create a new file at `wanted`, or at the next free ` (n)` name beside it, and fill it with
-/// `fill`; returns where it landed. An existing file is never replaced, and no library name
-/// ever holds a partly written file:
+/// `fill`; returns where it landed. Which name it takes is `names`'s answer for `arriving`
+/// ([`CatalogNames::destination`](super::free_name::CatalogNames::destination)): one with
+/// nothing on disk and no catalog row holding it — or the name of a row whose file is gone
+/// and which `arriving` is, so the index phase re-links that row (#247). An existing file is
+/// never replaced, and no library name ever holds a partly written file:
 ///
 /// - The contents are written to a hidden temporary file in the same folder
 ///   (`.<name>.chairphoto-part-…`, which no scan indexes) and synced.
@@ -482,16 +520,18 @@ fn name_free(path: &Path) -> bool {
 /// created). A crash before the placement leaves only the hidden temporary file.
 pub fn create_new_file(
     wanted: &Path,
+    names: &mut super::free_name::CatalogNames<'_>,
+    arriving: &super::free_name::Arriving,
     fill: impl FnMut(&mut std::fs::File) -> std::io::Result<()>,
 ) -> std::io::Result<PathBuf> {
-    create_new_with(wanted, unique_dest, fill)
+    create_new_with(wanted, |p| names.destination(p, arriving), fill)
 }
 
 /// [`create_new_file`], with the free-name search given — where a test makes a name be taken
 /// after it was found free.
 fn create_new_with(
     wanted: &Path,
-    next_free: impl Fn(&Path) -> Option<PathBuf>,
+    mut next_free: impl FnMut(&Path) -> Option<PathBuf>,
     mut fill: impl FnMut(&mut std::fs::File) -> std::io::Result<()>,
 ) -> std::io::Result<PathBuf> {
     use std::io::{Error, ErrorKind};
@@ -713,6 +753,16 @@ pub(crate) mod test_files {
         ok
     }
 
+    /// Write a sidecar for `photo` carrying `identifier` as its `xmp:Identifier`, whether or
+    /// not `photo` is there — as a sidecar left behind by a deleted original, or another
+    /// tool's (`xmp::write_identifier` refuses a missing original).
+    pub(crate) fn orphan_sidecar(photo: &Path, identifier: &str) {
+        let xml = format!(
+            r#"<x:xmpmeta xmlns:x="adobe:ns:meta/"><rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"><rdf:Description rdf:about="" xmlns:xmp="http://ns.adobe.com/xap/1.0/" xmp:Identifier="{identifier}"/></rdf:RDF></x:xmpmeta>"#
+        );
+        std::fs::write(crate::xmp::sidecar_path(photo), xml).unwrap();
+    }
+
     /// Write a small JPEG at `path` whose EXIF says it was taken at `time`, sub-second
     /// `subsec`, by the body with serial `serial`.
     pub(crate) fn stamped_jpeg(path: &Path, time: &str, subsec: &str, serial: &str) {
@@ -891,7 +941,7 @@ mod tests {
         #[cfg(not(unix))]
         std::fs::write(dir.join("DSC1 (3).ARW"), b"x").unwrap();
         assert_eq!(unique_dest(&dest), Some(dir.join("DSC1 (4).ARW")));
-        let placed = create_new_file(&dest, |f| {
+        let placed = create_new_with(&dest, unique_dest, |f| {
             use std::io::Write;
             f.write_all(b"arriving")
         })
@@ -932,7 +982,7 @@ mod tests {
         let dir = temp("fill-fails");
         let wanted = dir.join("DSC1.ARW");
         std::fs::write(&wanted, b"library").unwrap();
-        let err = create_new_file(&wanted, |_| Err(std::io::Error::other("card pulled"))).unwrap_err();
+        let err = create_new_with(&wanted, unique_dest, |_| Err(std::io::Error::other("card pulled"))).unwrap_err();
         assert_eq!(err.to_string(), "card pulled");
         assert!(!dir.join("DSC1 (2).ARW").exists());
         assert_eq!(std::fs::read(&wanted).unwrap(), b"library");
@@ -955,7 +1005,7 @@ mod tests {
         let dir = temp("part");
         let wanted = dir.join("DSC1.ARW");
         std::fs::write(&wanted, b"library").unwrap();
-        let placed = create_new_file(&wanted, |f| {
+        let placed = create_new_with(&wanted, unique_dest, |f| {
             use std::io::Write;
             f.write_all(b"half")?;
             let during = names(&dir);

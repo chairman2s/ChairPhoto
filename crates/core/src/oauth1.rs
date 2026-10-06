@@ -168,16 +168,61 @@ pub fn query_string(params: &BTreeMap<String, String>) -> String {
         .join("&")
 }
 
-/// `text` with every occurrence of each non-empty `secret` replaced by `[redacted]` — raw,
-/// percent-encoded, and double-encoded (as a signature base string quotes it). For error
-/// text that echoes a service reply: a signature-failure reply can quote the signed request.
+/// Secrets shorter than this are not redacted: a one-letter verifier would shred every word
+/// it occurs in, and a secret that short protects nothing anyway.
+const REDACT_MIN_CHARS: usize = 4;
+
+/// `text` with every occurrence of each `secret` replaced by `[redacted]`. For error text
+/// that echoes a service reply: a signature-failure reply can quote the signed request.
+///
+/// Each secret is matched raw, percent-encoded and double-encoded (as a signature base
+/// string quotes it), with upper- or lowercase hex, and form-encoded (space as `+`). One
+/// left-to-right pass, longest form first, never rescanning what it wrote, so one secret
+/// can't match inside another's replacement. Secrets under [`REDACT_MIN_CHARS`] are skipped.
 pub fn redact(text: &str, secrets: &[&str]) -> String {
-    let mut out = text.to_string();
-    for s in secrets.iter().filter(|s| !s.is_empty()) {
+    fn lower_hex(s: &str) -> String {
+        let mut out = String::with_capacity(s.len());
+        let mut chars = s.chars();
+        while let Some(c) = chars.next() {
+            out.push(c);
+            if c == '%' {
+                for h in chars.by_ref().take(2) {
+                    out.push(h.to_ascii_lowercase());
+                }
+            }
+        }
+        out
+    }
+    let mut forms: Vec<String> = Vec::new();
+    for s in secrets.iter().filter(|s| s.chars().count() >= REDACT_MIN_CHARS) {
+        forms.push(s.to_string());
+        forms.push(s.replace(' ', "+"));
         let once = percent_encode(s);
-        let twice = percent_encode(&once);
-        for form in [twice, once, s.to_string()] {
-            out = out.replace(&form, "[redacted]");
+        let plus = once.replace("%20", "+");
+        // Single-encoded in either hex case, then each of those encoded again (the outer
+        // `%25` has no letters, so case only matters on the inner layer).
+        for f in [lower_hex(&once), lower_hex(&plus), once, plus] {
+            forms.push(percent_encode(&f));
+            forms.push(f);
+        }
+    }
+    forms.sort_by(|a, b| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
+    forms.dedup();
+    if forms.is_empty() {
+        return text.to_string();
+    }
+
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0;
+    while i < text.len() {
+        let rest = &text[i..];
+        if let Some(f) = forms.iter().find(|f| rest.starts_with(f.as_str())) {
+            out.push_str("[redacted]");
+            i += f.len();
+        } else {
+            let c = rest.chars().next().expect("i is on a char boundary");
+            out.push(c);
+            i += c.len_utf8();
         }
     }
     out
@@ -543,6 +588,34 @@ mod tests {
         assert!(!r.contains(&percent_encode(&percent_encode(t))), "{r}");
         assert_eq!(r.matches("[redacted]").count(), 3, "{r}");
         assert_eq!(redact("no secrets here", &[""]), "no secrets here");
+    }
+
+    // The review's examples (claude-fix190 Low-1): short secrets and a secret that occurs in
+    // "[redacted]" must not shred the message.
+    #[test]
+    fn redact_skips_short_secrets_and_never_rescans_its_output() {
+        assert_eq!(redact("tok=T1", &["T1", "act"]), "tok=T1");
+        assert_eq!(
+            redact("oauth_problem=authorization_failed", &["a"]),
+            "oauth_problem=authorization_failed"
+        );
+        // One pass: "redacted" (a secret here) is not found inside the replacement text.
+        assert_eq!(
+            redact("x token-1234 y", &["token-1234", "redacted"]),
+            "x [redacted] y"
+        );
+        // Longest form first: a secret that contains another is hidden whole.
+        assert_eq!(redact("abcd-efgh", &["abcd", "abcd-efgh"]), "[redacted]");
+    }
+
+    // Low-2: lowercase-hex percent-encoding and form-encoding ('+' for space) are covered.
+    #[test]
+    fn redact_covers_lowercase_hex_and_plus_for_space() {
+        let t = "ab/c d+e";
+        for form in ["ab%2fc%20d%2be", "ab%2Fc+d%2Be", "ab%2fc+d%2be", "ab%252fc%2520d%252be", "ab/c+d+e"] {
+            let r = redact(&format!("<{form}>"), &[t]);
+            assert_eq!(r, "<[redacted]>", "form {form}");
+        }
     }
 
     #[test]

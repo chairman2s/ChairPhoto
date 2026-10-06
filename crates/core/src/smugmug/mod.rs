@@ -155,7 +155,7 @@ async fn list_albums_at(
     let albums_path = me["Response"]["User"]["Uris"]["UserAlbums"]["Uri"]
         .as_str()
         .ok_or("SmugMug: couldn't find the user's albums URI")?;
-    let albums_url = format!("{}{albums_path}", ep.api_base);
+    let albums_url = api_url(ep.api_base, albums_path)?;
 
     // 2. The album list (cap the page; album management/creation is out of scope).
     let list = signed_get_json(
@@ -205,7 +205,7 @@ async fn create_album_at(
     let folder = me["Response"]["User"]["Uris"]["Folder"]["Uri"]
         .as_str()
         .ok_or("SmugMug: couldn't find the user's root folder")?;
-    let create_url = format!("{}{folder}!albums", ep.api_base);
+    let create_url = format!("{}!albums", api_url(ep.api_base, folder)?);
 
     // JSON body is NOT part of the OAuth signature (only form-encoded bodies are), so we
     // sign the bare POST like the binary upload.
@@ -233,6 +233,17 @@ async fn create_album_at(
         .to_string();
     let name = album["Name"].as_str().unwrap_or(name).to_string();
     Ok(Album { uri, name })
+}
+
+/// `api_base` joined with a Uri from a SmugMug reply. The reply's Uri must be an absolute
+/// path (`/api/v2/…`): anything else (`.evil.example/x`, `@evil.example/x`, `//evil.example`)
+/// could move the request, and its signed `Authorization` header, to another host.
+fn api_url(api_base: &str, uri: &str) -> Result<String, String> {
+    if uri.starts_with('/') && !uri.starts_with("//") && !uri.contains('\\') {
+        Ok(format!("{api_base}{uri}"))
+    } else {
+        Err(format!("SmugMug returned an unexpected URI: {uri:?}"))
+    }
 }
 
 /// SmugMug UrlName must be a URL-safe TitleCase-ish token starting with a letter.
@@ -505,6 +516,26 @@ mod tests {
         assert_eq!(log[1].query()["count"], "500");
         assert_eq!((log[3].method.as_str(), log[4].method.as_str()), ("POST", "POST"));
         assert_eq!(log[4].body, b"jpeg bytes");
+    }
+
+    // Review claude-fix190 Low-4: a reply Uri that is not an absolute path is refused before
+    // any signed request goes to it.
+    #[tokio::test]
+    async fn reply_uri_that_could_change_host_is_refused() {
+        for bad in [".evil.example/x", "@evil.example/x", "//evil.example/x"] {
+            let reply = format!(
+                r#"{{"Response":{{"User":{{"Uris":{{"UserAlbums":{{"Uri":"{bad}"}},"Folder":{{"Uri":"{bad}"}}}}}}}}}}"#
+            );
+            let s = stub(&[("/api/v2!authuser", reply.as_str())]).await;
+            let u = urls(&s);
+            let err = list_albums_at(&ep(&u), KEY, SECRET, TOKEN, TOKEN_SECRET).await.unwrap_err();
+            assert!(err.contains("unexpected URI"), "{bad}: {err}");
+            let err = create_album_at(&ep(&u), KEY, SECRET, TOKEN, TOKEN_SECRET, "N").await.unwrap_err();
+            assert!(err.contains("unexpected URI"), "{bad}: {err}");
+            let paths: Vec<String> = s.log().iter().map(|r| r.path().to_string()).collect();
+            assert_eq!(paths, ["/api/v2!authuser", "/api/v2!authuser"], "{bad}");
+        }
+        assert_eq!(api_url("https://h", "/api/v2/x").unwrap(), "https://h/api/v2/x");
     }
 
     #[tokio::test]

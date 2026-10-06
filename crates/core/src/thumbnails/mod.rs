@@ -369,6 +369,9 @@ pub fn read_persistent_thumb(key: &OfflineThumbKey) -> Option<Vec<u8>> {
 pub struct OfflineCatalog {
     catalog: uuid::Uuid,
     photos: std::collections::HashSet<uuid::Uuid>,
+    /// Whether [`prune_offline_thumbs`] may remove this catalog's files for photos it does
+    /// not have ([`Self::keep_orphans`]).
+    prune_orphans: bool,
 }
 
 impl OfflineCatalog {
@@ -377,7 +380,20 @@ impl OfflineCatalog {
     pub fn new(catalog: &str, photos: impl IntoIterator<Item = String>) -> Option<Self> {
         let catalog = uuid::Uuid::parse_str(catalog).ok()?;
         let photos = photos.into_iter().filter_map(|p| uuid::Uuid::parse_str(&p).ok()).collect();
-        Some(Self { catalog, photos })
+        Some(Self { catalog, photos, prune_orphans: true })
+    }
+
+    /// The catalog's UUID, as the store names its directory.
+    pub fn catalog_uuid(&self) -> uuid::Uuid {
+        self.catalog
+    }
+
+    /// Keep every file in this catalog's directory, whatever photos it has: another catalog
+    /// may share its UUID (a copy of the file), and the photos this one dropped may be that
+    /// one's — offline, its only tile (review of release/face-thumbs, LOW 2).
+    pub fn keep_orphans(mut self) -> Self {
+        self.prune_orphans = false;
+        self
     }
 }
 
@@ -415,7 +431,26 @@ pub fn mark_offline_catalog_opened(catalog_uuid: &str) {
     let Ok(catalog) = uuid::Uuid::parse_str(catalog_uuid) else { return };
     let dir = persistent_thumb_dir().join(catalog.hyphenated().to_string());
     if is_own_dir(&dir) {
-        let _ = std::fs::write(dir.join(OPENED_MARKER), b"");
+        let _ = write_opened_marker(&dir);
+    }
+}
+
+/// Write `dir`'s [`OPENED_MARKER`] afresh: whatever is at the name is removed first — a
+/// symlink as the link itself, never its target — and the marker is made with `create_new`,
+/// which does not follow a symlink planted meanwhile (review of release/face-thumbs, LOW 1:
+/// a plain write followed one and truncated its target). Another writer marking it at the
+/// same moment is as good (`AlreadyExists` is success).
+fn write_opened_marker(dir: &Path) -> std::io::Result<()> {
+    let marker = dir.join(OPENED_MARKER);
+    match std::fs::remove_file(&marker) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
+    match std::fs::OpenOptions::new().write(true).create_new(true).open(&marker) {
+        Ok(_) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+        Err(e) => Err(e),
     }
 }
 
@@ -437,7 +472,9 @@ fn prune_offline_thumbs_in(store: &Path, open: &OfflineCatalog, now: std::time::
     let older_than = |at: SystemTime, age| now.duration_since(at).is_ok_and(|d| d > age);
     let own = store.join(open.catalog.hyphenated().to_string());
     if is_own_dir(&own) {
-        std::fs::write(own.join(OPENED_MARKER), b"")?;
+        write_opened_marker(&own)?;
+    }
+    if open.prune_orphans && is_own_dir(&own) {
         for entry in std::fs::read_dir(&own)? {
             let entry = entry?;
             let name = entry.file_name();
@@ -472,7 +509,13 @@ fn prune_offline_thumbs_in(store: &Path, open: &OfflineCatalog, now: std::time::
                 .chain(modified(&dir))
                 .max(),
         };
-        if last.is_some_and(|at| older_than(at, UNOPENED_CATALOG_AGE)) && std::fs::remove_dir_all(&dir).is_ok() {
+        // Read the marker again just before removing: a catalog switch may have marked it
+        // since (`mark_offline_catalog_opened`), and an opened catalog keeps its files.
+        let still_unopened = || modified(&dir.join(OPENED_MARKER)).is_none_or(|at| older_than(at, UNOPENED_CATALOG_AGE));
+        if last.is_some_and(|at| older_than(at, UNOPENED_CATALOG_AGE))
+            && still_unopened()
+            && std::fs::remove_dir_all(&dir).is_ok()
+        {
             pruned.catalogs += 1;
         }
     }
@@ -1910,6 +1953,50 @@ pub(crate) mod tests {
         assert!(store.join(open_cat.hyphenated().to_string()).join(OPENED_MARKER).is_file(), "the open catalog is marked");
         // A second prune finds nothing more.
         assert_eq!(prune_offline_thumbs_in(&store, &open, now).unwrap(), Pruned::default());
+    }
+
+    /// Review of release/face-thumbs, LOW 1: a symlink planted at the `.opened` name is
+    /// replaced by a marker of the store's own; its target is never written through.
+    #[test]
+    fn a_symlinked_opened_marker_never_touches_its_target() {
+        let tmp = TestTmpDir::new("offline-marker-symlink");
+        let store = tmp.path().join(PERSIST_DIR);
+        let cat = uuid::Uuid::new_v4();
+        let dir = store.join(cat.hyphenated().to_string());
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = tmp.path().join("precious.txt");
+        std::fs::write(&target, b"keep me").unwrap();
+        std::os::unix::fs::symlink(&target, dir.join(OPENED_MARKER)).unwrap();
+        let open = OfflineCatalog::new(&cat.to_string(), []).unwrap();
+        prune_offline_thumbs_in(&store, &open, std::time::SystemTime::now()).unwrap();
+        assert_eq!(std::fs::read(&target).unwrap(), b"keep me", "the prune's marker");
+        let meta = std::fs::symlink_metadata(dir.join(OPENED_MARKER)).unwrap();
+        assert!(meta.file_type().is_file(), "a marker of its own now");
+        std::fs::remove_file(dir.join(OPENED_MARKER)).unwrap();
+        std::os::unix::fs::symlink(&target, dir.join(OPENED_MARKER)).unwrap();
+        write_opened_marker(&dir).unwrap();
+        assert_eq!(std::fs::read(&target).unwrap(), b"keep me", "a switch's marker");
+        assert!(std::fs::symlink_metadata(dir.join(OPENED_MARKER)).unwrap().file_type().is_file());
+    }
+
+    /// Review of release/face-thumbs, LOW 2: a catalog whose UUID another known catalog shares
+    /// (`keep_orphans`) keeps the files of photos it does not have, however old.
+    #[test]
+    fn a_catalog_that_keeps_orphans_prunes_none() {
+        let tmp = TestTmpDir::new("offline-keep-orphans");
+        let store = tmp.path().join(PERSIST_DIR);
+        let now = std::time::SystemTime::now();
+        let cat = uuid::Uuid::new_v4();
+        let dir = store.join(cat.hyphenated().to_string());
+        std::fs::create_dir_all(&dir).unwrap();
+        let orphan = dir.join(format!("{}.jpg", uuid::Uuid::new_v4().hyphenated()));
+        std::fs::write(&orphan, b"jpeg").unwrap();
+        aged(&orphan, now, ORPHAN_AGE * 2);
+        let open = OfflineCatalog::new(&cat.to_string(), []).unwrap().keep_orphans();
+        assert_eq!(prune_offline_thumbs_in(&store, &open, now).unwrap(), Pruned::default());
+        assert!(orphan.is_file());
+        let open = OfflineCatalog::new(&cat.to_string(), []).unwrap();
+        assert_eq!(prune_offline_thumbs_in(&store, &open, now).unwrap().files, 1, "without it, pruned");
     }
 
     /// The offline thumbnail's key (#258) takes UUIDs only, so nothing else ever reaches its

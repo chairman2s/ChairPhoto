@@ -94,6 +94,32 @@ pub async fn open_default_catalog(state: &AppState) -> Result<PathBuf, String> {
     Ok(catalog_path)
 }
 
+/// Start the one-time migration of the pre-#258 offline thumbnails to the catalog `from` — the
+/// one the front end opened at start-up ([`open_default_catalog`]) — on the blocking pool;
+/// nothing waits on it, and the outcome is logged. A front end calls it once per process,
+/// after the start-up open (not from tests: it works on the real cache directory).
+pub fn spawn_offline_thumbnail_migration(state: &AppState, from: CatalogIdentity) {
+    let state = state.clone();
+    drop(spawn_blocking(move || match adopt_offline_thumbnails(&state, from) {
+        Ok(done) if done != crate::thumbnails::Adopted::default() => {
+            eprintln!("offline thumbnails: migrated the pre-#258 store: {done:?}")
+        }
+        Ok(_) => {}
+        Err(e) => eprintln!("offline thumbnails: pre-#258 store not migrated, kept for the next start: {e}"),
+    }));
+}
+
+/// Migrate the pre-#258 offline thumbnails (`thumbnails::adopt_id_keyed_thumbs`) to the
+/// catalog `from`, reading its keys only while it is still the open one. A failure (or another
+/// catalog open by now) leaves the old store for the next start.
+pub fn adopt_offline_thumbnails(state: &AppState, from: CatalogIdentity) -> Result<crate::thumbnails::Adopted, String> {
+    let Some(ids) = crate::thumbnails::id_keyed_thumb_ids().map_err(|e| e.to_string())? else {
+        return Ok(crate::thumbnails::Adopted::default());
+    };
+    let keys = super::with_catalog_as(state, from, |c| c.offline_thumb_keys(&ids))?;
+    crate::thumbnails::adopt_id_keyed_thumbs(&keys).map_err(|e| e.to_string())
+}
+
 /// `CHAIRPHOTO_LIBRARY_ROOT`, resolved to an absolute override for a *fresh* catalog's
 /// default root, or `None` when it is unset, empty, or rejected — callers fall back to the
 /// real `~/Pictures/Raw` default. See [`open_default_catalog`] for why this can never move

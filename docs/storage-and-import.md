@@ -637,8 +637,14 @@ drained when the NAS volume is detected:
   refreshes it too). The file is keyed by the catalog's UUID and the photo's UUID —
   `<cache>/chairphoto/persist-v2/<catalog uuid>/<photo uuid>.jpg` — never by photo id, which
   another catalog reuses for another photo, and never by the per-open `CatalogIdentity`, which
-  a restart changes (#258). The id-keyed files before #258 are deleted at start-up, not
-  migrated: nothing says which catalog wrote one.
+  a restart changes (#258). The id-keyed files before #258 (`persist/<id>.jpg`) are migrated
+  once, to the catalog opened at start-up (`thumbnails::adopt_id_keyed_thumbs`, off the UI
+  thread): each is copied to that catalog's photo of the id unless the photo already has its
+  own, and `persist/` is removed only once every copy has landed (a failed or interrupted run
+  leaves it for the next start). Nothing records which catalog wrote a file, so another
+  catalog's photo can be adopted — the same tile the old layout showed — until the next
+  render of the reachable original replaces it. An offload whose thumbnail keys cannot be
+  read fails before deleting anything.
 - `restore(photo)` — pull an archived original back to local (e.g. to edit it)
 
 **The ops and verification**: `catalog/lifecycle.rs` + the `app/storage.rs` service bodies

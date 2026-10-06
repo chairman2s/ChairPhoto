@@ -319,6 +319,37 @@ fn another_catalogs_offline_thumbnail_is_never_shown_for_a_colliding_id() {
     assert_eq!(render_image(&state, thumb).unwrap().image.to_rgb8(), a_tile);
 }
 
+/// Review fix258 M1: an offloaded photo's thumbnail kept by a pre-#258 build
+/// (`persist/<id>.jpg`) survives the first start of this one. The start-up catalog adopts it
+/// (`adopt_offline_thumbnails`) before anything removes the old store — the stale-cache
+/// cleanup leaves it alone — and the grid tile of the photo, whose original is away, is that
+/// thumbnail.
+#[test]
+fn an_offloaded_photos_old_thumbnail_survives_the_first_start() {
+    let dir = Fixture::new("media-offline-migrate");
+    let (state, ids) = catalog_with(&dir, &["m.jpg"], |root, n| {
+        write_jpeg(root, n, 900, 600);
+    });
+    let id = ids[0];
+    // What the old build kept, and the original gone home.
+    let old_store = dir.join("cache").join("chairphoto").join("persist");
+    std::fs::create_dir_all(&old_store).unwrap();
+    let kept = write_jpeg(&old_store, &format!("{id}.jpg"), 120, 80);
+    let expected = decode(&std::fs::read(&kept).unwrap());
+    std::fs::remove_file(dir.join("photos").join("m.jpg")).unwrap();
+
+    // The first start: the cleanup thread and the migration.
+    chairphoto_core::thumbnails::cleanup_stale_caches();
+    assert!(old_store.is_dir(), "the cleanup leaves the old store to its migration");
+    let from = chairphoto_core::app::catalog_identity(&state).unwrap();
+    let done = chairphoto_core::app::catalogs::adopt_offline_thumbnails(&state, from).unwrap();
+    assert_eq!(done.copied, 1);
+    assert!(!old_store.exists(), "removed once migrated");
+
+    let tile = render_image(&state, JobKey::photo(id, ImageKind::Thumb)).unwrap().image.to_rgb8();
+    assert_eq!(tile, expected, "the old thumbnail stands in for the offloaded photo");
+}
+
 /// The key survives a restart: it is the catalog's stable UUID, not the per-open
 /// `CatalogIdentity`, so a catalog reopened with its original away still finds its photo's
 /// thumbnail.

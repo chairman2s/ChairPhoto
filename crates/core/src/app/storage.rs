@@ -338,11 +338,13 @@ fn offload_until(
     let mut plan = crate::catalog::resolve_offload_plan(candidates).map_err(|e| crate::catalog::user_reason(&e))?;
     leave_unclaimed(&mut plan.frames, &mut plan.skipped, &claim, |f| f.photo_id);
     // Each member's offline thumbnail key (#258), read in one hold; the thumbnails are made
-    // off the lock. Best-effort like the thumbnails themselves: a failed read keeps none.
+    // off the lock. A failed read fails the offload before anything is deleted (review fix258
+    // N3): freeing the local copies without the thumbnail that keeps the photo visible while
+    // home is away is the one outcome to avoid, and a catalog read failing here is as good a
+    // reason to stop as the plan's own read failing. (A key that cannot exist — a photo whose
+    // UUID is not one — keeps no thumbnail, as a thumbnail that fails to generate never did.)
     let members: Vec<_> = std::iter::once(&plan.named).chain(plan.frames.iter()).collect();
-    let keys = cat
-        .with(|c| members.iter().map(|m| c.offline_thumb_key(m.photo_id)).collect::<crate::catalog::Result<Vec<_>>>())
-        .unwrap_or_default();
+    let keys = cat.with(|c| members.iter().map(|m| c.offline_thumb_key(m.photo_id)).collect::<crate::catalog::Result<Vec<_>>>())?;
     for (member, key) in members.iter().zip(keys) {
         if let (Some(local), Some(key)) = (member.local_files.first(), key) {
             let _ = crate::thumbnails::ensure_persistent_thumb(&key, local);
@@ -543,6 +545,37 @@ mod stack_tests {
         assert!(!jpg.exists());
         assert_eq!(restore_in(&held, claims, master, local, None).unwrap().restored, vec![master, frame]);
         assert!(jpg.exists());
+    }
+
+    /// A [`CatalogAccess`] whose `n`th read (from 1) fails, as a catalog read can.
+    struct FailNth<'a> {
+        catalog: &'a Catalog,
+        n: usize,
+        calls: std::cell::Cell<usize>,
+    }
+
+    impl CatalogAccess for FailNth<'_> {
+        fn with<T>(&self, f: impl FnOnce(&Catalog) -> crate::catalog::Result<T>) -> Result<T, String> {
+            self.calls.set(self.calls.get() + 1);
+            if self.calls.get() == self.n {
+                return Err("injected read failure".into());
+            }
+            self.catalog.with(f)
+        }
+    }
+
+    /// Review fix258 N3: the offline thumbnail keys are the third read of an offload (after
+    /// the claim's and the plan's). If it fails, the offload fails before deleting anything —
+    /// never a freed photo left with no offline thumbnail.
+    #[test]
+    fn an_offload_whose_thumbnail_keys_cannot_be_read_frees_nothing() {
+        let (_dir, state, master, _frame, raw, jpg) = stacked("thumb-keys");
+        backup_photo(&state, master).unwrap();
+        let guard = state.catalog.lock().unwrap();
+        let failing = FailNth { catalog: guard.as_ref().unwrap(), n: 3, calls: std::cell::Cell::new(0) };
+        let err = offload_in(&failing, &state.storage_claims, master, None).unwrap_err();
+        assert_eq!(err, "injected read failure");
+        assert!(raw.exists() && jpg.exists(), "nothing was freed");
     }
 
     /// A claimed offload whose claim was tripped deletes nothing and fails, so its queue

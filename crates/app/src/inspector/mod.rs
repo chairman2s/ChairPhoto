@@ -393,6 +393,10 @@ pub struct PhotoInspector {
     /// The core refuses a second operation on a photo anyway (`StorageClaims`); this keeps a
     /// double-click from starting one and overwriting the first one's message.
     pub storage_running: HashSet<i64>,
+    /// Bumped whenever the photo shown changes, and by every drift read started: a read
+    /// whose number is no longer this one stops before, or while, it hashes the local image
+    /// (review LOW-5) — moving through photos with Storage open hashes only the last.
+    drift_wanted: std::sync::Arc<std::sync::atomic::AtomicU64>,
     /// The photo whose "Replace backup with the local version" is asking for its
     /// confirmation (#257); cleared when the photo or the catalog changes.
     pub replace_confirm: Option<i64>,
@@ -476,6 +480,7 @@ impl PhotoInspector {
             storage_msg: None,
             storage_running: HashSet::new(),
             replace_confirm: None,
+            drift_wanted: Default::default(),
             editors: None,
             editors_reading: false,
             editors_seq: 0,
@@ -537,6 +542,7 @@ impl PhotoInspector {
             self.stack_key = photo.map(|p| (p.1, p.2));
             self.storage_msg = None;
             self.replace_confirm = None;
+            self.drift_wanted.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             self.renaming = None;
             self.publish_version = active_version;
             self.iptc.saved = IptcFields::default();
@@ -684,7 +690,12 @@ impl PhotoInspector {
             self.data.drift.load = Load::Loading;
         }
         let state = self.app.clone();
-        let rx = Runner::get(cx).run(move || chairphoto_core::app::storage::backup_drift_as(&state, from, id));
+        let wanted = self.drift_wanted.clone();
+        let token = wanted.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        let rx = Runner::get(cx).run(move || {
+            let stop = || wanted.load(std::sync::atomic::Ordering::Relaxed) != token;
+            chairphoto_core::app::storage::backup_drift_as(&state, from, id, &stop)
+        });
         cx.spawn(async move |this, cx| {
             let result = rx.await.unwrap_or_else(|_| Err("the worker stopped".into()));
             this.update(cx, |this, cx| {
@@ -725,6 +736,7 @@ impl PhotoInspector {
                 // photos, so none of them is in flight here.
                 self.storage_running.clear();
                 self.replace_confirm = None;
+                self.drift_wanted.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 self.data = PhotoData::default();
                 self.editors = None;
                 self.editors_reading = false;

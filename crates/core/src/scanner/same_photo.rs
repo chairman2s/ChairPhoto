@@ -593,6 +593,17 @@ pub(crate) fn create_hidden(wanted: &Path, tag: &str) -> std::io::Result<(PathBu
     static NEXT: AtomicU64 = AtomicU64::new(0);
     let dir = wanted.parent().unwrap_or_else(|| Path::new("."));
     let name = wanted.file_name().and_then(|s| s.to_str()).unwrap_or("file");
+    // The hidden name adds the tag, the pid and a counter; a name within that of the 255-byte
+    // limit is cut to fit (#231 import N-4), at a character boundary. The name is only for a
+    // person's eye: what a sweep needs is the tag and the pid, and the exclusive create makes
+    // every name unique. (An offload's long names never come here — they keep their own
+    // name in a hidden folder, `catalog::working_files::move_aside`.)
+    let budget = 255 - (4 + tag.len() + 30);
+    let mut cut = name.len().min(budget);
+    while !name.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    let name = &name[..cut];
     loop {
         let n = NEXT.fetch_add(1, Ordering::Relaxed);
         let part = dir.join(format!(".{name}.{tag}-{}-{n}", std::process::id()));

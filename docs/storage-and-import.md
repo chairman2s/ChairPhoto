@@ -514,7 +514,9 @@ Three rules govern carrying:
   **after moving it to a hidden name** in its folder (`.<name>.chairphoto-offload-<pid>-<n>`,
   #256; a name too long for that to fit in 255 bytes goes, under its own name, into a new
   hidden folder `.chairphoto-offload-<pid>-<n>/` beside it instead — never a shortened name,
-  which a crash would leave with nothing to say what it was called): companions first, then the image, each re-hashed there — the image against the
+  which a crash would leave with nothing to say what it was called; a copy's temporary
+  `.chairphoto-part` name, which nothing needs to put back, is cut to fit instead, so such a
+  name can be backed up at all): companions first, then the image, each re-hashed there — the image against the
   verified backup hash, a companion against the hash the carry confirmed at home — and
   freed only with exactly the companions the carry confirmed, never a fresh listing. Then
   it looks at every name it emptied once more, and only then deletes the hidden files. A
@@ -562,17 +564,24 @@ common case was ChairPhoto's own IPTC or GPS write to the sidecar after the back
 owner's decision (#257, 2026-10-06), implemented as follows:
 
 - **ChairPhoto's own sidecar goes home by itself.** When the local `<image>.xmp` differs
-  from the copy at home only because ChairPhoto rewrote it — its `chairphoto:LastWrite` is no
-  earlier than when home was last confirmed to hold that file (the companion's `carried_at`,
-  else the backup's `created_at`), and its mtime is within a few seconds of that stamp, so
-  nothing wrote it after ChairPhoto (`lifecycle::rewritten_by_chairphoto_since`) — the carry
-  of Back up (an existing backup's companion pass, a drained backup op included) and of
-  Offload copies it home again (`carry_companions_home`). The copy at home is first renamed
+  from the copy at home only because ChairPhoto rewrote it (`lifecycle::rewritten_by_chairphoto`)
+  — **home still hashes to what the last carry confirmed** there (`carried_hash`, recorded with
+  every carried companion: a copy edited at home since, by another machine or program, is a
+  two-sided divergence and waits for Replace backup; a row recorded before the hash was kept
+  has none and counts as changed), the local file carries a `chairphoto:LastWrite` no earlier
+  than that confirmation (`carried_at`, else the backup's `created_at`), and **the two differ
+  only in properties ChairPhoto's writers own** (IPTC, GPS, identifier, import batch, face
+  regions, the stamp; `xmp::differs_only_in_chairphoto_fields`, compared by namespace, not by
+  layout or prefix) — the carry of Back up (an existing backup's companion pass, a drained
+  backup op included) and of Offload copies it home again (`carry_companions_home`). A stamp
+  and an mtime alone could not tell ChairPhoto's write from another program's that kept both
+  (tools preserve unknown namespaces; `exiftool -P`, `rsync -t` and `touch -r` keep the
+  mtime), so the content decides. The copy at home is first renamed
   to `<name>.chairphoto-prev-<n>` beside it (the next free `n`, never over a file there and
   never by a copy), then the local version is copied in and verified like any lifecycle
   copy; a copy that fails puts the previous file back under its name. Offload then goes
   ahead. A basename sidecar (`DSC1.xmp`) is darktable's, never ChairPhoto's, and one with no
-  stamp, or written after its stamp by another program, is treated like an image.
+  stamp, or with a change outside what ChairPhoto owns, is treated like an image.
 - **An image, and a companion another program changed, wait for the owner.** The inspector
   offers **Replace backup with the local version** for a backed-up photo whose image no
   longer hashes to its verified backup, or whose companions differ at home for any other
@@ -584,14 +593,21 @@ owner's decision (#257, 2026-10-06), implemented as follows:
   verified hash; offload is then allowed. The image goes first; if a companion fails
   afterwards the image's new hash is still recorded (home holds it by then) and the error
   says what was already replaced. It acts on the photo alone, not its stack: each frame has
-  its own copy at home to answer for.
+  its own copy at home to answer for. A replace interrupted after keeping the earlier image
+  but before copying leaves home without it: Replace and Offload then say so, name the kept
+  `.chairphoto-prev-<n>`, and point to Back up, which copies the local version home again.
+  One interrupted after copying only records when run again — home already holds the local
+  version, so no second copy of it is kept.
 - **"Changed since backup" is a storage status.** With the Storage section open, the
   inspector compares a backed-up photo's local copy with its backup on a worker
   (`storage::backup_drift_as`: the local image hashed against the recorded hash — no read
   at home — and each carried companion against the file at home when home is reachable)
   and shows "Changed since backup" instead of "Backed up", with which files, and whether
   the next Back up or Offload takes them home (ChairPhoto's metadata — a Back up button is
-  shown for it) or only Replace backup does.
+  shown for it) or only Replace backup does. The image's hash is kept for the session by
+  (path, size, mtime), so showing a photo again reads nothing (a rewrite that keeps both the
+  size and the mtime is missed until the next session — Offload still re-hashes), and a
+  comparison the user moved on from stops before or while it reads the image.
 
 **Nothing at home is overwritten or deleted.** A `.chairphoto-prev-<n>` file is visible on
 purpose, so the owner can find the earlier version; it is no image or companion extension,

@@ -172,9 +172,6 @@ impl StorageClaims {
         let mut held = self.held();
         let hold = held.entry((db.to_path_buf(), id)).or_default();
         if hold.op == Some(ClaimKind::Frees) {
-            if hold.is_empty() {
-                held.remove(&(db.to_path_buf(), id));
-            }
             return None;
         }
         hold.writes += 1;
@@ -557,18 +554,31 @@ pub struct ReplaceReport {
 /// How the local copy of a photo read from the catalog `expected` names stands against its
 /// verified backup (#257) — the inspector's "Changed since backup". `None` when there is
 /// nothing to compare (no local copy on disk, or no verified backup). Reads the local image
-/// once to hash it, and the companions at home when home is reachable: a blocking worker,
-/// on a connection of its own to that catalog ([`bound`]). Read-only, so it claims nothing.
+/// once to hash it (once per session while its size and mtime stay the same), and the
+/// companions at home when home is reachable: a blocking worker, on a connection of its own
+/// to that catalog ([`bound`]). Read-only, so it claims nothing. `stop` is asked before it
+/// starts and while it reads the image: once it answers true (the user moved on to another
+/// photo) the comparison ends with [`DRIFT_SUPERSEDED`], having read no further.
 pub fn backup_drift_as(
     state: &AppState,
     expected: super::CatalogIdentity,
     photo_id: i64,
+    stop: &dyn Fn() -> bool,
 ) -> Result<Option<crate::catalog::BackupDrift>, String> {
+    if stop() {
+        return Err(DRIFT_SUPERSEDED.into());
+    }
     let cat = bound(state, expected)?;
     let candidates = cat.with(|c| c.plan_replace_candidates(photo_id))?;
     let Some(plan) = crate::catalog::resolve_replace_plan(candidates) else { return Ok(None) };
-    crate::catalog::backup_drift(&plan).map(Some).map_err(|e| crate::catalog::user_reason(&e))
+    match crate::catalog::backup_drift(&plan, stop).map_err(|e| crate::catalog::user_reason(&e))? {
+        Some(drift) => Ok(Some(drift)),
+        None => Err(DRIFT_SUPERSEDED.into()),
+    }
 }
+
+/// What [`backup_drift_as`] answers when its caller stopped wanting it.
+pub const DRIFT_SUPERSEDED: &str = "the comparison with the backup was superseded";
 
 /// The inspector's confirmed "Replace backup with the local version" (#257) of a photo read
 /// from the catalog `expected` names: every file at home that differs from the local one —
@@ -730,7 +740,39 @@ mod stack_tests {
     // ── #257: a backup the local version moved on from ────────────────────────────────
 
     fn drift(state: &AppState, id: i64) -> crate::catalog::BackupDrift {
-        backup_drift_as(state, super::super::catalog_identity(state).unwrap(), id).unwrap().unwrap()
+        backup_drift_as(state, super::super::catalog_identity(state).unwrap(), id, &|| false).unwrap().unwrap()
+    }
+
+    /// Review LOW-5: the drift check reads a local image once per session while its size and
+    /// mtime stay the same, and reads none of it once its caller has stopped wanting it.
+    #[test]
+    fn the_drift_check_hashes_an_image_once_and_not_at_all_when_superseded() {
+        let (_dir, state, master, _frame, raw, _jpg) = stacked("257-drift-cache");
+        backup_photo(&state, master).unwrap();
+        let from = super::super::catalog_identity(&state).unwrap();
+        assert_eq!(backup_drift_as(&state, from, master, &|| true).unwrap_err(), DRIFT_SUPERSEDED);
+        let asked = std::cell::Cell::new(0);
+        let stop_on_second_ask = || {
+            asked.set(asked.get() + 1);
+            asked.get() > 1
+        };
+        assert_eq!(backup_drift_as(&state, from, master, &stop_on_second_ask).unwrap_err(), DRIFT_SUPERSEDED);
+        assert!(!crate::catalog::drift_hash_cached(&raw), "a superseded read caches nothing");
+
+        assert!(!drift(&state, master).changed());
+        assert!(crate::catalog::drift_hash_cached(&raw));
+        // Unreadable now: a second look is answered from the cache, never the file.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&raw, std::fs::Permissions::from_mode(0o000)).unwrap();
+            let unreadable = std::fs::File::open(&raw).is_err(); // root reads anything
+            assert!(!drift(&state, master).changed());
+            std::fs::set_permissions(&raw, std::fs::Permissions::from_mode(0o644)).unwrap();
+            assert!(unreadable || std::env::var("USER").as_deref() == Ok("root"));
+        }
+        std::fs::write(&raw, b"raw-bytes rewritten").unwrap();
+        assert_eq!(drift(&state, master).image.as_deref(), Some("DSC1.ARW"), "a changed file is read again");
     }
 
     fn replace(state: &AppState, id: i64, confirm: bool) -> Result<ReplaceReport, String> {
@@ -771,6 +813,67 @@ mod stack_tests {
         assert_eq!(std::fs::read(dir.join("nas/2026/08/DSC1.ARW.xmp.chairphoto-prev-2")).unwrap(), second);
     }
 
+    /// Review of release/storage, MEDIUM-1 (probe P1): the copy at home was edited at home
+    /// after the carry — here by ChairPhoto on another machine, so it differs from the local
+    /// rewrite only in what ChairPhoto owns — then ChairPhoto rewrote the local sidecar. That
+    /// is two edits, not ChairPhoto's own: Back up and Offload leave home as it is (no
+    /// `.chairphoto-prev-<n>`), and the inspector says it needs Replace backup.
+    #[test]
+    fn a_sidecar_edited_at_home_since_the_carry_is_never_replaced_by_itself() {
+        let (dir, state, master, _frame, raw, _jpg) = stacked("257-p1-home-edited");
+        crate::xmp::write_gps(&raw, 59.9, 10.7).unwrap();
+        backup_photo(&state, master).unwrap();
+        let home = dir.join("nas/2026/08/DSC1.ARW.xmp");
+        crate::xmp::write_gps(&dir.join("nas/2026/08/DSC1.ARW"), 1.5, 2.5).unwrap(); // at home
+        let at_home = std::fs::read_to_string(&home).unwrap();
+        crate::xmp::write_gps(&raw, 60.4, 5.3).unwrap();
+
+        let d = drift(&state, master);
+        assert_eq!((d.companions.clone(), d.own_sidecars.clone()), (vec!["DSC1.ARW.xmp".to_string()], vec![]), "{d:?}");
+        backup_photo(&state, master).unwrap();
+        assert!(offload_photo(&state, master).unwrap_err().contains("DSC1.ARW.xmp differs from the copy at home"));
+
+        assert_eq!(std::fs::read_to_string(&home).unwrap(), at_home, "home's edit is untouched");
+        assert!(!dir.join("nas/2026/08/DSC1.ARW.xmp.chairphoto-prev-1").exists());
+        assert!(raw.exists());
+    }
+
+    /// Review LOW-2 / NIT-3: a replace interrupted after keeping the earlier image but before
+    /// copying (home's image missing, the earlier one kept beside it) — Replace and Offload
+    /// both point to Back up and name the kept file; Back up recovers. And one interrupted
+    /// after copying but before recording only records when run again, keeping no duplicate.
+    #[test]
+    fn an_interrupted_replace_says_how_to_recover_and_keeps_no_duplicate() {
+        let (dir, state, master, frame, raw, _jpg) = stacked("257-interrupted");
+        backup_photo(&state, master).unwrap();
+        std::fs::write(&raw, b"raw-bytes rewritten").unwrap();
+        let home = dir.join("nas/2026/08/DSC1.ARW");
+        let kept = dir.join("nas/2026/08/DSC1.ARW.chairphoto-prev-1");
+        std::fs::rename(&home, &kept).unwrap(); // the crash: kept, never copied
+
+        let replace_err = replace(&state, master, true).unwrap_err();
+        let offload_err = offload_photo(&state, master).unwrap_err();
+        for err in [&replace_err, &offload_err] {
+            assert!(err.contains("DSC1.ARW.chairphoto-prev-1") && err.contains("Back up"), "{err}");
+        }
+        backup_photo(&state, master).unwrap();
+        assert_eq!(std::fs::read(&home).unwrap(), b"raw-bytes rewritten");
+        assert_eq!(std::fs::read(&kept).unwrap(), b"raw-bytes");
+
+        // The other crash: the local version copied home, its hash never recorded.
+        std::fs::write(&raw, b"raw-bytes rewritten again").unwrap();
+        std::fs::copy(&raw, dir.join("nas/2026/08/.copy")).unwrap();
+        std::fs::rename(&home, dir.join("nas/2026/08/DSC1.ARW.chairphoto-prev-2")).unwrap();
+        std::fs::rename(dir.join("nas/2026/08/.copy"), &home).unwrap();
+        assert!(offload_photo(&state, master).is_err(), "the recorded hash is the earlier one");
+
+        let report = replace(&state, master, true).unwrap();
+
+        assert_eq!(report.replaced, [], "home already holds it: recorded, nothing kept again");
+        assert!(!dir.join("nas/2026/08/DSC1.ARW.chairphoto-prev-3").exists());
+        assert_eq!(offload_photo(&state, master).unwrap().freed, vec![master, frame]);
+    }
+
     /// A sidecar another program changed after the backup is never taken home by itself:
     /// Back up leaves home as it is, Offload refuses, and the inspector's check says it
     /// needs a decision. The confirmed Replace backup takes it home, keeping the earlier copy.
@@ -781,11 +884,12 @@ mod stack_tests {
         backup_photo(&state, master).unwrap();
         let home = dir.join("nas/2026/08/DSC1.ARW.xmp");
         let before = std::fs::read(&home).unwrap();
-        // Another program rewrites it after ChairPhoto's stamp.
+        // Another program adds its own property, keeping ChairPhoto's stamp.
         let sidecar = crate::xmp::sidecar_path(&raw);
-        std::fs::write(&sidecar, [before.as_slice(), b"<!-- darktable -->"].concat()).unwrap();
-        let later = std::time::SystemTime::now() + std::time::Duration::from_secs(60);
-        std::fs::File::options().write(true).open(&sidecar).unwrap().set_modified(later).unwrap();
+        let xml = String::from_utf8(before.clone()).unwrap();
+        assert!(xml.contains("</rdf:Description>"), "{xml}");
+        let foreign = r#"<darktable:history_end xmlns:darktable="http://darktable.sf.net/">3</darktable:history_end></rdf:Description>"#;
+        std::fs::write(&sidecar, xml.replacen("</rdf:Description>", foreign, 1)).unwrap();
 
         let d = drift(&state, master);
         assert!(d.needs_replace(), "{d:?}");
@@ -1412,12 +1516,6 @@ mod stack_tests {
         assert!(!claims.is_claimed(a, 5));
     }
 
-    /// **Forced interleaving.** While an offload of a stack is part-way through (its first
-    /// ownership check, before anything is deleted), a second offload, a restore and a
-    /// backup — of the master, or of its frame directly — are each refused with
-    /// [`IN_PROGRESS`], touching nothing; the offload then finishes, and a restore after it
-    /// runs. Without the claim the restore would add a row the offload's commit could drop,
-    /// and a second offload would race the first's deletes.
     /// LOW-5 of the #256 review: a sidecar write and an operation that keeps the local files
     /// (backup, restore, relocate) hold a photo side by side; only an operation that frees
     /// them (offload, Empty Trash) and a sidecar write exclude each other, whichever came
@@ -1479,6 +1577,12 @@ mod stack_tests {
         assert_eq!(with_catalog(&state, |c| c.resolve_photo_path(master)).unwrap(), Some(raw));
     }
 
+    /// **Forced interleaving.** While an offload of a stack is part-way through (its first
+    /// ownership check, before anything is deleted), a second offload, a restore and a
+    /// backup — of the master, or of its frame directly — are each refused with
+    /// [`IN_PROGRESS`], touching nothing; the offload then finishes, and a restore after it
+    /// runs. Without the claim the restore would add a row the offload's commit could drop,
+    /// and a second offload would race the first's deletes.
     #[test]
     fn a_second_verb_on_a_moment_in_flight_is_refused() {
         let (_dir, state, master, frame, raw, jpg) = stacked("claim-verbs");

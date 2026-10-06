@@ -1001,6 +1001,37 @@ fn a_photo_changed_since_backup_says_so_and_replaces_its_backup_once_confirmed(c
     assert!(!present(&app, "storage-replace", cx));
 }
 
+/// Review LOW-5: moving on to another photo before a queued comparison runs means that photo's
+/// image is never read; only the photo now shown is hashed.
+#[gpui_kit::test]
+fn moving_on_before_the_drift_check_runs_reads_nothing_of_the_photo_left(cx: &mut TestAppContext) {
+    let dir = TempDir::new("insp-storage-drift-moved");
+    let app = start(cx);
+    let ids = open_catalog_with_photos(&app, &dir, 2, cx);
+    let nas = dir.0.join("nas");
+    std::fs::create_dir_all(dir.0.join("photos/2026")).unwrap();
+    std::fs::create_dir_all(&nas).unwrap();
+    let raws: Vec<_> = (0..2).map(|i| dir.0.join(format!("photos/2026/p{i}.ARW"))).collect();
+    for (i, raw) in raws.iter().enumerate() {
+        std::fs::write(raw, format!("raw-{i}")).unwrap();
+    }
+    catalog(&app, |c| {
+        let nas = c.add_volume("NAS", &nas, chairphoto_core::catalog::VolumeKind::Backup).unwrap();
+        for id in &ids {
+            c.backup_photo(*id, nas).unwrap();
+        }
+    });
+    select(&app, ids[0], SelectMods::default(), cx);
+    if !present(&app, "storage-msg", cx) {
+        click(&app, "section-storage", cx);
+    }
+    select(&app, ids[1], SelectMods::default(), cx);
+    work(cx);
+
+    assert!(!chairphoto_core::catalog::drift_hash_cached(&raws[0]), "the photo left was never read");
+    assert!(chairphoto_core::catalog::drift_hash_cached(&raws[1]), "the photo shown was");
+}
+
 /// #257: the replace question belongs to the photo it was asked for — choosing another
 /// photo or a catalog switch drops it, so a confirm can never replace another photo's backup.
 #[gpui_kit::test]

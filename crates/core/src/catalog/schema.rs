@@ -345,6 +345,10 @@ CREATE TABLE IF NOT EXISTS photo_location_companions (
     source_mtime_seen INTEGER,
     -- When it was carried. NULL alongside a NULL `carried_mtime`.
     carried_at    INTEGER,
+    -- SHA-256 of the bytes the carry confirmed identical on both sides (#257): what home
+    -- held then, so an automatic re-backup can tell a copy changed at home since. NULL for
+    -- a row recorded before the column existed (added by `ensure_column` there).
+    carried_hash  TEXT,
     PRIMARY KEY (location_id, name)
 );
 

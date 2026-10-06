@@ -875,6 +875,28 @@ impl Catalog {
         Ok(ReplaceCandidates { photo_id, locals: self.copies_on_kind(photo_id, VolumeKind::Local)?, verified_backups })
     }
 
+    /// Adopt what a check found identical on both sides as carried (review relA2, LOW-B): a
+    /// companion row at backup copy `location_id` with no `carried_hash` — recorded before the
+    /// column existed, or never — gets the confirmed hash, as a carry would have recorded it.
+    /// A row that has a hash is left as it is (the carry that recorded it is the reference),
+    /// so this can only heal, never move a reference past a change.
+    pub fn adopt_carried(&self, location_id: i64, adopt: &[CarriedCompanion]) -> Result<()> {
+        let at = now();
+        for c in adopt {
+            self.conn.execute(
+                "INSERT INTO photo_location_companions(location_id, name, carried_mtime, carried_at, carried_hash)
+                 VALUES(?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT(location_id, name)
+                 DO UPDATE SET carried_mtime = excluded.carried_mtime,
+                               carried_at    = excluded.carried_at,
+                               carried_hash  = excluded.carried_hash
+                 WHERE carried_hash IS NULL",
+                params![location_id, c.name, c.source_mtime, at, c.hash],
+            )?;
+        }
+        Ok(())
+    }
+
     /// Record a replaced backup (#257): the backup copy `location_id` of `photo_id` now holds
     /// the image hashing to `hash`, and the companions `carried`. One transaction; a row that
     /// is gone (the photo deleted meanwhile) is an error, with nothing recorded.
@@ -1381,14 +1403,13 @@ pub fn rewritten_by_chairphoto(found: &crate::companions::Found, home: &Path, ho
 pub fn missing_backup_hint(backup: &Path) -> Option<String> {
     let (dir, file) = (backup.parent()?, backup.file_name()?.to_str()?);
     let prefix = format!("{file}.{PREV_TAG}-");
-    let mut kept: Vec<String> = std::fs::read_dir(dir)
+    // The highest number, compared as a number: prev-10 is newer than prev-9 (review relA2).
+    let (_, last) = std::fs::read_dir(dir)
         .ok()?
         .flatten()
         .filter_map(|e| e.file_name().to_str().map(str::to_string))
-        .filter(|n| n.starts_with(&prefix))
-        .collect();
-    kept.sort();
-    let last = kept.last()?;
+        .filter_map(|n| Some((n.strip_prefix(&prefix)?.parse::<u32>().ok()?, n)))
+        .max()?;
     Some(format!(
         "the backup copy of {file} is missing at home (the earlier version is kept there as {last}) — Back up copies the local version home again"
     ))
@@ -1615,14 +1636,22 @@ fn drift_hash(path: &Path, stop: &dyn Fn() -> bool) -> Result<Option<String>> {
 /// carried companion against the file at home when home is reachable. File IO off the
 /// catalog lock. `Ok(None)` when `stop` answered true before the image was read through —
 /// the caller no longer wants it.
-pub fn backup_drift(plan: &PhotoReplace, stop: &dyn Fn() -> bool) -> Result<Option<BackupDrift>> {
+///
+/// Also returns the companions it found byte-identical on both sides that home has no
+/// recorded hash for (a row from before `carried_hash`, review relA2 LOW-B), for the caller
+/// to adopt ([`Catalog::adopt_carried`]): the check itself has just confirmed what home holds.
+pub fn backup_drift(
+    plan: &PhotoReplace,
+    stop: &dyn Fn() -> bool,
+) -> Result<Option<(BackupDrift, Vec<CarriedCompanion>)>> {
     let mut drift = BackupDrift { home_unreachable: !plan.home_reachable, ..Default::default() };
+    let mut adopt = Vec::new();
     let Some(hash) = drift_hash(&plan.local, stop)? else { return Ok(None) };
     if hash != plan.expected_hash {
         drift.image = Some(name(&plan.local));
     }
     if !plan.home_reachable {
-        return Ok(Some(drift));
+        return Ok(Some((drift, adopt)));
     }
     for found in crate::companions::carried_beside(&plan.local) {
         let home = found.destination(&plan.backup_abs);
@@ -1632,6 +1661,14 @@ pub fn backup_drift(plan: &PhotoReplace, stop: &dyn Fn() -> bool) -> Result<Opti
         }
         let home_hash = sha256_file(&home)?;
         if sha256_file(&found.path)? == home_hash {
+            if !plan.stamps.carried_hash.contains_key(&found.name()) {
+                adopt.push(CarriedCompanion {
+                    name: found.name(),
+                    source_mtime: mtime_secs(&found.path)?,
+                    source: found.path.clone(),
+                    hash: home_hash,
+                });
+            }
             continue;
         }
         if rewritten_by_chairphoto(&found, &home, &home_hash, &plan.stamps) {
@@ -1640,7 +1677,7 @@ pub fn backup_drift(plan: &PhotoReplace, stop: &dyn Fn() -> bool) -> Result<Opti
             drift.companions.push(found.name());
         }
     }
-    Ok(Some(drift))
+    Ok(Some((drift, adopt)))
 }
 
 /// What [`replace_backup_with_local`] did — recorded whatever happened, since a file it
@@ -1676,9 +1713,12 @@ pub fn replace_backup_with_local(plan: &PhotoReplace) -> Result<ReplaceOutcome> 
     }
     let mut out = ReplaceOutcome::default();
     let local_hash = sha256_file(&plan.local)?;
-    // Home already holding the local version — a replace that copied it and stopped before
-    // recording — only needs recording, never another kept copy of the same bytes (NIT-3).
-    out.hash = if sha256_file(&plan.backup_abs)? == local_hash {
+    // Only what the drift check lists (review relA2, LOW-A): the image only when the local one
+    // moved on from its recorded hash — an unchanged local image leaves home's alone, unread
+    // over the NAS, whatever is there. Then home is read once: already holding the local
+    // version — a replace that copied it and stopped before recording — it only needs
+    // recording, never another kept copy of the same bytes (NIT-3).
+    out.hash = if local_hash == plan.expected_hash || sha256_file(&plan.backup_abs)? == local_hash {
         local_hash
     } else {
         let replaced = replace_at_home(&plan.local, &plan.backup_abs)?;

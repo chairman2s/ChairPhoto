@@ -629,15 +629,11 @@ pub(crate) fn create_part(wanted: &Path) -> std::io::Result<(PathBuf, std::fs::F
     create_hidden_named(wanted, &part_name(name), PART_TAG)
 }
 
-/// The longest file name most filesystems take, in bytes (`NAME_MAX`).
-const NAME_MAX: usize = 255;
-
 /// `name` as a copy's temporary name carries it: unchanged when `.<name>.<PART_TAG>-<pid>-<n>`
 /// fits in [`NAME_MAX`] whatever the pid and counter, else its first bytes (on a character
 /// boundary), `~`, and 16 hex digits of its SHA-256.
 fn part_name(name: &str) -> String {
-    // `.` + name + `.` + tag + `-` + up to 10 pid digits + `-` + up to 20 counter digits.
-    let room = NAME_MAX - (1 + 1 + PART_TAG.len() + 1 + 10 + 1 + 20);
+    let room = NAME_MAX - hidden_overhead(PART_TAG);
     if name.len() <= room {
         return name.to_string();
     }
@@ -649,6 +645,17 @@ fn part_name(name: &str) -> String {
         cut -= 1;
     }
     format!("{}~{hex}", &name[..cut])
+}
+
+/// The longest file name the filesystems a library lives on take, in bytes (`NAME_MAX`).
+pub(crate) const NAME_MAX: usize = 255;
+
+/// What `.<name>.<tag>-<pid>-<n>` adds to a name at most: the two dots, the tag, the two
+/// dashes, a 10-digit pid and a 20-digit counter. Shared with the offload's own long-name rule
+/// (`catalog::working_files::move_aside`), so a name this cuts is never one an offload moves
+/// aside by its hidden name — recovery reads the original name back from that one.
+pub(crate) const fn hidden_overhead(tag: &str) -> usize {
+    4 + tag.len() + 30
 }
 
 /// A new hidden file beside `wanted`, `.<name>.<tag>-<pid>-<n>`, created exclusively under a
@@ -671,7 +678,7 @@ fn create_hidden_named(wanted: &Path, name: &str, tag: &str) -> std::io::Result<
     // tag and the pid, and the exclusive create makes every name unique. (An offload's long
     // names never come here — they keep their own name in a hidden folder,
     // `catalog::working_files::move_aside`.)
-    let budget = NAME_MAX - (4 + tag.len() + 30);
+    let budget = NAME_MAX - hidden_overhead(tag);
     let mut cut = name.len().min(budget);
     while !name.is_char_boundary(cut) {
         cut -= 1;

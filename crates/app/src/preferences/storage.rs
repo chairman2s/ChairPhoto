@@ -723,7 +723,7 @@ mod tests {
         assert_eq!(removed_line(Removal::Empty, 3), "Removed 3 empty entries (no files deleted).");
         assert_eq!(compact_line(120 << 20, 80 << 20), "Compacted: 120 MB → 80 MB (reclaimed 40 MB).");
         assert_eq!(compact_line(80 << 20, 80 << 20), "Already compact (80 MB).");
-        let r = ScanResult { scanned: 4, imported: 4, created: 3, errors: 1, skipped: 0 };
+        let r = ScanResult { scanned: 4, imported: 4, created: 3, errors: 1, skipped: 0, ..Default::default() };
         assert_eq!(nas_index_line(&r), "Indexed 3 new photo(s) from the NAS, 1 errors. Find them under the \"On NAS\" filter.");
     }
 

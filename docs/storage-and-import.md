@@ -879,7 +879,29 @@ Two modes over the same core location model:
   crash guarantee. A name is free only when
   nothing is at it and nothing at its sidecar's name (`<name>.xmp`) either: a sidecar with
   no original beside it (another tool's, or one whose original was removed) belongs to some
-  other photo, and a new file placed beside it would adopt its identity and metadata. File mtime is never evidence (a
+  other photo, and a new file placed beside it would adopt its identity and metadata. Nor is
+  a name free that a catalog row holds (#247) — by its logical path, or by one of its
+  locations (any role) under that location's own volume base, its file there or not
+  (missing storage is normal): indexing matches
+  by path, so a new file there would take that row's identity, rating and tags. The catalog
+  is read once per date folder per import (`scanner::free_name::CatalogNames`), on the
+  import's own connection to the catalog it started against, never the one open since.
+  **One exception re-links instead of minting** (L-f of the third #246 review): a name whose
+  file is gone, held by the logical path of exactly one row, goes to the arriving file that
+  *is* that row's photo — for a card's file, its stamp against the capture metadata the row
+  stores must prove it without contents to compare (the row's file is gone): #246's rule
+  says the same capture **and** a sub-second or a serial is present, and equal, on both
+  sides (`same_photo::same_capture_without_contents`). The same second with a serial
+  missing on either side (the catalog's `-fast2` extraction skips MakerNotes serials) and
+  no sub-second on both could be another body's shot, so it re-links nothing, and neither
+  does no capture time; for a bundle's original, the bundle gives
+  it the row's identity — and only when the sidecar at that name, if any, carries the row's
+  identity and no other (one of another identity, of none, or that does not parse keeps the
+  name taken, and is left untouched). The file is placed at that name, even past a free
+  plain name, and indexing re-links the row: missing cleared, its rating, tags and edits
+  kept, no second row. So a photo deleted outside the app and imported again from its card
+  comes back to its row. Every other arriving file goes on to the next free ` (n)` with a
+  row of its own: a different capture is never attached to an old row. File mtime is never evidence (a
   copy changes it). The ` (n)` names an earlier import gave are checked too (every one in
   the folder, past a gap in the numbers or with the plain name gone), so importing a
   card again skips every file. Each date folder is listed once per import
@@ -905,7 +927,8 @@ held only those files: rows and identity sidecars, the import batch (and its UUI
 sidecars), queued backups, auto-tags and geofence tags; for a bundle, the merge runs over
 the manifest narrowed to those photos, so the originals not yet indexed are not inserted as
 metadata-only rows. Indexing always writes the catalog the import started against (its own
-connection to that file), never one opened since. The report says how many were indexed;
+connection to that file, opened before the copy, which reads the names that catalog's rows
+hold through it), never one opened since. The report says how many were indexed;
 the rest wait for a rescan (card) or a second import of the bundle, which matches what is
 already there by UUID.
 
@@ -1009,7 +1032,10 @@ The importer (`bundle/importer.rs`) runs in three phases:
 1. **Parse** — open the zip, validate `format_version`.
 2. **Copy** (off the catalog lock) — extract `originals/` into `<root>/YYYY/MM/DD/`;
    a collision is decided by card ingest's rule (#246): the same name, size and capture →
-   already imported, skip; anything else → rename with ` (n)` suffix; never overwrite. The
+   already imported, skip; anything else → rename with ` (n)` suffix; never overwrite. A
+   name a catalog row holds is not free either, its file gone or not (#247, as for a card),
+   unless that row has the bundle photo's identity and no sidecar there says otherwise: the
+   original then goes back to the row's name and the index phase re-links the row. The
    bundle's side is read from the original's bytes in memory (the manifest carries no
    capture time or serial), never written anywhere to be compared: one exiftool process
    reads the bytes from stdin and the library files from their paths, with one set of

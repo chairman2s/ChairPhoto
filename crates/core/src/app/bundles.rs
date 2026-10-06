@@ -8,7 +8,7 @@
 //! What it already unpacked stays in the library folder (never deleted); importing the
 //! bundle again finishes it.
 
-use super::scans::{library_root, IMPORT_CANCELLED};
+use super::scans::IMPORT_CANCELLED;
 use super::{AppState, CoreEvent, EventSink, ImportProgress};
 use crate::bundle::importer::BundleImportResult;
 use std::path::Path;
@@ -80,22 +80,26 @@ fn import_bundle_claimed_with(
     if abort.load(Ordering::Relaxed) {
         return Err(format!("{IMPORT_CANCELLED} before the bundle was opened."));
     }
-    let dest = library_root(state)?;
-    let db_path = {
+    // The root and the database are read under one lock, so they are one catalog's.
+    let (db_path, dest) = {
         let guard = state.catalog.lock().map_err(|e| e.to_string())?;
-        guard.as_ref().ok_or("No catalog is open")?.db_path().to_path_buf()
+        let catalog = guard.as_ref().ok_or("No catalog is open")?;
+        (catalog.db_path().to_path_buf(), catalog.root().to_path_buf())
     };
     let (manifest, mut archive) = crate::bundle::importer::open_bundle(bundle_path)?;
+    // The import's own connection to the catalog it started against, opened before the
+    // unpack: the unpack reads the names its rows hold (#247), and the index phase writes
+    // through it. A switch meanwhile never redirects either to the catalog opened since.
+    let sec = crate::catalog::Catalog::open_secondary(&db_path, &dest).map_err(|e| e.to_string())?;
     let (extracted, partial, aborted) = {
         let events = state.clone();
-        crate::bundle::importer::extract_originals_abortable(&manifest, &mut archive, &dest, abort, move |done, total| {
+        crate::bundle::importer::extract_originals_abortable(&sec, &manifest, &mut archive, &dest, abort, move |done, total| {
             events.send(CoreEvent::ImportProgress(ImportProgress { job, done, total }))
         })?
     };
     if aborted || abort.load(Ordering::Relaxed) {
         return Err(cancelled_message(partial.copied));
     }
-    let sec = crate::catalog::Catalog::open_secondary(&db_path, &dest).map_err(|e| e.to_string())?;
     // Stops before its next original once the flag trips (Cancel, a newer import, a switch),
     // with the originals indexed so far imported whole (`index_bundle_abortable`).
     let indexed =

@@ -50,6 +50,10 @@ pub struct BundleImportResult {
     pub skipped_duplicate: usize,
     /// Originals that encountered a non-fatal error during extraction (metadata-only).
     pub errors: usize,
+    /// Originals unpacked back onto the row of their identity that had lost its file — the
+    /// row re-linked, not a new one (#247) — and how many of those rows are in the trash.
+    pub restored: usize,
+    pub restored_trashed: usize,
     /// What the F1c merge did (new photos, new tags, etc.).
     pub merge: MergeSummary,
 }
@@ -120,17 +124,22 @@ pub struct ExtractedItem {
 ///   capture time, sub-second and camera serial agree, or, with no capture time on either
 ///   side, the contents — is this photo, already imported → `skipped_duplicate` (no write).
 /// - Any other collision → ` (n)` suffix (never overwrite).
+/// - A name `catalog`'s rows hold is not free, even with its file gone (#247), unless the
+///   row has this photo's identity: the original then goes back to that name and the index
+///   phase re-links the row ([`free_name`](crate::scanner::free_name)). `catalog` is the
+///   catalog the import indexes into, read on the import's own connection.
 ///
 /// `on_progress(done, total)` is called once per original (including skipped/error)
 /// so the caller can stream `import:progress` events.
 pub fn extract_originals(
+    catalog: &Catalog,
     manifest: &BundleManifest,
     archive: &mut ZipArchive<std::fs::File>,
     dest_base: &Path,
     on_progress: impl Fn(usize, usize),
 ) -> Result<(Vec<ExtractedItem>, BundleImportResult), String> {
     let never = std::sync::atomic::AtomicBool::new(false);
-    extract_originals_abortable(manifest, archive, dest_base, &never, on_progress)
+    extract_originals_abortable(catalog, manifest, archive, dest_base, &never, on_progress)
         .map(|(extracted, result, _)| (extracted, result))
 }
 
@@ -151,6 +160,7 @@ pub fn extract_originals(
 /// to be compared, so re-importing a bundle the library already holds writes nothing to the
 /// library's disk.
 pub fn extract_originals_abortable(
+    catalog: &Catalog,
     manifest: &BundleManifest,
     archive: &mut ZipArchive<std::fs::File>,
     dest_base: &Path,
@@ -164,11 +174,15 @@ pub fn extract_originals_abortable(
         copied: 0,
         skipped_duplicate: 0,
         errors: 0,
+        restored: 0,
+        restored_trashed: 0,
         merge: MergeSummary::default(),
     };
     let mut extracted: Vec<ExtractedItem> = Vec::new();
     // Each date folder is listed once for the unpack, and told of every name placed in it.
     let mut listings = same_photo::FolderListings::default();
+    // The names the catalog's rows hold, read once per date folder (#247).
+    let mut names = crate::scanner::free_name::CatalogNames::new(catalog);
 
     for (i, bp) in manifest.photos.iter().enumerate() {
         if abort.load(std::sync::atomic::Ordering::Relaxed) {
@@ -261,9 +275,12 @@ pub fn extract_originals_abortable(
             continue;
         }
 
-        // Any other collision is a different photo → ` (n)`, claimed so that a file placed
-        // there meanwhile is never overwritten.
-        let placed = same_photo::create_new_file(&dest, |file| {
+        // Any other collision — with a file, or with a catalog row whose file is gone — is a
+        // different photo → ` (n)`, claimed so that a file placed there meanwhile is never
+        // overwritten. The name of a row with this photo's identity is its own: the original
+        // goes back there, and indexing re-links the row (#247).
+        let arriving = crate::scanner::free_name::Arriving::Identity(crate::catalog::photo_identity_for(&bp.uuid));
+        let placed = same_photo::create_new_file(&dest, &mut names, &arriving, |file| {
             use std::io::Write;
             file.write_all(&orig_bytes)
         });
@@ -296,7 +313,8 @@ pub fn extract_originals_abortable(
 /// 1. If the bundle carries a sidecar for this original, extract it as-is (it already
 ///    contains `xmp:Identifier`) — as a new file only: an existing file at the sidecar's name
 ///    is never replaced (`dest` was chosen with that name free, so one there now is another
-///    program's, and is left as it is).
+///    program's, and is left as it is — or, where `dest` re-links the row of this photo's
+///    identity (#247), the row's own sidecar, already carrying that identity).
 /// 2. Otherwise, write a fresh merge-safe UUID sidecar from the bundle UUID now, before the
 ///    index phase runs — this is the binding invariant (AGENTS.md). A failure here is not
 ///    the end of it — the photo has no catalog row yet, so index_bundle is the one that
@@ -315,7 +333,8 @@ fn place_sidecar(
     };
     let arc_sidecar = format!("{}.xmp", arc_orig);
     // Never over an existing file: `dest` was chosen with its sidecar's name free
-    // (`same_photo::unique_dest`), so one there now appeared meanwhile and is someone else's.
+    // (`free_name::CatalogNames::destination`), so one there now appeared meanwhile and is
+    // someone else's — or is the sidecar of the row `dest` re-links, of this identity.
     let write_new = |bytes: &[u8]| -> std::io::Result<()> {
         use std::io::Write;
         let mut file = std::fs::OpenOptions::new().write(true).create_new(true).open(&sidecar_dest)?;
@@ -566,6 +585,13 @@ pub(crate) fn index_bundle_with(
             .is_none_or(|identity| identity == upsert.uuid);
         if upsert.created {
             newly_created.push(upsert.id);
+        } else if !item.already_in_library {
+            // An original unpacked onto a row that had lost its file: restored, not added
+            // (#247). Counted with whether it is in the trash, so it is not invisible.
+            partial_result.restored += 1;
+            if catalog.is_trashed(upsert.id).unwrap_or(false) {
+                partial_result.restored_trashed += 1;
+            }
         }
         if upsert.created && bundles_own {
             fresh.insert(upsert.id);
@@ -900,6 +926,13 @@ mod tests {
         (catalog, dir.into_subpath("photos"))
     }
 
+    /// A catalog of no photos rooted at `root`, for an unpack test that indexes nothing: its
+    /// database is a hidden file in `root`, which no unpack touches.
+    fn empty_catalog(root: &Path) -> Catalog {
+        std::fs::create_dir_all(root).unwrap();
+        Catalog::open(&root.join(".test.chairphoto"), root).unwrap()
+    }
+
     /// Build a minimal bundle zip with one "original" file (fake bytes) and write it
     /// to a temp path.
     fn make_test_bundle(
@@ -1043,7 +1076,7 @@ mod tests {
         assert_eq!(std::fs::metadata(&same).unwrap().len(), std::fs::metadata(&other).unwrap().len());
 
         let (manifest, mut archive) = open_bundle(&bundle_path).unwrap();
-        let (extracted, partial) = extract_originals(&manifest, &mut archive, &root, |_, _| {}).unwrap();
+        let (extracted, partial) = extract_originals(&catalog, &manifest, &mut archive, &root, |_, _| {}).unwrap();
         assert_eq!((partial.skipped_duplicate, partial.copied, partial.errors), (1, 1, 0));
         let kept = root.join("2026/06/29/DSC1 (2).jpg");
         assert_eq!(std::fs::read(&kept).unwrap(), std::fs::read(&other).unwrap());
@@ -1059,7 +1092,7 @@ mod tests {
         assert_eq!(other_row.path, "2026/06/29/DSC1 (2).jpg");
 
         let (manifest, mut archive) = open_bundle(&bundle_path).unwrap();
-        let (_, again) = extract_originals(&manifest, &mut archive, &root, |_, _| {}).unwrap();
+        let (_, again) = extract_originals(&catalog, &manifest, &mut archive, &root, |_, _| {}).unwrap();
         assert_eq!((again.skipped_duplicate, again.copied), (2, 0), "a second import skips both");
         assert!(!root.join("2026/06/29/DSC1 (3).jpg").exists());
     }
@@ -1097,7 +1130,7 @@ mod tests {
                 sidecar,
             );
             let (manifest, mut archive) = open_bundle(&bundle_path).unwrap();
-            let (extracted, partial) = extract_originals(&manifest, &mut archive, &root, |_, _| {}).unwrap();
+            let (extracted, partial) = extract_originals(&catalog, &manifest, &mut archive, &root, |_, _| {}).unwrap();
             assert_eq!((partial.copied, partial.skipped_duplicate, partial.errors), (1, 0, 0), "{tag}");
             let placed = dir.join("DSC01234 (3).ARW");
             assert_eq!(std::fs::read(&placed).unwrap(), b"FAKE RAW BYTES", "{tag}");
@@ -1138,7 +1171,7 @@ mod tests {
         std::fs::create_dir_all(&day).unwrap();
         std::fs::write(day.join("DSC1.ARW"), b"FAKE RAW ONE").unwrap();
         let (manifest, mut archive) = open_bundle(&bundle_path).unwrap();
-        let (_, partial) = extract_originals(&manifest, &mut archive, &dest_base, |_, _| {}).unwrap();
+        let (_, partial) = extract_originals(&empty_catalog(&dest_base), &manifest, &mut archive, &dest_base, |_, _| {}).unwrap();
         assert_eq!((partial.copied, partial.skipped_duplicate), (1, 1), "{partial:?}");
         assert_eq!(std::fs::read(day.join("DSC1 (2).ARW")).unwrap(), b"FAKE RAW TWO");
         assert_eq!(std::fs::read(day.join("DSC1.ARW")).unwrap(), b"FAKE RAW ONE");
@@ -1199,7 +1232,7 @@ mod tests {
             }
             let abort = AtomicBool::new(false);
             let (_, partial, aborted) =
-                extract_originals_abortable(&manifest, &mut archive, &dest_base, &abort, |done, _| {
+                extract_originals_abortable(&empty_catalog(&dest_base), &manifest, &mut archive, &dest_base, &abort, |done, _| {
                     if done == stop_after {
                         abort.store(true, Ordering::Relaxed)
                     }
@@ -1248,13 +1281,13 @@ mod tests {
         let bundle_path = bundle_of("246-again", photos);
         let (catalog, root) = temp_catalog("246-again");
         let (manifest, mut archive) = open_bundle(&bundle_path).unwrap();
-        let (extracted, partial) = extract_originals(&manifest, &mut archive, &root, |_, _| {}).unwrap();
+        let (extracted, partial) = extract_originals(&catalog, &manifest, &mut archive, &root, |_, _| {}).unwrap();
         assert_eq!(partial.copied, 3);
         index_bundle(&catalog, &manifest, &extracted, &root, partial).unwrap();
 
         let before = tree_snapshot(&root);
         let (manifest, mut archive) = open_bundle(&bundle_path).unwrap();
-        let (_, again) = extract_originals(&manifest, &mut archive, &root, |_, _| {
+        let (_, again) = extract_originals(&catalog, &manifest, &mut archive, &root, |_, _| {
             assert_eq!(tree_snapshot(&root), before, "the library is unchanged during the unpack");
         })
         .unwrap();
@@ -1280,7 +1313,7 @@ mod tests {
 
         let dest_base = temp_dir("extract-dest");
         let (extracted, partial) =
-            extract_originals(&manifest, &mut archive, &dest_base, |_, _| {})
+            extract_originals(&empty_catalog(&dest_base), &manifest, &mut archive, &dest_base, |_, _| {})
                 .expect("extract_originals");
 
         assert_eq!(partial.copied, 1);
@@ -1306,7 +1339,7 @@ mod tests {
         std::fs::write(date_dir.join("DSC01234.ARW"), b"FAKE RAW BYTES").unwrap();
 
         let (extracted, partial) =
-            extract_originals(&manifest, &mut archive, &dest_base, |_, _| {})
+            extract_originals(&empty_catalog(&dest_base), &manifest, &mut archive, &dest_base, |_, _| {})
                 .expect("extract_originals");
 
         assert_eq!(partial.skipped_duplicate, 1, "same-size must be skipped");
@@ -1329,7 +1362,7 @@ mod tests {
         std::fs::write(date_dir.join("DSC01234.ARW"), b"DIFFERENT BYTES").unwrap();
 
         let (extracted, partial) =
-            extract_originals(&manifest, &mut archive, &dest_base, |_, _| {})
+            extract_originals(&empty_catalog(&dest_base), &manifest, &mut archive, &dest_base, |_, _| {})
                 .expect("extract_originals");
 
         assert_eq!(partial.copied, 1, "different-size must copy with rename");
@@ -1350,7 +1383,7 @@ mod tests {
         let dest_base = root.to_path_buf();
 
         let (extracted, partial) =
-            extract_originals(&manifest, &mut archive, &dest_base, |_, _| {})
+            extract_originals(&catalog, &manifest, &mut archive, &dest_base, |_, _| {})
                 .expect("extract_originals");
 
         let result = index_bundle(&catalog, &manifest, &extracted, &dest_base, partial)
@@ -1383,7 +1416,7 @@ mod tests {
         let (manifest, mut archive) = open_bundle(&bundle_path).expect("open_bundle");
         let (catalog, root) = temp_catalog("iptc-148");
         let (extracted, partial) =
-            extract_originals(&manifest, &mut archive, &root, |_, _| {}).expect("extract_originals");
+            extract_originals(&catalog, &manifest, &mut archive, &root, |_, _| {}).expect("extract_originals");
         index_bundle(&catalog, &manifest, &extracted, &root, partial).expect("index_bundle");
 
         let photo = catalog.get_photo_by_uuid(&crate::catalog::photo_identity_for("uuid-iptc-148").unwrap()).unwrap();
@@ -1407,7 +1440,7 @@ mod tests {
         let (manifest, mut archive) = open_bundle(&bundle_path).expect("open_bundle");
         let (catalog, root) = temp_catalog("iptc-148-m1");
         let (extracted, partial) =
-            extract_originals(&manifest, &mut archive, &root, |_, _| {}).expect("extract_originals");
+            extract_originals(&catalog, &manifest, &mut archive, &root, |_, _| {}).expect("extract_originals");
         index_bundle(&catalog, &manifest, &extracted, &root, partial).expect("index_bundle");
 
         let photo =
@@ -1429,7 +1462,7 @@ mod tests {
         let (manifest, mut archive) = open_bundle(&bundle_path).expect("open_bundle");
         let (catalog, root) = temp_catalog("iptc-148-owed");
         let (extracted, partial) =
-            extract_originals(&manifest, &mut archive, &root, |_, _| {}).expect("extract_originals");
+            extract_originals(&catalog, &manifest, &mut archive, &root, |_, _| {}).expect("extract_originals");
         let xmp = crate::xmp::sidecar_path(&extracted[0].dest);
         std::fs::write(&xmp, "<x:xmpmeta not xml").unwrap();
         index_bundle(&catalog, &manifest, &extracted, &root, partial).expect("index_bundle");
@@ -1454,7 +1487,7 @@ mod tests {
 
         // First import.
         let (extracted, partial) =
-            extract_originals(&manifest, &mut archive, &root, |_, _| {})
+            extract_originals(&catalog, &manifest, &mut archive, &root, |_, _| {})
                 .expect("first extract");
         index_bundle(&catalog, &manifest, &extracted, &root, partial)
             .expect("first index");
@@ -1462,7 +1495,7 @@ mod tests {
         // Re-open the bundle for the second import.
         let (manifest2, mut archive2) = open_bundle(&bundle_path).expect("open_bundle 2");
         let (extracted2, partial2) =
-            extract_originals(&manifest2, &mut archive2, &root, |_, _| {})
+            extract_originals(&catalog, &manifest2, &mut archive2, &root, |_, _| {})
                 .expect("second extract");
 
         // The file already exists with the same size → skipped.
@@ -1504,7 +1537,7 @@ mod tests {
         catalog.set_culling(row.id, Some(5), None, None).unwrap();
 
         let (extracted, partial) =
-            extract_originals(&manifest, &mut archive, &root, |_, _| {}).expect("extract");
+            extract_originals(&catalog, &manifest, &mut archive, &root, |_, _| {}).expect("extract");
         index_bundle(&catalog, &manifest, &extracted, &root, partial).expect("index");
 
         let kept = catalog.get_photo(row.id).unwrap();
@@ -1588,7 +1621,7 @@ mod tests {
         let bundle_path = bundle_of("185", vec![(bp, Some(file))]);
 
         let (manifest, mut archive) = open_bundle(&bundle_path).unwrap();
-        let (extracted, partial) = extract_originals(&manifest, &mut archive, &root, |_, _| {}).unwrap();
+        let (extracted, partial) = extract_originals(&catalog, &manifest, &mut archive, &root, |_, _| {}).unwrap();
         assert_eq!((partial.skipped_duplicate, partial.copied), (1, 0), "the file is already here");
         let result = index_bundle(&catalog, &manifest, &extracted, &root, partial).unwrap();
         let m = &result.merge;
@@ -1630,7 +1663,7 @@ mod tests {
 
         // Importing the bundle again changes nothing more.
         let (manifest, mut archive) = open_bundle(&bundle_path).unwrap();
-        let (extracted, partial) = extract_originals(&manifest, &mut archive, &root, |_, _| {}).unwrap();
+        let (extracted, partial) = extract_originals(&catalog, &manifest, &mut archive, &root, |_, _| {}).unwrap();
         let again = index_bundle(&catalog, &manifest, &extracted, &root, partial).unwrap();
         assert_eq!((again.merge.photos_filled, again.merge.versions_added), (0, 0));
         assert_eq!(catalog.list_versions(row.id).unwrap().len(), 3);
@@ -1652,7 +1685,7 @@ mod tests {
 
         let bundle_path = make_test_bundle("185-apart", THEIRS, "2026/06/28/DSC01234.ARW");
         let (manifest, mut archive) = open_bundle(&bundle_path).unwrap();
-        let (extracted, partial) = extract_originals(&manifest, &mut archive, &root, |_, _| {}).unwrap();
+        let (extracted, partial) = extract_originals(&catalog, &manifest, &mut archive, &root, |_, _| {}).unwrap();
         assert_eq!(partial.skipped_duplicate, 1);
         let result = index_bundle(&catalog, &manifest, &extracted, &root, partial).expect("not a UNIQUE failure");
         assert_eq!((result.merge.photos_kept_apart, result.merge.photos_added), (1, 0), "{:?}", result.merge);
@@ -1681,7 +1714,7 @@ mod tests {
 
         let bundle_path = make_test_bundle("185-apart-n", THEIRS, "2026/06/28/DSC01234.ARW");
         let (manifest, mut archive) = open_bundle(&bundle_path).unwrap();
-        let (extracted, partial) = extract_originals(&manifest, &mut archive, &root, |_, _| {}).unwrap();
+        let (extracted, partial) = extract_originals(&catalog, &manifest, &mut archive, &root, |_, _| {}).unwrap();
         assert_eq!(partial.skipped_duplicate, 1);
         let result = index_bundle(&catalog, &manifest, &extracted, &root, partial).unwrap();
         assert_eq!((result.merge.photos_kept_apart, result.merge.photos_added), (1, 0), "{:?}", result.merge);
@@ -1715,7 +1748,7 @@ mod tests {
 
         let bundle_path = make_test_bundle("185-foreign", THEIRS, "2026/06/28/DSC01234.ARW");
         let (manifest, mut archive) = open_bundle(&bundle_path).unwrap();
-        let (extracted, partial) = extract_originals(&manifest, &mut archive, &root, |_, _| {}).unwrap();
+        let (extracted, partial) = extract_originals(&catalog, &manifest, &mut archive, &root, |_, _| {}).unwrap();
         assert_eq!(partial.skipped_duplicate, 1);
         assert!(!sidecar.exists(), "unpacking writes no sidecar for the owner's file");
         let result = index_bundle(&catalog, &manifest, &extracted, &root, partial).unwrap();
@@ -1748,12 +1781,82 @@ mod tests {
 
         let bundle_path = make_test_bundle("185-unrowed", THEIRS, "2026/06/28/DSC01234.ARW");
         let (manifest, mut archive) = open_bundle(&bundle_path).unwrap();
-        let (extracted, partial) = extract_originals(&manifest, &mut archive, &root, |_, _| {}).unwrap();
+        let (extracted, partial) = extract_originals(&catalog, &manifest, &mut archive, &root, |_, _| {}).unwrap();
         assert_eq!(partial.skipped_duplicate, 1);
         assert_eq!(crate::xmp::read_identifier(&original), None, "not bound while unpacking");
         index_bundle(&catalog, &manifest, &extracted, &root, partial).unwrap();
         assert_eq!(crate::xmp::read_identifier(&original).as_deref(), Some(THEIRS));
         assert_eq!(catalog.get_photo_by_uuid(THEIRS).unwrap().path, "2026/06/28/DSC01234.ARW");
+    }
+
+    // --- names a catalog row holds (#247) -----------------------------------------------
+
+    fn row_at(catalog: &Catalog, rel: &str) -> Option<(i64, String, i64)> {
+        catalog
+            .conn()
+            .query_row("SELECT id, uuid, missing FROM photos WHERE path = ?1", [rel], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })
+            .ok()
+    }
+
+    /// #247 for a bundle: a row whose file is gone holds its name; the bundle's photo of
+    /// another identity, at that relative path, goes to ` (2)` with a row of its own, and the
+    /// old row keeps its name and identity.
+    #[test]
+    fn a_bundle_photo_of_another_identity_never_takes_the_name_of_a_row_whose_file_is_gone() {
+        const OLD: &str = "44444444-4444-4444-8444-444444444444";
+        const NEW: &str = "55555555-5555-4555-8555-555555555555";
+        let (catalog, root) = temp_catalog("247-other");
+        let name = root.join("2026/06/28/DSC01234.ARW");
+        std::fs::create_dir_all(name.parent().unwrap()).unwrap();
+        std::fs::write(&name, b"OLD RAW BYTES!").unwrap();
+        let old_id = catalog.upsert_photo_with_identity(&name, None, 1, 14, Some(OLD)).unwrap().id;
+        std::fs::remove_file(&name).unwrap();
+
+        let bundle_path = make_test_bundle("247-other", NEW, "2026/06/28/DSC01234.ARW");
+        let (manifest, mut archive) = open_bundle(&bundle_path).unwrap();
+        let (extracted, partial) = extract_originals(&catalog, &manifest, &mut archive, &root, |_, _| {}).unwrap();
+        assert_eq!(partial.copied, 1);
+        assert_eq!(extracted[0].dest, root.join("2026/06/28/DSC01234 (2).ARW"));
+        assert!(!name.exists());
+        index_bundle(&catalog, &manifest, &extracted, &root, partial).unwrap();
+        assert_eq!(row_at(&catalog, "2026/06/28/DSC01234.ARW").map(|r| (r.0, r.1)), Some((old_id, OLD.to_string())));
+        assert_eq!(catalog.get_photo_by_uuid(NEW).unwrap().path, "2026/06/28/DSC01234 (2).ARW");
+    }
+
+    /// L-f of the third #246 review for a bundle: the photo's own row lost its file (its
+    /// sidecar left behind, or gone with it); importing the bundle again puts the original
+    /// back at the row's name and re-links the row — no ` (2)`, no second row.
+    #[test]
+    fn a_bundle_photo_whose_row_lost_its_file_goes_back_to_its_name() {
+        const UUID: &str = "33333333-3333-4333-8333-333333333333";
+        for sidecar_left in [true, false] {
+            let tag = format!("247-relink-{sidecar_left}");
+            let (catalog, root) = temp_catalog(&tag);
+            let bundle_path = make_test_bundle(&tag, UUID, "2026/06/28/DSC01234.ARW");
+            let (manifest, mut archive) = open_bundle(&bundle_path).unwrap();
+            let (extracted, partial) = extract_originals(&catalog, &manifest, &mut archive, &root, |_, _| {}).unwrap();
+            index_bundle(&catalog, &manifest, &extracted, &root, partial).unwrap();
+            let name = root.join("2026/06/28/DSC01234.ARW");
+            let (id, _, _) = row_at(&catalog, "2026/06/28/DSC01234.ARW").unwrap();
+            std::fs::remove_file(&name).unwrap();
+            if !sidecar_left {
+                std::fs::remove_file(crate::xmp::sidecar_path(&name)).unwrap();
+            }
+            catalog.reconcile_missing_for(&[id]).unwrap();
+
+            let (manifest, mut archive) = open_bundle(&bundle_path).unwrap();
+            let (extracted, partial) = extract_originals(&catalog, &manifest, &mut archive, &root, |_, _| {}).unwrap();
+            assert_eq!(partial.copied, 1, "{sidecar_left}");
+            assert_eq!(extracted[0].dest, name, "{sidecar_left}");
+            let result = index_bundle(&catalog, &manifest, &extracted, &root, partial).unwrap();
+            assert_eq!((result.restored, result.restored_trashed, result.merge.photos_added), (1, 0, 0), "{result:?}");
+            assert_eq!(row_at(&catalog, "2026/06/28/DSC01234.ARW"), Some((id, UUID.to_string(), 0)), "{sidecar_left}");
+            assert_eq!(photo_paths(&catalog), ["2026/06/28/DSC01234.ARW"], "{sidecar_left}");
+            assert!(!root.join("2026/06/28/DSC01234 (2).ARW").exists(), "{sidecar_left}");
+            assert_eq!(crate::xmp::read_identifier(&name).as_deref(), Some(UUID), "{sidecar_left}");
+        }
     }
 
     #[test]
@@ -1764,7 +1867,7 @@ mod tests {
 
         let dest = temp_dir("prog-dest");
         let calls = std::sync::Mutex::new(Vec::<(usize, usize)>::new());
-        extract_originals(&manifest, &mut archive, &dest, |done, total| {
+        extract_originals(&empty_catalog(&dest), &manifest, &mut archive, &dest, |done, total| {
             calls.lock().unwrap().push((done, total));
         })
         .expect("extract");

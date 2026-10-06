@@ -387,6 +387,80 @@ impl Catalog {
         Ok(())
     }
 
+    /// Every photo that holds a name directly in `folder`, by file name (#247): its logical
+    /// path (`photos.path`, catalog-root-relative) names it, or one of its locations does —
+    /// any role, on a volume whose base `folder` is under, the location's relative path read
+    /// under that volume's own base. Trashed, missing and offline photos included: whether the
+    /// file is there is not asked. Two queries per volume at most, never one per name, so an
+    /// import asks once per folder ([`crate::scanner::free_name::CatalogNames`]).
+    ///
+    /// [`ResolveMode::PathClassification`]: prefix comparisons, no stat.
+    pub fn names_held_in(&self, folder: &Path) -> Result<std::collections::HashMap<String, Vec<NameHolder>>> {
+        let mut held: std::collections::HashMap<String, Vec<NameHolder>> = std::collections::HashMap::new();
+        let child = |rel: &str, prefix: &str| rel.strip_prefix(prefix).filter(|n| !n.is_empty() && !n.contains('/')).map(str::to_string);
+        if let Ok(rel) = folder.strip_prefix(self.root()) {
+            let prefix = folder_prefix(rel);
+            let mut stmt = self.conn.prepare(
+                "SELECT id, uuid, path FROM photos WHERE path >= ?1 AND (?2 IS NULL OR path < ?2)",
+            )?;
+            let rows = stmt.query_map(params![prefix, prefix_end(&prefix)], |r| {
+                Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?))
+            })?;
+            for row in rows {
+                let (photo_id, uuid, path) = row?;
+                if let Some(name) = child(&path, &prefix) {
+                    held.entry(name).or_default().push(NameHolder { photo_id, uuid, by_path: true });
+                }
+            }
+        }
+        for volume in self.volume_rows()? {
+            let Ok(rel) = folder.strip_prefix(&volume.base_path) else { continue };
+            let prefix = folder_prefix(rel);
+            let mut stmt = self.conn.prepare(LOCATIONS_IN_FOLDER_SQL)?;
+            // `folder` is the volume's base itself: every relative path is in range, up to
+            // `char::MAX`, the last code point (no stored path starts with it).
+            let end = prefix_end(&prefix).unwrap_or_else(|| char::MAX.to_string());
+            let rows = stmt.query_map(params![volume.id, prefix, end], |r| {
+                Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?))
+            })?;
+            for row in rows {
+                let (photo_id, uuid, path) = row?;
+                let Some(name) = child(&path, &prefix) else { continue };
+                let holders = held.entry(name).or_default();
+                if !holders.iter().any(|h| h.photo_id == photo_id) {
+                    holders.push(NameHolder { photo_id, uuid, by_path: false });
+                }
+            }
+        }
+        Ok(held)
+    }
+
+    /// The capture-identifying metadata (#246's tags) stored for each photo whose logical
+    /// path is directly in `folder`, as `(photo_id, key, group, value)` — one query for the
+    /// folder ([`crate::scanner::same_photo::stamp_from_metadata`] reads it).
+    pub fn capture_metadata_in(&self, folder: &Path) -> Result<Vec<(i64, String, String, String)>> {
+        let Ok(rel) = folder.strip_prefix(self.root()) else { return Ok(Vec::new()) };
+        let prefix = folder_prefix(rel);
+        let mut stmt = self.conn.prepare(
+            "SELECT m.photo_id, m.key, m.group_name, m.value, p.path FROM photo_metadata m
+             JOIN photos p ON p.id = m.photo_id
+             WHERE p.path >= ?1 AND (?2 IS NULL OR p.path < ?2)
+               AND m.key IN ('DateTimeOriginal', 'SubSecTimeOriginal', 'CreateDate',
+                             'SerialNumber', 'InternalSerialNumber')",
+        )?;
+        let rows = stmt.query_map(params![prefix, prefix_end(&prefix)], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get::<_, String>(4)?))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (photo_id, key, group, value, path) = row?;
+            if path.strip_prefix(&prefix).is_some_and(|n| !n.contains('/')) {
+                out.push((photo_id, key, group, value));
+            }
+        }
+        Ok(out)
+    }
+
     /// Reconcile the `missing` flag across the WHOLE catalog: a photo is hidden
     /// (missing = 1) when its original can't be resolved AND it has no backup copy —
     /// i.e. genuinely gone (e.g. orphan rows left by a re-root). Photos that are merely
@@ -770,6 +844,40 @@ thread_local! {
 
 /// The single reachability stat for a volume base path, funnelled through one function so
 /// the test counter above sees every one of them.
+/// The locations on one volume (`?1`) whose relative path is in `[?2, ?3)`, with their
+/// photo's identity: a range over `idx_photo_locations_volume_path`.
+const LOCATIONS_IN_FOLDER_SQL: &str = "SELECT l.photo_id, p.uuid, l.relative_path FROM photo_locations l
+     JOIN photos p ON p.id = l.photo_id
+     WHERE l.volume_id = ?1 AND l.relative_path >= ?2 AND l.relative_path < ?3";
+
+/// A photo holding a name ([`Catalog::names_held_in`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NameHolder {
+    pub photo_id: i64,
+    pub uuid: String,
+    /// Held by the photo's logical path (`photos.path`), not only by one of its locations.
+    pub by_path: bool,
+}
+
+/// The stored-path prefix of the files directly in the folder `rel` (relative to a root or
+/// volume base): `"a/b/"`, or `""` for the root itself.
+fn folder_prefix(rel: &Path) -> String {
+    let rel = rel.to_string_lossy().replace('\\', "/");
+    if rel.is_empty() {
+        rel
+    } else {
+        format!("{rel}/")
+    }
+}
+
+/// The first string after every string that starts with `prefix` (`"a/b/"` → `"a/b0"`, as
+/// `'0'` follows `'/'`), so `path >= prefix AND path < end` uses `photos.path`'s index;
+/// `None` for the empty prefix, which every path starts with.
+fn prefix_end(prefix: &str) -> Option<String> {
+    let stem = prefix.strip_suffix('/')?;
+    Some(format!("{stem}0"))
+}
+
 fn volume_base_is_dir(base: &str) -> bool {
     #[cfg(test)]
     VOLUME_BASE_STATS.with(|c| c.set(c.get() + 1));
@@ -1073,6 +1181,26 @@ mod tests {
         );
         assert!(!is_missing(&catalog, plain_id));
         assert!(!is_missing(&catalog, backed_id));
+    }
+
+    /// F2 of the #247 review: the names a folder's locations hold are read by a range over
+    /// `idx_photo_locations_volume_path`, not a scan of every location in the catalog.
+    #[test]
+    fn the_names_locations_hold_are_read_by_index() {
+        let (catalog, _dir, _root) = temp_catalog("names-held-plan");
+        let plan: Vec<String> = catalog
+            .conn
+            .prepare(&format!("EXPLAIN QUERY PLAN {LOCATIONS_IN_FOLDER_SQL}"))
+            .unwrap()
+            .query_map(params![1, "2026/06/28/", "2026/06/280"], |r| r.get::<_, String>(3))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert!(
+            plan.iter().any(|step| step.contains("idx_photo_locations_volume_path") && step.contains("relative_path>?")),
+            "{plan:?}"
+        );
+        assert!(!plan.iter().any(|step| step.starts_with("SCAN l")), "{plan:?}");
     }
 
     /// Even with the NAS genuinely gone, a photo with a backup location is spared. This is

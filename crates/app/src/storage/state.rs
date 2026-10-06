@@ -663,10 +663,26 @@ pub fn card_import_line(r: &ScanResult) -> String {
     if r.skipped > 0 {
         line += &format!(", {} already imported", r.skipped);
     }
+    if r.restored > 0 {
+        line += &format!(", {}", restored_clause(r.restored, r.restored_trashed));
+    }
     if r.errors > 0 {
         line += &format!(", {} errors", r.errors);
     }
     line
+}
+
+/// The photos an import put back onto the rows that still held their names, their files
+/// gone (#247), and how many of those are in the trash — where a restored photo stays
+/// hidden, so the line says so rather than leave it invisible.
+fn restored_clause(restored: usize, trashed: usize) -> String {
+    if restored == 1 {
+        let trash = if trashed > 0 { ", in the trash" } else { "" };
+        format!("1 restored to its old row{trash}")
+    } else {
+        let trash = if trashed > 0 { format!(", {trashed} of them in the trash") } else { String::new() };
+        format!("{restored} restored to their old rows{trash}")
+    }
 }
 
 /// React's status line after a rescan.
@@ -719,6 +735,9 @@ pub fn bundle_import_line(r: &BundleImportResult) -> String {
     if r.skipped_duplicate > 0 {
         line += &format!(" {} already present (skipped).", r.skipped_duplicate);
     }
+    if r.restored > 0 {
+        line += &format!(" {}.", restored_clause(r.restored, r.restored_trashed));
+    }
     if r.merge.photos_filled > 0 {
         line += &format!(
             " {} already in the catalog filled in ({} new {}).",
@@ -748,11 +767,44 @@ mod tests {
 
     #[test]
     fn status_lines_match_reacts() {
-        let r = ScanResult { scanned: 5, imported: 4, created: 3, errors: 1, skipped: 2 };
+        let r = ScanResult { scanned: 5, imported: 4, created: 3, errors: 1, skipped: 2, ..Default::default() };
         assert_eq!(card_import_line(&r), "Imported 3 new of 5 on card, 2 already imported, 1 errors");
         assert_eq!(rescan_line(&r), "Scanned 5, imported 4 (3 new), 1 errors");
-        let clean = ScanResult { scanned: 2, imported: 2, created: 2, errors: 0, skipped: 0 };
+        let clean = ScanResult { scanned: 2, imported: 2, created: 2, errors: 0, skipped: 0, ..Default::default() };
         assert_eq!(card_import_line(&clean), "Imported 2 new of 2 on card");
+    }
+
+    /// #247: photos put back onto the rows that held their names are counted apart from the
+    /// new ones, and those in the trash are named, so a restored photo hidden there is not
+    /// invisible.
+    #[test]
+    fn the_import_lines_count_restored_photos_and_those_in_the_trash() {
+        let card = |restored, restored_trashed| ScanResult {
+            scanned: 4,
+            imported: 4,
+            created: 4 - restored,
+            restored,
+            restored_trashed,
+            ..Default::default()
+        };
+        assert_eq!(
+            card_import_line(&card(3, 1)),
+            "Imported 1 new of 4 on card, 3 restored to their old rows, 1 of them in the trash"
+        );
+        assert_eq!(card_import_line(&card(2, 0)), "Imported 2 new of 4 on card, 2 restored to their old rows");
+        assert_eq!(card_import_line(&card(1, 1)), "Imported 3 new of 4 on card, 1 restored to its old row, in the trash");
+        let bundle = BundleImportResult {
+            copied: 2,
+            skipped_duplicate: 0,
+            errors: 0,
+            restored: 2,
+            restored_trashed: 2,
+            merge: Default::default(),
+        };
+        assert_eq!(
+            bundle_import_line(&bundle),
+            "Import complete. No new photos. 2 originals copied. 2 restored to their old rows, 2 of them in the trash."
+        );
     }
 
     /// The drain line names no verb the queue may not have run, and says "queued" only for
@@ -781,6 +833,8 @@ mod tests {
             copied: 0,
             skipped_duplicate: 2,
             errors: 0,
+            restored: 0,
+            restored_trashed: 0,
             merge: chairphoto_core::catalog::MergeSummary {
                 photos_existing: 2,
                 photos_filled: 1,

@@ -4158,7 +4158,7 @@ fn bundle_round_trip_export_import_and_idempotent_reimport() {
 
     // ── Phase 2: extract originals into catalog B's root ─────────────────────
     let (extracted, partial) =
-        extract_originals(&manifest, &mut archive, &root_b, |_, _| {})
+        extract_originals(&cat_b, &manifest, &mut archive, &root_b, |_, _| {})
             .expect("extract_originals must succeed");
 
     assert_eq!(partial.copied, 2, "both originals extracted");
@@ -4240,7 +4240,7 @@ fn bundle_round_trip_export_import_and_idempotent_reimport() {
     let (manifest2, mut archive2) = open_bundle(&bundle_zip)
         .expect("open_bundle (2nd) must succeed");
     let (extracted2, partial2) =
-        extract_originals(&manifest2, &mut archive2, &root_b, |_, _| {})
+        extract_originals(&cat_b, &manifest2, &mut archive2, &root_b, |_, _| {})
             .expect("extract_originals (2nd) must succeed");
 
     // Same-size files already exist → skipped.
@@ -4304,7 +4304,7 @@ fn bundle_import_merges_with_pre_existing_local_taxonomy() {
     // Import the bundle.
     let (manifest, mut archive) = open_bundle(&bundle_zip).unwrap();
     let (extracted, partial) =
-        extract_originals(&manifest, &mut archive, &root_b, |_, _| {}).unwrap();
+        extract_originals(&cat_b, &manifest, &mut archive, &root_b, |_, _| {}).unwrap();
     let result = index_bundle(&cat_b, &manifest, &extracted, &root_b, partial).unwrap();
 
     // No new tags created — both Birds and Birds/Owls matched by path.
@@ -6268,7 +6268,7 @@ fn card_ingest_queues_identity_and_import_batch_sidecar_debt() {
     std::fs::create_dir_all(&card).unwrap();
     std::fs::write(card.join("IMG_1.jpg"), b"\xff\xd8one").unwrap();
 
-    let (copy_result, copied) = copy_from_card(&card, &root, None, |_, _| {}).unwrap();
+    let (copy_result, copied) = copy_from_card(&catalog, &card, &root, None, |_, _| {}).unwrap();
     assert_eq!(copied.len(), 1);
     let dest = copied[0].dest.clone();
     let sidecar_dir = dest.parent().unwrap().to_path_buf();
@@ -6351,7 +6351,7 @@ fn bundle_import_queues_identity_sidecar_debt_for_unwritable_extracted_copy() {
     let (cat_b, root_b) = temp_catalog("identity-bundle-b");
     let (manifest, mut archive) = open_bundle(&bundle_zip).unwrap();
     let (extracted, partial) =
-        extract_originals(&manifest, &mut archive, &root_b, |_, _| {}).unwrap();
+        extract_originals(&cat_b, &manifest, &mut archive, &root_b, |_, _| {}).unwrap();
     assert_eq!(extracted.len(), 2);
 
     let target = extracted[0].dest.clone();

@@ -5,7 +5,10 @@
 //!   re-hash it and then delete it (#256). While it has that name, nothing else can write
 //!   into it through the photo's own name: a writer either landed before the move (and the
 //!   re-hash sees it) or makes a new file at the photo's name (which the offload sees, and
-//!   keeps).
+//!   keeps). A name too long to take the ~50 bytes this adds within the 255-byte limit goes
+//!   into a hidden folder instead, under its own name: `.chairphoto-offload-<pid>-<n>/<name>`
+//!   (review of #256, NIT-4) — never a shortened name, which a crash would leave with
+//!   nothing to say what it was called.
 //!
 //! - `.<name>.chairphoto-part-<pid>-<n>` — a copy being written before it is verified and
 //!   given its name (`same_photo::create_part`: a lifecycle copy, an import).
@@ -25,10 +28,23 @@ use std::sync::{Condvar, Mutex};
 /// The tag in the name of a file an offload moved aside.
 pub(crate) const ASIDE_TAG: &str = "chairphoto-offload";
 
+/// The longest file name the filesystems a library lives on take, in bytes (`NAME_MAX`).
+const NAME_MAX: usize = 255;
+
+/// What `.<name>.<tag>-<pid>-<n>` adds to a name at most: the two dots, the tag, the dashes,
+/// a 10-digit pid and a 20-digit counter.
+const ASIDE_OVERHEAD: usize = 2 + ASIDE_TAG.len() + 2 + 10 + 20;
+
 /// Move `file` to a new hidden name beside it, unique to this call; `None` when there was no
 /// `file` to move. The new name is claimed first by an exclusive create, so the rename only
 /// ever replaces that empty file of ours — on every filesystem, with no fallback needed.
+///
+/// A name too long for the hidden name to fit in [`NAME_MAX`] is moved, under its own name,
+/// into a new hidden folder beside it instead ([`move_into_aside_folder`]).
 pub(crate) fn move_aside(file: &Path) -> std::io::Result<Option<PathBuf>> {
+    if file.file_name().map_or(0, |n| n.len()) + ASIDE_OVERHEAD > NAME_MAX {
+        return move_into_aside_folder(file);
+    }
     let (aside, placeholder) = crate::scanner::same_photo::create_hidden(file, ASIDE_TAG)?;
     drop(placeholder);
     match std::fs::rename(file, &aside) {
@@ -44,6 +60,73 @@ pub(crate) fn move_aside(file: &Path) -> std::io::Result<Option<PathBuf>> {
     }
 }
 
+/// [`move_aside`] for a long name: a new folder `.chairphoto-offload-<pid>-<n>` beside
+/// `file`, created exclusively, and `file` renamed into it under its own name — which can
+/// replace nothing, the folder being new and ours. A folder left empty (there was no `file`)
+/// is removed again.
+fn move_into_aside_folder(file: &Path) -> std::io::Result<Option<PathBuf>> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let dir = file.parent().unwrap_or_else(|| Path::new("."));
+    let Some(name) = file.file_name() else {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "no file name"));
+    };
+    let folder = loop {
+        let n = NEXT.fetch_add(1, Ordering::Relaxed);
+        let folder = dir.join(format!(".{ASIDE_TAG}-{}-{n}", std::process::id()));
+        match std::fs::create_dir(&folder) {
+            Ok(()) => break folder,
+            // Left by a crashed run of a process that had this id: take the next number.
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
+    };
+    let aside = folder.join(name);
+    match std::fs::rename(file, &aside) {
+        Ok(()) => Ok(Some(aside)),
+        Err(e) => {
+            let _ = std::fs::remove_dir(&folder);
+            if e.kind() == std::io::ErrorKind::NotFound {
+                Ok(None)
+            } else {
+                Err(e)
+            }
+        }
+    }
+}
+
+/// The hidden folder holding `aside`, if [`move_into_aside_folder`] put it in one.
+fn aside_folder(aside: &Path) -> Option<&Path> {
+    let folder = aside.parent()?;
+    let name = folder.file_name()?.to_str()?;
+    parse_folder(name).map(|_| folder)
+}
+
+/// Remove the hidden folder that held `aside` once it is empty; a folder holding anything
+/// else is left as it is.
+fn tidy(aside: &Path) {
+    if let Some(folder) = aside_folder(aside) {
+        let _ = std::fs::remove_dir(folder);
+    }
+}
+
+/// Delete a confirmed file an offload moved aside, and the hidden folder that held it when
+/// it had one.
+pub(crate) fn delete_aside(aside: &Path) -> std::io::Result<()> {
+    std::fs::remove_file(aside)?;
+    tidy(aside);
+    Ok(())
+}
+
+/// How a refusal names a moved-aside file: its hidden name, or its hidden folder and name.
+pub(crate) fn aside_label(aside: &Path) -> String {
+    let file = aside.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    match aside_folder(aside).and_then(Path::file_name) {
+        Some(folder) => format!("{}/{file}", folder.to_string_lossy()),
+        None => file,
+    }
+}
+
 /// Give a moved-aside file its name `original` back, never by a copy, and never replacing a
 /// file there (`same_photo::place_no_replace_without_copy`). `Ok(false)` when the name is
 /// taken (a new file was written there meanwhile); the aside file is then still where it was.
@@ -53,6 +136,14 @@ pub(crate) fn move_aside(file: &Path) -> std::io::Result<Option<PathBuf>> {
 /// free. A file created at that exact name between the look and the rename would be replaced
 /// there — a window of one syscall, against leaving the photo's file hidden for good.
 pub(crate) fn put_back(aside: &Path, original: &Path) -> std::io::Result<bool> {
+    let back = put_back_file(aside, original);
+    if matches!(back, Ok(true)) {
+        tidy(aside);
+    }
+    back
+}
+
+fn put_back_file(aside: &Path, original: &Path) -> std::io::Result<bool> {
     match crate::scanner::same_photo::place_no_replace_without_copy(aside, original) {
         Ok(()) => Ok(true),
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
@@ -89,6 +180,18 @@ fn parse<'a>(name: &'a str, tags: &[&'a str]) -> Option<Working<'a>> {
         return Some(Working { tag, original, pid: pid.parse().ok()? });
     }
     None
+}
+
+/// Parse a hidden folder's name, `.chairphoto-offload-<pid>-<n>` ([`move_into_aside_folder`]),
+/// to its pid.
+fn parse_folder(name: &str) -> Option<u32> {
+    let numbers = name.strip_prefix('.')?.strip_prefix(ASIDE_TAG)?.strip_prefix('-')?;
+    let (pid, n) = numbers.split_once('-')?;
+    let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    if !digits(pid) || !digits(n) {
+        return None;
+    }
+    pid.parse().ok()
 }
 
 /// Whether process `pid` is running on this machine. Only Linux can say (`/proc`); elsewhere
@@ -171,6 +274,10 @@ fn sweep(dir: &Path) -> bool {
     let now = std::time::SystemTime::now();
     for entry in entries.flatten() {
         let name = entry.file_name();
+        if let Some(pid) = name.to_str().and_then(parse_folder) {
+            recover_aside_folder(&entry.path(), dir, pid);
+            continue;
+        }
         let Some(working) = name.to_str().and_then(|n| parse(n, &[ASIDE_TAG, PART_TAG])) else { continue };
         // `symlink_metadata`: decided from the entry itself, never through a link.
         let Ok(meta) = std::fs::symlink_metadata(entry.path()) else { continue };
@@ -209,6 +316,25 @@ pub(crate) fn dead_pid() -> u32 {
     let pid = child.id();
     child.wait().unwrap();
     pid
+}
+
+/// Put back every file a crashed offload moved into the hidden folder `folder` (a long name,
+/// [`move_into_aside_folder`]) under its own name in `dir`, as [`recover_aside`] does for a
+/// hidden name, and remove the folder once it is empty. Only a real folder (never through a
+/// link) of a process that is no longer running, and only the regular files in it.
+fn recover_aside_folder(folder: &Path, dir: &Path, pid: u32) {
+    let is_folder = std::fs::symlink_metadata(folder).is_ok_and(|m| m.file_type().is_dir());
+    if !is_folder || running(pid) {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(folder) else { return };
+    for entry in entries.flatten() {
+        let Ok(meta) = std::fs::symlink_metadata(entry.path()) else { continue };
+        if meta.file_type().is_file() {
+            recover_aside(&entry.path(), &dir.join(entry.file_name()), meta.len());
+        }
+    }
+    let _ = std::fs::remove_dir(folder);
 }
 
 /// Put a crashed offload's file back under its name, never replacing a file there.
@@ -416,6 +542,69 @@ mod tests {
         assert!(put_back(&aside, &file).unwrap());
         assert_eq!(std::fs::read(&file).unwrap(), b"raw");
         assert!(!aside.exists());
+    }
+
+    // ── #256 NIT-4: a name too long for a hidden name ────────────────────────────────
+
+    /// A 250-byte name cannot take `.<name>.chairphoto-offload-<pid>-<n>` within 255 bytes.
+    /// It is moved under its own name into a hidden folder instead; it goes back, or is
+    /// deleted, and the folder goes with it.
+    #[test]
+    fn a_long_name_moves_aside_into_a_hidden_folder() {
+        let dir = TestTmpDir::new("working-files-long");
+        let long = format!("{}.ARW", "L".repeat(246));
+        assert_eq!(long.len(), 250);
+        let file = dir.join(&long);
+        std::fs::write(&file, b"raw").unwrap();
+
+        let aside = move_aside(&file).unwrap().expect("moved");
+        assert!(!file.exists());
+        assert_eq!(aside.file_name().unwrap(), long.as_str(), "under its own name");
+        assert!(aside_folder(&aside).is_some(), "in a hidden folder: {}", aside.display());
+        assert!(aside_label(&aside).starts_with(&format!(".{ASIDE_TAG}-")), "{}", aside_label(&aside));
+        assert!(put_back(&aside, &file).unwrap());
+        assert_eq!(std::fs::read(&file).unwrap(), b"raw");
+
+        let aside = move_aside(&file).unwrap().unwrap();
+        delete_aside(&aside).unwrap();
+        assert!(!file.exists());
+        let left: Vec<_> = std::fs::read_dir(&*dir).unwrap().flatten().map(|e| e.file_name()).collect();
+        assert!(left.is_empty(), "no folder left: {left:?}");
+        assert_eq!(move_aside(&file).unwrap(), None, "nothing to move");
+        assert_eq!(std::fs::read_dir(&*dir).unwrap().count(), 0, "and no folder made for it");
+    }
+
+    /// A crash with a long name moved aside: the next sweep puts it back under its own name
+    /// and removes the folder; a folder of a running process, or holding a file whose name is
+    /// taken, is left.
+    #[test]
+    fn a_crashed_long_names_folder_is_put_back() {
+        if !cfg!(target_os = "linux") {
+            println!("SKIPPED: a_crashed_long_names_folder_is_put_back — needs /proc");
+            return;
+        }
+        let dir = TestTmpDir::new("working-files-long-crash");
+        let folder = dir.to_path_buf();
+        let long = |c: &str| format!("{}.ARW", c.repeat(246));
+        let dead = dead_pid();
+        let crashed = folder.join(format!(".{ASIDE_TAG}-{dead}-0"));
+        std::fs::create_dir(&crashed).unwrap();
+        std::fs::write(crashed.join(long("A")), b"only copy of A").unwrap();
+        let taken = folder.join(format!(".{ASIDE_TAG}-{dead}-1"));
+        std::fs::create_dir(&taken).unwrap();
+        std::fs::write(taken.join(long("B")), b"older B").unwrap();
+        std::fs::write(folder.join(long("B")), b"newer B").unwrap();
+        let live = folder.join(format!(".{ASIDE_TAG}-{}-2", std::process::id()));
+        std::fs::create_dir(&live).unwrap();
+        std::fs::write(live.join(long("C")), b"in progress").unwrap();
+
+        sweep_once(&folder);
+
+        assert_eq!(std::fs::read(folder.join(long("A"))).unwrap(), b"only copy of A");
+        assert!(!crashed.exists(), "the emptied folder is removed");
+        assert_eq!(std::fs::read(folder.join(long("B"))).unwrap(), b"newer B", "never replaced");
+        assert_eq!(std::fs::read(taken.join(long("B"))).unwrap(), b"older B", "and the other kept");
+        assert!(live.join(long("C")).exists() && !folder.join(long("C")).exists(), "a running process's");
     }
 
     #[test]

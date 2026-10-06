@@ -1578,7 +1578,10 @@ impl Aside {
         };
         Err(CatalogError::Validation(match put_back_or_why(&hidden, file) {
             None => refusal,
-            Some(cause) => format!("{refusal}; its bytes were kept beside it as {} ({cause})", name(&hidden)),
+            Some(cause) => format!(
+                "{refusal}; its bytes were kept beside it as {} ({cause})",
+                super::working_files::aside_label(&hidden)
+            ),
         }))
     }
 
@@ -1590,7 +1593,7 @@ impl Aside {
         while let Some((_file, hidden)) = self.moved.first() {
             #[cfg(test)]
             offload_hook::step(offload_hook::Step::BeforeUnlink, _file);
-            std::fs::remove_file(hidden).map_err(io)?;
+            super::working_files::delete_aside(hidden).map_err(io)?;
             self.moved.remove(0);
         }
         Ok(())
@@ -1605,7 +1608,7 @@ impl Aside {
         let mut kept = Vec::new();
         while let Some((file, hidden)) = self.moved.pop() {
             if let Some(why) = put_back_or_why(&hidden, &file) {
-                kept.push(format!("{} as {} ({why})", name(&file), name(&hidden)));
+                kept.push(format!("{} as {} ({why})", name(&file), super::working_files::aside_label(&hidden)));
             }
         }
         if kept.is_empty() {

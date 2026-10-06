@@ -502,7 +502,9 @@ Three rules govern carrying:
 - **Offload deletes only what home holds byte for byte (#255).** Re-hashing the backup
   proves home is intact, not that it holds what is here. So offload checks each local file
   **after moving it to a hidden name** in its folder (`.<name>.chairphoto-offload-<pid>-<n>`,
-  #256): companions first, then the image, each re-hashed there — the image against the
+  #256; a name too long for that to fit in 255 bytes goes, under its own name, into a new
+  hidden folder `.chairphoto-offload-<pid>-<n>/` beside it instead — never a shortened name,
+  which a crash would leave with nothing to say what it was called): companions first, then the image, each re-hashed there — the image against the
   verified backup hash, a companion against the hash the carry confirmed at home — and
   freed only with exactly the companions the carry confirmed, never a fresh listing. Then
   it looks at every name it emptied once more, and only then deletes the hidden files. A

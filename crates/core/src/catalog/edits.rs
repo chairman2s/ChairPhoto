@@ -486,6 +486,13 @@ impl Catalog {
     ///   is gone — is refreshed. One query finds them; on a catalog only this build wrote it
     ///   finds none.
     pub(crate) fn heal_faces(&self, older_build_opened: bool) -> Result<()> {
+        // A version pin whose version is gone (an older build deleted it; `ON DELETE SET NULL`)
+        // already reads as automatic (`stored_face`); say so in the row, so its `cover_pin`
+        // does too. The face itself is refreshed below.
+        self.conn.execute(
+            "UPDATE photo_cover SET pin = ?1 WHERE pin = ?2 AND version_id IS NULL",
+            params![PIN_AUTO, PIN_VERSION],
+        )?;
         if older_build_opened {
             let created: Vec<i64> = {
                 let mut stmt = self
@@ -1028,6 +1035,8 @@ mod face_tests {
         assert_eq!(face(&c, p), Some(v1), "v1 edited: v1 (not {v2})");
         assert_eq!(face(&c, q), Some(w3), "w1 edited, then duplicated: the copy (not {w1})");
         assert_eq!(c.cover_pin(r).unwrap(), CoverPin::Auto, "the pinned version is gone: unpinned");
+        let pin: i64 = c.conn().query_row("SELECT pin FROM photo_cover WHERE photo_id = ?1", [r], |row| row.get(0)).unwrap();
+        assert_eq!(pin, PIN_AUTO, "and the row says so: no stale version pin left");
         assert_eq!(face(&c, r), Some(x2));
         assert_eq!(
             c.get_setting("schema_version").unwrap(),
@@ -1073,6 +1082,26 @@ mod face_tests {
         let seq: i64 =
             c.conn().query_row("SELECT changed_seq FROM photo_versions WHERE id = ?1", [aside], |r| r.get(0)).unwrap();
         assert!(seq < 0, "the version set aside is not promoted: {seq}");
+    }
+
+    /// An older build deletes a photo's pinned, only version (`ON DELETE SET NULL` leaves the
+    /// row pinned to nothing): the next open says the row is automatic, not a stale version pin.
+    #[test]
+    fn a_pin_left_on_a_deleted_version_is_cleared_on_open() {
+        let (c, dir, p) = catalog("older-pin-gone");
+        let v = c.create_version(p, "V").unwrap();
+        c.set_cover_pin(p, CoverPin::Version(v)).unwrap();
+        drop(c);
+        let path = dir.join("t.chairphoto");
+        let older = rusqlite::Connection::open(&path).unwrap();
+        older.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+        older.execute("DELETE FROM photo_versions WHERE id = ?1", [v]).unwrap();
+        drop(older);
+        let c = Catalog::open(&path, &dir.join("photos")).unwrap();
+        let pin: i64 = c.conn().query_row("SELECT pin FROM photo_cover WHERE photo_id = ?1", [p], |r| r.get(0)).unwrap();
+        assert_eq!(pin, PIN_AUTO);
+        assert_eq!(c.get_photo(p).unwrap().cover_pin, CoverPin::Auto);
+        assert_eq!(face(&c, p), None);
     }
 
     /// An older build's settings change to the face's own version gives it a new look token

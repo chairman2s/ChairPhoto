@@ -406,11 +406,13 @@ fn holds_bytes(path: &Path, bytes: &[u8]) -> bool {
 /// `dir/stem (n).ext`, the name a collision is renamed to.
 pub(crate) fn numbered(path: &Path, n: u32) -> PathBuf {
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
-    let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("file");
-    let mut name = format!("{stem} ({n})");
-    if let Some(ext) = path.extension().and_then(|s| s.to_str()) {
-        name.push('.');
-        name.push_str(ext);
+    // The stem's own bytes, UTF-8 or not: a non-UTF-8 stem is not `file`, whose ` (n)` name
+    // would be judged short enough for a sidecar when the name placed is not (relB3 NIT-A).
+    let mut name = path.file_stem().unwrap_or(std::ffi::OsStr::new("file")).to_os_string();
+    name.push(format!(" ({n})"));
+    if let Some(ext) = path.extension() {
+        name.push(".");
+        name.push(ext);
     }
     dir.join(name)
 }
@@ -1021,6 +1023,25 @@ mod tests {
             "not listed again: (3) is not seen, the placed (4) is"
         );
         assert_eq!(same_size_candidates(&dest, 4).len(), 4, "a fresh listing sees all");
+    }
+
+    // --- numbered names of a non-UTF-8 stem (relB3 NIT-A) ---------------------------------
+
+    /// A stem that is not UTF-8 keeps its own bytes in its ` (n)` name, so the free-name
+    /// search and `numbered_fits` judge the name that is placed, not a short `file (n)`.
+    #[test]
+    fn a_numbered_name_keeps_a_non_utf8_stem() {
+        use std::os::unix::ffi::OsStrExt;
+        let dir = Path::new("/lib/2026/06/28");
+        let wanted = dir.join(std::ffi::OsStr::from_bytes(b"IMG\xff.jpg"));
+        assert_eq!(numbered(&wanted, 2), dir.join(std::ffi::OsStr::from_bytes(b"IMG\xff (2).jpg")));
+        assert_eq!(numbered(&dir.join("IMG.jpg"), 3), dir.join("IMG (3).jpg"));
+        let mut long = vec![0xff];
+        long.extend(std::iter::repeat_n(b'D', 206));
+        long.extend(b".jpg");
+        let long = dir.join(std::ffi::OsStr::from_bytes(&long));
+        assert!(sidecar_name_fits(&long));
+        assert!(!numbered_fits(&long), "its ` (n)` names are as long as it, and more");
     }
 
     // --- placing a new file (L-4) ---------------------------------------------------------

@@ -8,9 +8,10 @@
 /// The catalog schema this build writes. A catalog stamped with a higher one was last opened by a
 /// newer build, and `Catalog::open` refuses it (`CatalogError::NewerSchema`) rather than write
 /// into a schema it does not know. Bump it whenever an older build would misread or corrupt
-/// what a change stores. v27 (#252): the automatic Library face (`photo_versions.changed_seq`,
-/// `photo_cover.pin`, the `photo_versions_settings_changed` trigger).
-pub const SCHEMA_VERSION: i64 = 27;
+/// what a change stores. v28 (#252): the automatic Library face (`photo_versions.changed_seq`,
+/// `photo_cover.pin`, the `photo_versions_settings_changed` trigger, and the heal of what an
+/// older build wrote). (v27 is the import batch's `bundle_merges`.)
+pub const SCHEMA_VERSION: i64 = 28;
 
 pub const SCHEMA_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS settings (

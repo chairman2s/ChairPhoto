@@ -123,7 +123,7 @@ pub(crate) const EXIF_ORIENTATION_SINCE: i64 = 26;
 /// The schema version of the automatic Library face's heal (#252 review L1): a catalog
 /// stamped below it once the face columns exist was opened by an older build since this one
 /// last opened it (`Catalog::heal_faces`).
-pub(crate) const AUTO_FACES_SINCE: i64 = 27;
+pub(crate) const AUTO_FACES_SINCE: i64 = 28;
 
 /// The `settings` key holding the catalog's own identity: a UUID v4 minted once, the first
 /// time a catalog is opened by a build that knows it, and never changed. It survives reopening,
@@ -618,7 +618,7 @@ impl Catalog {
     ///   latest version at once.
     ///
     /// On every open after that, the faces are healed from what an older build wrote
-    /// meanwhile (schema v27, review of #252 L1): the trigger keeps `changed_seq` true for
+    /// meanwhile (schema v28, review of #252 L1): the trigger keeps `changed_seq` true for
     /// its settings changes ([`Catalog::ensure_face_trigger`]), and [`Catalog::heal_faces`]
     /// orders the versions it created and moves each face it left behind. `prior_version` is
     /// the schema the catalog was stamped with before this open.
@@ -627,7 +627,7 @@ impl Catalog {
         let had_pin = has_column(&self.conn, "photo_cover", "pin")?;
         if had_seq && had_pin {
             self.ensure_face_trigger()?;
-            // Below v27 with the columns already there: an older build has opened the
+            // Below v28 with the columns already there: an older build has opened the
             // catalog since this one last did (every build stamps its own on open).
             return self.heal_faces(prior_version < AUTO_FACES_SINCE);
         }

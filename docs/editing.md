@@ -153,16 +153,18 @@ until it is written. Covers set before #252 migrate
 as pinned. Local to this catalog like the history: catalog merge and bundle export do not
 carry it.
 
-**An older build on the same catalog** (review of #252, L1; schema v27). A trigger in the
+**An older build on the same catalog** (review of #252, L1; schema v28). A trigger in the
 catalog file keeps `changed_seq` true whichever build changes a version's settings
 (`Catalog::ensure_face_trigger`): the version becomes the photo's latest change, and the
 face's `rev` rises when its own settings change. A version a build that does not know the
-column creates is left at `changed_seq` 0, no candidate; when an open finds the catalog
-stamped below v27 since this build last opened it (every build stamps its own schema on
+column creates is left at `changed_seq` 0, no candidate (this build never leaves one at 0:
+a version that must not be a change — a What-if, a version merged into an existing photo —
+is stored below 0, `catalog::edits::set_aside`); when an open finds the catalog
+stamped below v28 since this build last opened it (every build stamps its own schema on
 open), those versions become their photos' latest changes, in `updated_at` order — after
 everything else that build did, whatever the order it did it in. Every open then moves each
 face left behind (`Catalog::heal_faces`: an automatic face that is not the latest change, a
-version pin whose version is gone). What older builds do with a v27 catalog:
+version pin whose version is gone). What older builds do with a v28 catalog:
 
 - The packaged **2026.8.0** (schema 19, the Tauri shell) opens it without complaint — it has
   no newer-schema check — and stamps it back to 19. It knows nothing of faces: it never reads

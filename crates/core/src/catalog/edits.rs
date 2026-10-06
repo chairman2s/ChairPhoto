@@ -477,7 +477,7 @@ impl Catalog {
     /// its settings changes reach `changed_seq` only through [`Self::ensure_face_trigger`], the
     /// versions it creates are left at `changed_seq` 0, and it never moves `photo_cover`.
     ///
-    /// - `older_build_opened` (the catalog was stamped below v27 since this build last opened
+    /// - `older_build_opened` (the catalog was stamped below v28 since this build last opened
     ///   it): each version at 0 was created by such a build, and becomes its photo's latest
     ///   change, in `updated_at` order (then id). They count after everything else that build
     ///   did — its settings changes were ordered as they were made, its new versions only now.
@@ -628,6 +628,13 @@ pub(crate) fn settings_written(conn: &Connection, version_id: i64) -> Result<()>
 /// other version's and below 0, so it is never the automatic face — not even as the photo's
 /// only version, or the one left when the face is deleted — until its settings are written
 /// ([`settings_written`] puts it above them all). Call inside the insert's transaction.
+///
+/// **The convention for every version that must not be a change** — a What-if, and a version
+/// merged into an existing photo from a bundle or another catalog (#252 decision 2): store it
+/// below 0 through this function. `changed_seq` 0 is reserved for a row a build that knows no
+/// `changed_seq` inserted: [`Catalog::heal_faces`] makes each such row its photo's latest
+/// change once an older build has opened the catalog, so a version this build leaves at 0
+/// would move the face then.
 pub(crate) fn set_aside(conn: &Connection, version_id: i64, photo_id: i64) -> Result<()> {
     conn.execute(
         "UPDATE photo_versions
@@ -1051,6 +1058,9 @@ mod face_tests {
             )
             .unwrap();
         let zero = c.conn().last_insert_rowid();
+        // A version this build set aside (a What-if; a version merged into an existing photo)
+        // stays aside after an older build opened the catalog: it is below 0, not at 0.
+        let aside = c.create_version_with(p, "Merged", "{}", NewVersion::Aside).unwrap();
         drop(c);
         let path = dir.join("t.chairphoto");
         let root = dir.join("photos");
@@ -1060,6 +1070,9 @@ mod face_tests {
         drop(c);
         let c = Catalog::open(&path, &root).unwrap();
         assert_eq!(face(&c, p), Some(zero), "an older build since: its new version is the latest change");
+        let seq: i64 =
+            c.conn().query_row("SELECT changed_seq FROM photo_versions WHERE id = ?1", [aside], |r| r.get(0)).unwrap();
+        assert!(seq < 0, "the version set aside is not promoted: {seq}");
     }
 
     /// An older build's settings change to the face's own version gives it a new look token

@@ -188,10 +188,12 @@ impl AppModel {
         let opened = chairphoto_core::app::runtime().spawn(async move {
             let opened = chairphoto_core::app::open_default_catalog(&state).await;
             // The pre-#258 offline thumbnails go to the catalog opened at start-up, once, on
-            // the blocking pool (review fix258 M1).
+            // the blocking pool (review fix258 M1); and what a crashed offload left in its
+            // library is put back (#256 b), there too.
             if opened.is_ok() {
                 if let Ok(from) = chairphoto_core::app::catalog_identity(&state) {
                     chairphoto_core::app::catalogs::spawn_offline_thumbnail_migration(&state, from);
+                    chairphoto_core::app::storage::spawn_startup_sweep(&state, from);
                 }
             }
             opened

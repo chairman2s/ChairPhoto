@@ -566,7 +566,7 @@ pub fn sidecar_name_fits(path: &Path) -> bool {
 ///   NFS mount) by a hard link and the removal of the temporary name. A name taken between
 ///   finding it free and placing the file — another import, another program — fails that
 ///   step with "exists", and the next free name is tried.
-/// - On a filesystem with neither (exFAT, FAT), the name is claimed by an exclusive create
+/// - On a filesystem with neither (some FUSE mounts), the name is claimed by an exclusive create
 ///   (`O_CREAT|O_EXCL`) and the synced temporary file copied into it: still never an
 ///   overwrite, but a crash mid-copy can leave a short file there, as before.
 ///
@@ -664,6 +664,19 @@ fn create_hidden_named(wanted: &Path, name: &str, tag: &str) -> std::io::Result<
     use std::sync::atomic::AtomicU64;
     static NEXT: AtomicU64 = AtomicU64::new(0);
     let dir = wanted.parent().unwrap_or_else(|| Path::new("."));
+    // The hidden name adds the tag, the pid and a counter; a name within that of the 255-byte
+    // limit is cut to fit (#231 import N-4), at a character boundary. A copy's part file is
+    // already given a short name ([`part_name`]: a prefix and a hash), so this only cuts a
+    // caller's own long name. The name is only for a person's eye: what a sweep needs is the
+    // tag and the pid, and the exclusive create makes every name unique. (An offload's long
+    // names never come here — they keep their own name in a hidden folder,
+    // `catalog::working_files::move_aside`.)
+    let budget = NAME_MAX - (4 + tag.len() + 30);
+    let mut cut = name.len().min(budget);
+    while !name.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    let name = &name[..cut];
     loop {
         let n = NEXT.fetch_add(1, Ordering::Relaxed);
         let part = dir.join(format!(".{name}.{tag}-{}-{n}", std::process::id()));
@@ -689,7 +702,7 @@ pub(crate) enum Placed {
     /// One step (`renameat2(RENAME_NOREPLACE)` or a hard link): `to` is the very file that
     /// was at `part`, never partly written.
     InOneStep,
-    /// The filesystem had neither (exFAT, FAT): `to` was created and the bytes copied into
+    /// The filesystem had neither (some FUSE mounts): `to` was created and the bytes copied into
     /// it. A caller that verified `part` must verify `to` again.
     Copied,
 }
@@ -708,7 +721,66 @@ pub(crate) fn place_no_replace_without_copy(part: &Path, to: &Path) -> std::io::
     place(part, to, false).map(drop)
 }
 
+/// Every placement ends here: the file gets its name ([`place_unsynced`]), then the folder
+/// holding that name is synced ([`sync_dir_of`]) before the caller records it anywhere.
 fn place(part: &Path, to: &Path, may_copy: bool) -> std::io::Result<Placed> {
+    let placed = place_unsynced(part, to, may_copy)?;
+    sync_dir_of(to);
+    Ok(placed)
+}
+
+/// Make the name `path` was just given durable: fsync the folder holding it (#231, import
+/// review N-1). A file's own `sync_all` makes its bytes durable, not its name: after a
+/// rename or a link the new directory entry can still be lost to a power cut, while the
+/// catalog row recorded right after it says the file is there. Syncing the folder before
+/// the caller records the row closes that. (On ext4 and XFS a directory fsync commits the
+/// journal, which also carries an earlier `create_dir_all` of that folder; on other
+/// filesystems a just-created folder's own entry in its parent is not synced here.)
+///
+/// Best effort: the file is placed either way, and a filesystem that cannot fsync a
+/// directory (some network and FUSE mounts answer `EINVAL`) is no reason to report the
+/// placement failed — the caller would then remove a temporary name that no longer exists
+/// and leave a placed file unrecorded. Any other failure is logged.
+pub(crate) fn sync_dir_of(path: &Path) {
+    #[cfg(test)]
+    dir_sync::note(path);
+    #[cfg(unix)]
+    {
+        let dir = match path.parent() {
+            Some(dir) if !dir.as_os_str().is_empty() => dir,
+            _ => Path::new("."),
+        };
+        if let Err(e) = std::fs::File::open(dir).and_then(|d| d.sync_all()) {
+            use rustix::io::Errno;
+            if !matches!(Errno::from_io_error(&e), Some(Errno::INVAL | Errno::NOTSUP | Errno::BADF)) {
+                eprintln!("storage: could not sync folder {} after placing a file: {e}", dir.display());
+            }
+        }
+    }
+}
+
+/// Which folders this thread's placements synced ([`sync_dir_of`]) — where a test checks a
+/// placement is made durable before it returns.
+#[cfg(test)]
+pub(crate) mod dir_sync {
+    use std::cell::RefCell;
+    use std::path::{Path, PathBuf};
+
+    thread_local! {
+        static SYNCED: RefCell<Vec<PathBuf>> = const { RefCell::new(Vec::new()) };
+    }
+
+    pub(super) fn note(path: &Path) {
+        SYNCED.with(|s| s.borrow_mut().push(path.to_path_buf()));
+    }
+
+    /// The names whose folders were synced since the last call, in order.
+    pub(crate) fn take() -> Vec<PathBuf> {
+        SYNCED.with(|s| std::mem::take(&mut *s.borrow_mut()))
+    }
+}
+
+fn place_unsynced(part: &Path, to: &Path, may_copy: bool) -> std::io::Result<Placed> {
     #[cfg(test)]
     if copy_fallback::forced() {
         if !may_copy {
@@ -1153,6 +1225,37 @@ mod tests {
             place(&part, &free).unwrap();
             assert_eq!(std::fs::read(&free).unwrap(), b"ours", "{how}");
             assert!(!part.exists(), "{how}: the temporary name is gone");
+        }
+    }
+
+    /// #231 (import review N-1): every placement — a no-replace rename, a link, the copy
+    /// fallback, a put-back — syncs the folder of the name it gave before it returns, so a
+    /// power cut after the caller records the file cannot lose the name; a refused one syncs
+    /// nothing.
+    #[test]
+    fn a_placement_syncs_its_folder_before_it_returns() {
+        let dir = temp("placement-sync");
+        let _ = dir_sync::take();
+        type Place = fn(&Path, &Path) -> std::io::Result<()>;
+        let reporting: Place = |part, to| place_no_replace_reporting(part, to).map(drop);
+        let copied: Place = |part, to| {
+            let _forced = copy_fallback::force(|_| {});
+            place_no_replace(part, to)
+        };
+        for (how, place) in [
+            ("no-replace", place_no_replace as Place),
+            ("reporting", reporting),
+            ("without-copy", place_no_replace_without_copy),
+            ("copy", copied),
+        ] {
+            let part = dir.join(format!(".part-{how}"));
+            std::fs::write(&part, b"ours").unwrap();
+            let to = dir.join(format!("placed-{how}"));
+            place(&part, &to).unwrap();
+            assert_eq!(dir_sync::take(), [to.clone()], "{how}");
+            std::fs::write(&part, b"again").unwrap();
+            assert!(place(&part, &to).is_err(), "{how}");
+            assert!(dir_sync::take().is_empty(), "{how}: a refused placement syncs nothing");
         }
     }
 

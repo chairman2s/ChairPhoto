@@ -133,6 +133,10 @@ pub struct PhotoData {
     pub metadata: Slot<Vec<MetadataEntry>>,
     pub versions: Slot<Vec<PhotoVersion>>,
     pub publications: Slot<Vec<Publication>>,
+    /// How the local copy stands against its verified backup (#257): `None` inside when
+    /// there is nothing to compare. Hashes the local image, so it is read on the storage
+    /// [`Runner`], and only while the Storage section is open.
+    pub drift: Slot<Option<chairphoto_core::catalog::BackupDrift>>,
 }
 
 /// The details tab's collapsible sections, collapsed by default.
@@ -389,6 +393,13 @@ pub struct PhotoInspector {
     /// The core refuses a second operation on a photo anyway (`StorageClaims`); this keeps a
     /// double-click from starting one and overwriting the first one's message.
     pub storage_running: HashSet<i64>,
+    /// Bumped whenever the photo shown changes, and by every drift read started: a read
+    /// whose number is no longer this one stops before, or while, it hashes the local image
+    /// (review LOW-5) — moving through photos with Storage open hashes only the last.
+    drift_wanted: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// The photo whose "Replace backup with the local version" is asking for its
+    /// confirmation (#257); cleared when the photo or the catalog changes.
+    pub replace_confirm: Option<i64>,
     pub editors: Option<Editors>,
     editors_reading: bool,
     /// Bumped by every editors read started; only the newest one's result lands.
@@ -468,6 +479,8 @@ impl PhotoInspector {
             publish_version: None,
             storage_msg: None,
             storage_running: HashSet::new(),
+            replace_confirm: None,
+            drift_wanted: Default::default(),
             editors: None,
             editors_reading: false,
             editors_seq: 0,
@@ -528,6 +541,8 @@ impl PhotoInspector {
             self.data = PhotoData::default();
             self.stack_key = photo.map(|p| (p.1, p.2));
             self.storage_msg = None;
+            self.replace_confirm = None;
+            self.drift_wanted.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             self.renaming = None;
             self.publish_version = active_version;
             self.iptc.saved = IptcFields::default();
@@ -570,6 +585,9 @@ impl PhotoInspector {
                 }
                 if self.section_open(Section::Metadata) && matches!(self.data.metadata.load, Load::Idle) {
                     self.read(|t| &mut t.data.metadata, move |c| c.get_photo_metadata(id), cx);
+                }
+                if self.section_open(Section::Storage) && matches!(self.data.drift.load, Load::Idle) {
+                    self.read_drift(id, cx);
                 }
             }
             Some(InspectorTab::Versions) => {
@@ -659,6 +677,42 @@ impl PhotoInspector {
         .detach();
     }
 
+    /// Compare the photo's local copy with its verified backup (#257,
+    /// `storage::backup_drift_as`) on the storage [`Runner`]: it reads the local image, which
+    /// is not a short catalog read. The answer lands only for the photo and read it was
+    /// asked for.
+    fn read_drift(&mut self, id: i64, cx: &mut Context<Self>) {
+        let Some(from) = self.from else { return };
+        let generation = self.generation;
+        self.data.drift.seq += 1;
+        let seq = self.data.drift.seq;
+        if !matches!(self.data.drift.load, Load::Ready(_)) {
+            self.data.drift.load = Load::Loading;
+        }
+        let state = self.app.clone();
+        let wanted = self.drift_wanted.clone();
+        let token = wanted.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        let rx = Runner::get(cx).run(move || {
+            let stop = || wanted.load(std::sync::atomic::Ordering::Relaxed) != token;
+            chairphoto_core::app::storage::backup_drift_as(&state, from, id, &stop)
+        });
+        cx.spawn(async move |this, cx| {
+            let result = rx.await.unwrap_or_else(|_| Err("the worker stopped".into()));
+            this.update(cx, |this, cx| {
+                if this.generation != generation || this.data.drift.seq != seq {
+                    return;
+                }
+                this.data.drift.load = match result {
+                    Ok(v) => Load::Ready(v),
+                    Err(e) => Load::Failed(e),
+                };
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
     fn reload_versions(&mut self, cx: &mut Context<Self>) {
         let Some(id) = self.photo_id else { return };
         self.read(|t| &mut t.data.versions, move |c| c.list_versions(id), cx);
@@ -681,6 +735,8 @@ impl PhotoInspector {
                 // The old catalog's runs are bound to it; this catalog's photo ids are other
                 // photos, so none of them is in flight here.
                 self.storage_running.clear();
+                self.replace_confirm = None;
+                self.drift_wanted.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 self.data = PhotoData::default();
                 self.editors = None;
                 self.editors_reading = false;
@@ -896,6 +952,39 @@ impl PhotoInspector {
         );
     }
 
+    /// "Replace backup with the local version" (#257): ask first. Nothing runs until
+    /// [`Self::replace_backup`] is pressed on the question.
+    pub fn ask_replace_backup(&mut self, cx: &mut Context<Self>) {
+        self.replace_confirm = self.photo_id;
+        cx.notify();
+    }
+
+    pub fn cancel_replace_backup(&mut self, cx: &mut Context<Self>) {
+        self.replace_confirm = None;
+        cx.notify();
+    }
+
+    /// The confirmed Replace backup of the photo the question was asked for
+    /// (`storage::replace_backup_as`, bound to its catalog): the copy at home is kept as
+    /// `<name>.chairphoto-prev-<n>`, the local version copied, verified and recorded.
+    pub fn replace_backup(&mut self, cx: &mut Context<Self>) {
+        let (Some(id), Some(from)) = (self.photo_id, self.from) else { return };
+        if self.replace_confirm.take() != Some(id) || self.storage_running.contains(&id) {
+            cx.notify();
+            return;
+        }
+        self.storage_msg = Some("Replacing the backup…".into());
+        cx.notify();
+        self.storage_action(
+            id,
+            move |state| {
+                chairphoto_core::app::storage::replace_backup_as(state, from, id, true)
+                    .map(|report| chairphoto_model::storage_outcome::replace_message(&report))
+            },
+            cx,
+        );
+    }
+
     /// Run one storage verb for `id`, marked in flight ([`Self::storage_running`]) until it
     /// ends — whatever the inspector shows by then, so the mark is always cleared.
     fn storage_action(
@@ -917,6 +1006,9 @@ impl PhotoInspector {
                 cx.notify();
                 if this.generation == generation && this.photo_id == Some(id) {
                     this.storage_msg = Some(result.unwrap_or_else(|e| e));
+                    // What changed at home or here is compared again (#257).
+                    this.data.drift.load = Load::Idle;
+                    this.ensure_loaded(cx);
                     cx.notify();
                 }
                 this.changed(cx);

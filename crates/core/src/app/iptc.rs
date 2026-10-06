@@ -225,14 +225,16 @@ fn reserve(c: &crate::catalog::Catalog, photo_id: i64) -> crate::catalog::Result
 /// the catalog that stored it, and only then let the next writer in line go. A switch in
 /// between leaves the fields owed in that catalog, for its next repair pass.
 ///
-/// The write holds the photo's storage claim (`storage::StorageClaims`, #256) from before it
-/// opens the sidecar until it is settled, so it never runs inside an offload of that photo,
-/// which deletes the local sidecar once it is confirmed at home: a write landing after that
-/// confirmation would leave a newer sidecar beside a freed image, untracked, and the debt
-/// settled. Claims never wait. A photo another storage operation holds is not written: the
-/// fields stay owed, the save reports the sidecar pending with `storage::IN_PROGRESS`, and
-/// the next save or the repair pass writes them — to wherever the photo then resolves. An
-/// offload of a photo whose write holds the claim is refused the same way.
+/// The write holds a sidecar-write claim on the photo (`storage::StorageClaims::
+/// claim_sidecar_write`, #256) from before it opens the sidecar until it is settled, so it
+/// never runs inside an offload or Empty Trash of that photo, which delete the local sidecar
+/// once they have confirmed it: a write landing after that would leave a newer sidecar beside
+/// a freed image, untracked, and the debt settled. Claims never wait. A photo such an
+/// operation holds is not written: the fields stay owed, the save reports the sidecar pending
+/// with `storage::IN_PROGRESS`, and the next save or the repair pass writes them — to
+/// wherever the photo then resolves. An offload of a photo whose write holds the claim is
+/// refused the same way. A backup, restore or relocate of the photo does not hold up the
+/// write, nor the write them (review of #256, LOW-5): they leave the sidecar where it is.
 pub(crate) fn write_and_settle(
     state: &AppState,
     identity: CatalogIdentity,
@@ -250,7 +252,7 @@ pub(crate) fn write_and_settle(
     } else {
         Some(
             super::with_catalog_as(state, identity, |c| Ok(c.db_path().to_path_buf()))
-                .map(|db| state.storage_claims.claim(&db, write.photo_id, &[])),
+                .map(|db| state.storage_claims.claim_sidecar_write(&db, write.photo_id)),
         )
     };
     let outcome = match &claim {
@@ -794,7 +796,7 @@ mod tests {
     fn a_save_during_a_storage_operation_on_its_photo_leaves_the_sidecar_owed() {
         let (_dir, state, id, xmp) = foreign_photo("iptc-256-claimed", crate::xmp::test_fixtures::LIGHTROOM);
         let db = state.catalog.lock().unwrap().as_ref().unwrap().db_path().to_path_buf();
-        let offload = state.storage_claims.claim(&db, id, &[]).unwrap();
+        let offload = state.storage_claims.claim_to_free(&db, id, &[]).unwrap();
 
         let outcome = save_iptc(&state, id, &typed()).unwrap();
 
@@ -831,6 +833,25 @@ mod tests {
         assert_ne!(a.owed_iptc(id).unwrap(), crate::catalog::IptcMask::NONE, "still owed where it was stored");
     }
 
+    /// LOW-5 of the #256 review: a backup, restore or relocate holding the photo leaves its
+    /// sidecar where it is, so a save beside it writes the sidecar — never "pending (in
+    /// progress)" with nothing to retry it when the operation ends.
+    #[test]
+    fn a_save_during_a_backup_of_its_photo_writes_the_sidecar() {
+        let (_dir, state, id, xmp) = foreign_photo("iptc-256-backup", crate::xmp::test_fixtures::LIGHTROOM);
+        let db = state.catalog.lock().unwrap().as_ref().unwrap().db_path().to_path_buf();
+        let backup = state.storage_claims.claim(&db, id, &[]).unwrap();
+
+        let outcome = save_iptc(&state, id, &typed()).unwrap();
+
+        assert_eq!(outcome.sidecar, crate::catalog::IptcSidecarState::Written, "{outcome:?}");
+        assert_eq!(iptc(&read(&xmp)), written());
+        assert_eq!(owed(&state, id), crate::catalog::IptcMask::NONE);
+        assert!(state.storage_claims.is_claimed(&db, id), "the backup's claim is untouched");
+        drop(backup);
+        assert!(!state.storage_claims.is_claimed(&db, id));
+    }
+
     /// **Forced interleaving.** An offload pressed while a save's sidecar write is in flight
     /// (between the write and its settle) is refused as in progress, before it plans anything.
     #[test]
@@ -839,10 +860,15 @@ mod tests {
         let state = std::sync::Arc::new(state);
         let original = state.catalog.lock().unwrap().as_ref().unwrap().require_photo_path(id).unwrap();
         let tried = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let backed_up = std::sync::Arc::new(std::sync::Mutex::new(None));
         BEFORE_SETTLE.with(|cell| {
             *cell.borrow_mut() = Some((original, Box::new({
-                let (state, tried) = (state.clone(), tried.clone());
-                move || *tried.lock().unwrap() = Some(crate::app::storage::offload_photo(&state, id).map(drop))
+                let (state, tried, backed_up) = (state.clone(), tried.clone(), backed_up.clone());
+                move || {
+                    *tried.lock().unwrap() = Some(crate::app::storage::offload_photo(&state, id).map(drop));
+                    let db = state.catalog.lock().unwrap().as_ref().unwrap().db_path().to_path_buf();
+                    *backed_up.lock().unwrap() = Some(state.storage_claims.claim(&db, id, &[]).is_some());
+                }
             })));
         });
 
@@ -850,6 +876,8 @@ mod tests {
 
         let tried = tried.lock().unwrap().take().expect("the offload ran inside the write");
         assert_eq!(tried.unwrap_err(), crate::app::storage::IN_PROGRESS);
+        let backed = backed_up.lock().unwrap().take().expect("the backup claim ran inside the write");
+        assert!(backed, "a backup (which keeps the local files) is not held up by the write");
         assert_eq!(outcome.sidecar, crate::catalog::IptcSidecarState::Written, "{outcome:?}");
         assert_eq!(iptc(&read(&xmp)), written());
         // Afterwards the offload is refused on its own account (no backup), not as busy.

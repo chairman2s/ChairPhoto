@@ -49,8 +49,11 @@ pub use identity::{
 pub use iptc_owed::{IptcMask, IptcSettled, IptcSidecarState, IptcSidecarWrite, OwedDismissal, OwedIptc};
 pub use locations::{NameHolder, PathCandidate, ResolveMode};
 pub use lifecycle::{
-    any_backup_present, carry_companions, copy_and_verify, copy_with_companions, filter_offload_eligible,
-    resolve_backup_plan, resolve_offload_plan, resolve_restore_plan, sha256_file, verify_and_delete_locals,
+    any_backup_present, backup_drift, carry_companions, carry_companions_home, copy_and_verify,
+    copy_with_companions, filter_offload_eligible, replace_at_home, replace_backup_with_local,
+    resolve_backup_plan, resolve_offload_plan, resolve_replace_plan, resolve_restore_plan,
+    drift_hash_cached, missing_backup_hint, rewritten_by_chairphoto, sha256_file, verify_and_delete_locals, BackupDrift, BackupStamps,
+    PhotoReplace, ReplaceCandidates, ReplaceOutcome, Replaced, PREV_TAG,
     verify_and_delete_locals_abortable, BackupCandidates, BackupPlan, BackupReport, CarriedCompanion,
     CompanionCarry, CopyOutcome, FreedPhoto, OffloadCandidates, OffloadCarry, OffloadEligibility, OffloadPlan,
     OffloadReport, PhotoBackup, PhotoOffload, PhotoRestore, RestoreCandidates, RestorePlan, RestoreReport,
@@ -375,6 +378,9 @@ impl Catalog {
                  PRIMARY KEY (location_id, name)
              );",
         )?;
+        // What a carry confirmed at home, by hash (#257): an automatic re-backup replaces a
+        // companion at home only while home still holds exactly that.
+        self.ensure_column("photo_location_companions", "carried_hash", "TEXT")?;
         // Pixel-derived B&W flag for the monochrome auto-tag (schema v12).
         self.ensure_column("photos", "is_grayscale", "INTEGER")?;
         // Non-destructive user orientation override (degrees clockwise), schema v17.

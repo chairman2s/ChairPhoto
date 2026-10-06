@@ -945,6 +945,117 @@ fn back_up_of_a_photo_in_use_says_so_and_queues_nothing(cx: &mut TestAppContext)
     drop(held);
 }
 
+// --- storage: a local version that moved on from its backup (#257) --------------------
+
+/// A backed-up photo whose image was rewritten in place after its backup reads "Changed
+/// since backup", saying which file. Replace backup asks first — Cancel runs nothing — and
+/// the confirmed replace keeps the earlier copy at home as `<name>.chairphoto-prev-1`, copies
+/// the local version home, and the section compares again: Backed up, no Replace offered.
+#[gpui_kit::test]
+fn a_photo_changed_since_backup_says_so_and_replaces_its_backup_once_confirmed(cx: &mut TestAppContext) {
+    let dir = TempDir::new("insp-storage-changed");
+    let app = start(cx);
+    let ids = open_catalog_with_photos(&app, &dir, 1, cx);
+    let nas = dir.0.join("nas");
+    std::fs::create_dir_all(dir.0.join("photos/2026")).unwrap();
+    std::fs::create_dir_all(&nas).unwrap();
+    let raw = dir.0.join("photos/2026/p0.ARW");
+    std::fs::write(&raw, b"raw-0").unwrap();
+    catalog(&app, |c| {
+        let nas = c.add_volume("NAS", &nas, chairphoto_core::catalog::VolumeKind::Backup).unwrap();
+        c.backup_photo(ids[0], nas).unwrap();
+    });
+    std::fs::write(&raw, b"raw-0 rewritten in place").unwrap();
+    app.state.send(CoreEvent::CatalogSwitched(dir.0.join("photos.chairphoto").to_string_lossy().to_string()));
+    cx.run_until_parked();
+    select(&app, ids[0], SelectMods::default(), cx);
+    if !present(&app, "storage-msg", cx) {
+        click(&app, "section-storage", cx);
+    }
+    work(cx); // the comparison runs on the storage runner
+
+    let msg = aria(&app, "storage-msg", cx).unwrap();
+    assert_eq!(msg, "p0.ARW changed since backup — the copy at home is the earlier version");
+    assert!(present(&app, "storage-offload", cx));
+    click(&app, "storage-replace", cx);
+    assert!(present(&app, "storage-replace-question", cx), "it asks first");
+    assert_eq!(cx.update(|cx| Runner::get(cx).pending()), 0, "and runs nothing yet");
+    click(&app, "storage-replace-cancel", cx);
+    assert!(!present(&app, "storage-replace-question", cx));
+    assert_eq!(cx.update(|cx| Runner::get(cx).pending()), 0);
+
+    click(&app, "storage-replace", cx);
+    click(&app, "storage-replace-confirm", cx);
+    work(cx);
+
+    assert_eq!(
+        aria(&app, "storage-msg", cx).as_deref(),
+        Some("Backup replaced with the local version — the earlier copy kept at home as p0.ARW.chairphoto-prev-1")
+    );
+    assert_eq!(std::fs::read(nas.join("2026/p0.ARW")).unwrap(), b"raw-0 rewritten in place");
+    assert_eq!(std::fs::read(nas.join("2026/p0.ARW.chairphoto-prev-1")).unwrap(), b"raw-0");
+    let insp = inspector(&app, cx);
+    insp.read_with(cx, |i, _| {
+        assert!(matches!(&i.data.drift.load, Load::Ready(Some(d)) if !d.changed()), "compared again");
+    });
+    assert!(!present(&app, "storage-replace", cx));
+}
+
+/// Review LOW-5: moving on to another photo before a queued comparison runs means that photo's
+/// image is never read; only the photo now shown is hashed.
+#[gpui_kit::test]
+fn moving_on_before_the_drift_check_runs_reads_nothing_of_the_photo_left(cx: &mut TestAppContext) {
+    let dir = TempDir::new("insp-storage-drift-moved");
+    let app = start(cx);
+    let ids = open_catalog_with_photos(&app, &dir, 2, cx);
+    let nas = dir.0.join("nas");
+    std::fs::create_dir_all(dir.0.join("photos/2026")).unwrap();
+    std::fs::create_dir_all(&nas).unwrap();
+    let raws: Vec<_> = (0..2).map(|i| dir.0.join(format!("photos/2026/p{i}.ARW"))).collect();
+    for (i, raw) in raws.iter().enumerate() {
+        std::fs::write(raw, format!("raw-{i}")).unwrap();
+    }
+    catalog(&app, |c| {
+        let nas = c.add_volume("NAS", &nas, chairphoto_core::catalog::VolumeKind::Backup).unwrap();
+        for id in &ids {
+            c.backup_photo(*id, nas).unwrap();
+        }
+    });
+    select(&app, ids[0], SelectMods::default(), cx);
+    if !present(&app, "storage-msg", cx) {
+        click(&app, "section-storage", cx);
+    }
+    select(&app, ids[1], SelectMods::default(), cx);
+    work(cx);
+
+    assert!(!chairphoto_core::catalog::drift_hash_cached(&raws[0]), "the photo left was never read");
+    assert!(chairphoto_core::catalog::drift_hash_cached(&raws[1]), "the photo shown was");
+}
+
+/// #257: the replace question belongs to the photo it was asked for — choosing another
+/// photo or a catalog switch drops it, so a confirm can never replace another photo's backup.
+#[gpui_kit::test]
+fn the_replace_question_is_dropped_with_its_photo(cx: &mut TestAppContext) {
+    let dir = TempDir::new("insp-storage-replace-drop");
+    let app = start(cx);
+    let ids = open_catalog_with_photos(&app, &dir, 2, cx);
+    select(&app, ids[0], SelectMods::default(), cx);
+    let insp = inspector(&app, cx);
+    insp.update(cx, |i, cx| i.ask_replace_backup(cx));
+    insp.read_with(cx, |i, _| assert_eq!(i.replace_confirm, Some(ids[0])));
+    select(&app, ids[1], SelectMods::default(), cx);
+    insp.read_with(cx, |i, _| assert_eq!(i.replace_confirm, None));
+    insp.update(cx, |i, cx| i.replace_backup(cx));
+    insp.read_with(cx, |i, _| {
+        assert!(i.storage_running.is_empty() && i.storage_msg.is_none(), "an unasked confirm runs nothing")
+    });
+
+    insp.update(cx, |i, cx| i.ask_replace_backup(cx));
+    app.state.send(CoreEvent::CatalogSwitched(dir.0.join("photos.chairphoto").to_string_lossy().to_string()));
+    cx.run_until_parked();
+    insp.read_with(cx, |i, _| assert_eq!(i.replace_confirm, None));
+}
+
 // --- versions ------------------------------------------------------------------------
 
 /// Add (typed name, else "Version N"), choose, rename, duplicate, delete; the chosen version

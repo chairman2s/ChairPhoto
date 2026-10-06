@@ -15,26 +15,22 @@ use crate::catalog::{
     BackupReport, Catalog, DrainSummary, LocationRole, OffloadReport, PhotoBackup, PhotoRestore, RestoreReport,
     SkippedPhoto, VolumeKind,
 };
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
-/// Where a lifecycle step plans and records: the shared handle (`AppState` — whichever
-/// catalog is open at each step) or one bound connection (a drain, which must never apply
-/// one catalog's photo and operation ids to another's rows).
+/// Where a lifecycle step plans and records: one connection bound to one catalog — a verb's
+/// ([`bound`]) or a drain's ([`ReconcileClaim`]) — so no step can apply one catalog's photo
+/// ids to another's rows. There is deliberately no implementation for the shared `AppState`
+/// handle, which is whichever catalog is open at each step: a switch between a plan and its
+/// record would record catalog A's ids into B (review of #253, #231 c).
 trait CatalogAccess {
     fn with<T>(&self, f: impl FnOnce(&Catalog) -> crate::catalog::Result<T>) -> Result<T, String>;
 }
 
-/// Both report a catalog error as its user reads it ([`crate::catalog::user_reason`]): a
-/// storage verb's refusal reaches the inspector's status line and a queued op's error.
-impl CatalogAccess for AppState {
-    fn with<T>(&self, f: impl FnOnce(&Catalog) -> crate::catalog::Result<T>) -> Result<T, String> {
-        with_catalog(self, |c| Ok(f(c)))?.map_err(|e| crate::catalog::user_reason(&e))
-    }
-}
-
+/// Reports a catalog error as its user reads it ([`crate::catalog::user_reason`]): a storage
+/// verb's refusal reaches the inspector's status line and a queued op's error.
 impl CatalogAccess for Catalog {
     fn with<T>(&self, f: impl FnOnce(&Catalog) -> crate::catalog::Result<T>) -> Result<T, String> {
         f(self).map_err(|e| crate::catalog::user_reason(&e))
@@ -67,60 +63,136 @@ pub const IN_PROGRESS: &str = crate::catalog::IN_PROGRESS_REASON;
 /// pending); a drain whose op's photo is claimed leaves the op pending, untouched
 /// (`DrainSummary::busy`). So a claim cannot deadlock against anything.
 ///
-/// Empty Trash claims each photo for its delete ([`destroy_planned_photos`]) and Relocate for
-/// its re-pointing ([`relocate_photo`]), refusing a held photo with [`IN_PROGRESS`] (#256).
+/// Empty Trash claims each photo for its delete ([`destroy_planned_photos`]), Relocate for
+/// its re-pointing ([`relocate_photo`]) and Replace backup for its copy home
+/// ([`replace_backup_as`], #257), refusing a held photo with [`IN_PROGRESS`] (#256).
 ///
-/// An IPTC sidecar write claims its photo too (`iptc::write_and_settle`, #256), so a save
-/// never writes a sidecar an offload of that photo is confirming and deleting: whichever
-/// claims first goes ahead, and the other is refused — the write stays owed for the next
-/// save or the repair pass, the offload fails with [`IN_PROGRESS`] (a drain leaves it
-/// pending). The identity-repair pass, face-region and GPS writes do not claim; offload's
-/// move-aside check (`catalog::lifecycle`) still keeps what they write.
+/// **Sidecar writes** (#256): an IPTC sidecar write holds a [`SidecarWriteClaim`] on its
+/// photo (`iptc::write_and_settle`), and only the operations that **remove the photo's local
+/// files** — offload and Empty Trash, [`ClaimKind::Frees`] — exclude it: such an operation
+/// deletes the local sidecar once it has confirmed it, and a write landing after that check
+/// would leave a newer sidecar beside a freed image, untracked, with the debt settled.
+/// Whichever claims first goes ahead; the write stays owed for the next save or the repair
+/// pass, the offload fails with [`IN_PROGRESS`] (a drain leaves it pending). Every other
+/// operation ([`ClaimKind::Keeps`]: backup, restore, relocate) leaves the
+/// sidecar where it is, so a save beside it goes ahead and is never reported pending
+/// because of it (review of #256, LOW-5) — a copy that reads the sidecar while it is being
+/// replaced fails its own verification rather than recording a mix. The identity-repair
+/// pass, face-region and GPS writes do not claim at all (see `docs/storage-and-import.md`,
+/// "A storage verb acts on the moment"); offload's move-aside check
+/// (`catalog::lifecycle`) still keeps what they write.
 ///
 /// **Lock order** (`app::jobs`): the set's mutex is a leaf — nothing is acquired while it
 /// is held, and it is taken with no lock held but, at most, the catalog lock or a sidecar's
-/// write turn. The claim it
-/// grants is taken *before* the op's plan and held across the op's catalog-lock
-/// acquisitions; since nothing ever blocks on a claim, holding one there cannot invert the
-/// order.
+/// write turn. The claim it grants is taken *before* the op's plan and held across the op's
+/// catalog-lock acquisitions; since nothing ever blocks on a claim, holding one there cannot
+/// invert the order.
 ///
 /// Keyed by the catalog's database path as well as the id: a verb bound to catalog A (its
 /// own connection) can still be finishing after a switch, and photo 7 in catalog B is a
 /// different photo.
 #[derive(Default)]
 pub struct StorageClaims {
-    held: Mutex<HashSet<(PathBuf, i64)>>,
+    held: Mutex<HashMap<(PathBuf, i64), Hold>>,
+}
+
+/// What holds one photo: at most one storage operation, and any number of sidecar writes.
+#[derive(Default, Clone, Copy)]
+struct Hold {
+    op: Option<ClaimKind>,
+    writes: usize,
+}
+
+impl Hold {
+    fn is_empty(&self) -> bool {
+        self.op.is_none() && self.writes == 0
+    }
+
+    /// Whether an operation of `kind` may take this photo now.
+    fn admits(&self, kind: ClaimKind) -> bool {
+        self.op.is_none() && (kind == ClaimKind::Keeps || self.writes == 0)
+    }
+}
+
+/// What a storage operation does to the photo's local files — which decides whether a
+/// sidecar write may run beside it ([`StorageClaims`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClaimKind {
+    /// Copies, re-points or replaces the copy at home, and leaves the local files where they
+    /// are: backup, restore, relocate, replace backup.
+    Keeps,
+    /// Removes the photo's local files, its sidecar with them: offload, Empty Trash.
+    Frees,
 }
 
 impl StorageClaims {
     /// The set. A panic while it was held cannot leave it half-changed (each change is one
-    /// insert or remove), so a poisoned lock is still usable — and must be, or one panicked
-    /// worker would refuse every storage op for the rest of the session.
-    fn held(&self) -> MutexGuard<'_, HashSet<(PathBuf, i64)>> {
+    /// insert, update or remove), so a poisoned lock is still usable — and must be, or one
+    /// panicked worker would refuse every storage op for the rest of the session.
+    fn held(&self) -> MutexGuard<'_, HashMap<(PathBuf, i64), Hold>> {
         self.held.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Claim `named` and whichever of `frames` are free, in catalog `db`. `None` — claiming
-    /// nothing — when `named` itself is held by another operation. A frame held elsewhere is
-    /// simply not part of the claim; the op leaves it ([`StorageClaim::holds`]).
+    /// Claim `named` and whichever of `frames` are free, in catalog `db`, for an operation
+    /// that keeps the local files ([`ClaimKind::Keeps`]). `None` — claiming nothing — when
+    /// `named` itself is held by another operation. A frame held elsewhere is simply not part
+    /// of the claim; the op leaves it ([`StorageClaim::holds`]).
     pub fn claim(self: &Arc<Self>, db: &Path, named: i64, frames: &[i64]) -> Option<StorageClaim> {
+        self.claim_as(ClaimKind::Keeps, db, named, frames)
+    }
+
+    /// [`Self::claim`] for an operation that removes the local files ([`ClaimKind::Frees`]):
+    /// a photo a sidecar write holds is not free for it either.
+    pub fn claim_to_free(self: &Arc<Self>, db: &Path, named: i64, frames: &[i64]) -> Option<StorageClaim> {
+        self.claim_as(ClaimKind::Frees, db, named, frames)
+    }
+
+    /// [`Self::claim`] for an operation of `kind`.
+    pub fn claim_as(self: &Arc<Self>, kind: ClaimKind, db: &Path, named: i64, frames: &[i64]) -> Option<StorageClaim> {
         let mut held = self.held();
-        if held.contains(&(db.to_path_buf(), named)) {
+        let key = |id: i64| (db.to_path_buf(), id);
+        if !held.get(&key(named)).copied().unwrap_or_default().admits(kind) {
             return None;
         }
-        let mut ids = vec![named];
-        held.insert((db.to_path_buf(), named));
-        for &frame in frames {
-            if held.insert((db.to_path_buf(), frame)) {
-                ids.push(frame);
+        let mut ids = Vec::with_capacity(1 + frames.len());
+        for id in std::iter::once(named).chain(frames.iter().copied()) {
+            let hold = held.entry(key(id)).or_default();
+            if hold.admits(kind) {
+                hold.op = Some(kind);
+                ids.push(id);
             }
         }
         Some(StorageClaim { claims: Arc::clone(self), db: db.to_path_buf(), ids })
     }
 
-    /// Whether some operation holds photo `id` of catalog `db`.
+    /// Hold photo `id` of catalog `db` for one sidecar write; `None` while an operation that
+    /// removes the photo's local files holds it ([`ClaimKind::Frees`]). Sidecar writes do
+    /// not exclude each other here — the sidecar's own write turn orders them.
+    pub fn claim_sidecar_write(self: &Arc<Self>, db: &Path, id: i64) -> Option<SidecarWriteClaim> {
+        let mut held = self.held();
+        let hold = held.entry((db.to_path_buf(), id)).or_default();
+        if hold.op == Some(ClaimKind::Frees) {
+            return None;
+        }
+        hold.writes += 1;
+        Some(SidecarWriteClaim { claims: Arc::clone(self), db: db.to_path_buf(), id })
+    }
+
+    /// Whether some operation or sidecar write holds photo `id` of catalog `db`.
     pub fn is_claimed(&self, db: &Path, id: i64) -> bool {
-        self.held().contains(&(db.to_path_buf(), id))
+        self.held().get(&(db.to_path_buf(), id)).is_some_and(|h| !h.is_empty())
+    }
+
+    /// Change the hold of `(db, id)` by `f`, dropping the entry once nothing holds it.
+    fn release(&self, db: &Path, id: i64, f: impl FnOnce(&mut Hold)) {
+        let mut held = self.held();
+        let key = (db.to_path_buf(), id);
+        if let Some(hold) = held.get_mut(&key) {
+            f(hold);
+            if hold.is_empty() {
+                held.remove(&key);
+            }
+        }
     }
 }
 
@@ -140,20 +212,64 @@ impl StorageClaim {
 
 impl Drop for StorageClaim {
     fn drop(&mut self) {
-        let mut held = self.claims.held();
         for &id in &self.ids {
-            held.remove(&(self.db.clone(), id));
+            self.claims.release(&self.db, id, |h| h.op = None);
         }
     }
 }
 
-/// Claim `photo_id` and the frames stacked under it in the catalog `cat` reaches, before
-/// anything is planned — so the plan is made, and the work done, with every member it can
-/// take held. The stack is read under the catalog lock and the claim taken after it is
-/// released.
-fn claim_moment(cat: &impl CatalogAccess, claims: &Arc<StorageClaims>, photo_id: i64) -> Result<StorageClaim, String> {
+/// One sidecar write's hold on its photo ([`StorageClaims::claim_sidecar_write`]); released
+/// when dropped.
+pub struct SidecarWriteClaim {
+    claims: Arc<StorageClaims>,
+    db: PathBuf,
+    id: i64,
+}
+
+impl Drop for SidecarWriteClaim {
+    fn drop(&mut self) {
+        self.claims.release(&self.db, self.id, |h| h.writes = h.writes.saturating_sub(1));
+    }
+}
+
+/// Claim `photo_id` and the frames stacked under it in the catalog `cat` reaches, for an
+/// operation of `kind`, before anything is planned — so the plan is made, and the work done,
+/// with every member it can take held. The stack is read under the catalog lock and the
+/// claim taken after it is released.
+fn claim_moment(
+    cat: &impl CatalogAccess,
+    claims: &Arc<StorageClaims>,
+    kind: ClaimKind,
+    photo_id: i64,
+) -> Result<StorageClaim, String> {
     let (db, frames) = cat.with(|c| Ok((c.db_path().to_path_buf(), c.stack_frame_ids(photo_id)?)))?;
-    claims.claim(&db, photo_id, &frames).ok_or_else(|| IN_PROGRESS.to_string())
+    claims.claim_as(kind, &db, photo_id, &frames).ok_or_else(|| IN_PROGRESS.to_string())
+}
+
+// ── What a crashed offload left, put back at start-up (#256 b) ───────────────────────
+
+/// Start the sweep of the library root for what a crashed run left
+/// ([`startup_sweep`]) on the blocking pool; nothing waits on it, and what it does is
+/// logged. A front end calls it once per process, after the start-up open of the catalog
+/// `from`.
+pub fn spawn_startup_sweep(state: &AppState, from: super::CatalogIdentity) {
+    let state = state.clone();
+    drop(super::spawn_blocking(move || {
+        if let Err(e) = startup_sweep(&state, from) {
+            eprintln!("storage: the start-up sweep of the library did not run: {e}");
+        }
+    }));
+}
+
+/// Sweep every folder under the library root of the catalog `from` — read only while it is
+/// still the open one — for what a crashed offload or copy left
+/// (`catalog::working_files::sweep_tree`): a local file an offload had moved to a hidden name
+/// goes back under its own name, never replacing one, rather than staying missing until a
+/// storage operation happens to plan in that folder (review of #256, (b)). File IO only, with
+/// no lock held; returns how many folders were swept.
+pub fn startup_sweep(state: &AppState, from: super::CatalogIdentity) -> Result<usize, String> {
+    let root = super::with_catalog_as(state, from, |c| Ok(c.root().to_path_buf()))?;
+    Ok(crate::catalog::working_files::sweep_tree(&root))
 }
 
 /// Leave each planned frame the claim does not hold — held by another operation, or stacked
@@ -184,8 +300,12 @@ fn superseded(abort: Option<&AtomicBool>) -> bool {
 ///
 /// The named photo's failure is the call's failure; a frame that fails is reported and the
 /// rest continue, because the master is already at home by then.
+///
+/// Bound, like every verb, to the catalog open when it is called ([`bound`]): a switch
+/// mid-copy cannot record it into the catalog switched to.
 pub fn backup_to(state: &AppState, photo_id: i64, backup_id: i64) -> Result<BackupReport, String> {
-    backup_in(state, &state.storage_claims, photo_id, backup_id, None)
+    let cat = bound(state, super::catalog_identity(state)?)?;
+    backup_in(&cat, &state.storage_claims, photo_id, backup_id, None)
 }
 
 /// `abort`: the reconcile claim a drain runs this under. The named photo — the op in flight,
@@ -203,7 +323,7 @@ fn backup_in(
     backup_id: i64,
     abort: Option<&AtomicBool>,
 ) -> Result<BackupReport, String> {
-    let claim = claim_moment(cat, claims, photo_id)?;
+    let claim = claim_moment(cat, claims, ClaimKind::Keeps, photo_id)?;
     // Candidate rows under the lock; which copies are actually on disk is decided off it
     // (#85), so a slow NAS stalls this plan but no other catalog reader.
     let candidates = cat.with(|c| c.plan_backup_candidates(photo_id, backup_id))?;
@@ -237,7 +357,12 @@ fn backup_one(cat: &impl CatalogAccess, plan: PhotoBackup) -> Result<(), String>
     // The idempotency gate's rows come from under the lock; its stat runs off it (#85).
     let gate = cat.with(|c| c.verified_backup_candidates(photo_id))?;
     if crate::catalog::any_backup_present(&gate) {
-        let carried = crate::catalog::carry_companions(&source, &dest).map_err(|e| crate::catalog::user_reason(&e))?;
+        // ChairPhoto's own sidecar rewritten since home last held it goes home again, the
+        // copy there kept as `<name>.chairphoto-prev-<n>` (#257); any other difference is
+        // left as divergence for an explicit Replace backup.
+        let stamps = cat.with(|c| c.backup_stamps_at(photo_id, volume_id))?;
+        let carried = crate::catalog::carry_companions_home(&source, &dest, &stamps)
+            .map_err(|e| crate::catalog::user_reason(&e))?;
         return cat.with(|c| {
             c.record_companions_at(photo_id, volume_id, LocationRole::Backup, &carried.carried)
         });
@@ -300,8 +425,11 @@ pub fn restore_photo_as(
 /// local and why, and how many sidecar backups it deliberately left on disk. Persists an
 /// id-keyed thumbnail from a local copy of every member first, so each stays visible once
 /// only the NAS copy remains (frames are what the inspector's Stack section shows).
+///
+/// Bound to the catalog open when it is called ([`bound`]); a front end that read the id
+/// earlier passes that catalog's identity to [`offload_photo_as`] instead.
 pub fn offload_photo(state: &AppState, photo_id: i64) -> Result<OffloadReport, String> {
-    offload_in(state, &state.storage_claims, photo_id, None)
+    offload_photo_as(state, super::catalog_identity(state)?, photo_id)
 }
 
 /// `abort`: as [`backup_in`]'s, but stricter, because this is the verb that deletes: the
@@ -330,7 +458,7 @@ fn offload_until(
 ) -> Result<OffloadReport, String> {
     // Held from before the plan until the commit: a restore of the same photo cannot add a
     // row between this plan and its commit, nor a second offload delete under it (#254).
-    let claim = claim_moment(cat, claims, photo_id)?;
+    let claim = claim_moment(cat, claims, ClaimKind::Frees, photo_id)?;
     // Candidate rows under the lock; the per-frame backup gate stats off it (#85). The stat
     // can go stale by the delete, but never destructively: `free_local_copies` re-hashes the
     // backup before anything is removed.
@@ -362,8 +490,11 @@ fn offload_until(
 /// included (a restored photo arrives with the edit state an offload moved home) — **and the
 /// frames stacked under it that are away** (#82): offload frees the moment, so restore brings
 /// it back. A frame already local is left alone rather than overwritten.
+///
+/// Bound to the catalog open when it is called ([`bound`]).
 pub fn restore_to(state: &AppState, photo_id: i64, local_id: i64) -> Result<RestoreReport, String> {
-    restore_in(state, &state.storage_claims, photo_id, local_id, None)
+    let cat = bound(state, super::catalog_identity(state)?)?;
+    restore_in(&cat, &state.storage_claims, photo_id, local_id, None)
 }
 
 /// `abort` and `claims`: as [`backup_in`]'s.
@@ -374,7 +505,7 @@ fn restore_in(
     local_id: i64,
     abort: Option<&AtomicBool>,
 ) -> Result<RestoreReport, String> {
-    let claim = claim_moment(cat, claims, photo_id)?;
+    let claim = claim_moment(cat, claims, ClaimKind::Keeps, photo_id)?;
     // Candidate rows under the lock; which frames are already home and which backup is
     // reachable are statted off it (#85).
     let candidates = cat.with(|c| c.plan_restore_candidates(photo_id, local_id))?;
@@ -405,17 +536,103 @@ fn restore_one(cat: &impl CatalogAccess, plan: PhotoRestore) -> Result<(), Strin
     cat.with(|c| c.record_copy(photo_id, volume_id, &rel, LocationRole::LocalCache, &outcome))
 }
 
-/// Back up to the single backup volume. Errors when the NAS is offline; the UI queues a
-/// backup op instead (drained on reconcile).
-pub fn backup_photo(state: &AppState, photo_id: i64) -> Result<BackupReport, String> {
-    let backup_id = with_catalog(state, |c| single_volume_of_kind(c, VolumeKind::Backup, "backup"))?;
-    backup_to(state, photo_id, backup_id)
+// ── A backup the local version moved on from (#257) ──────────────────────────────
+
+/// Why [`replace_backup_as`] refused without its confirmation.
+pub const REPLACE_NEEDS_CONFIRMATION: &str = "replacing a backup needs an explicit confirmation";
+
+/// What a confirmed Replace backup did ([`replace_backup_as`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReplaceReport {
+    /// Each file at home that now holds the local version, by name, with the name its
+    /// previous bytes are kept under (`<name>.chairphoto-prev-<n>`). Empty when home already
+    /// held the local version.
+    pub replaced: Vec<(String, String)>,
 }
 
-/// Restore to the single local volume.
+/// How the local copy of a photo read from the catalog `expected` names stands against its
+/// verified backup (#257) — the inspector's "Changed since backup". `None` when there is
+/// nothing to compare (no local copy on disk, or no verified backup). Reads the local image
+/// once to hash it (once per session while its size and mtime stay the same), and the
+/// companions at home when home is reachable: a blocking worker, on a connection of its own
+/// to that catalog ([`bound`]). Read-only, so it claims nothing. `stop` is asked before it
+/// starts and while it reads the image: once it answers true (the user moved on to another
+/// photo) the comparison ends with [`DRIFT_SUPERSEDED`], having read no further.
+pub fn backup_drift_as(
+    state: &AppState,
+    expected: super::CatalogIdentity,
+    photo_id: i64,
+    stop: &dyn Fn() -> bool,
+) -> Result<Option<crate::catalog::BackupDrift>, String> {
+    if stop() {
+        return Err(DRIFT_SUPERSEDED.into());
+    }
+    let cat = bound(state, expected)?;
+    let candidates = cat.with(|c| c.plan_replace_candidates(photo_id))?;
+    let Some(plan) = crate::catalog::resolve_replace_plan(candidates) else { return Ok(None) };
+    match crate::catalog::backup_drift(&plan, stop).map_err(|e| crate::catalog::user_reason(&e))? {
+        Some(drift) => Ok(Some(drift)),
+        None => Err(DRIFT_SUPERSEDED.into()),
+    }
+}
+
+/// What [`backup_drift_as`] answers when its caller stopped wanting it.
+pub const DRIFT_SUPERSEDED: &str = "the comparison with the backup was superseded";
+
+/// The inspector's confirmed "Replace backup with the local version" (#257) of a photo read
+/// from the catalog `expected` names: every file at home that differs from the local one —
+/// the image, and any carried companion whoever changed it — is replaced by the local
+/// version, its previous bytes kept beside it as `<name>.chairphoto-prev-<n>`, copied and
+/// verified, and the new hash recorded, so the photo can then be offloaded. Nothing at home
+/// is overwritten or deleted. Refused without `confirm` ([`REPLACE_NEEDS_CONFIRMATION`]).
+///
+/// The photo alone, not its stack: each frame has its own copy at home to answer for. Claims
+/// the photo for the whole run ([`ClaimKind::Keeps`]: the local files stay), so it never
+/// runs beside another storage operation on it; a sidecar save may, and a sidecar replaced
+/// while it is copied fails that copy's verification. Blocking file IO on a connection of
+/// its own to the catalog ([`bound`]): a worker, never the UI thread.
+pub fn replace_backup_as(
+    state: &AppState,
+    expected: super::CatalogIdentity,
+    photo_id: i64,
+    confirm: bool,
+) -> Result<ReplaceReport, String> {
+    if !confirm {
+        return Err(REPLACE_NEEDS_CONFIRMATION.into());
+    }
+    let cat = bound(state, expected)?;
+    let db = cat.with(|c| Ok(c.db_path().to_path_buf()))?;
+    let claim = state.storage_claims.claim(&db, photo_id, &[]).ok_or_else(|| IN_PROGRESS.to_string())?;
+    let candidates = cat.with(|c| c.plan_replace_candidates(photo_id))?;
+    let plan = crate::catalog::resolve_replace_plan(candidates)
+        .ok_or_else(|| "no local copy and verified backup to compare".to_string())?;
+    let outcome = crate::catalog::replace_backup_with_local(&plan).map_err(|e| crate::catalog::user_reason(&e))?;
+    // Recorded whatever the companions did: the image at home is the local version by now.
+    cat.with(|c| c.record_replaced_backup(photo_id, plan.backup_location_id, &outcome.hash, &outcome.carried))?;
+    drop(claim);
+    let file = |p: &Path| p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let replaced: Vec<(String, String)> = outcome.replaced.iter().map(|(home, kept)| (file(home), file(kept))).collect();
+    match outcome.failed {
+        None => Ok(ReplaceReport { replaced }),
+        Some(why) if replaced.is_empty() => Err(why),
+        Some(why) => Err(format!(
+            "{why} — already replaced: {}",
+            replaced.iter().map(|(home, kept)| format!("{home} (the earlier kept as {kept})")).collect::<Vec<_>>().join(", ")
+        )),
+    }
+}
+
+/// Back up to the single backup volume. Errors when the NAS is offline; the UI queues a
+/// backup op instead (drained on reconcile). Bound to the catalog open when it is called,
+/// as [`backup_photo_as`] is to the one it names.
+pub fn backup_photo(state: &AppState, photo_id: i64) -> Result<BackupReport, String> {
+    backup_photo_as(state, super::catalog_identity(state)?, photo_id)
+}
+
+/// Restore to the single local volume. Bound as [`backup_photo`] is.
 pub fn restore_photo(state: &AppState, photo_id: i64) -> Result<RestoreReport, String> {
-    let local_id = with_catalog(state, |c| single_volume_of_kind(c, VolumeKind::Local, "local"))?;
-    restore_to(state, photo_id, local_id)
+    restore_photo_as(state, super::catalog_identity(state)?, photo_id)
 }
 
 // --- the storage verbs take the moment (#82) ---------------------------------------------
@@ -447,6 +664,282 @@ mod stack_tests {
         let state = AppState::default();
         *state.catalog.lock().unwrap() = Some(c);
         (dir, state, master, frame, raw, jpg)
+    }
+
+    /// A connection of its own to the open catalog — what every verb plans and records on.
+    fn on(state: &AppState) -> Catalog {
+        bound(state, super::super::catalog_identity(state).unwrap()).unwrap()
+    }
+
+    // ── #231 c: the AppState verbs are bound to one catalog ──────────────────────────
+
+    /// A switch landing between a verb's plan and its record (here: while the offload checks
+    /// its files) must not record catalog A's photo into B, whose photo of the same id is
+    /// another photo. The `AppState` verbs plan and record on a connection bound to the
+    /// catalog open when they were called, as the `_as` verbs do.
+    #[test]
+    fn an_appstate_verb_records_into_the_catalog_it_started_on() {
+        use crate::catalog::offload_hook::{self, Step};
+        let (dir, state, master, _frame, raw, _jpg) = stacked("bound-verbs");
+        backup_photo(&state, master).unwrap();
+        // Catalog B: same ids, its own local photo at the same id.
+        let b_root = dir.join("b-photos");
+        std::fs::create_dir_all(&b_root).unwrap();
+        let b = Catalog::open(&dir.join("b.chairphoto"), &b_root).unwrap();
+        let b_raw = b_root.join("B1.ARW");
+        std::fs::write(&b_raw, b"b-raw").unwrap();
+        let b_id = b.upsert_photo(&b_raw, None, 1, 9).unwrap().id;
+        assert_eq!(b_id, master, "the ids collide");
+        let switched = std::rc::Rc::new(std::cell::Cell::new(false));
+        let _hook = offload_hook::set({
+            let (state, switched, mut b) = (state.clone(), switched.clone(), Some(b));
+            move |step, _| {
+                if step == Step::BeforeMove && !switched.replace(true) {
+                    *state.catalog.lock().unwrap() = b.take();
+                }
+            }
+        });
+
+        offload_photo(&state, master).unwrap();
+
+        assert!(switched.get(), "the switch landed mid-offload");
+        assert!(!raw.exists(), "A's photo was freed");
+        let b_locals = with_catalog(&state, |c| c.photo_locations(b_id)).unwrap();
+        assert!(!b_locals.is_empty(), "B's photo keeps its local row: {b_locals:?}");
+        let a = Catalog::open(&dir.join("c.chairphoto"), &dir.join("photos")).unwrap();
+        assert_eq!(a.photo_storage_status(master).unwrap(), StorageStatus::Archived, "recorded into A");
+    }
+
+    // ── #231 d: a basename sidecar two images share ───────────────────────────────────
+
+    /// darktable's basename sidecar `DSC1.xmp` belongs to the RAW master and to the JPEG frame
+    /// alike. Offloading the master while the frame stays local (held by another operation
+    /// here) carries the sidecar home and leaves it beside the frame; offloading the frame
+    /// later frees it.
+    #[test]
+    fn offloading_a_master_keeps_a_basename_sidecar_its_local_frame_shares() {
+        let (dir, state, master, frame, raw, jpg) = stacked("shared-basename");
+        let xmp = raw.with_extension("xmp");
+        std::fs::write(&xmp, b"<darktable history/>").unwrap();
+        backup_photo(&state, master).unwrap();
+        let held = state.storage_claims.claim(&db_of(&state), frame, &[]).unwrap();
+
+        let report = offload_photo(&state, master).unwrap();
+
+        assert_eq!(report.freed, vec![master]);
+        assert!(!raw.exists(), "the master was freed");
+        assert!(jpg.exists(), "the held frame stayed");
+        assert_eq!(std::fs::read(&xmp).unwrap(), b"<darktable history/>", "its sidecar stayed with it");
+        assert_eq!(std::fs::read(dir.join("nas/2026/08/DSC1.xmp")).unwrap(), b"<darktable history/>", "and is home");
+
+        drop(held);
+        assert_eq!(offload_photo(&state, frame).unwrap().freed, vec![frame]);
+        assert!(!jpg.exists() && !xmp.exists(), "the last image naming it frees it");
+    }
+
+    // ── #257: a backup the local version moved on from ────────────────────────────────
+
+    fn drift(state: &AppState, id: i64) -> crate::catalog::BackupDrift {
+        backup_drift_as(state, super::super::catalog_identity(state).unwrap(), id, &|| false).unwrap().unwrap()
+    }
+
+    /// Review LOW-5: the drift check reads a local image once per session while its size and
+    /// mtime stay the same, and reads none of it once its caller has stopped wanting it.
+    #[test]
+    fn the_drift_check_hashes_an_image_once_and_not_at_all_when_superseded() {
+        let (_dir, state, master, _frame, raw, _jpg) = stacked("257-drift-cache");
+        backup_photo(&state, master).unwrap();
+        let from = super::super::catalog_identity(&state).unwrap();
+        assert_eq!(backup_drift_as(&state, from, master, &|| true).unwrap_err(), DRIFT_SUPERSEDED);
+        let asked = std::cell::Cell::new(0);
+        let stop_on_second_ask = || {
+            asked.set(asked.get() + 1);
+            asked.get() > 1
+        };
+        assert_eq!(backup_drift_as(&state, from, master, &stop_on_second_ask).unwrap_err(), DRIFT_SUPERSEDED);
+        assert!(!crate::catalog::drift_hash_cached(&raw), "a superseded read caches nothing");
+
+        assert!(!drift(&state, master).changed());
+        assert!(crate::catalog::drift_hash_cached(&raw));
+        // Unreadable now: a second look is answered from the cache, never the file.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&raw, std::fs::Permissions::from_mode(0o000)).unwrap();
+            let unreadable = std::fs::File::open(&raw).is_err(); // root reads anything
+            assert!(!drift(&state, master).changed());
+            std::fs::set_permissions(&raw, std::fs::Permissions::from_mode(0o644)).unwrap();
+            assert!(unreadable || std::env::var("USER").as_deref() == Ok("root"));
+        }
+        std::fs::write(&raw, b"raw-bytes rewritten").unwrap();
+        assert_eq!(drift(&state, master).image.as_deref(), Some("DSC1.ARW"), "a changed file is read again");
+    }
+
+    fn replace(state: &AppState, id: i64, confirm: bool) -> Result<ReplaceReport, String> {
+        replace_backup_as(state, super::super::catalog_identity(state).unwrap(), id, confirm)
+    }
+
+    /// ChairPhoto's own sidecar rewritten after the backup (an IPTC/GPS write) shows as
+    /// changed since backup, needing no decision: Back up takes it home again by itself, and
+    /// so does Offload, each keeping the previous copy at home as
+    /// `<name>.chairphoto-prev-<n>`. The photo is then offloaded.
+    #[test]
+    fn chairphotos_own_sidecar_rewrite_goes_home_again_keeping_the_previous_copy() {
+        let (dir, state, master, _frame, raw, _jpg) = stacked("257-own-sidecar");
+        crate::xmp::write_gps(&raw, 59.9, 10.7).unwrap();
+        backup_photo(&state, master).unwrap();
+        let home = dir.join("nas/2026/08/DSC1.ARW.xmp");
+        let first = std::fs::read(&home).unwrap();
+        assert_eq!(drift(&state, master), crate::catalog::BackupDrift::default(), "nothing changed yet");
+
+        crate::xmp::write_gps(&raw, 60.4, 5.3).unwrap();
+        let d = drift(&state, master);
+        assert!(d.changed() && !d.needs_replace(), "{d:?}");
+        assert_eq!(d.own_sidecars, ["DSC1.ARW.xmp"]);
+
+        backup_photo(&state, master).unwrap();
+        let second = std::fs::read(crate::xmp::sidecar_path(&raw)).unwrap();
+        assert_eq!(std::fs::read(&home).unwrap(), second, "Back up took it home");
+        assert_eq!(std::fs::read(dir.join("nas/2026/08/DSC1.ARW.xmp.chairphoto-prev-1")).unwrap(), first);
+        assert!(!drift(&state, master).changed());
+
+        crate::xmp::write_gps(&raw, 61.0, 6.0).unwrap();
+        let third = std::fs::read(crate::xmp::sidecar_path(&raw)).unwrap();
+        let report = offload_photo(&state, master).unwrap();
+        assert!(report.freed.contains(&master), "{report:?}");
+        assert!(!raw.exists());
+        assert_eq!(std::fs::read(&home).unwrap(), third, "Offload took it home first");
+        assert_eq!(std::fs::read(dir.join("nas/2026/08/DSC1.ARW.xmp.chairphoto-prev-1")).unwrap(), first);
+        assert_eq!(std::fs::read(dir.join("nas/2026/08/DSC1.ARW.xmp.chairphoto-prev-2")).unwrap(), second);
+    }
+
+    /// Review of release/storage, MEDIUM-1 (probe P1): the copy at home was edited at home
+    /// after the carry — here by ChairPhoto on another machine, so it differs from the local
+    /// rewrite only in what ChairPhoto owns — then ChairPhoto rewrote the local sidecar. That
+    /// is two edits, not ChairPhoto's own: Back up and Offload leave home as it is (no
+    /// `.chairphoto-prev-<n>`), and the inspector says it needs Replace backup.
+    #[test]
+    fn a_sidecar_edited_at_home_since_the_carry_is_never_replaced_by_itself() {
+        let (dir, state, master, _frame, raw, _jpg) = stacked("257-p1-home-edited");
+        crate::xmp::write_gps(&raw, 59.9, 10.7).unwrap();
+        backup_photo(&state, master).unwrap();
+        let home = dir.join("nas/2026/08/DSC1.ARW.xmp");
+        crate::xmp::write_gps(&dir.join("nas/2026/08/DSC1.ARW"), 1.5, 2.5).unwrap(); // at home
+        let at_home = std::fs::read_to_string(&home).unwrap();
+        crate::xmp::write_gps(&raw, 60.4, 5.3).unwrap();
+
+        let d = drift(&state, master);
+        assert_eq!((d.companions.clone(), d.own_sidecars.clone()), (vec!["DSC1.ARW.xmp".to_string()], vec![]), "{d:?}");
+        backup_photo(&state, master).unwrap();
+        assert!(offload_photo(&state, master).unwrap_err().contains("DSC1.ARW.xmp differs from the copy at home"));
+
+        assert_eq!(std::fs::read_to_string(&home).unwrap(), at_home, "home's edit is untouched");
+        assert!(!dir.join("nas/2026/08/DSC1.ARW.xmp.chairphoto-prev-1").exists());
+        assert!(raw.exists());
+    }
+
+    /// Review LOW-2 / NIT-3: a replace interrupted after keeping the earlier image but before
+    /// copying (home's image missing, the earlier one kept beside it) — Replace and Offload
+    /// both point to Back up and name the kept file; Back up recovers. And one interrupted
+    /// after copying but before recording only records when run again, keeping no duplicate.
+    #[test]
+    fn an_interrupted_replace_says_how_to_recover_and_keeps_no_duplicate() {
+        let (dir, state, master, frame, raw, _jpg) = stacked("257-interrupted");
+        backup_photo(&state, master).unwrap();
+        std::fs::write(&raw, b"raw-bytes rewritten").unwrap();
+        let home = dir.join("nas/2026/08/DSC1.ARW");
+        let kept = dir.join("nas/2026/08/DSC1.ARW.chairphoto-prev-1");
+        std::fs::rename(&home, &kept).unwrap(); // the crash: kept, never copied
+
+        let replace_err = replace(&state, master, true).unwrap_err();
+        let offload_err = offload_photo(&state, master).unwrap_err();
+        for err in [&replace_err, &offload_err] {
+            assert!(err.contains("DSC1.ARW.chairphoto-prev-1") && err.contains("Back up"), "{err}");
+        }
+        backup_photo(&state, master).unwrap();
+        assert_eq!(std::fs::read(&home).unwrap(), b"raw-bytes rewritten");
+        assert_eq!(std::fs::read(&kept).unwrap(), b"raw-bytes");
+
+        // The other crash: the local version copied home, its hash never recorded.
+        std::fs::write(&raw, b"raw-bytes rewritten again").unwrap();
+        std::fs::copy(&raw, dir.join("nas/2026/08/.copy")).unwrap();
+        std::fs::rename(&home, dir.join("nas/2026/08/DSC1.ARW.chairphoto-prev-2")).unwrap();
+        std::fs::rename(dir.join("nas/2026/08/.copy"), &home).unwrap();
+        assert!(offload_photo(&state, master).is_err(), "the recorded hash is the earlier one");
+
+        let report = replace(&state, master, true).unwrap();
+
+        assert_eq!(report.replaced, [], "home already holds it: recorded, nothing kept again");
+        assert!(!dir.join("nas/2026/08/DSC1.ARW.chairphoto-prev-3").exists());
+        assert_eq!(offload_photo(&state, master).unwrap().freed, vec![master, frame]);
+    }
+
+    /// A sidecar another program changed after the backup is never taken home by itself:
+    /// Back up leaves home as it is, Offload refuses, and the inspector's check says it
+    /// needs a decision. The confirmed Replace backup takes it home, keeping the earlier copy.
+    #[test]
+    fn a_sidecar_another_program_changed_waits_for_replace_backup() {
+        let (dir, state, master, _frame, raw, _jpg) = stacked("257-foreign-sidecar");
+        crate::xmp::write_gps(&raw, 59.9, 10.7).unwrap();
+        backup_photo(&state, master).unwrap();
+        let home = dir.join("nas/2026/08/DSC1.ARW.xmp");
+        let before = std::fs::read(&home).unwrap();
+        // Another program adds its own property, keeping ChairPhoto's stamp.
+        let sidecar = crate::xmp::sidecar_path(&raw);
+        let xml = String::from_utf8(before.clone()).unwrap();
+        assert!(xml.contains("</rdf:Description>"), "{xml}");
+        let foreign = r#"<darktable:history_end xmlns:darktable="http://darktable.sf.net/">3</darktable:history_end></rdf:Description>"#;
+        std::fs::write(&sidecar, xml.replacen("</rdf:Description>", foreign, 1)).unwrap();
+
+        let d = drift(&state, master);
+        assert!(d.needs_replace(), "{d:?}");
+        assert_eq!(d.companions, ["DSC1.ARW.xmp"]);
+        backup_photo(&state, master).unwrap();
+        assert_eq!(std::fs::read(&home).unwrap(), before, "Back up left home as it is");
+        let err = offload_photo(&state, master).unwrap_err();
+        assert!(err.contains("DSC1.ARW.xmp differs from the copy at home"), "{err}");
+        assert!(raw.exists());
+
+        let report = replace(&state, master, true).unwrap();
+
+        assert_eq!(report.replaced, [("DSC1.ARW.xmp".to_string(), "DSC1.ARW.xmp.chairphoto-prev-1".to_string())]);
+        assert_eq!(std::fs::read(&home).unwrap(), std::fs::read(&sidecar).unwrap());
+        assert_eq!(std::fs::read(dir.join("nas/2026/08/DSC1.ARW.xmp.chairphoto-prev-1")).unwrap(), before);
+        assert!(!drift(&state, master).changed());
+        assert!(offload_photo(&state, master).unwrap().freed.contains(&master));
+    }
+
+    /// An image rewritten in place after its backup: changed since backup, Offload refuses.
+    /// Replace backup needs its confirmation and is refused while another operation holds the
+    /// photo; confirmed, it keeps the earlier image at home under the next free
+    /// `<name>.chairphoto-prev-<n>` (never over one already there), copies and verifies the
+    /// local version, records its hash — and Offload then goes ahead.
+    #[test]
+    fn replace_backup_keeps_the_earlier_image_and_lets_offload_go_ahead() {
+        let (dir, state, master, frame, raw, _jpg) = stacked("257-image");
+        backup_photo(&state, master).unwrap();
+        std::fs::write(&raw, b"raw-bytes rewritten in place").unwrap();
+        let home = dir.join("nas/2026/08/DSC1.ARW");
+        std::fs::write(dir.join("nas/2026/08/DSC1.ARW.chairphoto-prev-1"), b"someone's").unwrap();
+
+        assert_eq!(drift(&state, master).image.as_deref(), Some("DSC1.ARW"));
+        assert!(offload_photo(&state, master).unwrap_err().contains(crate::catalog::LOCAL_CHANGED_REASON));
+        assert_eq!(replace(&state, master, false).unwrap_err(), REPLACE_NEEDS_CONFIRMATION);
+        let held = state.storage_claims.claim(&db_of(&state), master, &[]).unwrap();
+        assert_eq!(replace(&state, master, true).unwrap_err(), IN_PROGRESS);
+        drop(held);
+        assert_eq!(std::fs::read(&home).unwrap(), b"raw-bytes", "nothing changed at home yet");
+
+        let report = replace(&state, master, true).unwrap();
+
+        assert_eq!(report.replaced, [("DSC1.ARW".to_string(), "DSC1.ARW.chairphoto-prev-2".to_string())]);
+        assert_eq!(std::fs::read(&home).unwrap(), b"raw-bytes rewritten in place");
+        assert_eq!(std::fs::read(dir.join("nas/2026/08/DSC1.ARW.chairphoto-prev-2")).unwrap(), b"raw-bytes");
+        assert_eq!(std::fs::read(dir.join("nas/2026/08/DSC1.ARW.chairphoto-prev-1")).unwrap(), b"someone's");
+        assert!(!drift(&state, master).changed());
+        assert_eq!(replace(&state, master, true).unwrap().replaced, [], "home already holds it");
+        assert_eq!(offload_photo(&state, master).unwrap().freed, vec![master, frame]);
+        assert!(!raw.exists());
     }
 
     #[test]
@@ -585,7 +1078,7 @@ mod stack_tests {
         let (_dir, state, master, _frame, raw, jpg) = stacked("tripped");
         backup_photo(&state, master).unwrap();
         let tripped = AtomicBool::new(true);
-        let err = offload_in(&state, &state.storage_claims, master, Some(&tripped)).unwrap_err();
+        let err = offload_in(&on(&state), &state.storage_claims, master, Some(&tripped)).unwrap_err();
         assert!(err.contains("catalog switched"), "{err}");
         assert!(raw.exists() && jpg.exists(), "nothing was freed");
     }
@@ -698,7 +1191,7 @@ mod stack_tests {
         let (_dir, state, master, frame, _raw, _jpg) = stacked("tripped-backup");
         let nas = with_catalog(&state, |c| single_volume_of_kind(c, VolumeKind::Backup, "backup")).unwrap();
         let tripped = AtomicBool::new(true);
-        let report = backup_in(&state, &state.storage_claims, master, nas, Some(&tripped)).unwrap();
+        let report = backup_in(&on(&state), &state.storage_claims, master, nas, Some(&tripped)).unwrap();
         assert_eq!(report.backed_up, vec![master]);
         assert_eq!(report.skipped.len(), 1);
         assert_eq!((report.skipped[0].photo_id, report.skipped[0].kind), (frame, crate::catalog::SkipKind::Superseded));
@@ -1023,6 +1516,67 @@ mod stack_tests {
         assert!(!claims.is_claimed(a, 5));
     }
 
+    /// LOW-5 of the #256 review: a sidecar write and an operation that keeps the local files
+    /// (backup, restore, relocate) hold a photo side by side; only an operation that frees
+    /// them (offload, Empty Trash) and a sidecar write exclude each other, whichever came
+    /// first. Two operations still exclude each other whatever their kind.
+    #[test]
+    fn only_freeing_the_local_files_excludes_a_sidecar_write() {
+        let claims = Arc::new(StorageClaims::default());
+        let a = Path::new("/a.chairphoto");
+
+        let write = claims.claim_sidecar_write(a, 1).unwrap();
+        let backup = claims.claim(a, 1, &[]).expect("a backup goes ahead beside a write");
+        assert!(claims.claim_sidecar_write(a, 1).is_some(), "and a write beside a backup");
+        assert!(claims.claim_to_free(a, 1, &[]).is_none(), "an offload does not");
+        drop(backup);
+        assert!(claims.claim_to_free(a, 1, &[]).is_none(), "not while the write holds it");
+        let freeing = claims.claim_to_free(a, 2, &[1, 3]).unwrap();
+        assert!(!freeing.holds(1) && freeing.holds(3), "a frame being written is left");
+        drop(write);
+        let offload = claims.claim_to_free(a, 1, &[]).expect("free once the write is done");
+        assert!(claims.claim_sidecar_write(a, 1).is_none(), "a write is refused during it");
+        assert!(claims.claim(a, 1, &[]).is_none(), "and so is another operation");
+        drop(offload);
+        drop(freeing);
+        assert!(claims.claim(a, 1, &[]).is_some() && claims.claim_sidecar_write(a, 1).is_some());
+        assert!(!claims.is_claimed(a, 1) && !claims.is_claimed(a, 3), "every hold was released");
+    }
+
+    /// #256 (b): the start-up sweep puts back what a crashed offload left anywhere under the
+    /// library root, so the photo resolves again without a storage operation touching its
+    /// folder — and only for the catalog it was started for.
+    #[test]
+    fn the_startup_sweep_puts_back_a_crashed_offloads_file() {
+        if !cfg!(target_os = "linux") {
+            println!("SKIPPED: the_startup_sweep_puts_back_a_crashed_offloads_file — needs /proc");
+            return;
+        }
+        let (dir, state, master, _frame, raw, _jpg) = stacked("startup-sweep");
+        let folder = raw.parent().unwrap().to_path_buf();
+        let hidden = folder.join(format!(
+            ".DSC1.ARW.{}-{}-0",
+            crate::catalog::working_files::ASIDE_TAG,
+            crate::catalog::working_files::dead_pid()
+        ));
+        std::fs::rename(&raw, &hidden).unwrap();
+        crate::catalog::working_files::forget_swept(&folder); // the next run
+        let from = super::super::catalog_identity(&state).unwrap();
+        assert_eq!(with_catalog(&state, |c| c.resolve_photo_path(master)).unwrap(), None, "missing meanwhile");
+
+        let other = Catalog::open(&dir.join("other.chairphoto"), &dir.join("other")).unwrap();
+        let open = state.catalog.lock().unwrap().replace(other).unwrap();
+        assert_eq!(startup_sweep(&state, from).unwrap_err(), super::super::CATALOG_CHANGED);
+        assert!(hidden.exists(), "a sweep for a catalog no longer open does nothing");
+        *state.catalog.lock().unwrap() = Some(open);
+
+        assert!(startup_sweep(&state, from).unwrap() >= 3, "the root and its folders");
+
+        assert_eq!(std::fs::read(&raw).unwrap(), b"raw-bytes");
+        assert!(!hidden.exists());
+        assert_eq!(with_catalog(&state, |c| c.resolve_photo_path(master)).unwrap(), Some(raw));
+    }
+
     /// **Forced interleaving.** While an offload of a stack is part-way through (its first
     /// ownership check, before anything is deleted), a second offload, a restore and a
     /// backup — of the master, or of its frame directly — are each refused with
@@ -1047,7 +1601,7 @@ mod stack_tests {
             false
         };
 
-        let report = offload_until(&state, &state.storage_claims, master, &during).unwrap();
+        let report = offload_until(&on(&state), &state.storage_claims, master, &during).unwrap();
 
         let tried = tried.into_inner();
         assert_eq!(tried.len(), 6, "the second verbs ran while the offload held the moment");
@@ -1683,7 +2237,7 @@ pub fn empty_trash_as(
             &plans,
             &reachable,
             &abort,
-            &mut |id| claims.claim(&db, id, &[]),
+            &mut |id| claims.claim_to_free(&db, id, &[]),
             &mut |id| {
                 let guard = catalog.lock().map_err(|e| e.to_string())?;
                 let c = guard.as_ref().ok_or("No catalog is open")?;

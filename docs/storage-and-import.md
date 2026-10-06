@@ -457,6 +457,10 @@ and the backup transition is **deferred** until the NAS reappears.
 - **Offline** → NAS-only *and* NAS unreachable → browse/cull/tag still work; edit/export blocked
 - **Missing** → no known copy anywhere
 
+The inspector also shows **Changed since backup** for a backed-up photo whose local version
+moved on from its verified backup (#257, [below](#a-local-version-that-moved-on-from-its-backup-257)).
+It is computed on a worker when the Storage section is open, not on the grid's hot path.
+
 `Catalog::photo_storage_status` (+ a batch `photo_storage_statuses` for the grid)
 derives this from the photo's locations' volume kinds and reachability. A backup
 *record* counts as backed-up even while the NAS is unmounted (reachability only
@@ -498,11 +502,21 @@ Three rules govern carrying:
   reference point for answering "has the local file moved on since we copied it".
 - **Offload carries before it deletes.** Invariant 1 covers edit state too: freeing the
   local image must not strand the history beside it. Companions go home first, then the
-  local ones are freed with the image, and `restore` brings them back.
+  local ones are freed with the image, and `restore` brings them back. A basename companion
+  another image beside it shares — darktable's `DSC1.xmp` is the sidecar of `DSC1.ARW` and
+  of `DSC1.JPG` alike — is carried home but not freed while that image is still there
+  (#231 d): offloading the RAW master of a RAW+JPEG stack whose JPEG frame stays local (no
+  backup of its own, or held by another operation) leaves the frame its sidecar, and the
+  offload of the last image naming it frees it. A folder that cannot be listed counts as
+  shared.
 - **Offload deletes only what home holds byte for byte (#255).** Re-hashing the backup
   proves home is intact, not that it holds what is here. So offload checks each local file
   **after moving it to a hidden name** in its folder (`.<name>.chairphoto-offload-<pid>-<n>`,
-  #256): companions first, then the image, each re-hashed there — the image against the
+  #256; a name too long for that to fit in 255 bytes goes, under its own name, into a new
+  hidden folder `.chairphoto-offload-<pid>-<n>/` beside it instead — never a shortened name,
+  which a crash would leave with nothing to say what it was called; a copy's temporary
+  `.chairphoto-part` name, which nothing needs to put back, is cut to fit instead, so such a
+  name can be backed up at all): companions first, then the image, each re-hashed there — the image against the
   verified backup hash, a companion against the hash the carry confirmed at home — and
   freed only with exactly the companions the carry confirmed, never a fresh listing. Then
   it looks at every name it emptied once more, and only then deletes the hidden files. A
@@ -519,9 +533,10 @@ Three rules govern carrying:
   deleted, and a queued offload is kept `failed`
   with the reason ("changed since its backup — refusing to offload; the copy at home is the
   earlier version"). A crash between the move and the delete leaves the file under its
-  hidden name; the next backup, offload or restore plan that looks in that folder (once per
-  folder per run, off the catalog lock) puts every such file whose process is no longer
-  running back under its name, again never replacing one — a file left by a crash is never
+  hidden name; at start-up every folder under the library root is swept, off the UI thread
+  (`storage::spawn_startup_sweep`, hidden folders not entered), and the next backup, offload
+  or restore plan that looks in a folder does the same (once per folder per run, off the
+  catalog lock): every such file whose process is no longer running goes back under its name, again never replacing one — a file left by a crash is never
   deleted, since it may hold the only copy of a local change. An empty one is not put back
   (it is most likely a name the offload claimed and never filled; putting it back would make
   a 0-byte original); it is removed only when a non-empty file holds its name. A second
@@ -529,16 +544,75 @@ Three rules govern carrying:
   read of each local copy, on a local disk, beside the NAS read of the backup offload
   already made; size or mtime would be cheaper and are not content checks (an in-place
   rewrite can keep the size, and `exiftool -P` keeps the mtime). Back up does not replace a
-  verified backup that is present, so such a photo stays local until the owner decides how
-  a changed original reaches home.
-- **Divergence refuses; it never resolves.** A companion present on both sides with
-  different contents is two unreconciled edits. Backup leaves it untouched and does not
-  claim it as carried; offload refuses outright. Choosing a side would silently destroy
-  work.
+  verified backup that is present by itself; how a changed local version reaches home is
+  [below](#a-local-version-that-moved-on-from-its-backup-257).
+- **Divergence refuses; it never resolves** — with one exception, ChairPhoto's own sidecar
+  (below). A companion present on both sides with different contents is two unreconciled
+  edits. Backup leaves it untouched and does not claim it as carried; offload refuses
+  outright. Choosing a side would silently destroy work.
 
 Carrying is idempotent — an identical file already at the destination is adopted rather
 than rewritten — so a companion placed there by any other means is absorbed on the next
 pass instead of being re-copied or causing a conflict.
+
+### A local version that moved on from its backup (#257)
+
+Since #255 an offload refuses a photo whose local image or a carried companion changed
+after its verified backup, and Back up never replaces a backup that is present — it may be
+the only copy of the earlier version. Such a photo used to stay local for good, and the
+common case was ChairPhoto's own IPTC or GPS write to the sidecar after the backup. The
+owner's decision (#257, 2026-10-06), implemented as follows:
+
+- **ChairPhoto's own sidecar goes home by itself.** When the local `<image>.xmp` differs
+  from the copy at home only because ChairPhoto rewrote it (`lifecycle::rewritten_by_chairphoto`)
+  — **home still hashes to what the last carry confirmed** there (`carried_hash`, recorded with
+  every carried companion: a copy edited at home since, by another machine or program, is a
+  two-sided divergence and waits for Replace backup; a row recorded before the hash was kept
+  has none and counts as changed), the local file carries a `chairphoto:LastWrite` no earlier
+  than that confirmation (`carried_at`, else the backup's `created_at`), and **the two differ
+  only in properties ChairPhoto's writers own** (IPTC, GPS, identifier, import batch, face
+  regions, the stamp; `xmp::differs_only_in_chairphoto_fields`, compared by namespace, not by
+  layout or prefix) — the carry of Back up (an existing backup's companion pass, a drained
+  backup op included) and of Offload copies it home again (`carry_companions_home`). A stamp
+  and an mtime alone could not tell ChairPhoto's write from another program's that kept both
+  (tools preserve unknown namespaces; `exiftool -P`, `rsync -t` and `touch -r` keep the
+  mtime), so the content decides. The copy at home is first renamed
+  to `<name>.chairphoto-prev-<n>` beside it (the next free `n`, never over a file there and
+  never by a copy), then the local version is copied in and verified like any lifecycle
+  copy; a copy that fails puts the previous file back under its name. Offload then goes
+  ahead. A basename sidecar (`DSC1.xmp`) is darktable's, never ChairPhoto's, and one with no
+  stamp, or with a change outside what ChairPhoto owns, is treated like an image.
+- **An image, and a companion another program changed, wait for the owner.** The inspector
+  offers **Replace backup with the local version** for a backed-up photo whose image no
+  longer hashes to its verified backup, or whose companions differ at home for any other
+  reason (`storage::replace_backup_as`). It asks first — the question names the files and
+  says the copy at home is kept — and the backend refuses without that confirmation. It
+  claims the photo (another storage operation on it is refused, as in progress), keeps each
+  differing file at home as `<name>.chairphoto-prev-<n>`, copies and verifies the local
+  version into its name, carries any companion not yet there, and records the image's new
+  verified hash; offload is then allowed. The image goes first; if a companion fails
+  afterwards the image's new hash is still recorded (home holds it by then) and the error
+  says what was already replaced. It acts on the photo alone, not its stack: each frame has
+  its own copy at home to answer for. A replace interrupted after keeping the earlier image
+  but before copying leaves home without it: Replace and Offload then say so, name the kept
+  `.chairphoto-prev-<n>`, and point to Back up, which copies the local version home again.
+  One interrupted after copying only records when run again — home already holds the local
+  version, so no second copy of it is kept.
+- **"Changed since backup" is a storage status.** With the Storage section open, the
+  inspector compares a backed-up photo's local copy with its backup on a worker
+  (`storage::backup_drift_as`: the local image hashed against the recorded hash — no read
+  at home — and each carried companion against the file at home when home is reachable)
+  and shows "Changed since backup" instead of "Backed up", with which files, and whether
+  the next Back up or Offload takes them home (ChairPhoto's metadata — a Back up button is
+  shown for it) or only Replace backup does. The image's hash is kept for the session by
+  (path, size, mtime), so showing a photo again reads nothing (a rewrite that keeps both the
+  size and the mtime is missed until the next session — Offload still re-hashes), and a
+  comparison the user moved on from stops before or while it reads the image.
+
+**Nothing at home is overwritten or deleted.** A `.chairphoto-prev-<n>` file is visible on
+purpose, so the owner can find the earlier version; it is no image or companion extension,
+so no scan indexes it and no carry takes it. Nothing removes it, and the catalog does not
+track it: deleting the photo (Empty Trash) leaves it at home.
 
 **A sidecar backup is not a companion.** `<sidecar>.chairphoto-backup` — the copy the XMP
 safety rule takes before ChairPhoto's first write — is **per copy** by construction: each
@@ -762,7 +836,11 @@ next drain. The claim is per photo rather than one global gate because a drain c
 hours, and a user's Offload of an unrelated photo must not wait behind it. Its mutex is a
 leaf in the `app::jobs` lock order. The inspector also disables its storage buttons for a
 photo while one of them runs, so a double-click starts one run. The `Catalog::*_photo` sync
-wrappers do not claim; they are for tests and single-threaded callers.
+wrappers do not claim; they are for tests and single-threaded callers. The service verbs
+without `_as` (`storage::backup_photo`, `offload_photo`, `restore_photo`, `backup_to`,
+`restore_to`) bind to the catalog open when they are called and run on a connection of their
+own to it too (#231): no step of any verb plans or records through the shared handle, which
+is whichever catalog is open at that step.
 
 Empty Trash and Relocate claim too (#256). Emptying the trash claims each photo just before
 its delete, reads where its copies are under that claim (not when the run listed the
@@ -775,14 +853,20 @@ row, and holds the claim until the moved file's identity is recorded; a held pho
 refused and left pointing where it was — otherwise an offload's commit could drop the
 re-pointed row by id and leave the moved file with none.
 
-An IPTC sidecar write — a save, the debt panel's Retry, a geocode fill — claims its photo
-too, from before it opens the sidecar until it has settled (#256): an offload deletes the
-local sidecar once it has confirmed it at home, and a write landing after that check would
-leave a newer sidecar beside a freed image, untracked, with the debt settled. Whichever
-claims first goes ahead. A save that meets a claimed photo stores in the catalog and leaves
-the fields owed, reported "sidecar pending (a storage operation on this photo is already in
-progress)"; the next save or the repair pass writes them, to wherever the photo then
-resolves. An offload that meets a write is refused as in progress. The identity-repair pass,
+An IPTC sidecar write — a save, the debt panel's Retry, a geocode fill — holds a
+sidecar-write claim on its photo, from before it opens the sidecar until it has settled
+(#256), and only the operations that remove the photo's local files — offload and Empty
+Trash (`storage::ClaimKind::Frees`) — exclude it: an offload deletes the local sidecar once
+it has confirmed it at home, and a write landing after that check would leave a newer
+sidecar beside a freed image, untracked, with the debt settled. Whichever claims first goes
+ahead. A save that meets an offload stores in the catalog and leaves the fields owed,
+reported "sidecar pending (a storage operation on this photo is already in progress)"; the
+next save or the repair pass writes them, to wherever the photo then resolves. An offload
+that meets a write is refused as in progress. A backup, restore or relocate leaves the
+sidecar where it is, so a save beside one goes ahead and is written (review of #256, LOW-5:
+when every claim excluded it, a save during a long drain reported pending and nothing wrote
+it once the drain let go); a copy that reads a sidecar while it is being replaced fails its
+own verification rather than recording a mix, and the next carry takes the new one. The identity-repair pass,
 face-region and GPS writes do not claim. Each replaces the sidecar by a rename, so it
 either lands before the offload moves the sidecar aside — and fails its re-hash — or makes a
 new file at its name, which the offload keeps. In that second case the new file is built
@@ -793,18 +877,36 @@ user to merge by hand. Nothing is deleted, but the photo's own sidecar name now 
 thinner file. A write that lands after the offload's last look is beside a freed image,
 untracked (the photo is recorded archived). Both windows are one small file's hash wide.
 
+**Decided (review of #256, (c)): those three writes stay unclaimed.** A claim never waits, so
+a write that meets an offload must be dropped or remembered. An IPTC write can be refused
+because its fields stay owed and the next save or the repair pass writes them. GPS and
+face-region writes have no such record — they are best-effort and only logged when they
+fail — so a refused one would leave the sidecar without the user's change for good, to close
+a window that loses no byte (every file is kept, and the refusal names the one left under its
+hidden name) and is one small file's hash wide. They also run under the catalog lock in the
+catalog and plugin layers (`map::set_photo_gps`, `faces::write_regions`), which have no
+`AppState` and so no claims to take. The identity write does have a debt the repair pass
+retries, but it writes one element of a photo whose identity is owed, and stays with the
+other two rather than add a third rule. Revisit if GPS or face-region writes gain an owed
+record like IPTC's.
+
 Two guards do not depend on the claim. Offload's commit drops exactly the local location
 rows it planned from, by id, so a row added after the plan (a restore) is never dropped with
 them. And every lifecycle copy (`copy_and_verify`, used for images and companions) writes its
 own temp file (`.<name>.chairphoto-part-<pid>-<n>`, created exclusively) and places it
 **without replacing** whatever is at the destination — `renameat2(RENAME_NOREPLACE)`, else a
-hard link, else an exclusive create, the import's own placement. Two writers can never
-write into one file. A destination that already exists is accepted only when it hashes to
+hard link, else an exclusive create, the import's own placement — and then syncs the
+folder (`same_photo::sync_dir_of`), before the copy is recorded: a file's own sync makes its
+bytes durable, not its new name, and a power cut after the row is written must not leave it
+pointing at a name that was lost (#231, import review N-1; the import's placements share the
+helper). On ext4 and XFS a folder's sync commits the journal, which also carries a folder the
+copy just created; elsewhere that folder's own entry is not synced. A filesystem that cannot
+sync a folder is not a failure. Two writers can never write into one file. A destination that already exists is accepted only when it hashes to
 the source (another writer placed the same bytes); otherwise the copy fails and that file is
 left untouched. This also means a Restore no longer overwrites a local file that differs
 from the backup: it fails and names the file instead. On a filesystem with neither a
-no-replace rename nor hard links (an exFAT or FAT backup drive) the destination is claimed by
-an exclusive create and the verified temp copied into it; that second copy is hashed too, and
+no-replace rename nor hard links the destination is claimed by an exclusive create and the
+verified temp copied into it; that second copy is hashed too, and
 one that does not match is removed (the copy created it) and the copy fails (#256). A crash
 during that second copy can leave a short file at the destination, which later copies refuse
 as "already exists with different contents" until it is removed by hand; on every other
@@ -813,6 +915,15 @@ a folder (once per folder per run) removes the temp files there whose process is
 running on this machine and that have gone an hour unwritten — the hour because a backup
 folder can be shared with another machine whose copy is still writing; a temp file only ever
 holds bytes that exist elsewhere.
+
+Which filesystems take the copy fallback is narrower than it sounds (review of #256,
+NIT-3). Current Linux kernels accept `RENAME_NOREPLACE` on vfat and exFAT drives and on
+SMB/CIFS mounts — each driver's rename handler takes that flag — so those place in one step;
+NFS refuses every rename flag but has hard links, so it places by a link. (A reading of the
+kernel sources' rename handlers from memory, the review's and this note's alike; not tested
+on this machine or pinned to a kernel version.) What is left for the exclusive create and
+copy is a filesystem whose driver refuses the flag and has no hard links either: some FUSE
+mounts, depending on the daemon (unverified which).
 
 Restore is the same rule pointing the other way: a stack that leaves as seven frames comes
 back as seven. It brings home only the frames that are *away* — a frame already local is
@@ -894,8 +1005,9 @@ Two modes over the same core location model:
   temporary name (a prefix and a hash, N-4); the file still takes its full name. A file
   whose sidecar's name (`<name>.xmp`) would be over 255 bytes is not imported at all — its
   identity could never be written beside it — and the result counts it apart ("name too
-  long for a sidecar"). On a filesystem with neither (exFAT, FAT) the name is claimed by an
-  exclusive create and the temporary file copied in: still no overwrite, but without that
+  long for a sidecar"). On a filesystem with neither (some FUSE mounts; current Linux vfat,
+  exFAT and SMB drivers accept the no-replace rename) the name is claimed by an exclusive
+  create and the temporary file copied in: still no overwrite, but without that
   crash guarantee. A name is free only when
   nothing is at it and nothing at its sidecar's name (`<name>.xmp`) either: a sidecar with
   no original beside it (another tool's, or one whose original was removed) belongs to some

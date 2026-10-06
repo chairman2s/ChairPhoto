@@ -347,6 +347,13 @@ impl CatalogIdentity {
     pub fn is(&self, catalog: &Catalog) -> bool {
         catalog.instance_id() == self.0
     }
+
+    /// An identity no open catalog has (handle ids start at 1 and count up), for tests of
+    /// code that only compares identities.
+    #[cfg(test)]
+    pub(crate) fn unopened(n: u64) -> Self {
+        CatalogIdentity(u64::MAX - n)
+    }
 }
 
 /// Serialized (it crossed the Tauri shell's IPC until #165, and an event payload can carry it)

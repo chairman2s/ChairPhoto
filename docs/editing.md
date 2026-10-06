@@ -315,8 +315,9 @@ implemented — the crop fixes shape, resize would fix pixels.
   job reaching a worker in that window answers `CATALOG_CHANGED` and renders nothing, never
   the new catalog's photo of that id. The front end drops that answer — the stage like a
   cancellation, `EditRenders` as `RenderState::Stale` (nothing drawn, no failure, not asked
-  again). An engine-2 render that reuses a resident decode, found by photo id alone, checks
-  again after finding it. One render path (`media::render_edit_image`) serves every
+  again). An engine-2 render reuses a resident or offline decode only if it is the job's
+  catalog's photo (the decodes are keyed by catalog identity and photo id, #259), and checks
+  the catalog again after the load: a switch during it answers `CATALOG_CHANGED`. One render path (`media::render_edit_image`) serves every
   caller, engine-1 and engine-2 alike: it branches internally on the record's engine and on
   whether a resident RAW working image exists for the job's source token.
 - **Loupe:** shows the active version's render when the module is enabled (`renderForLoupe`):
@@ -346,7 +347,12 @@ engine**, which forks "<name> (RAW)" with the framing copied and tone and look r
   primaries, as-shot white balance, no auto-brightening, highlights clipped at sensor white,
   the camera's visible rectangle) into an f32 image held by `develop::ResidentSet`. A photo
   switch, leaving Develop, or a catalog switch trips the claim and releases it (the switch releases in its detach phase, with the slot); a
-  decode that finishes after a newer claim removes only its own image. The resident set's
+  decode that finishes after a newer claim removes only its own image. Each transition trips
+  the old claim before it releases, and a worker checks its claim under the resident set's
+  lock before inserting, so a tripped worker's decode is never resident, even for an instant
+  (#259). Each resident image also records the catalog its photo id came from: a claim, a
+  render outside Develop or an export takes only its own catalog's decode of an id, and a
+  claim is taken only while the catalog its photo was read from is still open. The resident set's
   lock is a leaf in the `commands::jobs` lock order. Each of those transitions is forced in
   `develop::session::tests` and `commands::jobs::tests`. The event
   `develop:source` carries the state — `preview` (preparing), `raw` with the **token**

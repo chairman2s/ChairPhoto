@@ -13,6 +13,20 @@
 //! detach phase (`DetachGuards::trip_and_clear_all`), and a superseded worker removes only
 //! its own token. A stale token — one whose claim was tripped — therefore names nothing,
 //! and `edit://` answers it with a 404 rather than other pixels.
+//!
+//! Every ownership change trips the old claim's abort flag *before* it releases or re-keys
+//! the set, and a worker inserts only after checking its flag under the set's own lock
+//! (`session::publish`, `session::preload_insert`), so a tripped worker's decode never lands
+//! after the release that was meant to remove it (#259).
+//!
+//! # Catalog
+//!
+//! Photo ids are per catalog, so each resident image also records the catalog its photo id
+//! was read from (`app::CatalogIdentity`, #259). Every lookup by photo id —
+//! [`ResidentSet::find_photo`] (a render outside the session reusing the session's decode)
+//! and [`ResidentSet::retain_rekey`] (a new claim adopting a preloaded neighbour) — matches
+//! the catalog too, so another catalog's photo with the same id is never taken for this
+//! one's, whatever a switch leaves behind.
 
 pub mod cache;
 pub mod offline;
@@ -22,15 +36,24 @@ mod camera_fit;
 
 pub use session::working_image_from;
 
+use crate::app::CatalogIdentity;
 use crate::plugins::edit::{SourceToken, WorkingImage};
 use std::sync::{Arc, Mutex};
+
+/// One resident working image: the token it is reachable by, the catalog its photo id
+/// belongs to, and the pixels.
+struct Resident {
+    token: SourceToken,
+    catalog: CatalogIdentity,
+    image: Arc<WorkingImage>,
+}
 
 /// Resident working images: the current photo and its preloaded neighbours, bounded by
 /// bytes. Inserting beyond the budget is refused rather than evicting the
 /// current photo; a `clear` on every ownership change is the cleanup the product demands.
 pub struct ResidentSet {
     budget_bytes: usize,
-    images: Vec<(SourceToken, Arc<WorkingImage>)>,
+    images: Vec<Resident>,
 }
 
 /// One 67 MP float image is ~800 MB; four fit a 64 GB machine with room, and one fits a
@@ -42,28 +65,37 @@ impl ResidentSet {
         ResidentSet { budget_bytes, images: Vec::new() }
     }
 
+    /// The image `token` names. A token is minted under one develop claim (its generation is
+    /// the claim's job id, never reused), so it names one catalog's photo.
     pub fn get(&self, token: &SourceToken) -> Option<Arc<WorkingImage>> {
-        self.images.iter().find(|(t, _)| t == token).map(|(_, i)| i.clone())
+        self.images.iter().find(|r| &r.token == token).map(|r| r.image.clone())
     }
 
-    /// Any resident image of `photo_id`, with its token (a render outside the session
-    /// reuses the session's decode rather than loading its own).
-    pub fn find_photo(&self, photo_id: i64) -> Option<(SourceToken, Arc<WorkingImage>)> {
+    /// [`get`](Self::get), only if the image is `catalog`'s photo.
+    pub fn get_in(&self, catalog: CatalogIdentity, token: &SourceToken) -> Option<Arc<WorkingImage>> {
+        self.images.iter().find(|r| &r.token == token && r.catalog == catalog).map(|r| r.image.clone())
+    }
+
+    /// Any resident image of `photo_id` in `catalog`, with its token (a render outside the
+    /// session reuses the session's decode rather than loading its own). Another catalog's
+    /// photo with this id is not it (#259).
+    pub fn find_photo(&self, catalog: CatalogIdentity, photo_id: i64) -> Option<(SourceToken, Arc<WorkingImage>)> {
         self.images
             .iter()
-            .find(|(t, _)| matches!(t, SourceToken::Working { photo_id: p, .. } if *p == photo_id))
-            .map(|(t, i)| (t.clone(), i.clone()))
+            .find(|r| r.catalog == catalog && matches!(r.token, SourceToken::Working { photo_id: p, .. } if p == photo_id))
+            .map(|r| (r.token.clone(), r.image.clone()))
     }
 
-    /// `false` when the image would exceed the budget (unless the set is empty: the current
-    /// photo always fits — a budget below one image would otherwise mean no Develop at all).
-    pub fn insert(&mut self, token: SourceToken, image: Arc<WorkingImage>) -> bool {
-        let used: usize = self.images.iter().map(|(_, i)| i.bytes()).sum();
+    /// Make `image` resident under `token`, as `catalog`'s photo. `false` when the image would
+    /// exceed the budget (unless the set is empty: the current photo always fits — a budget
+    /// below one image would otherwise mean no Develop at all).
+    pub fn insert(&mut self, catalog: CatalogIdentity, token: SourceToken, image: Arc<WorkingImage>) -> bool {
+        let used: usize = self.images.iter().map(|r| r.image.bytes()).sum();
         if !self.images.is_empty() && used + image.bytes() > self.budget_bytes {
             return false;
         }
-        self.images.retain(|(t, _)| *t != token);
-        self.images.push((token, image));
+        self.images.retain(|r| r.token != token);
+        self.images.push(Resident { token, catalog, image });
         true
     }
 
@@ -75,21 +107,24 @@ impl ResidentSet {
     /// touch the image a newer claim has meanwhile published.
     pub fn remove(&mut self, token: &SourceToken) -> bool {
         let before = self.images.len();
-        self.images.retain(|(t, _)| t != token);
+        self.images.retain(|r| &r.token != token);
         self.images.len() != before
     }
 
-    /// The ownership change of a new claim: keep the images of `keep` (the newly opened
-    /// photo and its neighbours) under the new `generation`, and drop everything else. The
-    /// old tokens name nothing afterwards — a URL minted under the previous claim 404s,
-    /// exactly as if the image had been released — while the pixels survive the step, which
-    /// is what makes stepping to a preloaded neighbour instant. Returns the photo ids kept.
-    pub fn retain_rekey(&mut self, keep: &[i64], generation: u64) -> Vec<i64> {
-        self.images.retain(|(t, _)| matches!(t, SourceToken::Working { photo_id, .. } if keep.contains(photo_id)));
+    /// The ownership change of a new claim in `catalog`: keep that catalog's images of `keep`
+    /// (the newly opened photo and its neighbours) under the new `generation`, and drop
+    /// everything else — another catalog's image of a kept id included (#259). The old tokens
+    /// name nothing afterwards — a URL minted under the previous claim 404s, exactly as if
+    /// the image had been released — while the pixels survive the step, which is what makes
+    /// stepping to a preloaded neighbour instant. Returns the photo ids kept.
+    pub fn retain_rekey(&mut self, catalog: CatalogIdentity, keep: &[i64], generation: u64) -> Vec<i64> {
+        self.images.retain(|r| {
+            r.catalog == catalog && matches!(r.token, SourceToken::Working { photo_id, .. } if keep.contains(&photo_id))
+        });
         let mut kept = Vec::new();
-        for (t, _) in self.images.iter_mut() {
-            if let SourceToken::Working { photo_id, .. } = *t {
-                *t = SourceToken::Working { photo_id, generation };
+        for r in self.images.iter_mut() {
+            if let SourceToken::Working { photo_id, .. } = r.token {
+                r.token = SourceToken::Working { photo_id, generation };
                 kept.push(photo_id);
             }
         }
@@ -128,7 +163,7 @@ pub(crate) fn release_all() {
 /// How many bytes the resident images hold right now — the number a "did it clean up"
 /// check reads.
 pub fn resident_bytes() -> usize {
-    with_resident(|r| r.images.iter().map(|(_, i)| i.bytes()).sum())
+    with_resident(|r| r.images.iter().map(|r| r.image.bytes()).sum())
 }
 
 /// The resident set is process-global, so tests that assert on it must not interleave:
@@ -432,7 +467,7 @@ mod tests {
         let image = Arc::new(working_image_from(d));
         let bytes = image.bytes();
         let token = SourceToken::Working { photo_id: 1, generation: 1 };
-        assert!(with_resident(|r| r.insert(token.clone(), image)));
+        assert!(with_resident(|r| r.insert(CatalogIdentity::unopened(1), token.clone(), image)));
         // A render at the stage size, so the framed-base cache holds its share too.
         let img = resident(&token).unwrap();
         let _ = crate::plugins::edit::render_proxy(
@@ -531,13 +566,35 @@ mod tests {
         test_image(w, h)
     }
 
+    /// The catalog the tests' photos belong to.
+    fn cat() -> CatalogIdentity {
+        CatalogIdentity::unopened(1)
+    }
+
+    /// #259: a resident image is one catalog's photo. Another catalog's photo with the same
+    /// id — say a decode a tripped worker left behind across a switch — is neither found for
+    /// this catalog's render nor adopted by this catalog's claim; the claim drops it.
+    #[test]
+    fn another_catalogs_image_of_the_same_id_is_neither_found_nor_adopted() {
+        let (a, b) = (CatalogIdentity::unopened(1), CatalogIdentity::unopened(2));
+        let mut set = ResidentSet::new(usize::MAX);
+        let a_token = SourceToken::Working { photo_id: 5, generation: 7 };
+        assert!(set.insert(a, a_token.clone(), img(37, 23)));
+        assert_eq!(set.find_photo(a, 5).map(|(t, _)| t), Some(a_token.clone()), "A finds its own");
+        assert!(set.find_photo(b, 5).is_none(), "B's photo 5 is another photo");
+
+        assert!(set.retain_rekey(b, &[5], 8).is_empty(), "B's claim adopts nothing");
+        assert!(set.is_empty(), "and A's image is dropped with the rest");
+        assert!(set.get(&SourceToken::Working { photo_id: 5, generation: 8 }).is_none());
+    }
+
     #[test]
     fn remove_drops_only_the_named_token() {
         let mut set = ResidentSet::new(usize::MAX);
         let a = SourceToken::Working { photo_id: 1, generation: 1 };
         let b = SourceToken::Working { photo_id: 2, generation: 2 };
-        assert!(set.insert(a.clone(), img(4, 4)));
-        assert!(set.insert(b.clone(), img(4, 4)));
+        assert!(set.insert(cat(), a.clone(), img(4, 4)));
+        assert!(set.insert(cat(), b.clone(), img(4, 4)));
         assert!(set.remove(&a));
         assert!(!set.remove(&a), "already gone");
         assert!(set.get(&a).is_none());
@@ -548,9 +605,9 @@ mod tests {
     fn retain_rekey_keeps_only_the_named_photos_under_the_new_generation() {
         let mut set = ResidentSet::new(usize::MAX);
         for id in [1, 2, 3] {
-            assert!(set.insert(SourceToken::Working { photo_id: id, generation: 7 }, img(4, 4)));
+            assert!(set.insert(cat(), SourceToken::Working { photo_id: id, generation: 7 }, img(4, 4)));
         }
-        let mut kept = set.retain_rekey(&[2, 3, 9], 8);
+        let mut kept = set.retain_rekey(cat(), &[2, 3, 9], 8);
         kept.sort();
         assert_eq!(kept, vec![2, 3]);
         assert_eq!(set.len(), 2);
@@ -559,7 +616,7 @@ mod tests {
             assert!(set.get(&SourceToken::Working { photo_id: id, generation: 7 }).is_none(), "old tokens name nothing");
         }
         assert!(set.get(&SourceToken::Working { photo_id: 1, generation: 7 }).is_none());
-        assert!(set.retain_rekey(&[], 9).is_empty());
+        assert!(set.retain_rekey(cat(), &[], 9).is_empty());
         assert!(set.is_empty());
     }
 
@@ -568,14 +625,14 @@ mod tests {
         let one = img(100, 100); // 120 000 bytes
         let mut set = ResidentSet::new(one.bytes() + 10);
         let cur = SourceToken::Working { photo_id: 1, generation: 1 };
-        assert!(set.insert(cur.clone(), one.clone()));
+        assert!(set.insert(cat(), cur.clone(), one.clone()));
         let neighbour = SourceToken::Working { photo_id: 2, generation: 1 };
-        assert!(!set.insert(neighbour.clone(), img(100, 100)), "over budget: refused");
+        assert!(!set.insert(cat(), neighbour.clone(), img(100, 100)), "over budget: refused");
         assert!(set.get(&cur).is_some(), "…and the current photo stays");
         assert!(set.get(&neighbour).is_none());
         // A budget too small for even one image still admits the current photo.
         let mut tiny = ResidentSet::new(1);
-        assert!(tiny.insert(cur.clone(), one));
+        assert!(tiny.insert(cat(), cur.clone(), one));
         set.clear();
         assert!(set.is_empty());
     }

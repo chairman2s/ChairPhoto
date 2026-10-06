@@ -187,7 +187,7 @@ fn a_rotated_cover_thumbnail_is_the_cover_render_rotated() {
     }
     let abs = dir.join("photos").join("c.jpg");
     let json = state.catalog.lock().unwrap().as_ref().unwrap().cover_of(id).unwrap().unwrap().2;
-    let cover = chairphoto_core::plugins::edit::cover::cover_thumb(&abs, id, &json).unwrap();
+    let cover = chairphoto_core::plugins::edit::cover::cover_thumb(&abs, chairphoto_core::app::catalog_identity(&state).unwrap(), id, &json).unwrap();
     let expected = image::load_from_memory(&cover).unwrap().rotate270().to_rgb8();
 
     let decoded = render_image(&state, JobKey::photo(id, ImageKind::Thumb)).unwrap().image.to_rgb8();
@@ -220,7 +220,7 @@ fn the_thumbnail_is_the_render_of_the_last_changed_version() {
         c.set_version_edit(w, dark).unwrap();
     });
     with_catalog(&|c| assert_eq!(c.get_photo(id).unwrap().cover_pin, chairphoto_core::catalog::CoverPin::Auto));
-    let look = |json: &str| decode(&chairphoto_core::plugins::edit::cover::cover_thumb(&abs, id, json).unwrap());
+    let look = |json: &str| decode(&chairphoto_core::plugins::edit::cover::cover_thumb(&abs, chairphoto_core::app::catalog_identity(&state).unwrap(), id, json).unwrap());
     let thumb = || render_image(&state, JobKey::photo(id, ImageKind::Thumb)).unwrap();
 
     let shown = thumb();

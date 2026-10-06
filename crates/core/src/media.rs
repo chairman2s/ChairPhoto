@@ -26,6 +26,9 @@ struct Resolved {
     /// Where the photo's offline thumbnail is kept (#258): under its catalog's UUID and its
     /// own, never under the photo id another catalog may also use. `None`: none is kept.
     offline: Option<crate::thumbnails::OfflineThumbKey>,
+    /// The catalog the photo id was resolved in: a cover render reuses only that catalog's
+    /// resident decode (#259).
+    catalog: crate::app::CatalogIdentity,
     is_video: bool,
 }
 
@@ -34,9 +37,10 @@ struct Resolved {
 /// `pick_existing` still returns the best available copy (local cache > primary > backup);
 /// the reachability cache only reorders the stats.
 fn resolve(state: &AppState, id: i64, kind: ImageKind) -> Result<Resolved, String> {
-    let (candidates, rotation, cover, offline) = {
+    let (candidates, rotation, cover, offline, identity) = {
         let guard = state.catalog.lock().map_err(|e| e.to_string())?;
         let catalog = guard.as_ref().ok_or("no catalog open")?;
+        let identity = crate::app::identity_of(catalog);
         let candidates = catalog.photo_path_candidates(id).map_err(|e| e.to_string())?;
         let rotation = catalog.photo_rotation(id).unwrap_or(0);
         // The cover version's settings, when the grid should show a version's look, and the
@@ -48,7 +52,7 @@ fn resolve(state: &AppState, id: i64, kind: ImageKind) -> Result<Resolved, Strin
             ),
             _ => (None, None),
         };
-        (candidates, rotation, cover, offline)
+        (candidates, rotation, cover, offline, identity)
     };
     let is_video = candidates.iter().any(|c| crate::scanner::is_video(&c.path));
     // A thumbnail has a persistent fallback below, so it resolves in FastDisplay: a
@@ -59,7 +63,7 @@ fn resolve(state: &AppState, id: i64, kind: ImageKind) -> Result<Resolved, Strin
         ImageKind::Preview | ImageKind::Zoom => ResolveMode::OriginalRequired,
     };
     let absolute = crate::volume_health::pick_existing(&candidates, &state.volume_health, mode);
-    Ok(Resolved { absolute, rotation, cover, offline, is_video })
+    Ok(Resolved { absolute, rotation, cover, offline, catalog: identity, is_video })
 }
 
 /// A decoded image from [`render_image`]: display-ready (oriented, user rotation applied,
@@ -123,7 +127,9 @@ pub fn render_image(state: &AppState, key: JobKey) -> Result<DecodedImage, Strin
 /// [`render_image`]'s photo body: the cached tier's JPEG, decoded once and rotated, and
 /// whether it is the cover version's render ([`DecodedImage::cover`]).
 fn decode_tier(id: i64, kind: ImageKind, resolved: Resolved) -> Result<(DynamicImage, bool), String> {
-    let Resolved { absolute, rotation, cover, offline, .. } = resolved;
+    let Resolved { absolute, rotation, cover, offline, catalog, .. } = resolved;
+    #[cfg(not(feature = "edit"))]
+    let _ = catalog;
     let decode = |bytes: &[u8]| image::load_from_memory(bytes).map_err(|e| e.to_string());
     let rotate = |img| crate::thumbnails::rotate_image(img, rotation);
     let Some(absolute) = absolute else {
@@ -142,7 +148,7 @@ fn decode_tier(id: i64, kind: ImageKind, resolved: Resolved) -> Result<(DynamicI
         ImageKind::Thumb => {
             if let Some(json) = &cover {
                 #[cfg(feature = "edit")]
-                match crate::plugins::edit::cover::cover_thumb(&absolute, id, json) {
+                match crate::plugins::edit::cover::cover_thumb(&absolute, catalog, id, json) {
                     Ok(bytes) => {
                         // The offline fallback above is the original's own thumbnail, which
                         // the plain path below refreshes on every render — so a rotation
@@ -325,11 +331,15 @@ fn render_edit(
     #[cfg(feature = "raw")]
     if edit::record_engine(&job.edit_json) == 2 {
         let budget = crate::develop::session::cache_budget_bytes(state);
-        let (token, image) = crate::develop::offline::working_image_for(job.photo_id, &path, budget)?;
-        // `working_image_for` reuses a resident decode found by photo id alone, which a switch
-        // landing after the check above could have made another catalog's. The job's catalog
-        // still open now means no switch came between (identities never repeat, and every
-        // switch releases the resident set), so the image is this catalog's photo.
+        // The resident or kept decode it may reuse is matched by the job's catalog as well as
+        // the photo id (#259), so it is this catalog's photo whatever a switch left behind;
+        // a fresh load reads `path`, which is this catalog's too.
+        let (token, image) = crate::develop::offline::working_image_for(job.catalog, job.photo_id, &path, budget)?;
+        #[cfg(test)]
+        tests::after_working_image();
+        // The load can take seconds. A switch that landed meanwhile closed the job's catalog:
+        // the job is answered like every edit job of a closed catalog (#251), with
+        // `CATALOG_CHANGED` and no frame, rather than a render nobody can show.
         in_job_catalog(state, job, |_| Ok(()))?;
         t.mark("working_image");
         let out = edit::render_proxy(RenderSource::Working { token, image }, &job.edit_json, job.max_edge, opts)?;
@@ -372,6 +382,115 @@ pub fn working_image(token: &crate::plugins::edit::SourceToken) -> Result<std::s
 #[cfg(all(test, feature = "edit", feature = "raw"))]
 mod tests {
     use super::*;
+    use image::GenericImageView as _;
+
+    thread_local! {
+        /// Run by an engine-2 render right after its working image is found or loaded, on the
+        /// rendering thread: where a test lands a catalog switch mid-render.
+        static AFTER_WORKING_IMAGE: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+    }
+
+    /// The hook `render_edit` calls (see [`AFTER_WORKING_IMAGE`]).
+    pub(super) fn after_working_image() {
+        if let Some(hook) = AFTER_WORKING_IMAGE.with(|h| h.borrow_mut().take()) {
+            hook();
+        }
+    }
+
+    // --- the engine-2 render's catalog (#259) ---------------------------------------------
+
+    /// A catalog whose photo 1 is a JPEG on disk (so its path resolves, and a RAW load of it
+    /// fails), open in `state`; the resident set empty and held for the test, and the decode
+    /// cache the test's own (`XDG_CACHE_HOME`), since a load reads it.
+    struct Engine2 {
+        state: AppState,
+        _dir: crate::test_support::TestTmpDir,
+        _cache: std::sync::MutexGuard<'static, ()>,
+        _serial: crate::develop::Serial,
+    }
+
+    fn engine2(tag: &str) -> Engine2 {
+        let serial = crate::develop::serial();
+        let cache = crate::thumbnails::tests::test_lock();
+        crate::develop::release_all();
+        let dir = crate::test_support::TestTmpDir::new(tag);
+        std::env::set_var("XDG_CACHE_HOME", dir.join("cache"));
+        let root = dir.join("photos");
+        std::fs::create_dir_all(&root).unwrap();
+        let path = crate::thumbnails::tests::write_test_jpeg(&root, "p.jpg", 80, 60);
+        let catalog = crate::catalog::Catalog::open(&dir.join("t.chairphoto"), &root).unwrap();
+        assert_eq!(catalog.upsert_photo(&path, None, 1, std::fs::metadata(&path).unwrap().len() as i64).unwrap().id, 1);
+        let state = AppState::default();
+        *state.catalog.lock().unwrap() = Some(catalog);
+        Engine2 { state, _dir: dir, _cache: cache, _serial: serial }
+    }
+
+    fn engine2_job(catalog: crate::app::CatalogIdentity) -> crate::image_pool::EditJob {
+        crate::image_pool::EditJob {
+            photo_id: 1,
+            edit_json: r#"{"engine":2,"display":"camera.2"}"#.into(),
+            max_edge: 64,
+            hi_res: false,
+            base_only: false,
+            source: crate::plugins::edit::SourceToken::Preview,
+            clip: false,
+            catalog,
+        }
+    }
+
+    /// Make a 37×23 synthetic decode resident as photo 1 of `catalog`.
+    fn resident_photo_1(catalog: crate::app::CatalogIdentity) {
+        let token = crate::plugins::edit::SourceToken::Working { photo_id: 1, generation: 777_777 };
+        assert!(crate::develop::with_resident(|r| r.insert(catalog, token, crate::develop::test_image(37, 23))));
+    }
+
+    /// #259 (review L1, probe P2): a decode resident for another catalog's photo 1 is not
+    /// this catalog's photo 1. An engine-2 render asked for the open catalog never renders it;
+    /// it loads its own photo's file (here not a RAW, so the load fails) instead.
+    #[test]
+    fn an_engine2_render_never_takes_another_catalogs_resident_decode() {
+        let rig = engine2("media-engine2-foreign");
+        resident_photo_1(crate::app::CatalogIdentity::unopened(1));
+        let job = engine2_job(crate::app::catalog_identity(&rig.state).unwrap());
+        match render_edit_image(&rig.state, &job) {
+            Ok(frame) => panic!("rendered a {:?} frame: the other catalog's resident decode", frame.dimensions()),
+            Err(e) => assert_ne!(e, crate::app::CATALOG_CHANGED, "the job's catalog is open"),
+        }
+        crate::develop::release_all();
+    }
+
+    /// The control: this catalog's own resident decode is reused — the 37×23 frame.
+    #[test]
+    fn an_engine2_render_reuses_its_own_catalogs_resident_decode() {
+        let rig = engine2("media-engine2-own");
+        let catalog = crate::app::catalog_identity(&rig.state).unwrap();
+        resident_photo_1(catalog);
+        let frame = render_edit_image(&rig.state, &engine2_job(catalog)).unwrap();
+        assert_eq!(frame.dimensions(), (37, 23));
+        crate::develop::release_all();
+    }
+
+    /// #259 (review L2): the re-check after the working image is found. A switch that lands
+    /// while it loads closes the job's catalog, so the job answers `CATALOG_CHANGED` and
+    /// renders nothing — even though the image it found is its own catalog's photo.
+    #[test]
+    fn an_engine2_render_overtaken_by_a_switch_answers_catalog_changed() {
+        let rig = engine2("media-engine2-switch");
+        let catalog = crate::app::catalog_identity(&rig.state).unwrap();
+        resident_photo_1(catalog);
+        let state = rig.state.clone();
+        let (other, other_root) = (rig._dir.join("other.chairphoto"), rig._dir.join("other"));
+        AFTER_WORKING_IMAGE.with(|h| {
+            *h.borrow_mut() = Some(Box::new(move || {
+                let b = crate::catalog::Catalog::open(&other, &other_root).unwrap();
+                *state.catalog.lock().unwrap() = Some(b);
+            }))
+        });
+        let answer = render_edit_image(&rig.state, &engine2_job(catalog)).map(|f| f.dimensions());
+        assert_eq!(answer, Err(crate::app::CATALOG_CHANGED.to_string()), "a frame for a catalog no longer open");
+        AFTER_WORKING_IMAGE.with(|h| assert!(h.borrow().is_none(), "the switch landed after the working image"));
+        crate::develop::release_all();
+    }
 
     /// A working-image token nothing resident answers to is an error, never a fall-through
     /// to the preview pixels.
@@ -399,13 +518,13 @@ mod tests {
         let offline = crate::thumbnails::OfflineThumbKey::new(&uuid::Uuid::new_v4().to_string(), &uuid::Uuid::new_v4().to_string());
         let tier = |kind, cover: Option<&str>| {
             let resolved =
-                Resolved { absolute: Some(path.clone()), rotation: 0, cover: cover.map(str::to_string), offline: offline.clone(), is_video: false };
+                Resolved { absolute: Some(path.clone()), rotation: 0, cover: cover.map(str::to_string), offline: offline.clone(), catalog: crate::app::CatalogIdentity::unopened(1), is_video: false };
             decode_tier(424_242, kind, resolved).map(|(_, cover)| cover)
         };
         assert_eq!(tier(ImageKind::Thumb, Some(r#"{"tone":{"ev":1}}"#)), Ok(true), "the cover's render");
         assert_eq!(tier(ImageKind::Thumb, None), Ok(false), "the plain thumbnail");
         assert_eq!(tier(ImageKind::Preview, Some(r#"{"tone":{"ev":1}}"#)), Ok(false), "only thumbnails show the cover");
-        let kept = Resolved { absolute: None, rotation: 0, cover: Some(r#"{"tone":{"ev":1}}"#.into()), offline, is_video: false };
+        let kept = Resolved { absolute: None, rotation: 0, cover: Some(r#"{"tone":{"ev":1}}"#.into()), offline, catalog: crate::app::CatalogIdentity::unopened(1), is_video: false };
         assert_eq!(decode_tier(424_242, ImageKind::Thumb, kept).map(|(_, c)| c), Ok(false), "the kept thumbnail");
     }
 }

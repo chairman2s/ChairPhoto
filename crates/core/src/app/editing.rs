@@ -35,8 +35,22 @@ pub fn with_catalog_from<T>(
 /// A photo's reachable original: candidates under a brief catalog lock, then a stat off it
 /// (`OriginalRequired`: an edit render, a decode or a probe needs the real file).
 pub fn original_path(state: &AppState, from: Option<CatalogIdentity>, photo_id: i64) -> Result<PathBuf, String> {
-    let candidates = with_catalog_from(state, from, |c| c.photo_path_candidates(photo_id))?;
+    original_path_in(state, from, photo_id).map(|(_, path)| path)
+}
+
+/// [`original_path`], with the identity of the catalog the path was read from — `from` when
+/// bound, else the one open at the read (#259: the develop session keys its decodes by it).
+fn original_path_in(
+    state: &AppState,
+    from: Option<CatalogIdentity>,
+    photo_id: i64,
+) -> Result<(CatalogIdentity, PathBuf), String> {
+    let (catalog, candidates) = match from {
+        Some(id) => (id, with_catalog_as(state, id, |c| c.photo_path_candidates(photo_id))?),
+        None => super::with_catalog_identified(state, |c| c.photo_path_candidates(photo_id))?,
+    };
     crate::volume_health::pick_existing(&candidates, &state.volume_health, crate::catalog::ResolveMode::OriginalRequired)
+        .map(|path| (catalog, path))
         .ok_or_else(|| format!("no reachable copy of photo {photo_id}"))
 }
 
@@ -123,8 +137,10 @@ pub fn develop_open(
     if order.superseded(ticket)? {
         return Err(DEVELOP_SUPERSEDED.into());
     }
-    let path = match original_path(state, from, photo_id) {
-        Ok(path) => path,
+    // The catalog the path is read from — `from`, or the one open now — is the catalog the
+    // session's decodes belong to (#259); the neighbours are read from the same one.
+    let (catalog, path) = match original_path_in(state, from, photo_id) {
+        Ok(found) => found,
         Err(e) => {
             order.settle(ticket)?;
             return Err(e);
@@ -141,14 +157,14 @@ pub fn develop_open(
             .iter()
             .copied()
             .filter(|&n| n != photo_id)
-            .filter_map(|n| original_path(state, from, n).ok().map(|p| (n, p)))
+            .filter_map(|n| original_path(state, Some(catalog), n).ok().map(|p| (n, p)))
             .filter(|(_, p)| crate::scanner::is_raw(p))
             .collect();
-        crate::develop::session::open(state, ticket, photo_id, path, probe, neighbours)
+        crate::develop::session::open(state, ticket, catalog, photo_id, path, probe, neighbours)
     }
     #[cfg(not(all(feature = "raw", feature = "edit")))]
     {
-        let _ = neighbours;
+        let _ = (neighbours, catalog);
         order.settle(ticket)?;
         Ok(probe)
     }
@@ -156,17 +172,18 @@ pub fn develop_open(
 
 /// The develop source state right now for `photo_id` (a view re-attaching).
 pub fn develop_current(state: &AppState, from: Option<CatalogIdentity>, photo_id: i64) -> Result<DevelopSource, String> {
-    let path = original_path(state, from, photo_id)?;
+    let (catalog, path) = original_path_in(state, from, photo_id)?;
     if !crate::scanner::is_raw(&path) {
         return Ok(DevelopSource::Jpeg);
     }
     let probe = probe_source(&path);
     #[cfg(all(feature = "raw", feature = "edit"))]
     {
-        Ok(crate::develop::session::current(state, photo_id, probe))
+        Ok(crate::develop::session::current(state, catalog, photo_id, probe))
     }
     #[cfg(not(all(feature = "raw", feature = "edit")))]
     {
+        let _ = catalog;
         Ok(probe)
     }
 }

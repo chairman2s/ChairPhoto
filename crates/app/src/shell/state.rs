@@ -467,6 +467,9 @@ pub struct ShellState {
     /// Faces read on their own (`refresh_face`) that landed while a row read was in flight:
     /// that read may predate the write, so they are read again once it lands.
     faces_after_rows: Vec<(i64, CatalogIdentity)>,
+    /// The generation of the last whole page of rows that landed (0: none yet). A face read
+    /// asked for before it is dropped ([`Self::on_face`]).
+    page_landed: u64,
     /// How many whole-library row reads `refresh_rows` started (tests).
     #[cfg(test)]
     pub(crate) row_reads: usize,
@@ -573,6 +576,7 @@ impl ShellState {
             rows_loaded: false,
             rows_pending: None,
             faces_after_rows: Vec::new(),
+            page_landed: 0,
             #[cfg(test)]
             row_reads: 0,
             rows_from: None,
@@ -1070,27 +1074,45 @@ impl ShellState {
     /// when the rows shown are another catalog's; refused on the worker when `from` is no
     /// longer the open catalog.
     pub fn refresh_face(&mut self, photo_id: i64, from: CatalogIdentity, cx: &mut Context<Self>) {
+        // Stamped with the newest row read asked for so far: a page asked for after this
+        // read started saw the write it was asked for, and carries the face as new or newer.
+        let asked_after = self.library.generation();
         let state = self.app.clone();
         let read = cx.background_executor().spawn(async move {
             with_catalog_as(&state, from, |c| c.get_photo(photo_id).map(|p| (p.cover_token, p.cover_pin)))
         });
         cx.spawn(async move |this, cx| {
             let Ok((token, pin)) = read.await else { return };
-            this.update(cx, |s, cx| {
-                if s.rows_from != Some(from) {
-                    return;
-                }
-                if s.rows_pending.is_some() {
-                    s.faces_after_rows.push((photo_id, from));
-                }
-                if s.library.patch_face(photo_id, token, pin) {
-                    cx.emit(RowsLanded);
-                    cx.notify();
-                }
-            })
-            .ok();
+            this.update(cx, |s, cx| s.on_face(photo_id, from, asked_after, token, pin, cx)).ok();
         })
         .detach();
+    }
+
+    /// A face read's answer ([`Self::refresh_face`]), asked for when the newest row read was
+    /// `asked_after`. Dropped when the rows shown are another catalog's, or when a whole page
+    /// asked for after it has landed meanwhile: that page read the catalog after this read
+    /// was asked for, so this answer can only be as new or older — patching it would put an
+    /// older face back over the page's (review of #252b, L2: a ~1 ms face read overtaken by
+    /// a ~300 ms page read). Read again once a page in flight lands, which may predate it.
+    pub(crate) fn on_face(
+        &mut self,
+        photo_id: i64,
+        from: CatalogIdentity,
+        asked_after: u64,
+        token: Option<String>,
+        pin: chairphoto_core::catalog::CoverPin,
+        cx: &mut Context<Self>,
+    ) {
+        if self.rows_from != Some(from) || self.page_landed > asked_after {
+            return;
+        }
+        if self.rows_pending.is_some() {
+            self.faces_after_rows.push((photo_id, from));
+        }
+        if self.library.patch_face(photo_id, token, pin) {
+            cx.emit(RowsLanded);
+            cx.notify();
+        }
     }
 
     /// A row read's answer. A page from another catalog than the rows shown (the core has
@@ -1126,6 +1148,7 @@ impl ShellState {
                 }
                 if landed {
                     self.rows_pending = None;
+                    self.page_landed = request.generation;
                     self.rows_loaded = true;
                     // The splash waits for the first photo list (`shell::splash`).
                     self.model.update(cx, |m, cx| m.boot_photos_loaded(cx));
@@ -1713,5 +1736,113 @@ mod tests {
         assert_eq!(jobs.bench_progress().unwrap().label, "Importing …");
         assert!(jobs.on_core_event(&CoreEvent::CatalogSwitched("x".into())));
         assert_eq!(jobs, Jobs::default());
+    }
+
+    // --- one face read against the whole page (#252 fix review) ----------------------------
+
+    mod face_reads {
+        use crate::tests::{colliding_catalog, core_switch, deliver_switch, open_catalog_with_photos, start, App, TempDir};
+        use chairphoto_core::app::with_catalog_identified;
+        use gpui_kit::TestAppContext;
+
+        /// A new version for `id` in the open catalog, so its face moves.
+        fn edit(app: &App, id: i64, ev: f64) {
+            let g = app.state.catalog.lock().unwrap();
+            let c = g.as_ref().unwrap();
+            let v = c.create_version(id, "V").unwrap();
+            c.set_version_edit(v, &format!(r#"{{"tone": {{"ev": {ev}}}}}"#)).unwrap();
+        }
+
+        fn db_token(app: &App, id: i64) -> Option<String> {
+            app.state.catalog.lock().unwrap().as_ref().unwrap().get_photo(id).unwrap().cover_token
+        }
+
+        fn row_token(app: &App, id: i64, cx: &mut TestAppContext) -> Option<String> {
+            app.wired.shell.read_with(cx, |s, _| s.library.photos().iter().find(|p| p.id == id).unwrap().cover_token.clone())
+        }
+
+        /// **Forced interleaving** (review of #252b, probe A). A whole page read whose snapshot
+        /// predates a write lands after the face read the write asked for: the stale page puts
+        /// the old face back, and the face read queued behind it restores the new one.
+        #[gpui_kit::test]
+        fn a_face_survives_a_page_read_that_predates_its_write(cx: &mut TestAppContext) {
+            let dir = TempDir::new("face-read-stale-page");
+            let app = start(cx);
+            let ids = open_catalog_with_photos(&app, &dir, 3, cx);
+            let x = ids[0];
+            let from = app.wired.shell.read_with(cx, |s, _| s.rows_from()).unwrap();
+            // A page read starts; its snapshot is taken now, before the write.
+            let (req, stale) = app.wired.shell.update(cx, |s, _| {
+                let req = s.library.refresh();
+                s.rows_pending = Some(req.generation);
+                let q = req.query.clone();
+                (req, with_catalog_identified(&s.app, |c| c.photo_page(&q)))
+            });
+            edit(&app, x, 1.0);
+            let want = db_token(&app, x);
+            assert!(want.is_some());
+            app.wired.shell.update(cx, |s, cx| s.refresh_face(x, from, cx));
+            cx.run_until_parked();
+            assert_eq!(row_token(&app, x, cx), want, "patched while the page read is in flight");
+            app.wired.shell.update(cx, |s, cx| s.on_page(&req, stale, cx));
+            cx.run_until_parked();
+            assert_eq!(row_token(&app, x, cx), want, "the queued re-read restored the face over the stale page");
+        }
+
+        /// **Forced interleaving** (review of #252b, L2). A face read asked for before a page
+        /// read that lands first answers with an older face than the page's: it is dropped,
+        /// and never puts the older face back over the newer one.
+        #[gpui_kit::test]
+        fn a_face_read_overtaken_by_a_newer_page_is_dropped(cx: &mut TestAppContext) {
+            let dir = TempDir::new("face-read-overtaken");
+            let app = start(cx);
+            let ids = open_catalog_with_photos(&app, &dir, 3, cx);
+            let x = ids[0];
+            let from = app.wired.shell.read_with(cx, |s, _| s.rows_from()).unwrap();
+            edit(&app, x, 1.0);
+            let old = db_token(&app, x);
+            // The face read is asked for, and reads `old`; its answer is held back.
+            let asked_after = app.wired.shell.read_with(cx, |s, _| s.library.generation());
+            let pin = app.state.catalog.lock().unwrap().as_ref().unwrap().get_photo(x).unwrap().cover_pin;
+            // Meanwhile the face moves (a pin from the Inspector) and a page read sees it.
+            edit(&app, x, 2.0);
+            let new = db_token(&app, x);
+            assert_ne!(new, old);
+            app.wired.shell.update(cx, |s, cx| s.refresh_rows(cx));
+            cx.run_until_parked();
+            assert_eq!(row_token(&app, x, cx), new, "the page landed");
+            // The held face read lands last.
+            app.wired.shell.update(cx, |s, cx| s.on_face(x, from, asked_after, old.clone(), pin, cx));
+            assert_eq!(row_token(&app, x, cx), new, "the older face never overwrites the page's");
+            // A face read asked for after that page still patches.
+            let asked_after = app.wired.shell.read_with(cx, |s, _| s.library.generation());
+            app.wired.shell.update(cx, |s, cx| s.on_face(x, from, asked_after, Some("9:9".into()), pin, cx));
+            assert_eq!(row_token(&app, x, cx).as_deref(), Some("9:9"));
+        }
+
+        /// Catalog identity: a face read for the old catalog is refused on the worker after a
+        /// core-only switch to one with colliding ids, and dropped once the switch is delivered.
+        #[gpui_kit::test]
+        fn a_face_read_never_patches_another_catalogs_face(cx: &mut TestAppContext) {
+            let dir = TempDir::new("face-read-switch");
+            let app = start(cx);
+            let ids = open_catalog_with_photos(&app, &dir, 3, cx);
+            let x = ids[0];
+            let from = app.wired.shell.read_with(cx, |s, _| s.rows_from()).unwrap();
+            let before = row_token(&app, x, cx);
+            let (b, bids) = colliding_catalog(&dir, "other", 3);
+            assert_eq!(bids[0], x);
+            core_switch(&app, b);
+            edit(&app, x, 2.0); // B's photo x now has a face
+            assert!(db_token(&app, x).is_some());
+            app.wired.shell.update(cx, |s, cx| s.refresh_face(x, from, cx));
+            cx.run_until_parked();
+            assert_eq!(row_token(&app, x, cx), before, "B's face never patched onto A's row");
+            deliver_switch(&app, cx);
+            let shown = row_token(&app, x, cx);
+            app.wired.shell.update(cx, |s, cx| s.refresh_face(x, from, cx));
+            cx.run_until_parked();
+            assert_eq!(row_token(&app, x, cx), shown);
+        }
     }
 }

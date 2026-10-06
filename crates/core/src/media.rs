@@ -156,14 +156,20 @@ fn decode_tier(id: i64, kind: ImageKind, resolved: Resolved) -> Result<(DynamicI
                         // (#252: every edited one) never takes that path, so the face path
                         // refreshes it the same way, writing only when it differs. The cost is the plain path's own:
                         // the cached thumbnail read, plus for a rotated photo one decode and
-                        // q90 encode of it, on this worker.
+                        // q90 encode of it, on this worker — once per process while nothing
+                        // it depends on moved ([`rotated_fallbacks`]).
                         if let Ok(plain) = thumbnail_bytes(&absolute) {
                             if ((rotation % 360) + 360) % 360 == 0 {
                                 keep_offline_thumb(offline.as_ref(), &plain);
-                            } else if let Ok(rotated) =
-                                decode(&plain).map(rotate).and_then(|img| crate::thumbnails::encode_rotated_jpeg(&img))
+                            } else if let Some(key) =
+                                offline.as_ref().filter(|k| !rotated_fallbacks::current(k, rotation, &plain))
                             {
-                                keep_offline_thumb(offline.as_ref(), &rotated);
+                                if let Ok(rotated) =
+                                    decode(&plain).map(rotate).and_then(|img| crate::thumbnails::encode_rotated_jpeg(&img))
+                                {
+                                    keep_offline_thumb(Some(key), &rotated);
+                                    rotated_fallbacks::checked(key, rotation, &plain);
+                                }
                             }
                         }
                         return decode(&bytes).map(|i| (rotate(i), true));
@@ -197,6 +203,67 @@ fn keep_offline_thumb(key: Option<&crate::thumbnails::OfflineThumbKey>, bytes: &
     let Some(key) = key else { return };
     if crate::thumbnails::read_persistent_thumb(key).as_deref() != Some(bytes) {
         crate::thumbnails::save_persistent_thumb(key, bytes);
+    }
+}
+
+/// The rotated face tiles whose offline fallback this process already brought up to date
+/// (review of #252b, L3). Checking one costs a decode, a rotation and a q90 encode of the
+/// cached thumbnail (~6.4 ms of pool CPU per 512 px tile), and the face path checks on every
+/// `ImageStore` miss — so a tile is checked again only when something it depends on moved:
+/// the rotation, the cached thumbnail's bytes (by hash), or the kept file (its length and
+/// mtime: removed, or rewritten by another writer). In memory only, and bounded.
+#[cfg(feature = "edit")]
+mod rotated_fallbacks {
+    use crate::thumbnails::{persistent_thumb_path, OfflineThumbKey};
+    use std::collections::hash_map::DefaultHasher;
+    use std::collections::HashMap;
+    use std::hash::{Hash, Hasher};
+    use std::sync::Mutex;
+    use std::time::SystemTime;
+
+    /// What a check saw: the rotation, the cached thumbnail's hash, the kept file's length
+    /// and mtime after it.
+    type Seen = (i64, u64, u64, Option<SystemTime>);
+
+    /// Entries kept before the memo starts over (a few MB at most).
+    const CAP: usize = 65_536;
+
+    static SEEN: Mutex<Option<HashMap<OfflineThumbKey, Seen>>> = Mutex::new(None);
+
+    /// The keys checked, one entry per check (tests).
+    #[cfg(test)]
+    pub(super) static CHECKS: Mutex<Vec<OfflineThumbKey>> = Mutex::new(Vec::new());
+
+    fn hash(bytes: &[u8]) -> u64 {
+        let mut h = DefaultHasher::new();
+        bytes.hash(&mut h);
+        h.finish()
+    }
+
+    fn kept(key: &OfflineThumbKey) -> Option<(u64, Option<SystemTime>)> {
+        let meta = std::fs::symlink_metadata(persistent_thumb_path(key)).ok()?;
+        Some((meta.len(), meta.modified().ok()))
+    }
+
+    /// Whether `key`'s fallback was brought up to date for `rotation` and these cached
+    /// thumbnail bytes, and the kept file is still what that left.
+    pub(super) fn current(key: &OfflineThumbKey, rotation: i64, plain: &[u8]) -> bool {
+        let Some((len, mtime)) = kept(key) else { return false };
+        let seen = SEEN.lock().unwrap_or_else(|p| p.into_inner());
+        seen.as_ref().and_then(|m| m.get(key)).is_some_and(|&s| s == (rotation, hash(plain), len, mtime))
+    }
+
+    /// `key`'s fallback was just brought up to date for `rotation` from `plain`.
+    pub(super) fn checked(key: &OfflineThumbKey, rotation: i64, plain: &[u8]) {
+        #[cfg(test)]
+        CHECKS.lock().unwrap_or_else(|p| p.into_inner()).push(key.clone());
+        let Some((len, mtime)) = kept(key) else { return };
+        let mut seen = SEEN.lock().unwrap_or_else(|p| p.into_inner());
+        let map = seen.get_or_insert_with(HashMap::new);
+        if map.len() >= CAP {
+            map.clear();
+        }
+        map.insert(key.clone(), (rotation, hash(plain), len, mtime));
     }
 }
 
@@ -526,5 +593,47 @@ mod tests {
         assert_eq!(tier(ImageKind::Preview, Some(r#"{"tone":{"ev":1}}"#)), Ok(false), "only thumbnails show the cover");
         let kept = Resolved { absolute: None, rotation: 0, cover: Some(r#"{"tone":{"ev":1}}"#.into()), offline, catalog: crate::app::CatalogIdentity::unopened(1), is_video: false };
         assert_eq!(decode_tier(424_242, ImageKind::Thumb, kept).map(|(_, c)| c), Ok(false), "the kept thumbnail");
+    }
+
+    /// Review of #252b, L3: a rotated face tile's offline fallback is checked — decoded,
+    /// rotated, encoded and compared — once, not on every render; and again when the rotation
+    /// changes or the kept file is gone, which it then writes again.
+    #[cfg(feature = "edit")]
+    #[test]
+    fn a_rotated_face_tiles_fallback_is_checked_once_until_something_moves() {
+        use crate::thumbnails::tests::{test_lock, write_test_jpeg, TestTmpDir};
+        use crate::thumbnails::{persistent_thumb_path, OfflineThumbKey};
+        let _guard = test_lock();
+        let tmp = TestTmpDir::new("media-rotated-fallback-memo");
+        std::env::set_var("XDG_CACHE_HOME", tmp.path().join("cache"));
+        let path = write_test_jpeg(tmp.path(), "r.jpg", 800, 600);
+        let key = OfflineThumbKey::new(&uuid::Uuid::new_v4().to_string(), &uuid::Uuid::new_v4().to_string()).unwrap();
+        let render = |rotation| {
+            let resolved = Resolved {
+                absolute: Some(path.clone()),
+                rotation,
+                cover: Some(r#"{"tone":{"ev":1}}"#.into()),
+                offline: Some(key.clone()),
+                catalog: crate::app::CatalogIdentity::unopened(1),
+                is_video: false,
+            };
+            assert_eq!(decode_tier(424_243, ImageKind::Thumb, resolved).map(|(_, cover)| cover), Ok(true));
+        };
+        let checks = || rotated_fallbacks::CHECKS.lock().unwrap().iter().filter(|k| **k == key).count();
+        render(90);
+        assert_eq!(checks(), 1, "the first render checks it");
+        let kept = persistent_thumb_path(&key);
+        let written = std::fs::read(&kept).unwrap();
+        render(90);
+        render(90);
+        assert_eq!(checks(), 1, "not again while nothing moved");
+        assert_eq!(std::fs::read(&kept).unwrap(), written);
+        render(270);
+        assert_eq!(checks(), 2, "the rotation moved");
+        assert_ne!(std::fs::read(&kept).unwrap(), written, "and the fallback follows it");
+        std::fs::remove_file(&kept).unwrap();
+        render(270);
+        assert_eq!(checks(), 3, "the kept file went");
+        assert!(kept.is_file(), "and is written again");
     }
 }

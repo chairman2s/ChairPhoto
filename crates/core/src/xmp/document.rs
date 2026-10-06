@@ -527,13 +527,17 @@ impl Folder {
     /// report one cheaply from the handle already open (non-Unix), which then shares the
     /// fallback queue keyed by `None`.
     ///
-    /// Reads the device [`Self::require_original`] already cached from its own `fstat`
-    /// (every production caller of [`sweep_later`] runs after `require_original`, inside
-    /// [`SidecarDocument::commit`]'s [`write_atomically`]): a *second* `fstat` here would be
-    /// on this very handle, which a folder whose mount is hung may block indefinitely — and
-    /// that call would run on whatever thread calls `sweep_later`, which may hold the catalog
-    /// lock. Falls back to a fresh `fstat` only when nothing is cached yet (a caller that
-    /// skipped `require_original`, e.g. a test calling this directly).
+    /// Reads the device [`Self::require_original`] already cached from its own `fstat`, when
+    /// it ran on this folder: a *second* `fstat` here would be on this very handle, which a
+    /// folder whose mount is hung may block indefinitely — and that call would run on whatever
+    /// thread calls `sweep_later`, which may hold the catalog lock. [`SidecarDocument::commit`]
+    /// sweeps the photo's own folder, which [`write_atomically`] ran `require_original` on, so
+    /// that common case has it cached. Not every sweep does: for a symlinked sidecar the temp
+    /// is made in the link target's folder (`linked`, opened by `write_atomically` itself),
+    /// which `require_original` never sees, so it falls back to a fresh `fstat` on the
+    /// committing thread — right after that thread created, wrote, synced and renamed the temp
+    /// through the same handle, so it adds no handle the write had not just used (review
+    /// relD L2). Tests calling this directly fall back the same way.
     fn device_id(&self) -> Option<u64> {
         #[cfg(unix)]
         return self.device.get().or_else(|| rustix::fs::fstat(&self.fd).ok().map(|st| st.st_dev as u64));
@@ -1558,6 +1562,19 @@ mod tests {
 
         let a2 = send_to(Some(101), "a2");
         assert_eq!(wait_swept(&a2), thread_a, "the same device reuses its sweeper thread");
+    }
+
+    /// Review relD L2, pinning what `device_id`'s doc says: a folder `write_atomically` opens
+    /// itself (a symlinked sidecar's `linked` target folder) never had `require_original` run
+    /// on it, so it has no cached device and `device_id` falls back to a fresh `fstat`.
+    #[cfg(unix)]
+    #[test]
+    fn a_folder_without_require_original_falls_back_to_fstat_for_its_device() {
+        use std::os::unix::fs::MetadataExt as _;
+        let dir = crate::test_support::TestTmpDir::new("doc-reld-l2-linked");
+        let folder = Folder::open_dir(&dir).unwrap();
+        assert!(folder.device.get().is_none(), "open_dir caches nothing; only require_original does");
+        assert_eq!(folder.device_id(), Some(std::fs::metadata(&*dir).unwrap().dev()));
     }
 
     /// #221 review coverage gap: the test above goes straight at `sweeper_for`, so a mutation

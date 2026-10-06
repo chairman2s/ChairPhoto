@@ -358,7 +358,7 @@ impl Shared {
         #[cfg(test)]
         {
             use std::sync::atomic::Ordering::SeqCst;
-            if self.fail_writes.fetch_update(SeqCst, SeqCst, |n| n.checked_sub(1)).is_ok() {
+            if self.fail_writes.try_update(SeqCst, SeqCst, |n| n.checked_sub(1)).is_ok() {
                 return Err(std::io::Error::other("injected write failure (test)"));
             }
         }

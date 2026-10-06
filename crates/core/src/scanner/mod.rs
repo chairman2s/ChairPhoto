@@ -745,16 +745,18 @@ pub fn copy_from_card_abortable(
             same_photo::stamp_from_metadata(m.entries.iter().map(|e| (e.key.as_str(), e.group_name.as_str(), e.value.as_str())))
         });
         let arriving = free_name::Arriving::Capture(stamp.unwrap_or_default());
-        if !same_photo::sidecar_name_fits(&dir.join(filename)) {
-            eprintln!("ingest: {} not imported: its name is too long for a sidecar beside it", src.display());
-            result.name_too_long += 1;
-            continue;
-        }
         // The row's photo was offloaded (a verified backup holds it): already imported, and
         // not copied back to this disk (#231 F5).
         if names.kept_elsewhere(&dir.join(filename), &arriving).is_some() {
             result.offloaded += 1;
             in_library.insert(src);
+            continue;
+        }
+        // Only a name made here must fit its sidecar: a row's capture coming back to the row's
+        // own name keeps that name — the card may hold its last copy (relB3 MEDIUM-B).
+        if !same_photo::sidecar_name_fits(&dir.join(filename)) && names.relink_target(&dir.join(filename), &arriving).is_none() {
+            eprintln!("ingest: {} not imported: its name is too long for a sidecar beside it", src.display());
+            result.name_too_long += 1;
             continue;
         }
         let placed = same_photo::create_new_file(&dir.join(filename), &mut names, &arriving, |out| {
@@ -1585,6 +1587,41 @@ mod tests {
             .unwrap();
         assert_eq!(debt, 0, "no identity debt");
         assert!(!day.join(&over).exists());
+    }
+
+    // --- card ingest: a long name the catalog already has (relB3 MEDIUM-B) -----------------
+
+    /// relB3 P2: a row holds a 220-byte name — too long for a new photo's sidecar, but the
+    /// row has it (a folder scan has no limit; an import under the old rule) — and its file
+    /// is lost while its local location row stays. The same capture on a card may be its last
+    /// copy: it goes back to the row's name and re-links the row, as for any lost file; no
+    /// new name is made, so none is refused.
+    #[test]
+    fn a_lost_file_under_a_long_name_is_restored_from_the_card() {
+        if !exiftool_available("a_lost_file_under_a_long_name_is_restored_from_the_card") {
+            return;
+        }
+        let (catalog, _dir, root, card) = ingest_rig("relb3-p2");
+        let long = format!("{}.jpg", "L".repeat(216));
+        assert!(!same_photo::sidecar_name_fits(Path::new(&long)));
+        stamped_jpeg(&card.join(&long), "2026:06:28 12:00:00", "123", "4711");
+        let name = root.join("2026/06/28").join(&long);
+        std::fs::create_dir_all(name.parent().unwrap()).unwrap();
+        std::fs::copy(card.join(&long), &name).unwrap();
+        scan_folder(&catalog, &root, &AtomicBool::new(false), &|_| {}).unwrap();
+        let rel = format!("2026/06/28/{long}");
+        let (id, uuid, _, _) = row_at(&catalog, &rel).unwrap();
+        rate(&catalog, id, 5);
+        std::fs::remove_file(&name).unwrap();
+        let _ = std::fs::remove_file(crate::xmp::sidecar_path(&name));
+        catalog.reconcile_missing_for(&[id]).unwrap();
+        assert_eq!(row_at(&catalog, &rel).unwrap().3, 1, "missing before");
+
+        let again = ingest_from_card(&catalog, &card, &root, None).unwrap();
+        assert_eq!((again.restored, again.name_too_long, again.created, again.errors), (1, 0, 0, 0), "{again:?}");
+        assert!(name.exists(), "the card's copy is back at the row's name");
+        assert_eq!(row_at(&catalog, &rel), Some((id, uuid.clone(), 5, 0)));
+        assert_eq!(photos(&catalog), [(rel, uuid)], "no second row");
     }
 
     /// The same capture comes back, but the sidecar at its name now carries another identity

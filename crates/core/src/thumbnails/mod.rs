@@ -158,24 +158,65 @@ pub(crate) fn encode_rotated_jpeg(img: &DynamicImage) -> Result<Vec<u8>, String>
     Ok(out.into_inner())
 }
 
-// --- persistent, photo-id-keyed thumbnails ---------------------------------
+// --- persistent offline thumbnails -------------------------------------------------------
 // The normal disk cache is keyed by path+mtime+size, so it can't be found once the
 // original is unreachable (e.g. a photo offloaded to a NAS that's now unmounted). This
-// second store is keyed only by photo id, so a NAS-only photo stays browsable offline.
-// It's written whenever a thumbnail is served while the original IS reachable, and
+// second store is keyed by the photo's identity instead, so a NAS-only photo stays browsable
+// offline. It's written whenever a thumbnail is served while the original IS reachable, and
 // proactively at offload time.
+//
+// The identity is the catalog's stable UUID plus the photo's UUID (#258), never a photo id:
+// ids are per catalog, so an id-keyed file one catalog kept was shown by every other catalog
+// with a photo of that id whose original was unreachable — another photo, indefinitely. Not
+// `app::CatalogIdentity` either: that is a per-open handle id, so a file keyed by it would
+// never be found after a restart. The pre-#258 id-keyed files ([`STALE_PERSIST_DIR`]) say
+// nothing about which catalog wrote them, so [`cleanup_stale_caches`] drops them rather than
+// guess; each comes back the next time its original is reachable.
 
-/// Path of a photo's persistent (id-keyed) thumbnail.
-pub fn persistent_thumb_path(photo_id: i64) -> PathBuf {
-    cache_dir()
-        .join("chairphoto")
-        .join("persist")
-        .join(format!("{photo_id}.jpg"))
+/// The directory of the offline thumbnails, under the cache's `chairphoto` directory.
+const PERSIST_DIR: &str = "persist-v2";
+
+/// Which photo, of which catalog, an offline thumbnail is kept for: the catalog's own UUID
+/// (`catalog::CATALOG_UUID_KEY`, the one in `chairphoto:FaceId` markers) and the photo's
+/// (`photos.uuid`). Both are UUIDs by construction ([`Self::new`] parses them), so the path
+/// built from them stays inside the store.
+///
+/// Why the catalog's UUID and not the photo's alone: the kept file is the photo *as that
+/// catalog shows it* — its user rotation applied — and catalogs that share a photo UUID (a
+/// merge, a bundle import) can rotate it differently. Two catalogs that share both UUIDs are
+/// copies of one catalog file (a restored backup, a sync): what one keeps is the other's too.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct OfflineThumbKey {
+    catalog: uuid::Uuid,
+    photo: uuid::Uuid,
+}
+
+impl OfflineThumbKey {
+    /// The key for `photo_uuid` in the catalog `catalog_uuid`; `None` unless both are UUIDs
+    /// (a catalog with no identity minted, a legacy row): such a photo keeps no offline
+    /// thumbnail rather than share one.
+    pub fn new(catalog_uuid: &str, photo_uuid: &str) -> Option<Self> {
+        let catalog = uuid::Uuid::parse_str(catalog_uuid).ok()?;
+        let photo = uuid::Uuid::parse_str(photo_uuid).ok()?;
+        Some(Self { catalog, photo })
+    }
+}
+
+/// The directory holding every catalog's offline thumbnails, one directory per catalog UUID.
+pub fn persistent_thumb_dir() -> PathBuf {
+    cache_dir().join("chairphoto").join(PERSIST_DIR)
+}
+
+/// Path of a photo's persistent (identity-keyed) thumbnail.
+pub fn persistent_thumb_path(key: &OfflineThumbKey) -> PathBuf {
+    persistent_thumb_dir()
+        .join(key.catalog.hyphenated().to_string())
+        .join(format!("{}.jpg", key.photo.hyphenated()))
 }
 
 /// Save (or refresh) a photo's persistent thumbnail. Best-effort.
-pub fn save_persistent_thumb(photo_id: i64, bytes: &[u8]) {
-    let p = persistent_thumb_path(photo_id);
+pub fn save_persistent_thumb(key: &OfflineThumbKey, bytes: &[u8]) {
+    let p = persistent_thumb_path(key);
     if let Some(parent) = p.parent() {
         std::fs::create_dir_all(parent).ok();
     }
@@ -183,15 +224,15 @@ pub fn save_persistent_thumb(photo_id: i64, bytes: &[u8]) {
 }
 
 /// A photo's persistent thumbnail bytes, if one was kept.
-pub fn read_persistent_thumb(photo_id: i64) -> Option<Vec<u8>> {
-    std::fs::read(persistent_thumb_path(photo_id)).ok()
+pub fn read_persistent_thumb(key: &OfflineThumbKey) -> Option<Vec<u8>> {
+    std::fs::read(persistent_thumb_path(key)).ok()
 }
 
-/// Generate a thumbnail from `path` and persist it under `photo_id` — called at offload
-/// time so the grid keeps an image after the original leaves local disk.
-pub fn ensure_persistent_thumb(photo_id: i64, path: &Path) -> Result<(), String> {
+/// Generate a thumbnail from `path` and persist it under `key` — called at offload time so
+/// the grid keeps an image after the original leaves local disk.
+pub fn ensure_persistent_thumb(key: &OfflineThumbKey, path: &Path) -> Result<(), String> {
     let bytes = thumbnail_bytes(path)?;
-    save_persistent_thumb(photo_id, &bytes);
+    save_persistent_thumb(key, &bytes);
     Ok(())
 }
 
@@ -773,14 +814,20 @@ const STALE_PREVIEW_DIR: &str = "p2048v5";
 /// `cover512v1`: cover thumbnails (`plugins::edit::cover`) before its `COVER_FORMAT` 2 (#245),
 /// rendered from those upscaled previews, so enlarged for originals under 512 px.
 const STALE_COVER_DIR: &str = "cover512v1";
+/// `persist`: the offline thumbnails before #258, keyed by photo id alone and so shared by
+/// every catalog with a photo of that id. Nothing records which catalog wrote one, so they are
+/// dropped, not moved: each catalog's own come back under [`PERSIST_DIR`] as its originals
+/// are seen again.
+const STALE_PERSIST_DIR: &str = "persist";
 /// What [`cleanup_stale_caches`] keeps of [`STALE_PREVIEW_DIR`] for [`cached_preview_size`]:
 /// one `<file name> <width> <height>` line per old preview.
 const STALE_PREVIEW_SIZES: &str = "p2048v5.sizes";
 
 /// One-time, best-effort removal of the cache directories older builds left behind:
 /// [`STALE_ZOOM_DIR`] (#168), [`STALE_THUMB_DIR`], [`STALE_PREVIEW_DIR`] and
-/// [`STALE_COVER_DIR`] (#245). Nothing reads their images any more, so removing them only
-/// reclaims disk space — except that the face-region writer's cross-check still wants the old
+/// [`STALE_COVER_DIR`] (#245), and [`STALE_PERSIST_DIR`] (#258). Nothing reads their images
+/// any more, so removing them only reclaims disk space (a photo whose original is away has no
+/// offline thumbnail until it is seen again, see [`OfflineThumbKey`]) — except that the face-region writer's cross-check still wants the old
 /// previews' pixel sizes until each photo's preview is regenerated ([`cached_preview_size`]).
 /// Those are written first, to [`STALE_PREVIEW_SIZES`] (through a temporary file renamed into
 /// place), and the preview directory is removed only once they have landed; if they cannot be
@@ -803,6 +850,7 @@ pub fn cleanup_stale_caches() {
     remove_own_dir(&root.join(STALE_ZOOM_DIR));
     remove_own_dir(&root.join(STALE_THUMB_DIR));
     remove_own_dir(&root.join(STALE_COVER_DIR));
+    remove_own_dir(&root.join(STALE_PERSIST_DIR));
     let previews = root.join(STALE_PREVIEW_DIR);
     if is_own_dir(&previews) && keep_stale_preview_sizes(&root, &previews).is_ok() {
         remove_own_dir(&previews);
@@ -1342,12 +1390,13 @@ pub(crate) mod tests {
         std::env::set_var("XDG_CACHE_HOME", &cache);
         let root = cache.join("chairphoto");
 
-        for stale in [STALE_ZOOM_DIR, STALE_THUMB_DIR, STALE_PREVIEW_DIR, STALE_COVER_DIR] {
+        for stale in [STALE_ZOOM_DIR, STALE_THUMB_DIR, STALE_PREVIEW_DIR, STALE_COVER_DIR, STALE_PERSIST_DIR] {
             std::fs::create_dir_all(root.join(stale)).unwrap();
             std::fs::write(root.join(stale).join("deadbeefdeadbeef.jpg"), b"old upscaled tier").unwrap();
         }
-        // The current tiers and the id-keyed persistent thumbnails must survive untouched.
-        let keep = ["z10000v6", "p2048v6", "t512v6", "cover512v2", "persist"];
+        // The current tiers and the identity-keyed offline thumbnails (#258) must survive
+        // untouched; the id-keyed `persist` directory before them goes.
+        let keep = ["z10000v6", "p2048v6", "t512v6", "cover512v2", PERSIST_DIR];
         for dir in keep {
             std::fs::create_dir_all(root.join(dir)).unwrap();
             std::fs::write(root.join(dir).join("keep.jpg"), b"current").unwrap();
@@ -1355,7 +1404,7 @@ pub(crate) mod tests {
 
         cleanup_stale_caches();
 
-        for stale in [STALE_ZOOM_DIR, STALE_THUMB_DIR, STALE_PREVIEW_DIR, STALE_COVER_DIR] {
+        for stale in [STALE_ZOOM_DIR, STALE_THUMB_DIR, STALE_PREVIEW_DIR, STALE_COVER_DIR, STALE_PERSIST_DIR] {
             assert!(!root.join(stale).exists(), "{stale} should be gone");
         }
         for dir in keep {
@@ -1363,6 +1412,21 @@ pub(crate) mod tests {
         }
         // The unreadable old "preview" kept no size, but the sizes file was still written.
         assert!(root.join(STALE_PREVIEW_SIZES).is_file());
+    }
+
+    /// The offline thumbnail's key (#258) takes UUIDs only, so nothing else ever reaches its
+    /// path; and a photo of one catalog never shares a file with its namesake in another.
+    #[test]
+    fn an_offline_thumbnail_key_is_two_uuids_and_names_its_catalog() {
+        let (cat_a, cat_b, photo) = (uuid::Uuid::new_v4().to_string(), uuid::Uuid::new_v4().to_string(), uuid::Uuid::new_v4().to_string());
+        assert!(OfflineThumbKey::new(&cat_a, "../../etc/passwd").is_none());
+        assert!(OfflineThumbKey::new("", &photo).is_none());
+        assert!(OfflineThumbKey::new(&cat_a, "42").is_none(), "a photo id is not a key");
+        let a = OfflineThumbKey::new(&cat_a, &photo).unwrap();
+        let b = OfflineThumbKey::new(&cat_b, &photo).unwrap();
+        assert_ne!(persistent_thumb_path(&a), persistent_thumb_path(&b));
+        assert!(persistent_thumb_path(&a).starts_with(persistent_thumb_dir()));
+        assert_eq!(OfflineThumbKey::new(&cat_a.to_uppercase(), &photo), Some(a), "one spelling per UUID");
     }
 
     #[test]
@@ -1395,13 +1459,13 @@ pub(crate) mod tests {
 
         let root = cache.join("chairphoto");
         std::fs::create_dir_all(&root).unwrap();
-        for stale in [STALE_ZOOM_DIR, STALE_THUMB_DIR, STALE_PREVIEW_DIR, STALE_COVER_DIR] {
+        for stale in [STALE_ZOOM_DIR, STALE_THUMB_DIR, STALE_PREVIEW_DIR, STALE_COVER_DIR, STALE_PERSIST_DIR] {
             std::os::unix::fs::symlink(&elsewhere, root.join(stale)).unwrap();
         }
 
         cleanup_stale_caches();
 
-        for stale in [STALE_ZOOM_DIR, STALE_THUMB_DIR, STALE_PREVIEW_DIR, STALE_COVER_DIR] {
+        for stale in [STALE_ZOOM_DIR, STALE_THUMB_DIR, STALE_PREVIEW_DIR, STALE_COVER_DIR, STALE_PERSIST_DIR] {
             let meta = std::fs::symlink_metadata(root.join(stale)).expect("the symlink itself must still exist");
             assert!(meta.file_type().is_symlink(), "{stale} must remain a symlink, not be removed or replaced");
         }

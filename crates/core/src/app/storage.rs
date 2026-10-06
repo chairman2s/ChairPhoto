@@ -337,9 +337,15 @@ fn offload_until(
     let candidates = cat.with(|c| c.plan_offload_candidates(photo_id))?;
     let mut plan = crate::catalog::resolve_offload_plan(candidates).map_err(|e| crate::catalog::user_reason(&e))?;
     leave_unclaimed(&mut plan.frames, &mut plan.skipped, &claim, |f| f.photo_id);
-    for member in std::iter::once(&plan.named).chain(plan.frames.iter()) {
-        if let Some(local) = member.local_files.first() {
-            let _ = crate::thumbnails::ensure_persistent_thumb(member.photo_id, local);
+    // Each member's offline thumbnail key (#258), read in one hold; the thumbnails are made
+    // off the lock. Best-effort like the thumbnails themselves: a failed read keeps none.
+    let members: Vec<_> = std::iter::once(&plan.named).chain(plan.frames.iter()).collect();
+    let keys = cat
+        .with(|c| members.iter().map(|m| c.offline_thumb_key(m.photo_id)).collect::<crate::catalog::Result<Vec<_>>>())
+        .unwrap_or_default();
+    for (member, key) in members.iter().zip(keys) {
+        if let (Some(local), Some(key)) = (member.local_files.first(), key) {
+            let _ = crate::thumbnails::ensure_persistent_thumb(&key, local);
         }
     }
     let carry = crate::catalog::verify_and_delete_locals_until(&plan, stopped).map_err(|e| crate::catalog::user_reason(&e))?;

@@ -772,6 +772,22 @@ impl Catalog {
         Ok(catalog_uuid(&self.conn)?)
     }
 
+    /// What `photo_id`'s offline thumbnail is kept under (#258): this catalog's identity and
+    /// the photo's UUID, read together. A read only — it never mints the catalog's identity,
+    /// so it costs a grid tile no write. `None` when the photo is not in the catalog or either
+    /// value is not a UUID ([`crate::thumbnails::OfflineThumbKey::new`]).
+    pub fn offline_thumb_key(&self, photo_id: i64) -> Result<Option<crate::thumbnails::OfflineThumbKey>> {
+        let row: Option<(String, Option<String>)> = self
+            .conn
+            .query_row(
+                "SELECT p.uuid, (SELECT value FROM settings WHERE key = ?2) FROM photos p WHERE p.id = ?1",
+                params![photo_id, CATALOG_UUID_KEY],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        Ok(row.and_then(|(photo, catalog)| crate::thumbnails::OfflineThumbKey::new(catalog.as_deref()?, &photo)))
+    }
+
     pub fn get_setting(&self, key: &str) -> Result<Option<String>> {
         Ok(self
             .conn

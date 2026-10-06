@@ -17,11 +17,15 @@ use image::DynamicImage;
 use std::path::PathBuf;
 
 /// One photo tier, resolved: a reachable copy (if any), the user rotation, the cover
-/// version's record (thumbnails only), and whether it is a video.
+/// version's record and the offline thumbnail's key (thumbnails only), and whether it is a
+/// video.
 struct Resolved {
     absolute: Option<PathBuf>,
     rotation: i64,
     cover: Option<String>,
+    /// Where the photo's offline thumbnail is kept (#258): under its catalog's UUID and its
+    /// own, never under the photo id another catalog may also use. `None`: none is kept.
+    offline: Option<crate::thumbnails::OfflineThumbKey>,
     is_video: bool,
 }
 
@@ -30,17 +34,21 @@ struct Resolved {
 /// `pick_existing` still returns the best available copy (local cache > primary > backup);
 /// the reachability cache only reorders the stats.
 fn resolve(state: &AppState, id: i64, kind: ImageKind) -> Result<Resolved, String> {
-    let (candidates, rotation, cover) = {
+    let (candidates, rotation, cover, offline) = {
         let guard = state.catalog.lock().map_err(|e| e.to_string())?;
         let catalog = guard.as_ref().ok_or("no catalog open")?;
         let candidates = catalog.photo_path_candidates(id).map_err(|e| e.to_string())?;
         let rotation = catalog.photo_rotation(id).unwrap_or(0);
-        // The cover version's settings, when the grid should show a version's look.
-        let cover = match kind {
-            ImageKind::Thumb => catalog.cover_of(id).ok().flatten().map(|(_, _, json)| json),
-            _ => None,
+        // The cover version's settings, when the grid should show a version's look, and the
+        // offline thumbnail's key, read in the same hold as the paths: the same photo.
+        let (cover, offline) = match kind {
+            ImageKind::Thumb => (
+                catalog.cover_of(id).ok().flatten().map(|(_, _, json)| json),
+                catalog.offline_thumb_key(id).ok().flatten(),
+            ),
+            _ => (None, None),
         };
-        (candidates, rotation, cover)
+        (candidates, rotation, cover, offline)
     };
     let is_video = candidates.iter().any(|c| crate::scanner::is_video(&c.path));
     // A thumbnail has a persistent fallback below, so it resolves in FastDisplay: a
@@ -51,7 +59,7 @@ fn resolve(state: &AppState, id: i64, kind: ImageKind) -> Result<Resolved, Strin
         ImageKind::Preview | ImageKind::Zoom => ResolveMode::OriginalRequired,
     };
     let absolute = crate::volume_health::pick_existing(&candidates, &state.volume_health, mode);
-    Ok(Resolved { absolute, rotation, cover, is_video })
+    Ok(Resolved { absolute, rotation, cover, offline, is_video })
 }
 
 /// A decoded image from [`render_image`]: display-ready (oriented, user rotation applied,
@@ -115,14 +123,18 @@ pub fn render_image(state: &AppState, key: JobKey) -> Result<DecodedImage, Strin
 /// [`render_image`]'s photo body: the cached tier's JPEG, decoded once and rotated, and
 /// whether it is the cover version's render ([`DecodedImage::cover`]).
 fn decode_tier(id: i64, kind: ImageKind, resolved: Resolved) -> Result<(DynamicImage, bool), String> {
-    let Resolved { absolute, rotation, cover, .. } = resolved;
+    let Resolved { absolute, rotation, cover, offline, .. } = resolved;
     let decode = |bytes: &[u8]| image::load_from_memory(bytes).map_err(|e| e.to_string());
     let rotate = |img| crate::thumbnails::rotate_image(img, rotation);
     let Some(absolute) = absolute else {
         let e = format!("no reachable copy of photo {id}");
         return match kind {
-            // The kept thumbnail is already rotated.
-            ImageKind::Thumb => decode(&crate::thumbnails::read_persistent_thumb(id).ok_or(e)?).map(|i| (i, false)),
+            // The kept thumbnail is already rotated, and it is this catalog's photo: its key
+            // names both by UUID (#258).
+            ImageKind::Thumb => {
+                let kept = offline.as_ref().and_then(crate::thumbnails::read_persistent_thumb).ok_or(e)?;
+                decode(&kept).map(|i| (i, false))
+            }
             _ => Err(e),
         };
     };
@@ -134,19 +146,18 @@ fn decode_tier(id: i64, kind: ImageKind, resolved: Resolved) -> Result<(DynamicI
                     Ok(bytes) => {
                         // The offline fallback above is the original's own thumbnail, which
                         // the plain path below refreshes on every render — so a rotation
-                        // change, or another catalog's photo of this id, never leaves it
-                        // stale. A photo whose tile shows its face (#252: every edited one)
-                        // never takes that path, so the face path refreshes it the same way,
-                        // writing only when it differs. The cost is the plain path's own:
+                        // change never leaves it stale. A photo whose tile shows its face
+                        // (#252: every edited one) never takes that path, so the face path
+                        // refreshes it the same way, writing only when it differs. The cost is the plain path's own:
                         // the cached thumbnail read, plus for a rotated photo one decode and
                         // q90 encode of it, on this worker.
                         if let Ok(plain) = thumbnail_bytes(&absolute) {
                             if ((rotation % 360) + 360) % 360 == 0 {
-                                keep_offline_thumb(id, &plain);
+                                keep_offline_thumb(offline.as_ref(), &plain);
                             } else if let Ok(rotated) =
                                 decode(&plain).map(rotate).and_then(|img| crate::thumbnails::encode_rotated_jpeg(&img))
                             {
-                                keep_offline_thumb(id, &rotated);
+                                keep_offline_thumb(offline.as_ref(), &rotated);
                             }
                         }
                         return decode(&bytes).map(|i| (rotate(i), true));
@@ -160,10 +171,12 @@ fn decode_tier(id: i64, kind: ImageKind, resolved: Resolved) -> Result<(DynamicI
             let img = rotate(decode(&bytes)?);
             // The persistent copy: the cached JPEG as-is, or, for a rotated photo, a q90
             // re-encode of these same pixels (the file the Tauri shell's byte path used to write too).
-            if ((rotation % 360) + 360) % 360 == 0 {
-                crate::thumbnails::save_persistent_thumb(id, &bytes);
-            } else if let Ok(rotated) = crate::thumbnails::encode_rotated_jpeg(&img) {
-                crate::thumbnails::save_persistent_thumb(id, &rotated);
+            if let Some(offline) = &offline {
+                if ((rotation % 360) + 360) % 360 == 0 {
+                    crate::thumbnails::save_persistent_thumb(offline, &bytes);
+                } else if let Ok(rotated) = crate::thumbnails::encode_rotated_jpeg(&img) {
+                    crate::thumbnails::save_persistent_thumb(offline, &rotated);
+                }
             }
             Ok((img, false))
         }
@@ -174,9 +187,10 @@ fn decode_tier(id: i64, kind: ImageKind, resolved: Resolved) -> Result<(DynamicI
 
 /// Keep `bytes` as the photo's offline fallback thumbnail unless that is what it holds.
 #[cfg(feature = "edit")]
-fn keep_offline_thumb(id: i64, bytes: &[u8]) {
-    if crate::thumbnails::read_persistent_thumb(id).as_deref() != Some(bytes) {
-        crate::thumbnails::save_persistent_thumb(id, bytes);
+fn keep_offline_thumb(key: Option<&crate::thumbnails::OfflineThumbKey>, bytes: &[u8]) {
+    let Some(key) = key else { return };
+    if crate::thumbnails::read_persistent_thumb(key).as_deref() != Some(bytes) {
+        crate::thumbnails::save_persistent_thumb(key, bytes);
     }
 }
 
@@ -382,15 +396,16 @@ mod tests {
         let tmp = TestTmpDir::new("media-cover");
         std::env::set_var("XDG_CACHE_HOME", tmp.path().join("cache"));
         let path = write_test_jpeg(tmp.path(), "cover.jpg", 800, 600);
+        let offline = crate::thumbnails::OfflineThumbKey::new(&uuid::Uuid::new_v4().to_string(), &uuid::Uuid::new_v4().to_string());
         let tier = |kind, cover: Option<&str>| {
             let resolved =
-                Resolved { absolute: Some(path.clone()), rotation: 0, cover: cover.map(str::to_string), is_video: false };
+                Resolved { absolute: Some(path.clone()), rotation: 0, cover: cover.map(str::to_string), offline: offline.clone(), is_video: false };
             decode_tier(424_242, kind, resolved).map(|(_, cover)| cover)
         };
         assert_eq!(tier(ImageKind::Thumb, Some(r#"{"tone":{"ev":1}}"#)), Ok(true), "the cover's render");
         assert_eq!(tier(ImageKind::Thumb, None), Ok(false), "the plain thumbnail");
         assert_eq!(tier(ImageKind::Preview, Some(r#"{"tone":{"ev":1}}"#)), Ok(false), "only thumbnails show the cover");
-        let kept = Resolved { absolute: None, rotation: 0, cover: Some(r#"{"tone":{"ev":1}}"#.into()), is_video: false };
+        let kept = Resolved { absolute: None, rotation: 0, cover: Some(r#"{"tone":{"ev":1}}"#.into()), offline, is_video: false };
         assert_eq!(decode_tier(424_242, ImageKind::Thumb, kept).map(|(_, c)| c), Ok(false), "the kept thumbnail");
     }
 }

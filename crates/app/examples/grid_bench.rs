@@ -17,10 +17,11 @@
 //! user's own catalog or cache.
 //!
 //! **Synthetic catalog.** `N` rows whose originals do not exist, so each thumbnail comes from
-//! the id-keyed persistent thumbnail store (`thumbnails::read_persistent_thumb`), which this
+//! the persistent offline thumbnail store (`thumbnails::read_persistent_thumb`), which this
 //! bench fills with hard links to the cache's existing persistent thumbnails (real 342×512
-//! JPEGs, decoded per tile like any other). Row ids start at 10,000,000 so the links never
-//! collide with a real catalog's ids in the same cache; they are removed at exit.
+//! JPEGs, decoded per tile like any other). The store is keyed by catalog and photo UUID
+//! (#258), so the links sit under the synthetic catalog's own directory; they are removed at
+//! exit. Row ids start at 10,000,000.
 //!
 //! The window is unthrottled (`inactive_frame_interval: None`): the bench never takes focus.
 
@@ -69,10 +70,18 @@ fn synthetic_catalog(dir: &Path, n: usize) -> (Catalog, Vec<PathBuf>) {
     conn.execute("DELETE FROM photos WHERE id = ?1", [FIRST_ID - 1]).expect("drop the placeholder");
     tx.commit().expect("commit");
 
-    // Thumbnails: hard links to the cache's existing persistent ones (the agent library's).
-    let sources: Vec<PathBuf> = (1..=64)
-        .map(chairphoto_core::thumbnails::persistent_thumb_path)
-        .filter(|p| p.is_file())
+    // Thumbnails: hard links to up to 64 of the cache's existing persistent ones (the agent
+    // library's, whichever catalog kept them).
+    let sources: Vec<PathBuf> = std::fs::read_dir(chairphoto_core::thumbnails::persistent_thumb_dir())
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|catalog| std::fs::read_dir(catalog.path()).ok())
+        .flatten()
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|p| p.is_file() && p.extension().is_some_and(|e| e == "jpg"))
+        .take(64)
         .collect();
     assert!(!sources.is_empty(), "no persistent thumbnails in XDG_CACHE_HOME to link to — run the agent library once");
     let ids: Vec<i64> = conn
@@ -85,7 +94,8 @@ fn synthetic_catalog(dir: &Path, n: usize) -> (Catalog, Vec<PathBuf>) {
     assert!(ids.iter().all(|&id| id >= FIRST_ID), "synthetic ids start at {FIRST_ID}");
     let mut made = Vec::with_capacity(ids.len());
     for (i, id) in ids.iter().enumerate() {
-        let target = chairphoto_core::thumbnails::persistent_thumb_path(*id);
+        let key = catalog.offline_thumb_key(*id).expect("read the key").expect("a synthetic row has a key");
+        let target = chairphoto_core::thumbnails::persistent_thumb_path(&key);
         std::fs::create_dir_all(target.parent().unwrap()).unwrap();
         let _ = std::fs::remove_file(&target);
         let source = &sources[i % sources.len()];

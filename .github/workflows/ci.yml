@@ -36,7 +36,13 @@ jobs:
             zlib1g-dev clang pkg-config \
             libimage-exiftool-perl exiv2 ffmpeg imagemagick
 
-      - uses: dtolnay/rust-toolchain@stable
+      # Pinned to the toolchain the release is built and verified with locally (Arch's `rust`),
+      # so a new stable release's lints (e.g. 1.99's `fetch_update` deprecation under
+      # -D warnings) cannot fail a PR whose code did not change. Bump it on purpose, together
+      # with the local toolchain, after `cargo check` is clean on the new version.
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.98.1
       # The Cargo workspace is the repository root (crates/core, crates/model, crates/app),
       # so the default `. -> target` is the right cache key.
       - uses: Swatinem/rust-cache@v2

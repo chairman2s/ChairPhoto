@@ -82,6 +82,23 @@ jobs:
           RUSTFLAGS: "-D warnings"
         run: cargo check --workspace --all-targets
 
+      # THIRD_PARTY_LICENSES.txt (#244) is committed, not built in packaging/PKGBUILD, so a
+      # Cargo.lock change (dependency added/removed/bumped) can land without the notices file
+      # that should have come with it. Regenerate into a scratch path with the same command
+      # packaging/README.md documents and diff against the committed copy; a real mismatch
+      # fails the job rather than shipping a stale notices file. The version pin here is the
+      # one the committed file was last generated with (packaging/README.md, "Third-party
+      # notices") — bump both together.
+      - name: Third-party notices staleness check
+        run: |
+          cargo install --locked --features cli cargo-about@0.9.2
+          cargo about generate about.hbs -m crates/app/Cargo.toml --features flickr,smugmug \
+            --locked --fail -o /tmp/THIRD_PARTY_LICENSES.generated.txt
+          if ! diff -u THIRD_PARTY_LICENSES.txt /tmp/THIRD_PARTY_LICENSES.generated.txt; then
+            echo "::error::THIRD_PARTY_LICENSES.txt is stale. Regenerate it (packaging/README.md, \"Third-party notices\") and commit the result." >&2
+            exit 1
+          fi
+
 # Note: the `faces-cuda` / `smarttags-cuda` features are deliberately not built here —
 # they require an NVIDIA toolchain no standard runner has. Verify those locally with
 # `cargo check --workspace --all-features --all-targets`.

@@ -42,7 +42,7 @@ impl RequestSender {
     pub fn send(&self, request: Request) -> Result<(), Refused> {
         let reserved = self
             .queued
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| (n < MAX_QUEUED_REQUESTS).then_some(n + 1));
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| (n < MAX_QUEUED_REQUESTS).then_some(n + 1));
         if reserved.is_err() {
             eprintln!("single instance: {MAX_QUEUED_REQUESTS} requests already wait for the main thread; refusing one");
             return Err(Refused::Busy);

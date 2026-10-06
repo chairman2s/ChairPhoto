@@ -8,7 +8,8 @@
 //! and a count the user can read is what makes the per-frame gate visible rather than
 //! mysterious. A lone photo keeps the plain verb it always had.
 
-use chairphoto_core::catalog::{BackupReport, OffloadReport, RestoreReport, SkippedPhoto};
+use chairphoto_core::app::storage::ReplaceReport;
+use chairphoto_core::catalog::{BackupDrift, BackupReport, OffloadReport, RestoreReport, SkippedPhoto};
 
 /// How a verb reports acting on a stack: "Backed up 4 of 7 — no local copy to back up". A
 /// lone photo (nothing skipped, one photo touched) keeps the plain verb.
@@ -62,6 +63,54 @@ pub fn offload_message(report: &OffloadReport) -> String {
     parts.join(" — ")
 }
 
+// ── A backup the local version moved on from (#257) ──────────────────────────────
+
+/// The files only an explicit Replace backup takes home: the image, then the companions
+/// another program changed.
+fn needing_replace(drift: &BackupDrift) -> Vec<&str> {
+    drift.image.iter().chain(&drift.companions).map(String::as_str).collect()
+}
+
+/// The Storage section's line for a photo whose local version moved on from its verified
+/// backup — `None` when it has not (#257). Says which files, and how each gets home:
+/// ChairPhoto's own metadata by the next Back up or Offload, anything else only by Replace
+/// backup, since the copy at home is then the earlier version.
+pub fn drift_message(drift: &BackupDrift) -> Option<String> {
+    if !drift.changed() {
+        return None;
+    }
+    let mut parts = Vec::new();
+    let explicit = needing_replace(drift);
+    if !explicit.is_empty() {
+        parts.push(format!("{} changed since backup — the copy at home is the earlier version", explicit.join(", ")));
+    }
+    if !drift.own_sidecars.is_empty() {
+        parts.push(format!(
+            "{} (ChairPhoto's metadata) changed since backup — the next Back up or Offload takes it home",
+            drift.own_sidecars.join(", ")
+        ));
+    }
+    Some(parts.join("; "))
+}
+
+/// What Replace backup asks before it runs (#257): which files, and that the copy at home
+/// is kept, not overwritten.
+pub fn replace_question(drift: &BackupDrift) -> String {
+    format!(
+        "Replace the backup of {} with the local version? The copy at home is kept beside it as <name>.chairphoto-prev-<n>.",
+        needing_replace(drift).join(", ")
+    )
+}
+
+/// The status line after a confirmed Replace backup (#257).
+pub fn replace_message(report: &ReplaceReport) -> String {
+    if report.replaced.is_empty() {
+        return "The backup already holds the local version".to_string();
+    }
+    let kept: Vec<&str> = report.replaced.iter().map(|(_, kept)| kept.as_str()).collect();
+    format!("Backup replaced with the local version — the earlier copy kept at home as {}", kept.join(", "))
+}
+
 /// The status line after the inspector's Restore.
 pub fn restore_message(report: &RestoreReport) -> String {
     if report.restored.len() == 1 && report.skipped.is_empty() {
@@ -78,6 +127,41 @@ pub fn retrieve_message(report: &RestoreReport) -> String {
         "Retrieved from NAS.".to_string()
     } else {
         format!("{}.", outcome("Retrieved", " from NAS", &report.restored, &report.skipped, report.total))
+    }
+}
+
+#[cfg(test)]
+mod drift_tests {
+    use super::*;
+
+    #[test]
+    fn a_drift_says_which_files_and_how_each_gets_home() {
+        assert_eq!(drift_message(&BackupDrift::default()), None);
+        let own = BackupDrift { own_sidecars: vec!["DSC1.ARW.xmp".into()], ..Default::default() };
+        assert_eq!(
+            drift_message(&own).unwrap(),
+            "DSC1.ARW.xmp (ChairPhoto's metadata) changed since backup — the next Back up or Offload takes it home"
+        );
+        let both = BackupDrift { image: Some("DSC1.ARW".into()), companions: vec!["DSC1.ARW.pp3".into()], ..own };
+        assert_eq!(
+            drift_message(&both).unwrap(),
+            "DSC1.ARW, DSC1.ARW.pp3 changed since backup — the copy at home is the earlier version; \
+             DSC1.ARW.xmp (ChairPhoto's metadata) changed since backup — the next Back up or Offload takes it home"
+        );
+        assert_eq!(
+            replace_question(&both),
+            "Replace the backup of DSC1.ARW, DSC1.ARW.pp3 with the local version? The copy at home is kept beside it as <name>.chairphoto-prev-<n>."
+        );
+    }
+
+    #[test]
+    fn a_replace_names_where_the_earlier_copy_is_kept() {
+        assert_eq!(replace_message(&ReplaceReport::default()), "The backup already holds the local version");
+        let report = ReplaceReport { replaced: vec![("DSC1.ARW".into(), "DSC1.ARW.chairphoto-prev-1".into())] };
+        assert_eq!(
+            replace_message(&report),
+            "Backup replaced with the local version — the earlier copy kept at home as DSC1.ARW.chairphoto-prev-1"
+        );
     }
 }
 

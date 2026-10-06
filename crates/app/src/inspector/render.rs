@@ -386,11 +386,27 @@ impl PhotoInspector {
 
     fn render_storage(&self, photo: i64, colors: Colors, cx: &Context<Self>) -> AnyElement {
         let status = self.shell.read(cx).library.statuses().get(&photo).copied();
+        // "Changed since backup" is a status of its own (#257): a backed-up photo whose local
+        // version moved on from its verified backup.
+        let drift = match (&self.data.drift.load, status) {
+            (Load::Ready(Some(d)), Some(StorageStatus::BackedUp)) if d.changed() => Some(d.clone()),
+            _ => None,
+        };
+        let meta = |s: StorageStatus| match &drift {
+            Some(_) => ("Changed since backup", colors.rating),
+            None => storage_meta(s, colors),
+        };
         let summary = status.map(|s| {
-            let (text, color) = storage_meta(s, colors);
+            let (text, color) = meta(s);
             div().flex().items_center().gap(px(5.)).child(div().size(px(6.)).rounded_full().bg(color)).child(text).into_any_element()
         });
-        let msg = self.storage_msg.clone().or_else(|| status.map(|s| storage_meta(s, colors).0.to_string())).unwrap_or_default();
+        let msg = self
+            .storage_msg
+            .clone()
+            .or_else(|| drift.as_ref().and_then(chairphoto_model::storage_outcome::drift_message))
+            .or_else(|| status.map(|s| meta(s).0.to_string()))
+            .unwrap_or_default();
+        let asking = self.replace_confirm == Some(photo);
         self.section(
             Section::Storage,
             "Storage",
@@ -404,17 +420,64 @@ impl PhotoInspector {
                         r = r.child(self.chip("storage-backup", "Back up", idle, colors, cx, |t, _, cx| t.back_up(cx)))
                     }
                     Some(StorageStatus::BackedUp) => {
-                        r = r.child(self.chip("storage-offload", "Offload local", idle, colors, cx, |t, _, cx| t.offload(cx)))
+                        r = r.child(self.chip("storage-offload", "Offload local", idle, colors, cx, |t, _, cx| t.offload(cx)));
+                        match &drift {
+                            Some(d) if d.needs_replace() && !asking => {
+                                r = r.child(self.chip(
+                                    "storage-replace",
+                                    "Replace backup with the local version",
+                                    idle,
+                                    colors,
+                                    cx,
+                                    |t, _, cx| t.ask_replace_backup(cx),
+                                ))
+                            }
+                            // ChairPhoto's own metadata only: Back up takes it home now.
+                            Some(d) if !d.needs_replace() => {
+                                r = r.child(self.chip("storage-backup", "Back up", idle, colors, cx, |t, _, cx| t.back_up(cx)))
+                            }
+                            _ => {}
+                        }
                     }
                     Some(StorageStatus::Archived | StorageStatus::Offline) => {
                         r = r.child(self.chip("storage-restore", "Restore local", idle, colors, cx, |t, _, cx| t.restore(cx)))
                     }
                     _ => {}
                 }
-                r.child(
+                let r = r.child(
                     div().id("storage-msg").text_size(px(10.5)).text_color(colors.mute).aria_label(msg.clone()).child(msg).test_support(),
-                )
-                .into_any_element()
+                );
+                match drift.as_ref().filter(|d| asking && d.needs_replace()) {
+                    // The confirmation the replace needs (#257): which files, and that the copy
+                    // at home is kept.
+                    Some(d) => {
+                        let question = chairphoto_model::storage_outcome::replace_question(d);
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap(px(6.))
+                            .child(r)
+                            .child(
+                                div()
+                                    .id("storage-replace-question")
+                                    .text_size(px(10.5))
+                                    .aria_label(question.clone())
+                                    .child(question)
+                                    .test_support(),
+                            )
+                            .child(
+                                row()
+                                    .child(self.chip("storage-replace-confirm", "Replace backup", idle, colors, cx, |t, _, cx| {
+                                        t.replace_backup(cx)
+                                    }))
+                                    .child(self.chip("storage-replace-cancel", "Cancel", true, colors, cx, |t, _, cx| {
+                                        t.cancel_replace_backup(cx)
+                                    })),
+                            )
+                            .into_any_element()
+                    }
+                    None => r.into_any_element(),
+                }
             },
             colors,
             cx,

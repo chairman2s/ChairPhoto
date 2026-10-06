@@ -457,6 +457,10 @@ and the backup transition is **deferred** until the NAS reappears.
 - **Offline** → NAS-only *and* NAS unreachable → browse/cull/tag still work; edit/export blocked
 - **Missing** → no known copy anywhere
 
+The inspector also shows **Changed since backup** for a backed-up photo whose local version
+moved on from its verified backup (#257, [below](#a-local-version-that-moved-on-from-its-backup-257)).
+It is computed on a worker when the Storage section is open, not on the grid's hot path.
+
 `Catalog::photo_storage_status` (+ a batch `photo_storage_statuses` for the grid)
 derives this from the photo's locations' volume kinds and reachability. A backup
 *record* counts as backed-up even while the NAS is unmounted (reachability only
@@ -538,16 +542,61 @@ Three rules govern carrying:
   read of each local copy, on a local disk, beside the NAS read of the backup offload
   already made; size or mtime would be cheaper and are not content checks (an in-place
   rewrite can keep the size, and `exiftool -P` keeps the mtime). Back up does not replace a
-  verified backup that is present, so such a photo stays local until the owner decides how
-  a changed original reaches home.
-- **Divergence refuses; it never resolves.** A companion present on both sides with
-  different contents is two unreconciled edits. Backup leaves it untouched and does not
-  claim it as carried; offload refuses outright. Choosing a side would silently destroy
-  work.
+  verified backup that is present by itself; how a changed local version reaches home is
+  [below](#a-local-version-that-moved-on-from-its-backup-257).
+- **Divergence refuses; it never resolves** — with one exception, ChairPhoto's own sidecar
+  (below). A companion present on both sides with different contents is two unreconciled
+  edits. Backup leaves it untouched and does not claim it as carried; offload refuses
+  outright. Choosing a side would silently destroy work.
 
 Carrying is idempotent — an identical file already at the destination is adopted rather
 than rewritten — so a companion placed there by any other means is absorbed on the next
 pass instead of being re-copied or causing a conflict.
+
+### A local version that moved on from its backup (#257)
+
+Since #255 an offload refuses a photo whose local image or a carried companion changed
+after its verified backup, and Back up never replaces a backup that is present — it may be
+the only copy of the earlier version. Such a photo used to stay local for good, and the
+common case was ChairPhoto's own IPTC or GPS write to the sidecar after the backup. The
+owner's decision (#257, 2026-10-06), implemented as follows:
+
+- **ChairPhoto's own sidecar goes home by itself.** When the local `<image>.xmp` differs
+  from the copy at home only because ChairPhoto rewrote it — its `chairphoto:LastWrite` is no
+  earlier than when home was last confirmed to hold that file (the companion's `carried_at`,
+  else the backup's `created_at`), and its mtime is within a few seconds of that stamp, so
+  nothing wrote it after ChairPhoto (`lifecycle::rewritten_by_chairphoto_since`) — the carry
+  of Back up (an existing backup's companion pass, a drained backup op included) and of
+  Offload copies it home again (`carry_companions_home`). The copy at home is first renamed
+  to `<name>.chairphoto-prev-<n>` beside it (the next free `n`, never over a file there and
+  never by a copy), then the local version is copied in and verified like any lifecycle
+  copy; a copy that fails puts the previous file back under its name. Offload then goes
+  ahead. A basename sidecar (`DSC1.xmp`) is darktable's, never ChairPhoto's, and one with no
+  stamp, or written after its stamp by another program, is treated like an image.
+- **An image, and a companion another program changed, wait for the owner.** The inspector
+  offers **Replace backup with the local version** for a backed-up photo whose image no
+  longer hashes to its verified backup, or whose companions differ at home for any other
+  reason (`storage::replace_backup_as`). It asks first — the question names the files and
+  says the copy at home is kept — and the backend refuses without that confirmation. It
+  claims the photo (another storage operation on it is refused, as in progress), keeps each
+  differing file at home as `<name>.chairphoto-prev-<n>`, copies and verifies the local
+  version into its name, carries any companion not yet there, and records the image's new
+  verified hash; offload is then allowed. The image goes first; if a companion fails
+  afterwards the image's new hash is still recorded (home holds it by then) and the error
+  says what was already replaced. It acts on the photo alone, not its stack: each frame has
+  its own copy at home to answer for.
+- **"Changed since backup" is a storage status.** With the Storage section open, the
+  inspector compares a backed-up photo's local copy with its backup on a worker
+  (`storage::backup_drift_as`: the local image hashed against the recorded hash — no read
+  at home — and each carried companion against the file at home when home is reachable)
+  and shows "Changed since backup" instead of "Backed up", with which files, and whether
+  the next Back up or Offload takes them home (ChairPhoto's metadata — a Back up button is
+  shown for it) or only Replace backup does.
+
+**Nothing at home is overwritten or deleted.** A `.chairphoto-prev-<n>` file is visible on
+purpose, so the owner can find the earlier version; it is no image or companion extension,
+so no scan indexes it and no carry takes it. Nothing removes it, and the catalog does not
+track it: deleting the photo (Empty Trash) leaves it at home.
 
 **A sidecar backup is not a companion.** `<sidecar>.chairphoto-backup` — the copy the XMP
 safety rule takes before ChairPhoto's first write — is **per copy** by construction: each

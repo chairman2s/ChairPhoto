@@ -63,8 +63,9 @@ pub const IN_PROGRESS: &str = crate::catalog::IN_PROGRESS_REASON;
 /// pending); a drain whose op's photo is claimed leaves the op pending, untouched
 /// (`DrainSummary::busy`). So a claim cannot deadlock against anything.
 ///
-/// Empty Trash claims each photo for its delete ([`destroy_planned_photos`]) and Relocate for
-/// its re-pointing ([`relocate_photo`]), refusing a held photo with [`IN_PROGRESS`] (#256).
+/// Empty Trash claims each photo for its delete ([`destroy_planned_photos`]), Relocate for
+/// its re-pointing ([`relocate_photo`]) and Replace backup for its copy home
+/// ([`replace_backup_as`], #257), refusing a held photo with [`IN_PROGRESS`] (#256).
 ///
 /// **Sidecar writes** (#256): an IPTC sidecar write holds a [`SidecarWriteClaim`] on its
 /// photo (`iptc::write_and_settle`), and only the operations that **remove the photo's local
@@ -117,8 +118,8 @@ impl Hold {
 /// sidecar write may run beside it ([`StorageClaims`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ClaimKind {
-    /// Copies or re-points, and leaves the local files where they are: backup, restore,
-    /// relocate.
+    /// Copies, re-points or replaces the copy at home, and leaves the local files where they
+    /// are: backup, restore, relocate, replace backup.
     Keeps,
     /// Removes the photo's local files, its sidecar with them: offload, Empty Trash.
     Frees,
@@ -359,7 +360,12 @@ fn backup_one(cat: &impl CatalogAccess, plan: PhotoBackup) -> Result<(), String>
     // The idempotency gate's rows come from under the lock; its stat runs off it (#85).
     let gate = cat.with(|c| c.verified_backup_candidates(photo_id))?;
     if crate::catalog::any_backup_present(&gate) {
-        let carried = crate::catalog::carry_companions(&source, &dest).map_err(|e| crate::catalog::user_reason(&e))?;
+        // ChairPhoto's own sidecar rewritten since home last held it goes home again, the
+        // copy there kept as `<name>.chairphoto-prev-<n>` (#257); any other difference is
+        // left as divergence for an explicit Replace backup.
+        let stamps = cat.with(|c| c.backup_stamps_at(photo_id, volume_id))?;
+        let carried = crate::catalog::carry_companions_home(&source, &dest, &stamps)
+            .map_err(|e| crate::catalog::user_reason(&e))?;
         return cat.with(|c| {
             c.record_companions_at(photo_id, volume_id, LocationRole::Backup, &carried.carried)
         });
@@ -533,6 +539,80 @@ fn restore_one(cat: &impl CatalogAccess, plan: PhotoRestore) -> Result<(), Strin
     cat.with(|c| c.record_copy(photo_id, volume_id, &rel, LocationRole::LocalCache, &outcome))
 }
 
+// ── A backup the local version moved on from (#257) ──────────────────────────────
+
+/// Why [`replace_backup_as`] refused without its confirmation.
+pub const REPLACE_NEEDS_CONFIRMATION: &str = "replacing a backup needs an explicit confirmation";
+
+/// What a confirmed Replace backup did ([`replace_backup_as`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReplaceReport {
+    /// Each file at home that now holds the local version, by name, with the name its
+    /// previous bytes are kept under (`<name>.chairphoto-prev-<n>`). Empty when home already
+    /// held the local version.
+    pub replaced: Vec<(String, String)>,
+}
+
+/// How the local copy of a photo read from the catalog `expected` names stands against its
+/// verified backup (#257) — the inspector's "Changed since backup". `None` when there is
+/// nothing to compare (no local copy on disk, or no verified backup). Reads the local image
+/// once to hash it, and the companions at home when home is reachable: a blocking worker,
+/// on a connection of its own to that catalog ([`bound`]). Read-only, so it claims nothing.
+pub fn backup_drift_as(
+    state: &AppState,
+    expected: super::CatalogIdentity,
+    photo_id: i64,
+) -> Result<Option<crate::catalog::BackupDrift>, String> {
+    let cat = bound(state, expected)?;
+    let candidates = cat.with(|c| c.plan_replace_candidates(photo_id))?;
+    let Some(plan) = crate::catalog::resolve_replace_plan(candidates) else { return Ok(None) };
+    crate::catalog::backup_drift(&plan).map(Some).map_err(|e| crate::catalog::user_reason(&e))
+}
+
+/// The inspector's confirmed "Replace backup with the local version" (#257) of a photo read
+/// from the catalog `expected` names: every file at home that differs from the local one —
+/// the image, and any carried companion whoever changed it — is replaced by the local
+/// version, its previous bytes kept beside it as `<name>.chairphoto-prev-<n>`, copied and
+/// verified, and the new hash recorded, so the photo can then be offloaded. Nothing at home
+/// is overwritten or deleted. Refused without `confirm` ([`REPLACE_NEEDS_CONFIRMATION`]).
+///
+/// The photo alone, not its stack: each frame has its own copy at home to answer for. Claims
+/// the photo for the whole run ([`ClaimKind::Keeps`]: the local files stay), so it never
+/// runs beside another storage operation on it; a sidecar save may, and a sidecar replaced
+/// while it is copied fails that copy's verification. Blocking file IO on a connection of
+/// its own to the catalog ([`bound`]): a worker, never the UI thread.
+pub fn replace_backup_as(
+    state: &AppState,
+    expected: super::CatalogIdentity,
+    photo_id: i64,
+    confirm: bool,
+) -> Result<ReplaceReport, String> {
+    if !confirm {
+        return Err(REPLACE_NEEDS_CONFIRMATION.into());
+    }
+    let cat = bound(state, expected)?;
+    let db = cat.with(|c| Ok(c.db_path().to_path_buf()))?;
+    let claim = state.storage_claims.claim(&db, photo_id, &[]).ok_or_else(|| IN_PROGRESS.to_string())?;
+    let candidates = cat.with(|c| c.plan_replace_candidates(photo_id))?;
+    let plan = crate::catalog::resolve_replace_plan(candidates)
+        .ok_or_else(|| "no local copy and verified backup to compare".to_string())?;
+    let outcome = crate::catalog::replace_backup_with_local(&plan).map_err(|e| crate::catalog::user_reason(&e))?;
+    // Recorded whatever the companions did: the image at home is the local version by now.
+    cat.with(|c| c.record_replaced_backup(photo_id, plan.backup_location_id, &outcome.hash, &outcome.carried))?;
+    drop(claim);
+    let file = |p: &Path| p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let replaced: Vec<(String, String)> = outcome.replaced.iter().map(|(home, kept)| (file(home), file(kept))).collect();
+    match outcome.failed {
+        None => Ok(ReplaceReport { replaced }),
+        Some(why) if replaced.is_empty() => Err(why),
+        Some(why) => Err(format!(
+            "{why} — already replaced: {}",
+            replaced.iter().map(|(home, kept)| format!("{home} (the earlier kept as {kept})")).collect::<Vec<_>>().join(", ")
+        )),
+    }
+}
+
 /// Back up to the single backup volume. Errors when the NAS is offline; the UI queues a
 /// backup op instead (drained on reconcile). Bound to the catalog open when it is called,
 /// as [`backup_photo_as`] is to the one it names.
@@ -645,6 +725,117 @@ mod stack_tests {
         drop(held);
         assert_eq!(offload_photo(&state, frame).unwrap().freed, vec![frame]);
         assert!(!jpg.exists() && !xmp.exists(), "the last image naming it frees it");
+    }
+
+    // ── #257: a backup the local version moved on from ────────────────────────────────
+
+    fn drift(state: &AppState, id: i64) -> crate::catalog::BackupDrift {
+        backup_drift_as(state, super::super::catalog_identity(state).unwrap(), id).unwrap().unwrap()
+    }
+
+    fn replace(state: &AppState, id: i64, confirm: bool) -> Result<ReplaceReport, String> {
+        replace_backup_as(state, super::super::catalog_identity(state).unwrap(), id, confirm)
+    }
+
+    /// ChairPhoto's own sidecar rewritten after the backup (an IPTC/GPS write) shows as
+    /// changed since backup, needing no decision: Back up takes it home again by itself, and
+    /// so does Offload, each keeping the previous copy at home as
+    /// `<name>.chairphoto-prev-<n>`. The photo is then offloaded.
+    #[test]
+    fn chairphotos_own_sidecar_rewrite_goes_home_again_keeping_the_previous_copy() {
+        let (dir, state, master, _frame, raw, _jpg) = stacked("257-own-sidecar");
+        crate::xmp::write_gps(&raw, 59.9, 10.7).unwrap();
+        backup_photo(&state, master).unwrap();
+        let home = dir.join("nas/2026/08/DSC1.ARW.xmp");
+        let first = std::fs::read(&home).unwrap();
+        assert_eq!(drift(&state, master), crate::catalog::BackupDrift::default(), "nothing changed yet");
+
+        crate::xmp::write_gps(&raw, 60.4, 5.3).unwrap();
+        let d = drift(&state, master);
+        assert!(d.changed() && !d.needs_replace(), "{d:?}");
+        assert_eq!(d.own_sidecars, ["DSC1.ARW.xmp"]);
+
+        backup_photo(&state, master).unwrap();
+        let second = std::fs::read(crate::xmp::sidecar_path(&raw)).unwrap();
+        assert_eq!(std::fs::read(&home).unwrap(), second, "Back up took it home");
+        assert_eq!(std::fs::read(dir.join("nas/2026/08/DSC1.ARW.xmp.chairphoto-prev-1")).unwrap(), first);
+        assert!(!drift(&state, master).changed());
+
+        crate::xmp::write_gps(&raw, 61.0, 6.0).unwrap();
+        let third = std::fs::read(crate::xmp::sidecar_path(&raw)).unwrap();
+        let report = offload_photo(&state, master).unwrap();
+        assert!(report.freed.contains(&master), "{report:?}");
+        assert!(!raw.exists());
+        assert_eq!(std::fs::read(&home).unwrap(), third, "Offload took it home first");
+        assert_eq!(std::fs::read(dir.join("nas/2026/08/DSC1.ARW.xmp.chairphoto-prev-1")).unwrap(), first);
+        assert_eq!(std::fs::read(dir.join("nas/2026/08/DSC1.ARW.xmp.chairphoto-prev-2")).unwrap(), second);
+    }
+
+    /// A sidecar another program changed after the backup is never taken home by itself:
+    /// Back up leaves home as it is, Offload refuses, and the inspector's check says it
+    /// needs a decision. The confirmed Replace backup takes it home, keeping the earlier copy.
+    #[test]
+    fn a_sidecar_another_program_changed_waits_for_replace_backup() {
+        let (dir, state, master, _frame, raw, _jpg) = stacked("257-foreign-sidecar");
+        crate::xmp::write_gps(&raw, 59.9, 10.7).unwrap();
+        backup_photo(&state, master).unwrap();
+        let home = dir.join("nas/2026/08/DSC1.ARW.xmp");
+        let before = std::fs::read(&home).unwrap();
+        // Another program rewrites it after ChairPhoto's stamp.
+        let sidecar = crate::xmp::sidecar_path(&raw);
+        std::fs::write(&sidecar, [before.as_slice(), b"<!-- darktable -->"].concat()).unwrap();
+        let later = std::time::SystemTime::now() + std::time::Duration::from_secs(60);
+        std::fs::File::options().write(true).open(&sidecar).unwrap().set_modified(later).unwrap();
+
+        let d = drift(&state, master);
+        assert!(d.needs_replace(), "{d:?}");
+        assert_eq!(d.companions, ["DSC1.ARW.xmp"]);
+        backup_photo(&state, master).unwrap();
+        assert_eq!(std::fs::read(&home).unwrap(), before, "Back up left home as it is");
+        let err = offload_photo(&state, master).unwrap_err();
+        assert!(err.contains("DSC1.ARW.xmp differs from the copy at home"), "{err}");
+        assert!(raw.exists());
+
+        let report = replace(&state, master, true).unwrap();
+
+        assert_eq!(report.replaced, [("DSC1.ARW.xmp".to_string(), "DSC1.ARW.xmp.chairphoto-prev-1".to_string())]);
+        assert_eq!(std::fs::read(&home).unwrap(), std::fs::read(&sidecar).unwrap());
+        assert_eq!(std::fs::read(dir.join("nas/2026/08/DSC1.ARW.xmp.chairphoto-prev-1")).unwrap(), before);
+        assert!(!drift(&state, master).changed());
+        assert!(offload_photo(&state, master).unwrap().freed.contains(&master));
+    }
+
+    /// An image rewritten in place after its backup: changed since backup, Offload refuses.
+    /// Replace backup needs its confirmation and is refused while another operation holds the
+    /// photo; confirmed, it keeps the earlier image at home under the next free
+    /// `<name>.chairphoto-prev-<n>` (never over one already there), copies and verifies the
+    /// local version, records its hash — and Offload then goes ahead.
+    #[test]
+    fn replace_backup_keeps_the_earlier_image_and_lets_offload_go_ahead() {
+        let (dir, state, master, frame, raw, _jpg) = stacked("257-image");
+        backup_photo(&state, master).unwrap();
+        std::fs::write(&raw, b"raw-bytes rewritten in place").unwrap();
+        let home = dir.join("nas/2026/08/DSC1.ARW");
+        std::fs::write(dir.join("nas/2026/08/DSC1.ARW.chairphoto-prev-1"), b"someone's").unwrap();
+
+        assert_eq!(drift(&state, master).image.as_deref(), Some("DSC1.ARW"));
+        assert!(offload_photo(&state, master).unwrap_err().contains(crate::catalog::LOCAL_CHANGED_REASON));
+        assert_eq!(replace(&state, master, false).unwrap_err(), REPLACE_NEEDS_CONFIRMATION);
+        let held = state.storage_claims.claim(&db_of(&state), master, &[]).unwrap();
+        assert_eq!(replace(&state, master, true).unwrap_err(), IN_PROGRESS);
+        drop(held);
+        assert_eq!(std::fs::read(&home).unwrap(), b"raw-bytes", "nothing changed at home yet");
+
+        let report = replace(&state, master, true).unwrap();
+
+        assert_eq!(report.replaced, [("DSC1.ARW".to_string(), "DSC1.ARW.chairphoto-prev-2".to_string())]);
+        assert_eq!(std::fs::read(&home).unwrap(), b"raw-bytes rewritten in place");
+        assert_eq!(std::fs::read(dir.join("nas/2026/08/DSC1.ARW.chairphoto-prev-2")).unwrap(), b"raw-bytes");
+        assert_eq!(std::fs::read(dir.join("nas/2026/08/DSC1.ARW.chairphoto-prev-1")).unwrap(), b"someone's");
+        assert!(!drift(&state, master).changed());
+        assert_eq!(replace(&state, master, true).unwrap().replaced, [], "home already holds it");
+        assert_eq!(offload_photo(&state, master).unwrap().freed, vec![master, frame]);
+        assert!(!raw.exists());
     }
 
     #[test]

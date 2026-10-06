@@ -98,3 +98,26 @@ fn now() -> i64 {
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0)
 }
+
+/// The `chairphoto:LastWrite` stamp (Unix seconds) of the sidecar file `sidecar` itself — not
+/// a photo's path — in element or attribute form, in whichever top-level `rdf:Description`
+/// carries it. `None` when there is no such file, no stamp, or it does not parse. Storage
+/// reads it to tell ChairPhoto's own rewrite of a sidecar from another program's (#257).
+pub fn read_last_write(sidecar: &Path) -> Option<i64> {
+    let file = std::fs::File::open(sidecar).ok()?;
+    let root = repair::parse_for_read(file).ok()?;
+    let rdf = dom::rdf_of(&root)?;
+    rdf.children.iter().find_map(|node| {
+        let xmltree::XMLNode::Element(desc) = node else { return None };
+        if desc.namespace.as_deref() != Some(NS_RDF) || desc.name != "Description" {
+            return None;
+        }
+        let element = desc.children.iter().find_map(|n| match n {
+            xmltree::XMLNode::Element(e) if e.namespace.as_deref() == Some(NS_CHAIRPHOTO) && e.name == "LastWrite" => {
+                dom::first_text(e)
+            }
+            _ => None,
+        });
+        element.or_else(|| parse::ns_attr(desc, NS_CHAIRPHOTO, "LastWrite").map(str::to_string))?.trim().parse().ok()
+    })
+}

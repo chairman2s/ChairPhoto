@@ -190,6 +190,9 @@ pub struct PhotoOffload {
     /// The `photo_locations.id` of each local row the plan read — exactly the rows
     /// [`Catalog::commit_offload`] drops once the files are gone (#254).
     pub local_location_ids: Vec<i64>,
+    /// When home last held each of the backup's files — for carrying ChairPhoto's own
+    /// rewritten sidecar home again (#257).
+    pub stamps: BackupStamps,
 }
 
 /// What offloading one tile covers — the stack half of [`BackupPlan`]'s reasoning.
@@ -226,6 +229,8 @@ struct OffloadMember {
     verified_backups: Vec<Copy>,
     /// Local rows — freed wholesale, so nothing here depends on a stat.
     locals: Vec<Copy>,
+    /// Each verified backup's [`BackupStamps`], by `photo_locations.id`.
+    stamps: std::collections::HashMap<i64, BackupStamps>,
 }
 
 /// One photo's local copies, freed and confirmed at home — the caller still has to record
@@ -466,15 +471,20 @@ impl Catalog {
 
     /// One photo's rows for [`OffloadCandidates`].
     fn offload_member(&self, photo_id: i64) -> Result<OffloadMember> {
-        let verified_backups = self
+        let verified_backups: Vec<Copy> = self
             .copies_on_kind(photo_id, VolumeKind::Backup)?
             .into_iter()
             .filter(|c| c.verified_hash.is_some())
             .collect();
+        let stamps = verified_backups
+            .iter()
+            .map(|c| Ok((c.location_id, self.backup_stamps(c.location_id)?)))
+            .collect::<Result<_>>()?;
         Ok(OffloadMember {
             photo_id,
             verified_backups,
             locals: self.copies_on_kind(photo_id, VolumeKind::Local)?,
+            stamps,
         })
     }
 
@@ -810,6 +820,74 @@ impl Catalog {
         Ok(report)
     }
 
+    // --- a backup the local version moved on from (#257) -------------------
+
+    /// When home last held each file of the backup copy `location_id` ([`BackupStamps`]).
+    /// PURE SQL. A row that is gone gives stamps that make nothing ChairPhoto's own.
+    pub fn backup_stamps(&self, location_id: i64) -> Result<BackupStamps> {
+        let backed_up_at: Option<i64> = self
+            .conn
+            .query_row("SELECT created_at FROM photo_locations WHERE id = ?1", params![location_id], |r| r.get(0))
+            .optional()?;
+        let Some(backed_up_at) = backed_up_at else { return Ok(BackupStamps::default()) };
+        let mut stmt = self.conn.prepare(
+            "SELECT name, carried_at FROM photo_location_companions
+             WHERE location_id = ?1 AND carried_at IS NOT NULL",
+        )?;
+        let carried_at = stmt
+            .query_map(params![location_id], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(BackupStamps { backed_up_at, carried_at })
+    }
+
+    /// [`Catalog::backup_stamps`] of the photo's backup copy on volume `volume_id` — stamps
+    /// that make nothing ChairPhoto's own when it has none there. PURE SQL.
+    pub fn backup_stamps_at(&self, photo_id: i64, volume_id: i64) -> Result<BackupStamps> {
+        match self.location_id(photo_id, volume_id, LocationRole::Backup)? {
+            Some(id) => self.backup_stamps(id),
+            None => Ok(BackupStamps::default()),
+        }
+    }
+
+    /// The rows a drift check or a Replace backup of `photo_id` draws on (#257): its local
+    /// copies, and its verified backups with their [`BackupStamps`]. PURE SQL; the stat half
+    /// is [`resolve_replace_plan`], off the lock.
+    pub fn plan_replace_candidates(&self, photo_id: i64) -> Result<ReplaceCandidates> {
+        let verified_backups = self
+            .copies_on_kind(photo_id, VolumeKind::Backup)?
+            .into_iter()
+            .filter(|c| c.verified_hash.is_some())
+            .map(|c| {
+                let stamps = self.backup_stamps(c.location_id)?;
+                Ok((c, stamps))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(ReplaceCandidates { photo_id, locals: self.copies_on_kind(photo_id, VolumeKind::Local)?, verified_backups })
+    }
+
+    /// Record a replaced backup (#257): the backup copy `location_id` of `photo_id` now holds
+    /// the image hashing to `hash`, and the companions `carried`. One transaction; a row that
+    /// is gone (the photo deleted meanwhile) is an error, with nothing recorded.
+    pub fn record_replaced_backup(
+        &self,
+        photo_id: i64,
+        location_id: i64,
+        hash: &str,
+        carried: &[CarriedCompanion],
+    ) -> Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        let updated = tx.execute(
+            "UPDATE photo_locations SET verified_hash = ?1 WHERE id = ?2 AND photo_id = ?3",
+            params![hash, location_id, photo_id],
+        )?;
+        if updated == 0 {
+            return Err(CatalogError::Validation("the backup's location row is gone".into()));
+        }
+        self.record_companions(location_id, carried)?;
+        tx.commit()?;
+        Ok(())
+    }
+
     // --- helpers -----------------------------------------------------------
 
     fn set_location_verified_hash(
@@ -1027,7 +1105,7 @@ pub fn resolve_offload_plan(candidates: OffloadCandidates) -> Result<OffloadPlan
     Ok(OffloadPlan { named, frames, skipped, total })
 }
 
-fn resolve_offload_member(member: OffloadMember) -> Result<PhotoOffload> {
+fn resolve_offload_member(mut member: OffloadMember) -> Result<PhotoOffload> {
     let backup = first_present(member.verified_backups).ok_or_else(|| {
         CatalogError::Validation("no verified backup — refusing to offload".into())
     })?;
@@ -1039,6 +1117,7 @@ fn resolve_offload_member(member: OffloadMember) -> Result<PhotoOffload> {
         expected_hash: backup.verified_hash.unwrap_or_default(),
         local_files: member.locals.into_iter().map(|c| c.abs).collect(),
         local_location_ids,
+        stamps: member.stamps.remove(&backup.location_id).unwrap_or_default(),
     })
 }
 
@@ -1143,6 +1222,9 @@ pub struct CompanionCarry {
     /// Companions that exist on both sides with different contents. Left untouched: the
     /// two sides hold different edits and picking one would silently discard the other.
     pub diverged: Vec<PathBuf>,
+    /// Where each copy at home that ChairPhoto's own sidecar rewrite replaced was kept
+    /// ([`carry_companions_home`], #257).
+    pub replaced: Vec<PathBuf>,
 }
 
 /// The result of one lifecycle copy: the verified hash **and** the companions that
@@ -1209,6 +1291,315 @@ pub fn carry_companions(src_image: &Path, dest_image: &Path) -> Result<Companion
             source: found.path.clone(),
             hash,
         });
+    }
+    Ok(out)
+}
+
+// --- a backup the local version moved on from (#257) ----------------------------------
+
+/// The tag a replaced copy at home is kept under: `<name>.chairphoto-prev-<n>` (#257).
+/// Visible (not dot-prefixed), so the owner can find it; never an image or companion
+/// extension, so no scan takes it for a photo and no carry for a companion.
+pub const PREV_TAG: &str = "chairphoto-prev";
+
+/// How long after a sidecar's own `chairphoto:LastWrite` stamp its mtime may be and still be
+/// that write's: ChairPhoto stamps the time, then writes and renames the file, all within
+/// one save. A later mtime means another program wrote the file after ChairPhoto did.
+const OWN_WRITE_SLACK_SECS: i64 = 5;
+
+/// When each file at one backup location was last confirmed to hold what the local copy
+/// held (#257): a carried companion's `carried_at` (every carry that finds both sides
+/// identical records it again), else the location's own `created_at` — the time of the
+/// backup itself. What ChairPhoto wrote to its own sidecar after that is not at home yet.
+#[derive(Debug, Clone)]
+pub struct BackupStamps {
+    /// `photo_locations.created_at` of the backup copy.
+    pub backed_up_at: i64,
+    /// `carried_at` of each companion recorded there, by file name.
+    pub carried_at: std::collections::HashMap<String, i64>,
+}
+
+impl Default for BackupStamps {
+    /// Stamps that make nothing ChairPhoto's own rewrite: no backup row to compare with.
+    fn default() -> Self {
+        Self { backed_up_at: i64::MAX, carried_at: Default::default() }
+    }
+}
+
+impl BackupStamps {
+    fn since(&self, name: &str) -> i64 {
+        self.carried_at.get(name).copied().unwrap_or(self.backed_up_at)
+    }
+}
+
+/// Whether the companion `found` differs from home only because ChairPhoto rewrote it after
+/// home last held it (#257): it is ChairPhoto's own sidecar (`<image>.xmp`, the appended form
+/// — a basename `DSC1.xmp` is darktable's), its `chairphoto:LastWrite` is no earlier than
+/// `since`, and nothing wrote it after that stamp (its mtime). A sidecar another program
+/// changed after ChairPhoto's write — or one ChairPhoto never stamped — is not.
+pub fn rewritten_by_chairphoto_since(found: &crate::companions::Found, since: i64) -> bool {
+    if found.form != crate::companions::Form::Appended || found.ext != crate::companions::SIDECAR_EXT {
+        return false;
+    }
+    let Some(stamp) = crate::xmp::read_last_write(&found.path) else { return false };
+    let Ok(mtime) = mtime_secs(&found.path) else { return false };
+    stamp >= since && mtime <= stamp + OWN_WRITE_SLACK_SECS
+}
+
+/// A copy at home replaced by the local version ([`replace_at_home`]).
+#[derive(Debug, Clone)]
+pub struct Replaced {
+    /// The file at home now holding the local version.
+    pub home: PathBuf,
+    /// Where the previous bytes at home were kept: `<name>.chairphoto-prev-<n>`.
+    pub kept_as: PathBuf,
+    /// SHA-256 of the local version, verified at home.
+    pub hash: String,
+}
+
+/// Replace the file at `home` with `local`, keeping the previous bytes (#257): the file at
+/// `home` is first given the next free name `<name>.chairphoto-prev-<n>` beside it — never
+/// replacing a file there and never by a copy (`working_files::put_back`), so the previous
+/// bytes are never rewritten or half-moved — then `local` is copied into the emptied name and
+/// verified ([`copy_and_verify`], which places without replacing). A copy that fails puts
+/// the previous file back under its name; if even that cannot happen (a new file took the
+/// name), it stays under its kept name, which the error says. Nothing at home is ever
+/// overwritten or deleted.
+pub fn replace_at_home(local: &Path, home: &Path) -> Result<Replaced> {
+    let kept_as = keep_previous(home)?;
+    match copy_and_verify(local, home, None) {
+        Ok(hash) => Ok(Replaced { home: home.to_path_buf(), kept_as, hash }),
+        Err(e) => {
+            let why = user_reason(&e);
+            Err(CatalogError::Validation(match super::working_files::put_back(&kept_as, home) {
+                Ok(true) => format!("{} could not be replaced ({why}); the backup is as it was", name(home)),
+                _ => format!(
+                    "{} could not be replaced ({why}); the previous backup is kept as {}",
+                    name(home),
+                    name(&kept_as)
+                ),
+            }))
+        }
+    }
+}
+
+/// Give `home` the next free `<name>.chairphoto-prev-<n>` (from 1) beside it, without
+/// replacing anything; the new name. Where the filesystem has neither a no-replace rename
+/// nor hard links, a plain rename once the name is seen free (`working_files::put_back`).
+fn keep_previous(home: &Path) -> Result<PathBuf> {
+    for n in 1..=1000u32 {
+        let mut kept = home.as_os_str().to_os_string();
+        kept.push(format!(".{PREV_TAG}-{n}"));
+        let kept = PathBuf::from(kept);
+        match super::working_files::put_back(home, &kept) {
+            Ok(true) => return Ok(kept),
+            Ok(false) => continue, // taken: the next number
+            Err(e) => return Err(io(e)),
+        }
+    }
+    Err(CatalogError::Validation(format!("no free name to keep the previous {} under", name(home))))
+}
+
+/// [`carry_companions`] for a backup that already holds the image (#257): a companion that
+/// differs at home only because ChairPhoto rewrote its own sidecar after home last held it
+/// ([`rewritten_by_chairphoto_since`], against `stamps`) is backed up again — the copy at
+/// home kept as `<name>.chairphoto-prev-<n>` ([`replace_at_home`]) — and counts as carried.
+/// Any other difference is left as divergence, exactly as [`carry_companions`] leaves it.
+pub fn carry_companions_home(src_image: &Path, dest_image: &Path, stamps: &BackupStamps) -> Result<CompanionCarry> {
+    let mut out = CompanionCarry::default();
+    for found in crate::companions::carried_beside(src_image) {
+        let dest = found.destination(dest_image);
+        let hash = if dest.is_file() {
+            let source_hash = sha256_file(&found.path)?;
+            if sha256_file(&dest)? == source_hash {
+                source_hash
+            } else if rewritten_by_chairphoto_since(&found, stamps.since(&found.name())) {
+                let replaced = replace_at_home(&found.path, &dest)?;
+                out.replaced.push(replaced.kept_as);
+                replaced.hash
+            } else {
+                out.diverged.push(found.path.clone());
+                continue;
+            }
+        } else {
+            copy_and_verify(&found.path, &dest, None)?
+        };
+        out.carried.push(CarriedCompanion {
+            name: found.name(),
+            source_mtime: mtime_secs(&found.path)?,
+            source: found.path.clone(),
+            hash,
+        });
+    }
+    Ok(out)
+}
+
+/// How one photo's local copy stands against its verified backup (#257) — the inspector's
+/// "Changed since backup".
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BackupDrift {
+    /// The local image's name, when it no longer hashes to its verified backup.
+    pub image: Option<String>,
+    /// Companions that differ at home for any other reason than ChairPhoto's own sidecar
+    /// write: only an explicit Replace backup takes them home.
+    pub companions: Vec<String>,
+    /// ChairPhoto's own sidecar, rewritten since home last held it: the next Back up or
+    /// Offload takes it home by itself, keeping the previous copy.
+    pub own_sidecars: Vec<String>,
+    /// The backup could not be reached, so companions were not compared.
+    pub home_unreachable: bool,
+}
+
+impl BackupDrift {
+    /// Whether the local version is known to have moved on from home.
+    pub fn changed(&self) -> bool {
+        self.image.is_some() || !self.companions.is_empty() || !self.own_sidecars.is_empty()
+    }
+
+    /// Whether only an explicit Replace backup can take it home.
+    pub fn needs_replace(&self) -> bool {
+        self.image.is_some() || !self.companions.is_empty()
+    }
+}
+
+/// One photo's local copy and the verified backup it is compared with or replaced at (#257),
+/// resolved off the catalog lock ([`resolve_replace_plan`]).
+pub struct PhotoReplace {
+    pub photo_id: i64,
+    pub local: PathBuf,
+    pub backup_abs: PathBuf,
+    pub backup_location_id: i64,
+    pub expected_hash: String,
+    pub stamps: BackupStamps,
+    /// Whether the backup file was on disk when this was resolved.
+    pub home_reachable: bool,
+}
+
+/// The rows a drift check or a replace draws on, in PURE SQL
+/// ([`Catalog::plan_replace_candidates`]).
+pub struct ReplaceCandidates {
+    photo_id: i64,
+    locals: Vec<Copy>,
+    verified_backups: Vec<(Copy, BackupStamps)>,
+}
+
+/// The stat half of [`Catalog::plan_replace_candidates`], with no catalog lock held: the
+/// first local copy on disk, and the first verified backup on disk (else the first one
+/// recorded, marked unreachable). `None` when the photo has no local copy on disk or no
+/// verified backup row — there is nothing to compare.
+pub fn resolve_replace_plan(candidates: ReplaceCandidates) -> Option<PhotoReplace> {
+    let ReplaceCandidates { photo_id, locals, mut verified_backups } = candidates;
+    sweep_local_folders(std::iter::once(&locals));
+    let local = first_present(locals)?;
+    let at = verified_backups
+        .iter()
+        .position(|(c, _)| crate::volume_health::candidate_exists(&c.abs));
+    let home_reachable = at.is_some();
+    if verified_backups.is_empty() {
+        return None;
+    }
+    let (backup, stamps) = verified_backups.swap_remove(at.unwrap_or(0));
+    Some(PhotoReplace {
+        photo_id,
+        local: local.abs,
+        backup_location_id: backup.location_id,
+        expected_hash: backup.verified_hash.unwrap_or_default(),
+        backup_abs: backup.abs,
+        stamps,
+        home_reachable,
+    })
+}
+
+/// Compare a photo's local copy with its verified backup (#257): the image by its hash
+/// against the recorded one (no read at home), each carried companion against the file at
+/// home when home is reachable. File IO — one read of the local image — off the catalog lock.
+pub fn backup_drift(plan: &PhotoReplace) -> Result<BackupDrift> {
+    let mut drift = BackupDrift { home_unreachable: !plan.home_reachable, ..Default::default() };
+    if sha256_file(&plan.local)? != plan.expected_hash {
+        drift.image = Some(name(&plan.local));
+    }
+    if !plan.home_reachable {
+        return Ok(drift);
+    }
+    for found in crate::companions::carried_beside(&plan.local) {
+        let home = found.destination(&plan.backup_abs);
+        // Not at home yet: the next carry takes it. The same: nothing to say.
+        if !home.is_file() || sha256_file(&found.path)? == sha256_file(&home)? {
+            continue;
+        }
+        if rewritten_by_chairphoto_since(&found, plan.stamps.since(&found.name())) {
+            drift.own_sidecars.push(found.name());
+        } else {
+            drift.companions.push(found.name());
+        }
+    }
+    Ok(drift)
+}
+
+/// What [`replace_backup_with_local`] did — recorded whatever happened, since a file it
+/// replaced is replaced at home either way.
+#[derive(Debug, Clone, Default)]
+pub struct ReplaceOutcome {
+    /// The image's verified hash at home now.
+    pub hash: String,
+    /// The companions confirmed identical at home.
+    pub carried: Vec<CarriedCompanion>,
+    /// Each file at home that was replaced, and where its previous bytes were kept.
+    pub replaced: Vec<(PathBuf, PathBuf)>,
+    /// Why the run stopped before every companion was home, if it did.
+    pub failed: Option<String>,
+}
+
+/// The user's explicit, confirmed "Replace backup with the local version" (#257): every file
+/// of the photo at home that differs from the local one — the image, and any carried
+/// companion whoever changed it — is replaced by the local version, its previous bytes kept
+/// beside it as `<name>.chairphoto-prev-<n>` ([`replace_at_home`]); a companion not yet at
+/// home is carried. Identical files are left as they are. File IO, off the catalog lock;
+/// [`Catalog::record_replaced_backup`] records the result.
+///
+/// The image goes first. Its failure is the call's error, with nothing at home changed. A
+/// companion that cannot be replaced afterwards stops the run (`failed`), and what was done
+/// by then is still returned for the caller to record — the image at home is the local
+/// version by then, and its new hash must be recorded or the next offload would take the
+/// changed backup for bit rot.
+pub fn replace_backup_with_local(plan: &PhotoReplace) -> Result<ReplaceOutcome> {
+    if !plan.home_reachable {
+        return Err(CatalogError::Validation("the backup is not reachable".into()));
+    }
+    let mut out = ReplaceOutcome::default();
+    let local_hash = sha256_file(&plan.local)?;
+    out.hash = if local_hash == plan.expected_hash {
+        local_hash
+    } else {
+        let replaced = replace_at_home(&plan.local, &plan.backup_abs)?;
+        out.replaced.push((replaced.home, replaced.kept_as));
+        replaced.hash
+    };
+    for found in crate::companions::carried_beside(&plan.local) {
+        let home = found.destination(&plan.backup_abs);
+        let carried = (|| -> Result<CarriedCompanion> {
+            let hash = if !home.is_file() {
+                copy_and_verify(&found.path, &home, None)?
+            } else {
+                let hash = sha256_file(&found.path)?;
+                if sha256_file(&home)? == hash {
+                    hash
+                } else {
+                    let replaced = replace_at_home(&found.path, &home)?;
+                    out.replaced.push((replaced.home, replaced.kept_as));
+                    replaced.hash
+                }
+            };
+            Ok(CarriedCompanion { name: found.name(), source_mtime: mtime_secs(&found.path)?, source: found.path.clone(), hash })
+        })();
+        match carried {
+            Ok(c) => out.carried.push(c),
+            Err(e) => {
+                out.failed = Some(user_reason(&e));
+                break;
+            }
+        }
     }
     Ok(out)
 }
@@ -1436,7 +1827,9 @@ fn free_local_copies(photo: &PhotoOffload, stopped: &dyn Fn() -> bool) -> std::r
     // choose between them.
     let mut carried = Vec::new();
     for file in &photo.local_files {
-        let carry = carry_companions(file, &photo.backup_abs)?;
+        // ChairPhoto's own sidecar rewritten since home last held it goes home again, the
+        // copy there kept (#257); any other difference refuses below.
+        let carry = carry_companions_home(file, &photo.backup_abs, &photo.stamps)?;
         if let Some(first) = carry.diverged.first() {
             return Err(CatalogError::Validation(format!(
                 "{} differs from the copy at home — refusing to offload",
@@ -2029,6 +2422,64 @@ mod tests {
     /// Review probe P5: a local original rewritten after its backup (an external tool
     /// writing into a JPEG or DNG in place). The backup re-hashes fine — it is the local copy
     /// that moved on — so offload must refuse, delete nothing, and keep the rows.
+    // ── #257: a backup the local version moved on from ────────────────────────────────
+
+    /// A replace keeps the previous bytes at home under the next free
+    /// `<name>.chairphoto-prev-<n>` — never over one already there — and a copy that fails
+    /// puts them back under the name, so a failed replace leaves home as it was.
+    #[test]
+    fn replacing_at_home_keeps_the_previous_bytes_and_undoes_a_failed_copy() {
+        let dir = TestTmpDir::new("lifecycle-replace-at-home");
+        let local = dir.join("DSC1.ARW");
+        let home = dir.join("nas/DSC1.ARW");
+        std::fs::create_dir_all(home.parent().unwrap()).unwrap();
+        std::fs::write(&local, b"new").unwrap();
+        std::fs::write(&home, b"old").unwrap();
+        std::fs::write(dir.join("nas/DSC1.ARW.chairphoto-prev-1"), b"older still").unwrap();
+
+        let replaced = replace_at_home(&local, &home).unwrap();
+
+        assert_eq!(replaced.kept_as, dir.join("nas/DSC1.ARW.chairphoto-prev-2"));
+        assert_eq!(std::fs::read(&home).unwrap(), b"new");
+        assert_eq!(std::fs::read(&replaced.kept_as).unwrap(), b"old");
+        assert_eq!(std::fs::read(dir.join("nas/DSC1.ARW.chairphoto-prev-1")).unwrap(), b"older still");
+        assert_eq!(replaced.hash, sha256_file(&local).unwrap());
+
+        let err = replace_at_home(&dir.join("absent.ARW"), &home).unwrap_err().to_string();
+        assert!(err.contains("the backup is as it was"), "{err}");
+        assert_eq!(std::fs::read(&home).unwrap(), b"new", "put back under its name");
+        assert!(!dir.join("nas/DSC1.ARW.chairphoto-prev-3").exists());
+    }
+
+    /// Only ChairPhoto's own sidecar (`<image>.xmp`), stamped at or after the time home last
+    /// held it and not written since that stamp, counts as ChairPhoto's own rewrite.
+    #[test]
+    fn only_chairphotos_own_unchanged_stamp_counts_as_its_rewrite() {
+        let dir = TestTmpDir::new("lifecycle-own-rewrite");
+        let raw = dir.join("DSC1.ARW");
+        std::fs::write(&raw, b"raw").unwrap();
+        let since = now() - 60;
+        crate::xmp::write_gps(&raw, 59.9, 10.7).unwrap();
+        let own = || crate::companions::carried_beside(&raw).into_iter().find(|f| f.ext == "xmp").unwrap();
+        assert!(rewritten_by_chairphoto_since(&own(), since));
+        assert!(!rewritten_by_chairphoto_since(&own(), now() + 60), "stamped before home last held it");
+
+        // Another program's write after ChairPhoto's stamp (its mtime well after it).
+        let later = std::time::SystemTime::now() + std::time::Duration::from_secs(60);
+        std::fs::File::options().write(true).open(&own().path).unwrap().set_modified(later).unwrap();
+        assert!(!rewritten_by_chairphoto_since(&own(), since));
+
+        // No stamp at all; and darktable's basename form even with one.
+        std::fs::write(&own().path, b"<x:xmpmeta xmlns:x=\"adobe:ns:meta/\"/>").unwrap();
+        assert!(!rewritten_by_chairphoto_since(&own(), since));
+        let basename = dir.join("DSC1.xmp");
+        std::fs::rename(crate::xmp::sidecar_path(&raw), &basename).unwrap();
+        crate::xmp::write_gps(&raw, 59.9, 10.7).unwrap();
+        std::fs::rename(crate::xmp::sidecar_path(&raw), &basename).unwrap();
+        let found = crate::companions::carried_beside(&raw).into_iter().find(|f| f.path == basename).unwrap();
+        assert!(!rewritten_by_chairphoto_since(&found, since), "a basename sidecar is never ChairPhoto's");
+    }
+
     #[test]
     fn offload_refuses_a_local_copy_rewritten_after_its_backup() {
         let (catalog, dir, raw, id, _nas) = backed_up_photo("local-changed");

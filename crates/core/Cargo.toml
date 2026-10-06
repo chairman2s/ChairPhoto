@@ -88,7 +88,8 @@ slideshow = []
 # after cloning. Build without it: `--no-default-features --features ai,edit`.
 raw = []
 # Test-only, a pure compile gate (no extra deps): exposes the slideshow module's frame-root
-# override (`app::slideshow::set_test_frame_root`) outside `#[cfg(test)]`, so a *consumer*
+# override (`app::slideshow::test_hooks::set_test_frame_root`) outside `#[cfg(test)]`, so a
+# *consumer*
 # crate's own tests can point `FrameDir::create()` at a scratch directory instead of the
 # real `~/.cache` (#228). `cfg(test)` alone only covers this crate's own test binary — a test
 # in `chairphoto-app`, which links this crate as an ordinary dependency, never sees it. Never

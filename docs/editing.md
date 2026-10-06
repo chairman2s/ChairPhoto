@@ -117,7 +117,11 @@ in memory (docs/plans/raw-foundation, slice 4), so a step shows the RAW at once.
 filmstrip is the look of its **most recently changed version** — the one whose settings were
 written last: a settled edit, a proof adopted, a history step (undo/redo included), a new or
 duplicated version, a version merged in from a bundle. Opening or renaming a version is not a
-change. With no versions it is the original (owner decision, #252). "☆ Use as cover" on the
+change. With no versions it is the original (owner decision, #252). A Duel's "What-if"
+variant is a side branch, not a change: it is banked beside the version being edited and the
+face stays where it was — on another version or on the original — until the variant itself is
+edited ("+ New version" does move it, as editing continues there; #252 decision 2026-10-06,
+`catalog::NewVersion::Aside`). "☆ Use as cover" on the
 Darkroom bar **pins** what is shown as the face — the version being edited, or, with
 "Original" chosen on the shelf, the untouched original — and it stays the face whatever is
 edited later; "★ Cover" unpins it, and the face follows the latest change again. The bar says
@@ -143,7 +147,9 @@ Stored in the core table `photo_cover` (one row per photo): `version_id` is the 
 kept current in the transaction of every write that can move it (`catalog::edits`,
 `settings_written` / `refresh_face`), `pin` says how it is chosen (0 automatic, 1 the
 version, 2 the original), and `rev` counts. Versions order by `photo_versions.changed_seq`,
-which each settings write sets one past the photo's highest. Covers set before #252 migrate
+which each settings write sets one past the photo's highest; only a version above 0 is a
+candidate, and a version banked aside goes below every other and below 0, so it never is
+until it is written. Covers set before #252 migrate
 as pinned. Local to this catalog like the history: catalog merge and bundle export do not
 carry it.
 

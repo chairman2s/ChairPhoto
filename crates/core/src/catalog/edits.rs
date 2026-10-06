@@ -23,6 +23,18 @@ pub const HISTORY_CAP: i64 = 200;
 /// The label of step 0: the settings the version had when its history began.
 pub const HISTORY_BASELINE_LABEL: &str = "Before";
 
+/// What a new version is to its photo's automatic Library face (#252).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NewVersion {
+    /// A change of the photo ("+ New version", a duplicate, a first save): the automatic face
+    /// moves to it.
+    Change,
+    /// A side branch banked beside the version being edited (a Duel's "What-if"): the face
+    /// stays where it is. It is not a candidate for the automatic face until its settings
+    /// are written.
+    Aside,
+}
+
 fn validated_edit_json(edit_json: &str) -> Result<&str> {
     let trimmed = edit_json.trim();
     let value = if trimmed.is_empty() { "{}" } else { trimmed };
@@ -97,10 +109,18 @@ impl Catalog {
 
     /// Create a new (empty) version for a photo, appended at the end. Returns its id.
     pub fn create_version(&self, photo_id: i64, name: &str) -> Result<i64> {
+        self.create_version_with(photo_id, name, "{}", NewVersion::Change)
+    }
+
+    /// Create a version holding `edit_json`, appended at the end, in one write: no reader
+    /// ever sees it empty, nor the face on it before its settings (review of #252, N2).
+    /// [`NewVersion`] says whether it moves the automatic face. Returns its id.
+    pub fn create_version_with(&self, photo_id: i64, name: &str, edit_json: &str, kind: NewVersion) -> Result<i64> {
         let name = name.trim();
         if name.is_empty() {
             return Err(CatalogError::Validation("version name is empty".into()));
         }
+        let value = validated_edit_json(edit_json)?;
         let position: i64 = self.conn.query_row(
             "SELECT COALESCE(MAX(position), -1) + 1 FROM photo_versions WHERE photo_id = ?1",
             params![photo_id],
@@ -110,12 +130,15 @@ impl Catalog {
         atomically(&self.conn, || {
             self.conn.execute(
                 "INSERT INTO photo_versions(photo_id, name, edit_json, position, created_at, updated_at)
-                 VALUES(?1, ?2, '{}', ?3, ?4, ?4)",
-                params![photo_id, name, position, now],
+                 VALUES(?1, ?2, ?3, ?4, ?5, ?5)",
+                params![photo_id, name, value, position, now],
             )?;
             let id = self.conn.last_insert_rowid();
-            // A new version is the latest change: the automatic face moves to it.
-            settings_written(&self.conn, id)?;
+            match kind {
+                // A new version is the latest change: the automatic face moves to it.
+                NewVersion::Change => settings_written(&self.conn, id)?,
+                NewVersion::Aside => set_aside(&self.conn, id, photo_id)?,
+            }
             Ok(id)
         })
     }
@@ -519,22 +542,41 @@ pub(crate) fn settings_written(conn: &Connection, version_id: i64) -> Result<()>
         conn.query_row("SELECT photo_id FROM photo_versions WHERE id = ?1", params![version_id], |r| r.get(0))?;
     conn.execute(
         "UPDATE photo_versions
-            SET changed_seq = (SELECT COALESCE(MAX(changed_seq), 0) + 1 FROM photo_versions WHERE photo_id = ?2)
+            SET changed_seq = (SELECT MAX(COALESCE(MAX(changed_seq), 0), 0) + 1
+                                 FROM photo_versions WHERE photo_id = ?2)
           WHERE id = ?1",
         params![version_id, photo_id],
     )?;
     refresh_face(conn, photo_id, Some(version_id))
 }
 
+/// `version_id` was banked aside ([`NewVersion::Aside`]): its `changed_seq` goes below every
+/// other version's and below 0, so it is never the automatic face — not even as the photo's
+/// only version, or the one left when the face is deleted — until its settings are written
+/// ([`settings_written`] puts it above them all). Call inside the insert's transaction.
+fn set_aside(conn: &Connection, version_id: i64, photo_id: i64) -> Result<()> {
+    conn.execute(
+        "UPDATE photo_versions
+            SET changed_seq = (SELECT MIN(COALESCE(MIN(changed_seq), 0), 0) - 1
+                                 FROM photo_versions WHERE photo_id = ?2 AND id <> ?1)
+          WHERE id = ?1",
+        params![version_id, photo_id],
+    )?;
+    Ok(())
+}
+
 /// The face a pin gives: the pinned version or the original, or — automatic — the version
-/// whose settings were written last, else the original.
+/// whose settings were written last, else the original. A version whose `changed_seq` is not
+/// above 0 was never written as a change here (banked aside, or inserted by an older build
+/// and not healed yet) and is no candidate.
 fn face_under(conn: &Connection, photo_id: i64, pin: CoverPin) -> Result<Option<i64>> {
     Ok(match pin {
         CoverPin::Version(v) => Some(v),
         CoverPin::Original => None,
         CoverPin::Auto => conn
             .query_row(
-                "SELECT id FROM photo_versions WHERE photo_id = ?1 ORDER BY changed_seq DESC, id DESC LIMIT 1",
+                "SELECT id FROM photo_versions WHERE photo_id = ?1 AND changed_seq > 0
+                  ORDER BY changed_seq DESC, id DESC LIMIT 1",
                 params![photo_id],
                 |r| r.get(0),
             )
@@ -722,6 +764,31 @@ mod face_tests {
         assert_eq!(face(&c, p), Some(v1));
         c.delete_version(v1).unwrap();
         assert_eq!(face(&c, p), None, "no versions left: the original");
+    }
+
+    /// A version banked aside (a Duel's "What-if") is created with its settings in one write
+    /// and leaves the face where it is — on another version, on the original, and when the
+    /// face is deleted — until its own settings are written (#252 decision, 2026-10-06).
+    #[test]
+    fn a_version_banked_aside_never_moves_the_face_until_it_is_edited() {
+        let (c, _dir, p) = catalog("aside");
+        let only = c.create_version_with(p, "What-if — ev", r#"{"fade":0.1}"#, NewVersion::Aside).unwrap();
+        assert_eq!(c.get_version(only).unwrap().unwrap().edit_json, r#"{"fade":0.1}"#, "its settings, in one write");
+        assert_eq!(face(&c, p), None, "the photo's only version, banked aside: the original stays the face");
+        let v1 = c.create_version_with(p, "V1", r#"{"fade":0.2}"#, NewVersion::Change).unwrap();
+        assert_eq!(face(&c, p), Some(v1), "+ New version moves it");
+        let before = rev(&c, p);
+        let aside = c.create_version_with(p, "What-if — contrast", "{}", NewVersion::Aside).unwrap();
+        assert_eq!((face(&c, p), rev(&c, p)), (Some(v1), before), "the face and its token stay");
+        c.delete_version(v1).unwrap();
+        assert_eq!(face(&c, p), None, "the face deleted: banked variants are not the fallback");
+        // Edited, a variant is a change like any other.
+        c.set_version_edit(aside, r#"{"fade":0.3}"#).unwrap();
+        assert_eq!(face(&c, p), Some(aside));
+        c.commit_version_edit(only, r#"{"fade":0.4}"#, "Fade", false).unwrap();
+        assert_eq!(face(&c, p), Some(only));
+        assert!(c.create_version_with(p, "Bad", "{", NewVersion::Aside).is_err(), "not JSON: nothing created");
+        assert_eq!(c.list_versions(p).unwrap().len(), 2);
     }
 
     /// The face's rev rises on every change of the face, and its token is never one shown

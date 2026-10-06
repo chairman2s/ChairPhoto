@@ -90,7 +90,7 @@ use crate::shell::state::{ShellState, Surface};
 use crate::storage::Runner;
 use chairphoto_core::app::editing::{self, DevelopTicket};
 use chairphoto_core::app::{with_catalog_as, AppState, CatalogIdentity, CoreEvent};
-use chairphoto_core::catalog::{CoverPin, Photo, PhotoVersion, VersionHistory};
+use chairphoto_core::catalog::{CoverPin, NewVersion, Photo, PhotoVersion, VersionHistory};
 use chairphoto_core::develop_source::DevelopSource;
 use chairphoto_core::plugins::edit::SourceToken;
 use chairphoto_model::darkroom::develop_source::{is_preparing, reduce_source, SourceState};

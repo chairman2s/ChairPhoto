@@ -1291,6 +1291,38 @@ fn the_face_follows_the_latest_edit_until_a_version_or_the_original_is_pinned(cx
     assert!(rig.present("dk-face-auto", cx));
 }
 
+/// A duel's ⑂ banks a "What-if" version beside the one edited, and the face stays where it
+/// was (#252 decision, 2026-10-06); "+ New version" still moves it.
+#[gpui_kit::test]
+fn a_banked_what_if_does_not_move_the_face(cx: &mut TestAppContext) {
+    use super::view::Overlay;
+    let rig = rig("dk-face-whatif", 1, cx);
+    let photo = rig.ids[0];
+    let token = |rig: &Rig| rig.catalog(|c| c.get_photo(photo).unwrap().cover_token);
+    rig.slide(Control::Tone(ToneKey::Ev), 0.5, cx);
+    rig.settle_and_save(cx);
+    let v1 = rig.versions()[0].id;
+    let before = token(&rig);
+    assert!(before.as_deref().is_some_and(|t| t.starts_with(&format!("{v1}:"))), "{before:?}");
+    rig.with_view(cx, |v, window, cx| v.open_duel(window, cx));
+    let duel = rig.view(cx).read_with(cx, |v, _| match v.overlay() {
+        Some(Overlay::Duel(d)) => d.clone(),
+        _ => panic!("the duel is mounted"),
+    });
+    duel.update(cx, |d, cx| d.fork(1, cx));
+    work(cx);
+    let versions = rig.versions();
+    assert_eq!(versions.len(), 2, "the variant was banked");
+    assert!(versions[1].name.starts_with("What-if — "), "{:?}", versions[1].name);
+    assert_eq!(token(&rig), before, "the face and its look are unchanged");
+    assert_eq!(rig.version_id(cx), Some(v1), "the version edited stays the same");
+    rig.press("escape", cx);
+    rig.darkroom(cx).update(cx, |d, cx| d.new_version(cx));
+    work(cx);
+    let v3 = rig.version_id(cx).unwrap();
+    assert!(token(&rig).is_some_and(|t| t.starts_with(&format!("{v3}:"))), "+ New version moves the face");
+}
+
 /// **Catalog identity.** Pinning the Original after the core switched to a catalog with
 /// colliding ids writes nothing there: refused with the event withheld; with it delivered,
 /// Develop has closed and there is nothing to pin.

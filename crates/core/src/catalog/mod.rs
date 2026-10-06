@@ -13,7 +13,7 @@ mod batches;
 mod busy;
 pub mod culling;
 mod edits;
-pub use edits::{HISTORY_BASELINE_LABEL, HISTORY_CAP};
+pub use edits::{NewVersion, HISTORY_BASELINE_LABEL, HISTORY_CAP};
 mod facets;
 mod groups;
 mod identity;

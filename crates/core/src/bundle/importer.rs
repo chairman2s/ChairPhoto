@@ -60,6 +60,10 @@ pub struct BundleImportResult {
     /// Originals whose name is too long for a sidecar beside it (`<name>.xmp` over 255
     /// bytes): not unpacked, since the photo's identity could never be written.
     pub name_too_long: usize,
+    /// The (uuid, relative path) of each original refused as `name_too_long`: the index
+    /// phase leaves them out of the merge, so they get no row at all (relB2 LOW-2).
+    #[serde(skip)]
+    pub refused: Vec<(String, String)>,
     /// What the F1c merge did (new photos, new tags, etc.).
     pub merge: MergeSummary,
 }
@@ -189,6 +193,7 @@ pub fn extract_originals_abortable(
         restored_trashed: 0,
         offloaded: 0,
         name_too_long: 0,
+        refused: Vec::new(),
         merge: MergeSummary::default(),
     };
     let mut extracted: Vec<ExtractedItem> = Vec::new();
@@ -273,6 +278,7 @@ pub fn extract_originals_abortable(
                 bp.relative_path
             );
             result.name_too_long += 1;
+            result.refused.push((bp.uuid.clone(), bp.relative_path.clone()));
             continue;
         }
 
@@ -331,6 +337,15 @@ pub fn extract_originals_abortable(
         });
         let dest = match placed {
             Ok(dest) => dest,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && !same_photo::numbered_fits(&dest) => {
+                eprintln!(
+                    "bundle import: {} not unpacked: no name beside it short enough for a sidecar",
+                    bp.relative_path
+                );
+                result.name_too_long += 1;
+                result.refused.push((bp.uuid.clone(), bp.relative_path.clone()));
+                continue;
+            }
             Err(e) => {
                 eprintln!("bundle import: placing {} ({}) failed: {e}", bp.uuid, dest.display());
                 result.errors += 1;
@@ -746,7 +761,10 @@ pub(crate) fn index_bundle_with(
     // A blank-uuid photo whose original was indexed carries, for the merge, the identity of
     // the row it was indexed into (#150).
     let prepared;
-    let manifest = if indexed < total || !indexed_blank.is_empty() || !matched_by_capture.is_empty() {
+    // Originals refused for a name too long for a sidecar are not imported at all: no row,
+    // not even the metadata-only one the merge gives a photo whose original is not here.
+    let refused: std::collections::HashSet<(String, String)> = partial_result.refused.iter().cloned().collect();
+    let manifest = if indexed < total || !indexed_blank.is_empty() || !matched_by_capture.is_empty() || !refused.is_empty() {
         let done: std::collections::HashSet<(&str, &str)> = extracted[..indexed]
             .iter()
             .map(|i| (i.photo_uuid.as_str(), i.relative_path.as_str()))
@@ -756,6 +774,7 @@ pub(crate) fn index_bundle_with(
                 .photos
                 .iter()
                 .filter(|p| indexed == total || done.contains(&(p.uuid.as_str(), p.relative_path.as_str())))
+                .filter(|p| !refused.contains(&(p.uuid.clone(), p.relative_path.clone())))
                 .map(|p| {
                     let mut p = p.clone();
                     if let Some(row) = matched_by_capture.get(&(p.uuid.as_str(), p.relative_path.as_str())) {
@@ -2153,16 +2172,18 @@ mod tests {
         }
     }
 
-    /// Review LOW-5 of #231 N-4: an original whose sidecar's name would be over 255 bytes is
-    /// not unpacked — its identity could never be written beside it — and the result says
-    /// why; the merge inserts no row for it at that path either (it has no original here and
-    /// its path is free, so it is a metadata-only row, as for an original the bundle lacks).
+    /// Review LOW-5 of #231 N-4 (and relB2 LOW-2): an original whose sidecar could not be
+    /// written beside it — its name, with the sidecar writer's temp name, over 255 bytes — is
+    /// not imported at all: not unpacked, the result says why, and the index phase gives it
+    /// no row (not the metadata-only row a photo whose original the bundle lacks gets).
     #[test]
     fn an_original_too_long_for_a_sidecar_is_not_unpacked() {
         let src_dir = temp_dir("long-src");
         let src = src_dir.join("long.ARW");
         std::fs::write(&src, b"FAKE RAW BYTES").unwrap();
-        let long = format!("{}.ARW", "D".repeat(249));
+        // 230 bytes: its sidecar's own name (234) fits in 255, the sidecar writer's temp name
+        // does not (relB2 LOW-1), so its sidecar could never be written.
+        let long = format!("{}.ARW", "D".repeat(226));
         assert!(!crate::scanner::same_photo::sidecar_name_fits(Path::new(&long)));
         let bundle_path = bundle_of(
             "long",
@@ -2174,6 +2195,9 @@ mod tests {
         assert_eq!((partial.name_too_long, partial.copied, partial.errors), (1, 0, 0), "{partial:?}");
         assert!(extracted.is_empty());
         assert!(!root.join("2026/06/28").join(&long).exists());
+        let result = index_bundle(&catalog, &manifest, &extracted, &root, partial).unwrap();
+        assert_eq!((result.name_too_long, result.merge.photos_added), (1, 0), "{:?}", result.merge);
+        assert!(photo_paths(&catalog).is_empty(), "no row, not even a metadata-only one");
     }
 
     #[test]

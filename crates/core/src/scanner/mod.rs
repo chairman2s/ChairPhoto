@@ -762,9 +762,17 @@ pub fn copy_from_card_abortable(
             std::io::copy(&mut input, out)?;
             out.set_permissions(input.metadata()?.permissions())
         });
-        let Ok(dest) = placed else {
-            result.errors += 1;
-            continue;
+        let dest = match placed {
+            Ok(dest) => dest,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && !same_photo::numbered_fits(&dir.join(filename)) => {
+                eprintln!("ingest: {} not imported: no name beside it short enough for a sidecar", src.display());
+                result.name_too_long += 1;
+                continue;
+            }
+            Err(_) => {
+                result.errors += 1;
+                continue;
+            }
         };
         in_library.insert(src);
         copied.push(CopiedItem { dest, meta: m });
@@ -1525,6 +1533,58 @@ mod tests {
             }
             assert_eq!(photos(&catalog), [("2026/06/28/IMG.jpg".to_string(), uuid)], "{case}: one row");
         }
+    }
+
+    /// relB2 LOW-3: a card file whose own name just fits, arriving at a name a different file
+    /// holds, would need a ` (n)` name too long for a sidecar: it is refused as
+    /// `name_too_long` (not an error), the search stops at the first name that does not fit,
+    /// and nothing is copied.
+    #[test]
+    fn a_numbered_name_too_long_for_a_sidecar_is_refused_not_an_error() {
+        let (catalog, _dir, root, card) = ingest_rig("numbered-too-long");
+        let name = (1..=255usize)
+            .rev()
+            .map(|n| format!("{}.jpg", "D".repeat(n - 4)))
+            .find(|n| same_photo::sidecar_name_fits(Path::new(n)))
+            .unwrap();
+        assert!(!same_photo::numbered_fits(Path::new(&name)));
+        std::fs::create_dir_all(&card).unwrap();
+        std::fs::write(card.join(&name), b"\xff\xd8the card's").unwrap();
+        let day = fixed_day(&card.join(&name), &root);
+        std::fs::create_dir_all(&day).unwrap();
+        std::fs::write(day.join(&name), b"\xff\xd8another photo, longer").unwrap();
+
+        let result = ingest_from_card(&catalog, &card, &root, None).unwrap();
+        assert_eq!((result.name_too_long, result.errors, result.created), (1, 0, 0), "{result:?}");
+        assert_eq!(std::fs::read_dir(&day).unwrap().count(), 1, "nothing copied beside it");
+    }
+
+    /// relB2 LOW-1 at the boundary: the longest card file name `sidecar_name_fits` allows is
+    /// imported with its identity in its sidecar (no identity debt); one byte longer is
+    /// refused as `name_too_long`.
+    #[test]
+    fn the_longest_name_imported_carries_its_identity_and_one_more_byte_is_refused() {
+        let (catalog, _dir, root, card) = ingest_rig("name-boundary");
+        let limit = (1..=255usize).rev().find(|n| same_photo::sidecar_name_fits(Path::new(&"D".repeat(*n)))).unwrap();
+        assert!(limit < 251, "the writer's temp name is budgeted: {limit}");
+        std::fs::create_dir_all(&card).unwrap();
+        let fits = format!("{}.jpg", "A".repeat(limit - 4));
+        let over = format!("{}.jpg", "B".repeat(limit - 3));
+        std::fs::write(card.join(&fits), b"\xff\xd8one").unwrap();
+        std::fs::write(card.join(&over), b"\xff\xd8two").unwrap();
+        let day = fixed_day(&card.join(&fits), &root);
+        fixed_day(&card.join(&over), &root);
+
+        let result = ingest_from_card(&catalog, &card, &root, None).unwrap();
+        assert_eq!((result.created, result.name_too_long, result.errors), (1, 1, 0), "{result:?}");
+        let (id, uuid, _, _) = row_at(&catalog, &format!("{}/{fits}", day.strip_prefix(&root).unwrap().to_string_lossy())).unwrap();
+        assert_eq!(crate::xmp::read_identifier(&day.join(&fits)).as_deref(), Some(uuid.as_str()));
+        let debt: i64 = catalog
+            .conn()
+            .query_row("SELECT COUNT(*) FROM pending_sidecar_identity WHERE photo_id = ?1", [id], |r| r.get(0))
+            .unwrap();
+        assert_eq!(debt, 0, "no identity debt");
+        assert!(!day.join(&over).exists());
     }
 
     /// The same capture comes back, but the sidecar at its name now carries another identity

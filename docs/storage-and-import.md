@@ -892,9 +892,12 @@ Two modes over the same core location model:
   running here, unwritten for over an hour (`working_files::remove_if_stale_part`). A name
   within the temporary name's ~30 bytes of the 255-byte limit is carried shortened in the
   temporary name (a prefix and a hash, N-4); the file still takes its full name. A file
-  whose sidecar's name (`<name>.xmp`) would be over 255 bytes is not imported at all — its
-  identity could never be written beside it — and the result counts it apart ("name too
-  long for a sidecar"). On a filesystem with neither (exFAT, FAT) the name is claimed by an
+  whose sidecar could not be written — its name (`<name>.xmp`), or a name the sidecar writer
+  makes on the way (its `.<sidecar>.<pid>-<hex>.chairphoto-tmp` temp file, its
+  `.chairphoto-backup`), over 255 bytes (`xmp::sidecar_fits`, the writer's own budget) — is
+  not imported at all, no row either: its identity could never be written beside it. The
+  result counts it apart ("name too long for a sidecar"), as it does a file whose name fits
+  but whose ` (n)` names, needed because the name is taken, do not. On a filesystem with neither (exFAT, FAT) the name is claimed by an
   exclusive create and the temporary file copied in: still no overwrite, but without that
   crash guarantee. A name is free only when
   nothing is at it and nothing at its sidecar's name (`<name>.xmp`) either: a sidecar with
@@ -930,7 +933,9 @@ Two modes over the same core location model:
   and a backup location with a verified hash — is already imported: its card's file (or a
   bundle's original) is skipped, counted apart ("already offloaded, not copied back"), and
   not copied back to this disk (#231 F5). The record decides, not a look at the backup
-  volume, which may be unmounted. A photo that still has a local location row lost its file
+  volume, which may be unmounted. Removing a local volume drops its location rows, so its
+  photos then count as offloaded here too — the same rule as the NAS-only filter
+  (`StorageTier::Nas`). A photo that still has a local location row lost its file
   some other way, and the card may hold its last copy: it is restored to its row; when
   unsure, the file is copied. The import dialog's listing flags an offloaded photo the same
   way. Every other arriving file goes on to the next free ` (n)` with a

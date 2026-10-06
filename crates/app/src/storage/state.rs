@@ -845,6 +845,7 @@ mod tests {
             restored_trashed: 2,
             offloaded: 0,
             name_too_long: 0,
+            refused: Vec::new(),
             merge: Default::default(),
         };
         assert_eq!(
@@ -884,6 +885,7 @@ mod tests {
             restored_trashed: 0,
             offloaded: 0,
             name_too_long: 0,
+            refused: Vec::new(),
             merge: chairphoto_core::catalog::MergeSummary {
                 photos_existing: 2,
                 photos_matched_by_capture: 2,
@@ -912,6 +914,7 @@ mod tests {
             restored_trashed: 0,
             offloaded: 0,
             name_too_long: 0,
+            refused: Vec::new(),
             merge: chairphoto_core::catalog::MergeSummary {
                 photos_existing: 2,
                 photos_filled: 1,

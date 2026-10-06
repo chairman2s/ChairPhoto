@@ -543,13 +543,23 @@ pub(crate) fn absent(path: &Path) -> bool {
     std::fs::symlink_metadata(path).is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound)
 }
 
-/// Whether a photo named like `path` can have its sidecar, `<name>.xmp`, beside it: the
-/// sidecar's name fits in [`NAME_MAX`] bytes. A photo whose sidecar can never be written
-/// could never carry its identity (`xmp:Identifier`), so card ingest and bundle import
-/// refuse such a file with that reason rather than import it with a debt no repair can pay
-/// (review of #231 N-4, LOW-5).
+/// Whether a photo named like `path` can have its sidecar, `<name>.xmp`, written beside it:
+/// the sidecar's name and every name its writer makes on the way (its temp file, its backup)
+/// fit the filesystem's limit ([`crate::xmp::sidecar_fits`], the writer's own budget). A
+/// photo whose sidecar can never be written could never carry its identity
+/// (`xmp:Identifier`), so card ingest and bundle import refuse such a file with that reason
+/// rather than import it with a debt no repair can pay (review of #231 N-4, LOW-5; relB2
+/// LOW-1).
 pub fn sidecar_name_fits(path: &Path) -> bool {
-    path.file_name().is_some_and(|n| n.len() + ".xmp".len() <= NAME_MAX)
+    crate::xmp::sidecar_fits(path)
+}
+
+/// Whether every ` (n)` name the free-name search may try beside `wanted` can have its sidecar
+/// written. When not, a placement that found no free name ran out of names that fit rather
+/// than of free ones: the file is refused for a name too long, not counted as an error
+/// (relB2 LOW-3).
+pub fn numbered_fits(wanted: &Path) -> bool {
+    sidecar_name_fits(&numbered(wanted, 9_999))
 }
 
 /// Create a new file at `wanted`, or at the next free ` (n)` name beside it, and fill it with
@@ -1116,7 +1126,7 @@ mod tests {
     fn a_name_near_the_length_limit_is_still_placed() {
         let dir = temp("long-name");
         for name in [format!("{}.ARW", "D".repeat(246)), format!("{}é{}.ARW", "D".repeat(188), "x".repeat(57))] {
-            assert!(name.len() > 240 && sidecar_name_fits(&dir.join(&name)), "{}", name.len());
+            assert!(name.len() > 240 && name.len() + ".xmp".len() <= 255, "{}", name.len());
             let wanted = dir.join(&name);
             let placed = create_new_with(&wanted, unique_dest, |f| {
                 use std::io::Write;

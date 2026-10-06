@@ -56,6 +56,7 @@ mod test_xml;
 #[cfg(test)]
 mod tests;
 
+pub use document::sidecar_fits;
 pub use gps::{decimal_to_dms_lat, decimal_to_dms_lng, read_gps, write_gps};
 pub use identity::{
     overwrite_identifier, overwrite_identifier_checked, read_identifier, read_identifiers,

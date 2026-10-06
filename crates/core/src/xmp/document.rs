@@ -646,11 +646,36 @@ fn temp_path(sidecar: &Path) -> PathBuf {
     let mut name = std::ffi::OsString::from(".");
     name.push(sidecar.file_name().unwrap_or_default());
     let random = uuid::Uuid::new_v4().simple().to_string();
-    name.push(format!(".{}-{}{TEMP_SUFFIX}", std::process::id(), &random[..12]));
+    name.push(format!(".{}-{}{TEMP_SUFFIX}", std::process::id(), &random[..TEMP_RANDOM_LEN]));
     sidecar.with_file_name(name)
 }
 
 const TEMP_SUFFIX: &str = ".chairphoto-tmp";
+/// Hex digits of the random part of [`temp_path`].
+const TEMP_RANDOM_LEN: usize = 12;
+
+/// The longest file name most filesystems take, in bytes (`NAME_MAX`).
+const NAME_MAX: usize = 255;
+
+/// The longest name, in bytes, the sidecar writer creates beside a sidecar whose own name is
+/// `sidecar_len` bytes: its temp file ([`temp_path`], with the widest pid a `u32` prints) or
+/// its pre-chairphoto backup (`<sidecar>.chairphoto-backup`). Built from the same constants
+/// those names are, so the budget cannot drift from them.
+fn longest_working_name(sidecar_len: usize) -> usize {
+    let pid_digits = u32::MAX.to_string().len();
+    let temp = 1 + sidecar_len + 1 + pid_digits + 1 + TEMP_RANDOM_LEN + TEMP_SUFFIX.len();
+    let backup = sidecar_len + crate::companions::SIDECAR_BACKUP_SUFFIX.len();
+    temp.max(backup)
+}
+
+/// Whether the sidecar of a photo at `photo` (`<name>.xmp`, [`super::sidecar_path`]) can be
+/// written: the sidecar's own name, its writer's temp name and its backup all fit in
+/// [`NAME_MAX`] bytes. A photo whose sidecar cannot be written could never carry its identity
+/// (`xmp:Identifier`), so imports refuse it (`scanner::same_photo::sidecar_name_fits`).
+pub fn sidecar_fits(photo: &Path) -> bool {
+    let Some(sidecar) = super::sidecar_path(photo).file_name().map(|n| n.len()) else { return false };
+    sidecar <= NAME_MAX && longest_working_name(sidecar) <= NAME_MAX
+}
 
 /// Whether `name` is a temp file [`temp_path`] made: `.<name>.<pid>-<12 hex>.chairphoto-tmp`.
 /// Nothing else is ever swept.
@@ -858,6 +883,35 @@ mod tests {
         let photo = dir.join(name);
         std::fs::write(&photo, b"raw").unwrap();
         (dir, photo)
+    }
+
+    // --- the name budget (#231 N-4, relB2 LOW-1) ---------------------------------------------
+
+    /// `sidecar_fits` budgets for every name the writer makes: at the longest photo name it
+    /// allows, an identity is written into a fresh sidecar and into a foreign one (which is
+    /// backed up first) — the temp file and the backup both fit. One byte longer and it says
+    /// no. The temp name the writer makes is never longer than the budget it is checked by.
+    #[test]
+    fn the_longest_name_sidecar_fits_allows_can_have_its_sidecar_written() {
+        let limit = (1..=NAME_MAX).rev().find(|n| sidecar_fits(Path::new(&"D".repeat(*n)))).unwrap();
+        assert!(!sidecar_fits(Path::new(&"D".repeat(limit + 1))));
+        for foreign in [false, true] {
+            let (_dir, p) = photo(&format!("doc-name-budget-{foreign}"), &format!("{}.ARW", "D".repeat(limit - 4)));
+            assert_eq!(p.file_name().unwrap().len(), limit);
+            let sidecar = sidecar_path(&p);
+            if foreign {
+                std::fs::write(&sidecar, FOREIGN).unwrap();
+            }
+            let temp = temp_path(&sidecar);
+            assert!(temp.file_name().unwrap().len() <= longest_working_name(sidecar.file_name().unwrap().len()));
+            crate::xmp::write_identifier(&p, "11111111-1111-4111-8111-111111111111").unwrap();
+            assert_eq!(
+                crate::xmp::read_identifier(&p).as_deref(),
+                Some("11111111-1111-4111-8111-111111111111"),
+                "{foreign}: the identity is in the sidecar"
+            );
+            assert_eq!(sidecar_backup_path(&sidecar).exists(), foreign, "{foreign}: the backup");
+        }
     }
 
     /// A fresh (non-existent) sidecar: `open` creates RDF/Description with `rdf:about=""` and

@@ -91,8 +91,11 @@ impl<'c> CatalogNames<'c> {
             return Some(relink);
         }
         let dir = wanted.parent()?;
+        // A ` (n)` name whose sidecar could not be written ends the search: every later one is
+        // as long or longer (relB2 LOW-3; the caller reports it, `same_photo::numbered_fits`).
         std::iter::once(wanted.to_path_buf())
             .chain((2..10_000).map(|n| same_photo::numbered(wanted, n)))
+            .take_while(|c| same_photo::sidecar_name_fits(c))
             .find(|c| same_photo::name_free(c) && self.held_by(dir, c).is_some_and(|h| h.is_empty()))
     }
 

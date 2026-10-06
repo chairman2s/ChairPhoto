@@ -290,6 +290,11 @@ pub fn with_catalog<T>(
 /// closed with [`CATALOG_CHANGED`] when the open catalog is no longer that one. The check
 /// and the write run under the same catalog lock, so no switch fits between them.
 ///
+/// Reads that put a photo on screen are bound the same way where a front end keeps no
+/// catalog check of its own: an edit render carries the identity in its job
+/// (`image_pool::EditJob::catalog`, #251), and the worker reads the photo under it or answers
+/// [`CATALOG_CHANGED`] and renders nothing.
+///
 /// The identity is the open handle's [`Catalog::instance_id`], not its path, so a switch away
 /// and back also counts as a change. That errs towards refusing a write the user can redo.
 /// Lock order: it adds no lock; it is checked under the catalog lock the write takes anyway.

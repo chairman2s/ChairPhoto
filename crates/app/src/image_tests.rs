@@ -94,6 +94,14 @@ pub(crate) fn pixels(w: u32, h: u32) -> Loaded {
     Loaded { image: to_bgra(DynamicImage::new_rgb8(w, h)), video_tile: false, cover: false, rendered_in: None }
 }
 
+/// A catalog identity for a test with no catalog open (a stage or job built by hand): `n`
+/// through the identity's opaque serialized form, the only way to make one outside the core.
+/// Distinct `n` are distinct identities. Only the `edit` feature's tests build jobs by hand.
+#[cfg(feature = "edit")]
+pub(crate) fn identity(n: u64) -> chairphoto_core::app::CatalogIdentity {
+    serde_json::from_value(serde_json::Value::String(n.to_string())).expect("an identity")
+}
+
 fn thumb(id: i64) -> JobKey {
     JobKey::photo(id, ImageKind::Thumb)
 }

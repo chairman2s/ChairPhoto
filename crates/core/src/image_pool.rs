@@ -145,11 +145,16 @@ pub struct EditJob {
     /// The sensor-clipping overlay instead of the render: a transparent image with the same
     /// geometry and size, marked where the RAW itself clipped. Engine 2 only.
     pub clip: bool,
-    /// Which catalog the caller had open when it asked (the GPUI app's
-    /// `AppModel::catalog_epoch`). Photo ids from different catalogs are different photos, so
-    /// two otherwise identical requests across a catalog switch are different jobs and must
-    /// never merge into one render. Neither the pool nor the renderer reads it.
-    pub catalog_epoch: u64,
+    /// The catalog `photo_id` was read from (#251). Photo ids are per catalog, and a switch
+    /// publishes the new catalog before `catalog:switched` reaches a front end, so a request
+    /// made for one catalog can reach a worker while another is open. The renderer resolves
+    /// the photo only while this catalog is still the open one, checked under the same
+    /// catalog lock as the read (`app::with_catalog_as`); otherwise it renders nothing and
+    /// answers [`CATALOG_CHANGED`](crate::app::CATALOG_CHANGED) — a stale request, never
+    /// another photo's pixels. Part of the key, so two otherwise identical requests across a
+    /// switch (or a re-root, which reopens under a new identity) are different jobs and never
+    /// merge into one render. The pool itself never reads it.
+    pub catalog: crate::app::CatalogIdentity,
 }
 
 /// A one-shot callback that receives the rendered result (or an error string).

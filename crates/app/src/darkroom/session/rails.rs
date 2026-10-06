@@ -533,7 +533,7 @@ impl Darkroom {
     pub fn variant_source(&self) -> Option<VariantSource> {
         let open = self.open.as_ref()?;
         let token = open.source_token().and_then(SourceToken::parse).unwrap_or(SourceToken::Preview);
-        let mut source = VariantSource::new(open.photo.id, open.epoch, token);
+        let mut source = VariantSource::new(open.photo.id, open.from, token);
         let (linear, camera_ev) = (open.engine() == 2, open.source.camera_ev);
         source.encode = Rc::new(move |r: &VersionEdit| if linear { as_linear_record(r, camera_ev) } else { r.clone() }.to_json());
         Some(source)
@@ -724,11 +724,11 @@ impl Darkroom {
             .shell
             .read(cx)
             .loupe_print()
-            .is_some_and(|p| p.photo.id == open.photo.id && p.edit_json == edit_json && p.source == source);
+            .is_some_and(|p| p.photo.id == open.photo.id && p.from == open.from && p.edit_json == edit_json && p.source == source);
         if same {
             return;
         }
-        let print = LoupePrint { photo: open.photo.clone(), edit_json, source };
+        let print = LoupePrint { photo: open.photo.clone(), from: open.from, edit_json, source };
         self.shell.update(cx, |s, cx| s.set_loupe_print(Some(print), cx));
     }
 

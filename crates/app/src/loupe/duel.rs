@@ -18,6 +18,7 @@ use crate::loupe::edit_renders::{EditRenders, RenderState};
 use crate::loupe::zoom::fitted;
 use crate::loupe::*;
 use crate::shell::style::Colors;
+use chairphoto_core::app::CatalogIdentity;
 use chairphoto_core::image_pool::EditJob;
 use chairphoto_core::plugins::edit::SourceToken;
 use chairphoto_model::darkroom::kelvin::KelvinContext;
@@ -35,8 +36,9 @@ use std::rc::Rc;
 #[derive(Clone)]
 pub struct VariantSource {
     pub photo_id: i64,
-    /// The catalog the Darkroom was opened under (`AppModel::catalog_epoch`).
-    pub catalog_epoch: u64,
+    /// The catalog the Darkroom's photo was read from (`OpenPhoto::from`): every variant job
+    /// is bound to it (`EditJob::catalog`, #251).
+    pub catalog: CatalogIdentity,
     /// The stage's own pixels: the camera preview, or the resident RAW working image.
     pub source: SourceToken,
     /// The record as the renderer gets it (the Darkroom stamps the engine; React's
@@ -45,8 +47,8 @@ pub struct VariantSource {
 }
 
 impl VariantSource {
-    pub fn new(photo_id: i64, catalog_epoch: u64, source: SourceToken) -> Self {
-        VariantSource { photo_id, catalog_epoch, source, encode: Rc::new(|r: &VersionEdit| r.to_json()) }
+    pub fn new(photo_id: i64, catalog: CatalogIdentity, source: SourceToken) -> Self {
+        VariantSource { photo_id, catalog, source, encode: Rc::new(|r: &VersionEdit| r.to_json()) }
     }
 
     /// The render job for `record` at `max_edge`.
@@ -59,17 +61,18 @@ impl VariantSource {
             base_only: false,
             source: self.source.clone(),
             clip: false,
-            catalog_epoch: self.catalog_epoch,
+            catalog: self.catalog,
         }
     }
 }
 
 /// What a variant cell shows in place of its picture (`RenderedImage.tsx`): `loading` while it
-/// renders, a quiet "—" once it failed (React showed no error text there), nothing once ready.
+/// renders, a quiet "—" once it failed (React showed no error text there) or was refused for a
+/// catalog no longer open ([`RenderState::Stale`]), nothing once ready.
 pub fn variant_placeholder(state: &RenderState, loading: &'static str) -> Option<&'static str> {
     match state {
         RenderState::Ready(_) => None,
-        RenderState::Failed(_) => Some("—"),
+        RenderState::Failed(_) | RenderState::Stale => Some("—"),
         RenderState::Rendering | RenderState::Absent => Some(loading),
     }
 }

@@ -1294,7 +1294,8 @@ fn a_darkroom_print_in_the_pop_out_hides_the_boxes_with_a_note(cx: &mut TestAppC
 
     let row = f.app.wired.shell.read_with(cx, |s, _| s.library.photos().iter().find(|p| p.id == photo).cloned()).unwrap();
     let source = SourceToken::Working { photo_id: photo, generation: 1 };
-    let print = LoupePrint { photo: row, edit_json: "{\"ev\":1}".into(), source };
+    let from = f.app.wired.shell.read_with(cx, |s, _| s.rows_from()).unwrap();
+    let print = LoupePrint { photo: row, from, edit_json: "{\"ev\":1}".into(), source };
     f.app.wired.shell.update(cx, |s, cx| s.set_loupe_print(Some(print), cx));
     work(&f.app, cx);
     in_window(h, cx, |_, _| ());

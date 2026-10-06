@@ -325,7 +325,7 @@ fn an_edit_frame_is_the_engine_render_of_the_preview_tier() {
         base_only,
         source: SourceToken::Preview,
         clip: false,
-        catalog_epoch: 0,
+        catalog: chairphoto_core::app::catalog_identity(&state).unwrap(),
     };
     let engine = |max_edge, skip_look| {
         let preview = cached_tier(&abs, ImageKind::Preview);
@@ -345,4 +345,73 @@ fn an_edit_frame_is_the_engine_render_of_the_preview_tier() {
     // The same frame through the pool's key.
     let via_key = render_image(&state, JobKey::Edit(base)).unwrap();
     assert_eq!(via_key.image.to_rgb8(), base_frame);
+}
+
+// --- Catalog identity (#251) -----------------------------------------------------------------
+
+/// An edit render belongs to the catalog its photo id was read from. A switch publishes the
+/// new catalog before a front end hears of it, so a job asked for the old catalog's photo can
+/// reach a worker while a catalog with a colliding id is open: it renders nothing and answers
+/// `CATALOG_CHANGED`, never the other photo's pixels. A job asked for the new catalog renders
+/// the new catalog's photo, and with no catalog open at all (between a switch's two phases) a
+/// job is refused the same way.
+#[cfg(feature = "edit")]
+#[test]
+fn an_edit_job_renders_only_in_the_catalog_it_was_asked_for() {
+    use chairphoto_core::app::{catalog_identity, CATALOG_CHANGED};
+    use chairphoto_core::image_pool::EditJob;
+    use chairphoto_core::media::render_edit_image;
+    use chairphoto_core::plugins::edit::{render_proxy, RenderOpts, RenderSource, SourceToken};
+
+    let dir = Fixture::new("media-edit-identity");
+    // Two catalogs whose first photos share an id but not their pixels (or their shape).
+    let (state, a_ids) = catalog_with(&dir.join("a"), &["a.jpg"], |root, n| {
+        write_jpeg(root, n, 2400, 1600);
+    });
+    let (b_state, b_ids) = catalog_with(&dir.join("b"), &["b.jpg"], |root, n| {
+        write_jpeg(root, n, 1200, 1800);
+    });
+    assert_eq!(a_ids, b_ids, "the two catalogs' photos collide on id");
+    let id = a_ids[0];
+    let b_catalog = b_state.catalog.lock().unwrap().take().unwrap();
+    let record = r#"{"tone": {"ev": 0.3}}"#;
+    let job = |catalog| EditJob {
+        photo_id: id,
+        edit_json: record.into(),
+        max_edge: 900,
+        hi_res: false,
+        base_only: false,
+        source: SourceToken::Preview,
+        clip: false,
+        catalog,
+    };
+    let engine = |abs: PathBuf| {
+        let preview = cached_tier(&abs, ImageKind::Preview);
+        render_proxy(RenderSource::PreviewJpeg(&preview), record, 900, RenderOpts::default()).unwrap().to_rgb8()
+    };
+    let a_frame = engine(dir.join("a").join("photos").join("a.jpg"));
+    let b_frame = engine(dir.join("b").join("photos").join("b.jpg"));
+    assert_ne!(a_frame.dimensions(), b_frame.dimensions());
+
+    let a = catalog_identity(&state).unwrap();
+    let asked_in_a = job(a);
+    assert_eq!(render_edit_image(&state, &asked_in_a).unwrap().to_rgb8(), a_frame, "A open: A's photo");
+
+    // The switch publishes B; nothing has told the requester yet.
+    *state.catalog.lock().unwrap() = Some(b_catalog);
+    let b = catalog_identity(&state).unwrap();
+    assert_ne!(a, b);
+    let err = render_edit_image(&state, &asked_in_a).unwrap_err();
+    assert_eq!(err, CATALOG_CHANGED, "asked in A, rendered nothing in B");
+    let via_key = render_image(&state, JobKey::Edit(asked_in_a.clone())).map(|d| d.image.to_rgb8());
+    assert_eq!(via_key, Err(CATALOG_CHANGED.to_string()), "the pool's runner answers the same");
+    assert_ne!(JobKey::Edit(asked_in_a.clone()), JobKey::Edit(job(b)), "never one pool job");
+
+    // Asked again for B — after `catalog:switched` — it is B's photo.
+    assert_eq!(render_edit_image(&state, &job(b)).unwrap().to_rgb8(), b_frame, "asked in B: B's photo");
+
+    // Between a switch's two phases no catalog is open: refused alike.
+    let b_catalog = state.catalog.lock().unwrap().take();
+    assert_eq!(render_edit_image(&state, &job(b)).unwrap_err(), CATALOG_CHANGED);
+    drop(b_catalog);
 }

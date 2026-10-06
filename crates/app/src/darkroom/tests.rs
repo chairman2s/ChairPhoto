@@ -172,7 +172,7 @@ fn develop_opens_on_the_active_photo_bound_to_its_catalog(cx: &mut TestAppContex
     // The open renders the record at once: a fast frame for this photo and catalog.
     let job = rig.last_edit_job();
     assert_eq!((job.photo_id, job.max_edge, job.source.clone()), (rig.ids[0], FAST_EDGE, SourceToken::Preview));
-    assert_eq!(job.catalog_epoch, rig.app.wired.model.read_with(cx, |m, _| m.catalog_epoch));
+    assert_eq!(job.catalog, from, "bound to the catalog its row was read from");
     // Nothing selected: nothing to develop.
     rig.app.wired.shell.update(cx, |s, cx| {
         s.show_library(cx);
@@ -181,6 +181,59 @@ fn develop_opens_on_the_active_photo_bound_to_its_catalog(cx: &mut TestAppContex
     });
     cx.run_until_parked();
     assert_eq!(rig.surface(cx), Surface::Library);
+}
+
+// --- frames across a catalog switch (#251) ----------------------------------------------
+
+/// A frame asked for the open photo of catalog A, on a worker when the core switches to B
+/// (whose photo has the same id): the real worker body renders nothing for it
+/// (`CATALOG_CHANGED`) and the stage drops that answer — no frame of B's photo, and no
+/// failure reported. Without `catalog:switched`, the stage's next frame (the settle) is still
+/// A's and refused alike; with it, the Darkroom closes and the answer has no stage to reach.
+fn frames_across_a_switch(delivered: bool, cx: &mut TestAppContext) {
+    let rig = rig(if delivered { "dk-frame-switch-ev" } else { "dk-frame-switch" }, 1, cx);
+    let (photo, a) = rig.darkroom(cx).read_with(cx, |d, _| d.open.as_ref().map(|o| (o.photo.id, o.from)).unwrap());
+    let stage = rig.darkroom(cx).read_with(cx, |d, _| d.open.as_ref().unwrap().stage.clone());
+    let job = rig.last_edit_job();
+    assert_eq!((job.photo_id, job.catalog), (photo, a), "the open's frame, bound to its row's catalog");
+    let key = JobKey::Edit(job);
+    rig.pool.start(key.clone()); // on a worker: it cannot be cancelled
+
+    let (b, b_ids) = colliding_catalog(&rig.dir, "b", 1);
+    assert_eq!(b_ids, rig.ids, "the ids collide");
+    core_switch(&rig.app, b);
+    if delivered {
+        crate::tests::deliver_switch(&rig.app, cx);
+        assert_eq!(rig.open_photo(cx), None, "the switch closed the Darkroom");
+    }
+    let run = crate::image_store::runner(rig.app.state.clone());
+    let answer = run(key.clone());
+    assert_eq!(answer.as_ref().map(|_| ()).map_err(String::as_str), Err(CATALOG_CHANGED), "rendered in B");
+    rig.pool.finish(&key, answer);
+    cx.run_until_parked();
+    let (frame, failure, failed) = stage.read_with(cx, |s, _| (s.frame().is_some(), s.failure().cloned(), s.stats().failed));
+    assert!(!frame, "delivered={delivered}: no frame of B's photo");
+    assert_eq!((failure, failed), (None, 0), "delivered={delivered}: dropped, not a failure");
+    if !delivered {
+        advance(cx, SETTLE * 2); // the open's settle: a full frame, still A's
+        let full = rig.last_edit_job();
+        assert_eq!((full.max_edge, full.catalog), (FULL_EDGE, a));
+        let key = JobKey::Edit(full);
+        rig.pool.finish(&key, run(key.clone()));
+        cx.run_until_parked();
+        let (frame, failure) = stage.read_with(cx, |s, _| (s.frame().is_some(), s.failure().cloned()));
+        assert!(!frame && failure.is_none(), "the settle refused alike");
+    }
+}
+
+#[gpui_kit::test]
+fn a_frame_asked_before_an_unannounced_switch_draws_nothing_of_the_new_catalog(cx: &mut TestAppContext) {
+    frames_across_a_switch(false, cx);
+}
+
+#[gpui_kit::test]
+fn a_frame_asked_before_an_announced_switch_draws_nothing_of_the_new_catalog(cx: &mut TestAppContext) {
+    frames_across_a_switch(true, cx);
 }
 
 /// The control → record → render request flow, and the settle: a slider writes the record,

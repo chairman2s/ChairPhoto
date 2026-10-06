@@ -346,6 +346,9 @@ pub enum StageView {
 #[derive(Debug, Clone)]
 pub struct LoupePrint {
     pub photo: Photo,
+    /// The catalog the Darkroom read `photo` from: the print's renders are bound to it
+    /// (`EditJob::catalog`, #251).
+    pub from: CatalogIdentity,
     pub edit_json: String,
     pub source: chairphoto_core::plugins::edit::SourceToken,
 }
@@ -420,7 +423,9 @@ impl PartialEq for LoupeProofPreview {
         match (&self.cell, &other.cell) {
             (RenderState::Ready(a), RenderState::Ready(b)) => std::sync::Arc::ptr_eq(a, b),
             (RenderState::Failed(a), RenderState::Failed(b)) => a == b,
-            (RenderState::Rendering, RenderState::Rendering) | (RenderState::Absent, RenderState::Absent) => true,
+            (RenderState::Rendering, RenderState::Rendering)
+            | (RenderState::Stale, RenderState::Stale)
+            | (RenderState::Absent, RenderState::Absent) => true,
             _ => false,
         }
     }

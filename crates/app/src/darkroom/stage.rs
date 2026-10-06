@@ -23,10 +23,14 @@
 //! only ever be stale — unless the pool merged the new request into one of them (the same
 //! record and size again).
 //!
-//! Every job carries the catalog epoch the stage was opened under (`EditJob::catalog_epoch`).
-//! A render cannot be interrupted, and the pool merges identical keys; without the epoch a
-//! stage opened after a catalog switch for the same photo id, record and source would adopt a
-//! render still running for the other catalog's photo.
+//! Every job carries the catalog the stage's photo was read from (`EditJob::catalog`, #251).
+//! A render cannot be interrupted, and the pool merges identical keys; without it a stage
+//! opened after a catalog switch for the same photo id, record and source would adopt a render
+//! still running for the other catalog's photo. The worker renders a job only while its
+//! catalog is the open one (checked under the catalog lock); in a switch's window, before
+//! `catalog:switched` closes the stage, it answers `CATALOG_CHANGED` instead of the new
+//! catalog's photo of that id, and the stage drops that answer like a cancellation: the frame
+//! shown stays, and no failure is reported.
 //!
 //! **Frame timing.** Every request is stamped ([`FrameSample`], `chairphoto_model`'s
 //! `render_timing`): requested, answered (the BGRA frame is back on the UI thread) and taken
@@ -41,6 +45,7 @@
 //! The Darkroom view (`super::view`) draws these frames; `super::session` owns the stage.
 
 use crate::image_store::{Loaded, Submit};
+use chairphoto_core::app::{CatalogIdentity, CATALOG_CHANGED};
 use chairphoto_core::image_pool::{EditJob, JobKey, CANCELLED};
 use chairphoto_core::plugins::edit::SourceToken;
 use chairphoto_model::darkroom::render_timing::{format_sample, summarize, FrameSample, Tier, TimingSummary};
@@ -117,7 +122,8 @@ pub struct FrameStats {
 pub enum FrameOutcome {
     /// It became the stage's frame.
     Shown,
-    /// Cancelled, rendered for a closed stage, or not newer than the frame shown.
+    /// Cancelled, refused for a catalog no longer open (`CATALOG_CHANGED`, #251), rendered for
+    /// a closed stage, or not newer than the frame shown.
     Superseded,
     /// The newest-so-far frame's render failed.
     Failed,
@@ -134,8 +140,9 @@ pub fn fast_wait(last_fast: Option<Instant>, now: Instant) -> Duration {
 }
 
 /// What a finished frame of `generation` at `tier` is to a stage showing `shown` (closed at
-/// `closed_at`, if it was): cancelled, closed-over or not newer — superseded; else shown, or
-/// failed. The stage's ordering rule (module docs) — shared with `examples/darkroom_bench.rs`.
+/// `closed_at`, if it was): cancelled, refused for another catalog, closed-over or not newer —
+/// superseded; else shown, or failed. The stage's ordering rule (module docs) — shared with
+/// `examples/darkroom_bench.rs`.
 pub fn frame_outcome(
     generation: u64,
     tier: FrameTier,
@@ -143,7 +150,8 @@ pub fn frame_outcome(
     closed_at: Option<u64>,
     result: Result<(), &str>,
 ) -> FrameOutcome {
-    if matches!(result, Err(e) if e == CANCELLED) || closed_at.is_some_and(|g| generation < g) {
+    let dropped = matches!(result, Err(e) if e == CANCELLED || e == CATALOG_CHANGED);
+    if dropped || closed_at.is_some_and(|g| generation < g) {
         return FrameOutcome::Superseded;
     }
     if shown.is_some_and(|s| (generation, tier) <= s) {
@@ -172,8 +180,8 @@ pub fn failed_frames<'a>(samples: impl IntoIterator<Item = &'a FrameSample>) -> 
 pub struct DarkroomStage {
     pool: Arc<dyn Submit>,
     photo_id: i64,
-    /// The catalog this stage renders for (`AppModel::catalog_epoch` when it was opened).
-    catalog_epoch: u64,
+    /// The catalog this stage's photo was read from (`OpenPhoto::from`).
+    catalog: CatalogIdentity,
     source: SourceToken,
     edit_json: String,
     generation: u64,
@@ -199,14 +207,14 @@ pub struct DarkroomStage {
 }
 
 impl DarkroomStage {
-    /// A stage for `photo_id` of the catalog open under `catalog_epoch`
-    /// (`AppModel::catalog_epoch`), rendering from `source` (the camera preview, or a
-    /// resident RAW working image by token) with the record `edit_json`. Renders nothing
-    /// until asked. A catalog switch needs a new stage: this one's frames are its catalog's.
+    /// A stage for `photo_id` of the catalog `catalog` (the one its row was read from),
+    /// rendering from `source` (the camera preview, or a resident RAW working image by token)
+    /// with the record `edit_json`. Renders nothing until asked. A catalog switch needs a new
+    /// stage: this one's frames are its catalog's.
     pub fn new(
         pool: Arc<dyn Submit>,
         photo_id: i64,
-        catalog_epoch: u64,
+        catalog: CatalogIdentity,
         source: SourceToken,
         edit_json: String,
         cx: &mut Context<Self>,
@@ -222,7 +230,7 @@ impl DarkroomStage {
         Self {
             pool,
             photo_id,
-            catalog_epoch,
+            catalog,
             source,
             edit_json,
             generation: 0,
@@ -355,7 +363,7 @@ impl DarkroomStage {
             base_only: false,
             source: self.source.clone(),
             clip: self.clip,
-            catalog_epoch: self.catalog_epoch,
+            catalog: self.catalog,
         });
         let requested = self.now_ms(cx);
         if self.samples.len() >= MAX_SAMPLES {
@@ -457,7 +465,7 @@ impl DarkroomStage {
 mod tests {
     use super::{DarkroomStage, FrameTier, FAST_EDGE, FAST_INTERVAL, FULL_EDGE, SETTLE};
     use crate::image_store::Submit;
-    use crate::image_tests::{pixels, FakePool};
+    use crate::image_tests::{identity, pixels, FakePool};
     use chairphoto_core::image_pool::JobKey;
     use gpui_kit::{AppContext as _, Entity, TestAppContext};
     use std::sync::Arc;
@@ -468,7 +476,7 @@ mod tests {
         let pool = Arc::new(FakePool::default());
         let stage = cx.update(|cx| {
             let pool: Arc<dyn Submit> = pool.clone();
-            cx.new(|cx| DarkroomStage::new(pool, 42, 0, SourceToken::Preview, "{}".into(), cx))
+            cx.new(|cx| DarkroomStage::new(pool, 42, identity(1), SourceToken::Preview, "{}".into(), cx))
         });
         (pool, stage)
     }
@@ -698,6 +706,9 @@ mod tests {
         assert_eq!(frame_outcome(1, full, Some((2, fast)), None, Ok(())), FrameOutcome::Superseded);
         assert_eq!(frame_outcome(3, fast, None, Some(4), Ok(())), FrameOutcome::Superseded, "closed over");
         assert_eq!(frame_outcome(3, fast, None, None, Err(CANCELLED)), FrameOutcome::Superseded);
+        // Refused for a catalog no longer open (#251): dropped, never a failure to report.
+        let changed = chairphoto_core::app::CATALOG_CHANGED;
+        assert_eq!(frame_outcome(3, fast, Some((2, full)), None, Err(changed)), FrameOutcome::Superseded);
         assert_eq!(frame_outcome(3, fast, Some((2, full)), None, Err("decode failed")), FrameOutcome::Failed);
         assert_eq!(frame_outcome(1, fast, Some((2, full)), None, Err("decode failed")), FrameOutcome::Superseded);
     }
@@ -709,10 +720,10 @@ mod tests {
     #[gpui_kit::test]
     fn a_new_catalogs_stage_never_adopts_the_old_catalogs_render(cx: &mut TestAppContext) {
         let pool = Arc::new(FakePool::default());
-        let open = |epoch: u64, cx: &mut TestAppContext| {
+        let open = |catalog: u64, cx: &mut TestAppContext| {
             let pool: Arc<dyn Submit> = pool.clone();
             cx.update(|cx| {
-                cx.new(|cx| DarkroomStage::new(pool, 42, epoch, SourceToken::Preview, "{}".into(), cx))
+                cx.new(|cx| DarkroomStage::new(pool, 42, identity(catalog), SourceToken::Preview, "{}".into(), cx))
             })
         };
         let old_stage = open(0, cx);

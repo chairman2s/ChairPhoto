@@ -322,33 +322,39 @@ impl LoupeView {
         /// React's loupe render size (`renderForLoupe`, `edit://` at 2560 px).
         const LOUPE_EDGE: u32 = 2560;
         let target = self.zoom.read(cx).photo();
-        let epoch = self.model.read(cx).catalog_epoch;
         // The record to render and its pixels, and why (`Self::record_source`, shared with
         // `render_bar`'s label so the two can never disagree, #250 review): a proof sheet's
         // previewed candidate, else the Darkroom's print, else the active version — each only
         // on its own photo (the trailing filter, below). The proof case also keeps its 320 px
         // cell render, a placeholder until its own loupe-size render lands.
+        //
+        // Each record's renders are bound to the catalog its photo id was read from
+        // (`EditJob::catalog`, #251): the Darkroom's open for a proof or the print, the shell's
+        // rows for the active version (no rows read since a switch: nothing to render).
         let chosen = target.and_then(|id| self.record_source(id, cx));
         let (record, placeholder) = match chosen {
             Some(RecordSource::Proof(p)) => {
                 let edit_json = (p.source.encode)(&p.candidate.record);
-                (Some((p.photo_id, edit_json, p.source.source)), Some(p.cell))
+                (Some((p.photo_id, edit_json, p.source.source, p.source.catalog)), Some(p.cell))
             }
-            Some(RecordSource::Print(print)) => (Some((print.photo.id, print.edit_json, print.source)), None),
+            Some(RecordSource::Print(print)) => {
+                (Some((print.photo.id, print.edit_json, print.source, print.from)), None)
+            }
             None => {
                 let shell = self.shell.read(cx);
-                (shell.active_version().map(|v| (v.photo_id, v.edit_json.clone(), SourceToken::Preview)), None)
+                let version = shell.active_version().zip(shell.rows_from());
+                (version.map(|(v, from)| (v.photo_id, v.edit_json.clone(), SourceToken::Preview, from)), None)
             }
         };
-        let record = record.filter(|(photo, _, _)| Some(*photo) == target);
+        let record = record.filter(|(photo, ..)| Some(*photo) == target);
         let placeholder = if record.is_some() { placeholder } else { None };
-        let Some((photo, edit_json, source)) = record else {
+        let Some((photo, edit_json, source, from)) = record else {
             self.renders.update(cx, |r, cx| r.want(&[], cx));
             self.zoom.update(cx, |z, cx| z.set_override(None, cx));
             return;
         };
-        let mut lo = preview_job(photo, &edit_json, LOUPE_EDGE, false, epoch);
-        let mut hi = preview_job(photo, &edit_json, 0, true, epoch);
+        let mut lo = preview_job(photo, &edit_json, LOUPE_EDGE, false, from);
+        let mut hi = preview_job(photo, &edit_json, 0, true, from);
         lo.source = source.clone();
         hi.source = source;
         let wants_hi = self.zoom.read(cx).wants_hi();
@@ -361,7 +367,7 @@ impl LoupeView {
         // until it lands (#250 review). Only for this photo; a print for another photo is
         // never wanted here regardless of what wins below.
         let print_lo = self.print(cx).filter(|p| p.photo.id == photo).map(|p| {
-            let mut j = preview_job(p.photo.id, &p.edit_json, LOUPE_EDGE, false, epoch);
+            let mut j = preview_job(p.photo.id, &p.edit_json, LOUPE_EDGE, false, p.from);
             j.source = p.source.clone();
             j
         });
@@ -369,7 +375,7 @@ impl LoupeView {
             .then(|| self.print(cx).filter(|p| p.photo.id == photo))
             .flatten()
             .map(|p| {
-                let mut j = preview_job(p.photo.id, &p.edit_json, 0, true, epoch);
+                let mut j = preview_job(p.photo.id, &p.edit_json, 0, true, p.from);
                 j.source = p.source.clone();
                 j
             });

@@ -54,7 +54,11 @@ portrait and rotated photos render the right way up.
 - Folder → `make_collage_freeform` writes the image where you choose.
 - Library → `save_collage_to_catalog` writes it under `<library root>/Collages/` and
   indexes it via `scanner::index_generated_file` (UUID, sidecar, metadata, no import
-  batch), so it appears as a normal catalog photo.
+  batch), so it appears as a normal catalog photo. Its name (`collage.jpg`, else
+  `collage (n).jpg`) is claimed on disk and is never one a catalog row holds — a collage
+  deleted outside the app keeps its row, and indexing by path would hand that row to the
+  new file — in any case variant, nor one beside a sidecar left there (#231 T1, the
+  import rule of `docs/storage-and-import.md`).
 
 A collage saved to the library is stamped with the **current time as its capture date** —
 it has no EXIF date, which would otherwise sort it to the bottom of a date-ordered library

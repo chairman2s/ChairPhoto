@@ -41,9 +41,15 @@
 //!   photo is in the library already, as the other row's — a row inserted there would
 //!   describe a file that is not this photo's, or none.
 //!
-//! Consequences: **re-merging the same bundle is a no-op** (a version is added only for
-//! settings the photo does not already have), and merging a bundle whose photos/tags
-//! partly pre-exist adds only what is genuinely new.
+//! - **Once per bundle** (#248): every photo a bundle's photo is merged into is recorded
+//!   with the bundle — its batch uuid and when it was written (`bundle_merges`). Merging
+//!   that bundle into it again applies nothing: a rating the user cleared, an imported
+//!   version or a tag they removed after the first import stays so. A later export of the
+//!   same batch is another bundle and fills the blanks again.
+//!
+//! Consequences: **re-merging the same bundle is a no-op** (a photo it was merged into is
+//! not filled again, and tag assignments union idempotently), and merging a bundle whose
+//! photos/tags partly pre-exist adds only what is genuinely new.
 //!
 //! The whole apply runs in a single transaction so a failure rolls back cleanly.
 
@@ -84,6 +90,18 @@ pub struct MergeSummary {
     /// holds their path — the same capture imported separately on each side (#246): kept
     /// apart, neither inserted nor merged.
     pub photos_kept_apart: usize,
+    /// The names (the bundle's relative paths) of the photos kept apart, in bundle order, so
+    /// the import result can say which they are (#249).
+    pub kept_apart_names: Vec<String>,
+    /// Bundle photos found in the library as the same capture under another identity, proven
+    /// by the strict re-link rule (#249), and merged onto that row, which keeps its identity.
+    /// Set by the importer (`bundle::importer`), which decides the match; counted in
+    /// `photos_existing` too.
+    pub photos_matched_by_capture: usize,
+    /// Existing photos this very bundle (batch uuid and export time) was merged into by an
+    /// earlier import (#248): nothing of it is applied again — no fill, no version, no tag —
+    /// so a value the user cleared or a tag they removed since stays so.
+    pub photos_merged_before: usize,
 }
 
 /// The name of the version an existing photo gains from a bundle's photo-level edit record.
@@ -131,6 +149,8 @@ impl Catalog {
                 tag_id_by_uuid: HashMap::new(),
                 fresh,
                 kept_apart,
+                batch_uuid: manifest.batch.uuid.trim(),
+                bundle_created_at: manifest.created_at,
             };
             ctx.run(manifest)?;
             ctx.outcome
@@ -152,6 +172,13 @@ struct MergeCtx<'a> {
     fresh: &'a HashSet<i64>,
     /// Identities the importer kept apart (see `merge_bundle_into`).
     kept_apart: &'a HashSet<String>,
+    /// The bundle's batch uuid, which `bundle_merges` records per photo (#248). Blank: a
+    /// bundle with no batch identity, recorded nowhere.
+    batch_uuid: &'a str,
+    /// When the bundle was written (`BundleManifest::created_at`): with the batch uuid, which
+    /// bundle this is. A later export of the same batch, carrying work done since, is another
+    /// bundle and fills the photo's blanks again (#248, decision 2026-10-06).
+    bundle_created_at: i64,
 }
 
 impl MergeCtx<'_> {
@@ -388,11 +415,20 @@ impl MergeCtx<'_> {
             }
         };
 
+        // This very bundle was merged into the photo before (#248): nothing of it is applied
+        // again, its tags included — a tag the user removed since stays removed.
+        let mut merged_before = false;
         let photo_id = match existing {
             Some(id) => {
-                // Existing photo: never overwritten; only what it lacks is filled in.
+                // Existing photo: never overwritten; only what it lacks is filled in — once per
+                // bundle (#248).
                 self.outcome.summary.photos_existing += 1;
-                if !self.fresh.contains(&id) {
+                if self.fresh.contains(&id) {
+                    // Created by the importer for this bundle a moment ago, with its state.
+                } else if self.merged_before(id)? {
+                    self.outcome.summary.photos_merged_before += 1;
+                    merged_before = true;
+                } else {
                     self.fill_existing(id, photo)?;
                 }
                 id
@@ -408,6 +444,7 @@ impl MergeCtx<'_> {
                     photo.relative_path
                 );
                 self.outcome.summary.photos_kept_apart += 1;
+                self.outcome.summary.kept_apart_names.push(photo.relative_path.clone());
                 return Ok(());
             }
             None => {
@@ -424,7 +461,41 @@ impl MergeCtx<'_> {
             )?;
         }
 
-        self.union_assignments(photo_id, photo)?;
+        if !merged_before {
+            self.record_merged(photo_id)?;
+            self.union_assignments(photo_id, photo)?;
+        }
+        Ok(())
+    }
+
+    /// Whether this bundle — its batch, exported at `created_at` — was merged into `photo_id`
+    /// by an earlier import (#248).
+    fn merged_before(&self, photo_id: i64) -> Result<bool> {
+        if self.batch_uuid.is_empty() {
+            return Ok(false);
+        }
+        Ok(self
+            .tx
+            .query_row(
+                "SELECT 1 FROM bundle_merges WHERE photo_id = ?1 AND batch_uuid = ?2 AND bundle_created_at = ?3",
+                params![photo_id, self.batch_uuid, self.bundle_created_at],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some())
+    }
+
+    /// Record that this bundle's batch has been merged into `photo_id` (#248), so importing
+    /// it again fills nothing in and adds no version there.
+    fn record_merged(&self, photo_id: i64) -> Result<()> {
+        if self.batch_uuid.is_empty() {
+            return Ok(());
+        }
+        self.tx.execute(
+            "INSERT OR IGNORE INTO bundle_merges(photo_id, batch_uuid, bundle_created_at, merged_at)
+             VALUES(?1, ?2, ?3, ?4)",
+            params![photo_id, self.batch_uuid, self.bundle_created_at, now()],
+        )?;
         Ok(())
     }
 
@@ -498,8 +569,10 @@ impl MergeCtx<'_> {
                         ?4, ?4)",
                 params![photo_id, name, value, ts],
             )?;
-            // A version written into this catalog: the automatic face moves to it (#252).
-            super::edits::settings_written(self.tx, self.tx.last_insert_rowid())?;
+            // Not a change made here: an existing photo's face stays where it is (#252,
+            // decision 2026-10-06). The version keeps `changed_seq` 0 — never written in this
+            // catalog — which the automatic face passes over until it is edited here
+            // (`edits::face_under`). A stale bundle never regresses the face to an older look.
             has.push(parsed);
             added += 1;
         }
@@ -797,7 +870,7 @@ mod tests {
     /// An existing photo keeps every value it has — culling, IPTC, its edit record and its
     /// version — and gains the bundle's edit record and version as new versions after its
     /// own; its tags union. Merging again adds nothing more.
-    // --- the Library face (#252): `photo_cover` is local, versions merged in move it ------
+    // --- the Library face (#252): `photo_cover` is local; a new photo's merged versions move it
 
     #[test]
     fn merged_versions_give_a_new_photo_its_face_and_leave_a_pin_alone() {
@@ -812,10 +885,56 @@ mod tests {
         // A pinned face stays where the user put it when another merge adds versions.
         cat.set_cover_pin(photo.id, crate::catalog::CoverPin::Original).unwrap();
         let mut more = sample_manifest();
+        more.batch.uuid = "batch-2".into();
         more.photos[0].versions[0].edit_json = r#"{"crop":"4:5"}"#.into();
         cat.merge_bundle(&more).unwrap();
         assert_eq!(cat.list_versions(photo.id).unwrap().len(), versions.len() + 1, "a version was added");
         assert_eq!(cat.cover_of(photo.id).unwrap(), None, "the pinned original stays the face");
+    }
+
+    /// #252 (decision 2026-10-06; the merge test the #252 review found missing): versions
+    /// merged into an EXISTING photo do not move its face. A photo showing its own edited
+    /// version keeps showing it, rev unchanged; a photo with no versions keeps its original,
+    /// even when a later face refresh runs. Editing a merged version here makes it the face.
+    #[test]
+    fn versions_merged_into_an_existing_photo_leave_its_face_alone() {
+        let face = |cat: &Catalog, id: i64| cat.cover_of(id).unwrap().map(|f| (f.0, f.1));
+        let insert = |cat: &Catalog| {
+            cat.conn()
+                .execute(
+                    "INSERT INTO photos(uuid, path, mtime_ns, size, extension, created_at, updated_at)
+                     VALUES(?1, 'existing/local.ARW', 1, 1, 'arw', 1, 1)",
+                    params![crate::catalog::photo_identity_for("photo-a").unwrap()],
+                )
+                .unwrap();
+            cat.conn().last_insert_rowid()
+        };
+
+        // Its own edited version is the face, and stays so.
+        let (cat, _root) = temp_catalog("face-existing");
+        let id = insert(&cat);
+        let mine = cat.create_version(id, "Mine").unwrap();
+        cat.set_version_edit(mine, r#"{"local":1}"#).unwrap();
+        let before = face(&cat, id);
+        assert_eq!(before.map(|f| f.0), Some(mine));
+        let out = cat.merge_bundle_into(&sample_manifest(), &HashSet::new(), &HashSet::new()).unwrap();
+        assert_eq!(out.summary.versions_added, 2);
+        assert_eq!(face(&cat, id), before, "the face and its rev are unchanged");
+
+        // No versions of its own: the original stays the face, through a later refresh too.
+        let (cat, _root) = temp_catalog("face-original");
+        let id = insert(&cat);
+        cat.merge_bundle_into(&sample_manifest(), &HashSet::new(), &HashSet::new()).unwrap();
+        let merged = cat.list_versions(id).unwrap();
+        assert_eq!(merged.len(), 2);
+        assert_eq!(face(&cat, id), None, "the original is still the face");
+        cat.delete_version(merged[0].id).unwrap();
+        assert_eq!(face(&cat, id), None, "a refresh does not pick a merged version");
+        assert_eq!(cat.cover_pin(id).unwrap(), crate::catalog::CoverPin::Auto, "and nothing was pinned");
+
+        // An edit here is a change here: the face follows it.
+        cat.set_version_edit(merged[1].id, r#"{"crop":"4:5"}"#).unwrap();
+        assert_eq!(face(&cat, id).map(|f| f.0), Some(merged[1].id));
     }
 
     #[test]
@@ -980,6 +1099,117 @@ mod tests {
         assert_eq!(cat.get_photo(id).unwrap().rating, 0);
         assert!(cat.list_versions(id).unwrap().is_empty());
         assert_eq!(out.summary.assignments_added, 1, "its tags still union");
+    }
+
+    // --- once per bundle (#248) ------------------------------------------------------------
+
+    /// #248: what a bundle filled in on an existing photo, and the versions and tags it added,
+    /// are the user's to clear. Merging the same bundle again brings none of it back — no
+    /// culling, no IPTC offered, no version, no tag (review LOW-4). A later export of the
+    /// same batch (another `created_at`) is another bundle and fills the blanks again; so is
+    /// another batch.
+    #[test]
+    fn a_batch_merged_into_a_photo_before_fills_nothing_again() {
+        let (cat, _root) = temp_catalog("once");
+        cat.conn()
+            .execute(
+                "INSERT INTO photos(uuid, path, mtime_ns, size, extension, created_at, updated_at)
+                 VALUES(?1, 'existing/local.ARW', 1, 1, 'arw', 1, 1)",
+                params![crate::catalog::photo_identity_for("photo-a").unwrap()],
+            )
+            .unwrap();
+        let id = cat.conn().last_insert_rowid();
+        let first = cat.merge_bundle_into(&sample_manifest(), &HashSet::new(), &HashSet::new()).unwrap();
+        assert_eq!((first.summary.photos_filled, first.summary.versions_added), (1, 2));
+        assert_eq!(first.iptc_fills.len(), 1);
+
+        // The user clears what the bundle filled in and removes what it added.
+        cat.set_culling(id, Some(0), Some(""), Some(PickState::None)).unwrap();
+        for v in cat.list_versions(id).unwrap() {
+            cat.delete_version(v.id).unwrap();
+        }
+        cat.conn().execute("DELETE FROM photo_tags WHERE photo_id = ?1", params![id]).unwrap();
+
+        let again = cat.merge_bundle_into(&sample_manifest(), &HashSet::new(), &HashSet::new()).unwrap();
+        let s = &again.summary;
+        assert_eq!((s.photos_existing, s.photos_merged_before, s.photos_filled, s.versions_added), (1, 1, 0, 0), "{s:?}");
+        assert!(again.iptc_fills.is_empty(), "no IPTC offered again");
+        assert!(again.versions_added_to.is_empty());
+        let after = cat.get_photo(id).unwrap();
+        assert_eq!((after.rating, after.label.as_str(), after.pick_state), (0, "", PickState::None));
+        assert!(cat.list_versions(id).unwrap().is_empty(), "the removed versions stay removed");
+        assert_eq!(s.assignments_added, 0, "nor its tags");
+        assert!(cat.get_photo_tags(id).unwrap().is_empty(), "the removed tag stays removed");
+
+        // Another batch is another bundle: its blanks are filled.
+        let mut other = sample_manifest();
+        other.batch.uuid = "batch-2".into();
+        let third = cat.merge_bundle_into(&other, &HashSet::new(), &HashSet::new()).unwrap();
+        assert_eq!((third.summary.photos_merged_before, third.summary.photos_filled), (0, 1));
+        assert_eq!(cat.get_photo(id).unwrap().rating, 4);
+    }
+
+    /// #248, review MEDIUM-2 / probe P1 (decision 2026-10-06): the key is the bundle, not the
+    /// batch. The same batch exported again later, carrying work done on the other machine
+    /// since — a rating, IPTC, a new version — fills the photo's blanks and adds the version.
+    #[test]
+    fn a_later_export_of_the_same_batch_is_another_bundle() {
+        let (cat, _root) = temp_catalog("once-later");
+        cat.conn()
+            .execute(
+                "INSERT INTO photos(uuid, path, mtime_ns, size, extension, created_at, updated_at)
+                 VALUES(?1, 'existing/local.ARW', 1, 1, 'arw', 1, 1)",
+                params![crate::catalog::photo_identity_for("photo-a").unwrap()],
+            )
+            .unwrap();
+        let id = cat.conn().last_insert_rowid();
+        let mut early = sample_manifest();
+        early.photos[0].rating = 0;
+        early.photos[0].iptc = Default::default();
+        early.photos[0].edit_record = None;
+        early.photos[0].versions.clear();
+        cat.merge_bundle_into(&early, &HashSet::new(), &HashSet::new()).unwrap();
+        assert!(cat.list_versions(id).unwrap().is_empty());
+
+        let mut later = sample_manifest();
+        later.created_at = early.created_at + 86_400;
+        let out = cat.merge_bundle_into(&later, &HashSet::new(), &HashSet::new()).unwrap();
+        let s = &out.summary;
+        assert_eq!((s.photos_merged_before, s.photos_filled, s.versions_added), (0, 1, 2), "{s:?}");
+        assert_eq!(out.iptc_fills.len(), 1, "its IPTC is offered for the blanks");
+        assert_eq!(cat.get_photo(id).unwrap().rating, 4);
+
+        // And that later bundle, imported once more, applies nothing.
+        let again = cat.merge_bundle_into(&later, &HashSet::new(), &HashSet::new()).unwrap();
+        assert_eq!((again.summary.photos_merged_before, again.summary.photos_filled), (1, 0));
+    }
+
+    /// #248: a photo the merge inserted, and a row the importer created for the bundle
+    /// (`fresh`), are recorded too: a value cleared on either after the import stays cleared
+    /// when the bundle is imported again.
+    #[test]
+    fn an_inserted_or_fresh_photo_is_recorded_as_merged() {
+        let (cat, _root) = temp_catalog("once-new");
+        cat.merge_bundle(&sample_manifest()).unwrap();
+        let inserted = cat.get_photo_by_uuid("photo-a").unwrap().id;
+        cat.set_culling(inserted, Some(0), None, None).unwrap();
+        let again = cat.merge_bundle(&sample_manifest()).unwrap();
+        assert_eq!((again.photos_merged_before, again.photos_filled), (1, 0));
+        assert_eq!(cat.get_photo(inserted).unwrap().rating, 0);
+
+        let (cat, _root) = temp_catalog("once-fresh");
+        cat.conn()
+            .execute(
+                "INSERT INTO photos(uuid, path, mtime_ns, size, extension, created_at, updated_at)
+                 VALUES(?1, 'existing/local.ARW', 1, 1, 'arw', 1, 1)",
+                params![crate::catalog::photo_identity_for("photo-a").unwrap()],
+            )
+            .unwrap();
+        let fresh = cat.conn().last_insert_rowid();
+        cat.merge_bundle_into(&sample_manifest(), &HashSet::from([fresh]), &HashSet::new()).unwrap();
+        let again = cat.merge_bundle_into(&sample_manifest(), &HashSet::new(), &HashSet::new()).unwrap();
+        assert_eq!((again.summary.photos_merged_before, again.summary.photos_filled), (1, 0));
+        assert_eq!(cat.get_photo(fresh).unwrap().rating, 0, "the blank the user left is not filled");
     }
 
     /// A bundle photo whose identity no row holds, at a path another photo (another identity)

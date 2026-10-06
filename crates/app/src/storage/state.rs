@@ -666,6 +666,12 @@ pub fn card_import_line(r: &ScanResult) -> String {
     if r.restored > 0 {
         line += &format!(", {}", restored_clause(r.restored, r.restored_trashed));
     }
+    if r.offloaded > 0 {
+        line += &format!(", {} already offloaded, not copied back", r.offloaded);
+    }
+    if r.name_too_long > 0 {
+        line += &format!(", {} not imported (name too long for a sidecar)", r.name_too_long);
+    }
     if r.errors > 0 {
         line += &format!(", {} errors", r.errors);
     }
@@ -720,6 +726,19 @@ pub fn drain_status(s: &chairphoto_core::catalog::DrainSummary) -> String {
     line
 }
 
+/// The photos a bundle import kept apart, by file name (#249): `": A.ARW, B.ARW"`, the first
+/// five and how many more; empty when none were named.
+fn kept_apart_names(paths: &[String]) -> String {
+    const SHOWN: usize = 5;
+    if paths.is_empty() {
+        return String::new();
+    }
+    let names: Vec<&str> = paths.iter().take(SHOWN).map(|p| p.rsplit('/').next().unwrap_or(p)).collect();
+    let more = paths.len().saturating_sub(SHOWN);
+    let tail = if more > 0 { format!(" and {more} more") } else { String::new() };
+    format!(": {}{tail}", names.join(", "))
+}
+
 /// BundleImportDialog's result line.
 pub fn bundle_import_line(r: &BundleImportResult) -> String {
     let plural = |n: usize, one: &str, many: &str| if n == 1 { one.to_string() } else { many.to_string() };
@@ -738,6 +757,12 @@ pub fn bundle_import_line(r: &BundleImportResult) -> String {
     if r.restored > 0 {
         line += &format!(" {}.", restored_clause(r.restored, r.restored_trashed));
     }
+    if r.offloaded > 0 {
+        line += &format!(" {} already offloaded, not copied back.", r.offloaded);
+    }
+    if r.name_too_long > 0 {
+        line += &format!(" {} not unpacked (name too long for a sidecar).", r.name_too_long);
+    }
     if r.merge.photos_filled > 0 {
         line += &format!(
             " {} already in the catalog filled in ({} new {}).",
@@ -746,10 +771,23 @@ pub fn bundle_import_line(r: &BundleImportResult) -> String {
             plural(r.merge.versions_added, "version", "versions")
         );
     }
+    if r.merge.photos_merged_before > 0 {
+        line += &format!(
+            " {} merged from this bundle before (left as they are).",
+            r.merge.photos_merged_before
+        );
+    }
+    if r.merge.photos_matched_by_capture > 0 {
+        line += &format!(
+            " {} matched to the same capture here under another identity (filled in, identity kept).",
+            r.merge.photos_matched_by_capture
+        );
+    }
     if r.merge.photos_kept_apart > 0 {
         line += &format!(
-            " {} kept apart (the same file is here under another identity).",
-            r.merge.photos_kept_apart
+            " {} kept apart (the same file is here under another identity){}.",
+            r.merge.photos_kept_apart,
+            kept_apart_names(&r.merge.kept_apart_names)
         );
     }
     if r.merge.tags_created > 0 {
@@ -793,12 +831,20 @@ mod tests {
         );
         assert_eq!(card_import_line(&card(2, 0)), "Imported 2 new of 4 on card, 2 restored to their old rows");
         assert_eq!(card_import_line(&card(1, 1)), "Imported 3 new of 4 on card, 1 restored to its old row, in the trash");
+        // #231 F5 and LOW-5: offloaded photos and refused names have their own counts.
+        let other = ScanResult { scanned: 3, offloaded: 2, name_too_long: 1, ..Default::default() };
+        assert_eq!(
+            card_import_line(&other),
+            "Imported 0 new of 3 on card, 2 already offloaded, not copied back, 1 not imported (name too long for a sidecar)"
+        );
         let bundle = BundleImportResult {
             copied: 2,
             skipped_duplicate: 0,
             errors: 0,
             restored: 2,
             restored_trashed: 2,
+            offloaded: 0,
+            name_too_long: 0,
             merge: Default::default(),
         };
         assert_eq!(
@@ -825,6 +871,35 @@ mod tests {
         assert_eq!(drain_status(&busy), "Storage queue: 1 done, 2 waiting (photo in use)");
     }
 
+    /// #249: the bundle line names the photos kept apart (the first five, then how many more)
+    /// and counts those matched to the same capture under another identity.
+    #[test]
+    fn the_bundle_line_names_the_photos_kept_apart() {
+        let names: Vec<String> = (1..=7).map(|i| format!("2026/06/28/DSC{i}.ARW")).collect();
+        let r = BundleImportResult {
+            copied: 0,
+            skipped_duplicate: 9,
+            errors: 0,
+            restored: 0,
+            restored_trashed: 0,
+            offloaded: 0,
+            name_too_long: 0,
+            merge: chairphoto_core::catalog::MergeSummary {
+                photos_existing: 2,
+                photos_matched_by_capture: 2,
+                photos_kept_apart: 7,
+                kept_apart_names: names,
+                ..Default::default()
+            },
+        };
+        assert_eq!(
+            bundle_import_line(&r),
+            "Import complete. No new photos. 9 already present (skipped). 2 matched to the same capture here \
+             under another identity (filled in, identity kept). 7 kept apart (the same file is here under \
+             another identity): DSC1.ARW, DSC2.ARW, DSC3.ARW, DSC4.ARW, DSC5.ARW and 2 more."
+        );
+    }
+
     /// #185: the bundle line says what an import filled in on photos already in the catalog,
     /// and what it kept apart.
     #[test]
@@ -835,18 +910,22 @@ mod tests {
             errors: 0,
             restored: 0,
             restored_trashed: 0,
+            offloaded: 0,
+            name_too_long: 0,
             merge: chairphoto_core::catalog::MergeSummary {
                 photos_existing: 2,
                 photos_filled: 1,
                 versions_added: 2,
                 photos_kept_apart: 1,
+                photos_merged_before: 3,
                 ..Default::default()
             },
         };
         assert_eq!(
             bundle_import_line(&r),
             "Import complete. No new photos. 2 already present (skipped). 1 already in the catalog filled in \
-             (2 new versions). 1 kept apart (the same file is here under another identity)."
+             (2 new versions). 3 merged from this bundle before (left as they are). 1 kept apart (the same \
+             file is here under another identity)."
         );
     }
 }

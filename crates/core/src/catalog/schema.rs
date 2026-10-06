@@ -5,7 +5,7 @@
 //!  2. Photo `path` is stored RELATIVE to the catalog root (see the
 //!     `catalog_root` setting), so a catalog can be remapped on import.
 
-pub const SCHEMA_VERSION: i64 = 26;
+pub const SCHEMA_VERSION: i64 = 27;
 
 pub const SCHEMA_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS settings (
@@ -352,8 +352,10 @@ CREATE TABLE IF NOT EXISTS photo_location_companions (
 -- a commit, a history step, a new or duplicated version) — not a rename or a reorder, which
 -- bump `updated_at`. Each write sets it one past the photo's highest, so the most recently
 -- changed version has the largest; the automatic Library face is that version (#252,
--- `photo_cover`). A counter, not a time: two writes in one second still order. Added to
--- older catalogs by `ensure_column` and backfilled from `updated_at` there.
+-- `photo_cover`). A counter, not a time: two writes in one second still order. 0 = never
+-- written in this catalog: a version a bundle or catalog merge added to an existing photo,
+-- which the automatic face passes over until it is edited here (#252). Added to older
+-- catalogs by `ensure_column` and backfilled from `updated_at` there (from 1).
 CREATE TABLE IF NOT EXISTS photo_versions (
     id         INTEGER PRIMARY KEY,
     photo_id   INTEGER NOT NULL REFERENCES photos(id) ON DELETE CASCADE,
@@ -569,4 +571,24 @@ CREATE TABLE IF NOT EXISTS pending_sidecar_iptc (
     last_attempt_at INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_pending_sidecar_iptc_owed ON pending_sidecar_iptc(photo_id) WHERE owed != 0;
+
+-- Schema v27 (#248). Which bundle has already been merged into which photo. A bundle is its
+-- import batch (`import_batches.uuid`, as the manifest carries it) exported at a time
+-- (`BundleManifest::created_at`, Unix seconds): a later export of the same batch carries the
+-- work done since and is another bundle. A bundle fills only an existing photo's blanks, and
+-- cannot tell "never set" from "the user cleared it": without this, importing the same bundle
+-- again would bring back a rating, label, pick, IPTC value or tag the user removed, and a
+-- version the user deleted. `Catalog::merge_bundle_into` records every photo it merges a
+-- bundle's photo into — inserted, created by the importer for the bundle, or filled in — and
+-- applies nothing of that bundle to a photo already recorded (no fill, no version, no tag).
+-- Local to this catalog: never exported or merged. No backfill: which bundles earlier
+-- imports merged is not recorded anywhere. (An unreleased first shape keyed on the batch
+-- alone is dropped and recreated by `Catalog::migrate_locked`.)
+CREATE TABLE IF NOT EXISTS bundle_merges (
+    photo_id          INTEGER NOT NULL REFERENCES photos(id) ON DELETE CASCADE,
+    batch_uuid        TEXT NOT NULL,
+    bundle_created_at INTEGER NOT NULL,
+    merged_at         INTEGER NOT NULL,
+    PRIMARY KEY (photo_id, batch_uuid, bundle_created_at)
+) WITHOUT ROWID;
 "#;

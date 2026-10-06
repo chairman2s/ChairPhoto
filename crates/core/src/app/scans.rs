@@ -127,11 +127,17 @@ fn scan_nas_folder_in(
 }
 
 /// The photos on a card/source folder, each flagged as a duplicate when the library already
-/// holds it at its date-tree destination (the same name, size and capture, #246). Filesystem
-/// and metadata only.
+/// holds it at its date-tree destination (the same name, size and capture, #246), or as
+/// offloaded when its row's photo was offloaded (#231 F5) — as the copy will decide. Reads
+/// the catalog on its own connection, never under the shared lock past the first read.
 pub fn list_card_photos(state: &AppState, source: &Path) -> Result<Vec<crate::scanner::CardPhoto>, String> {
-    let dest = library_root(state)?;
-    crate::scanner::list_card_photos(source, &dest)
+    let (db_path, dest) = {
+        let guard = state.catalog.lock().map_err(|e| e.to_string())?;
+        let catalog = guard.as_ref().ok_or("No catalog is open")?;
+        (catalog.db_path().to_path_buf(), catalog.root().to_path_buf())
+    };
+    let catalog = crate::catalog::Catalog::open_secondary(&db_path, &dest).map_err(|e| e.to_string())?;
+    crate::scanner::list_card_photos(source, &dest, Some(&catalog))
 }
 
 /// What an import stopped by [`cancel_import`], a newer import or a catalog switch reports.
@@ -281,13 +287,6 @@ fn cancelled_while_indexing(indexed: usize, total: usize) -> String {
 /// Stop the running card or bundle import before its next file. A no-op when none runs.
 pub fn cancel_import(state: &AppState) -> Result<(), String> {
     state.jobs.import.trip()
-}
-
-/// The open catalog's library root, read under a brief lock.
-pub(crate) fn library_root(state: &AppState) -> Result<PathBuf, String> {
-    let guard = state.catalog.lock().map_err(|e| e.to_string())?;
-    let catalog = guard.as_ref().ok_or("No catalog is open")?;
-    Ok(catalog.root().to_path_buf())
 }
 
 #[cfg(test)]

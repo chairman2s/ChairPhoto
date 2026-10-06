@@ -168,7 +168,6 @@ fn sweep(dir: &Path) -> bool {
     #[cfg(test)]
     tests::before_listing(dir);
     let Ok(entries) = std::fs::read_dir(dir) else { return false };
-    let now = std::time::SystemTime::now();
     for entry in entries.flatten() {
         let name = entry.file_name();
         let Some(working) = name.to_str().and_then(|n| parse(n, &[ASIDE_TAG, PART_TAG])) else { continue };
@@ -179,11 +178,30 @@ fn sweep(dir: &Path) -> bool {
         }
         if working.tag == ASIDE_TAG {
             recover_aside(&entry.path(), &dir.join(working.original), meta.len());
-        } else if meta.modified().is_ok_and(|m| now.duration_since(m).is_ok_and(|age| age > STALE_PART_AGE)) {
-            let _ = std::fs::remove_file(entry.path());
+        } else {
+            remove_if_stale_part(&entry.path());
         }
     }
     true
+}
+
+/// Remove `path` when it is a copy's temporary file a crashed run left (#231 N-2): a name of
+/// the exact pattern `.<name>.chairphoto-part-<pid>-<n>`, a regular file (a symlink is never
+/// followed or touched), whose process is not running here, unwritten for over
+/// [`STALE_PART_AGE`]. Anything else is left. Returns whether it was removed. The library
+/// scan calls it for each hidden file its walk meets, so a crashed import's temporary files
+/// go on the next scan of their folder.
+pub(crate) fn remove_if_stale_part(path: &Path) -> bool {
+    let Some(working) = path.file_name().and_then(|n| n.to_str()).and_then(|n| parse(n, &[PART_TAG])) else {
+        return false;
+    };
+    let Ok(meta) = std::fs::symlink_metadata(path) else { return false };
+    if !meta.file_type().is_file() || running(working.pid) {
+        return false;
+    }
+    let now = std::time::SystemTime::now();
+    let stale = meta.modified().is_ok_and(|m| now.duration_since(m).is_ok_and(|age| age > STALE_PART_AGE));
+    stale && std::fs::remove_file(path).is_ok()
 }
 
 /// How long a copy's temporary file must have gone unwritten before a sweep removes it, on
@@ -192,7 +210,7 @@ fn sweep(dir: &Path) -> bool {
 /// moves) or about to place it (within seconds of the last write). An hour leaves room for
 /// clock skew between the machines; a temp file is only ever a copy of bytes that exist
 /// elsewhere, so a late removal costs disk space, never data.
-const STALE_PART_AGE: std::time::Duration = std::time::Duration::from_secs(60 * 60);
+pub(crate) const STALE_PART_AGE: std::time::Duration = std::time::Duration::from_secs(60 * 60);
 
 /// Let `dir` be swept again in this run — a test standing in for the next run after a crash.
 #[cfg(test)]

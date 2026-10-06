@@ -511,7 +511,7 @@ const PIN_VERSION: i64 = 1;
 const PIN_ORIGINAL: i64 = 2;
 
 /// `version_id`'s settings were just written (a save, a commit, a history step, a new,
-/// duplicated or merged-in version): it becomes its photo's most recently changed version
+/// duplicated version, or one a bundle brings with a new photo): it becomes its photo's most recently changed version
 /// and the face is brought up to date, its rev rising if this version is the face, as its
 /// look changed. Call inside the write's transaction.
 pub(crate) fn settings_written(conn: &Connection, version_id: i64) -> Result<()> {
@@ -527,14 +527,24 @@ pub(crate) fn settings_written(conn: &Connection, version_id: i64) -> Result<()>
 }
 
 /// The face a pin gives: the pinned version or the original, or — automatic — the version
-/// whose settings were written last, else the original.
+/// whose settings were written last in this catalog, else the original. A version whose
+/// settings were never written here (`changed_seq` 0: merged into an existing photo from a
+/// bundle, #252) is not a candidate until it is.
+///
+/// **Merged versions are 0 on purpose and must never be healed.** `catalog::merge`
+/// (`fill_existing`) stores every version a bundle or catalog merge adds to an EXISTING photo
+/// with `changed_seq` 0, so it does not move that photo's face (decision on #252,
+/// 2026-10-06). Any pass that repairs `changed_seq` (for example one promoting 0s left by an
+/// older build) must skip these versions; promoting them would move faces against that
+/// decision. Only an edit made here (`settings_written`) lifts one above 0.
 fn face_under(conn: &Connection, photo_id: i64, pin: CoverPin) -> Result<Option<i64>> {
     Ok(match pin {
         CoverPin::Version(v) => Some(v),
         CoverPin::Original => None,
         CoverPin::Auto => conn
             .query_row(
-                "SELECT id FROM photo_versions WHERE photo_id = ?1 ORDER BY changed_seq DESC, id DESC LIMIT 1",
+                "SELECT id FROM photo_versions WHERE photo_id = ?1 AND changed_seq > 0
+                 ORDER BY changed_seq DESC, id DESC LIMIT 1",
                 params![photo_id],
                 |r| r.get(0),
             )

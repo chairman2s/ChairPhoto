@@ -510,7 +510,16 @@ pub fn unique_path(path: &std::path::Path) -> PathBuf {
 /// exclusive create (`O_EXCL`), so a concurrent writer choosing names the same way never gets
 /// the same one, and the caller owns — and may remove — exactly the file it was handed.
 pub fn reserve_unique_path(path: &std::path::Path) -> Result<PathBuf, String> {
-    for candidate in unique_candidates(path) {
+    reserve_unique_path_where(path, |_| true)
+}
+
+/// [`reserve_unique_path`] over only the candidates `usable` allows — where a name free on
+/// disk can still be taken, as one a catalog row holds is (#247).
+pub fn reserve_unique_path_where(
+    path: &std::path::Path,
+    usable: impl Fn(&std::path::Path) -> bool,
+) -> Result<PathBuf, String> {
+    for candidate in unique_candidates(path).filter(|c| usable(c)) {
         match std::fs::OpenOptions::new().write(true).create_new(true).open(&candidate) {
             Ok(_) => return Ok(candidate),
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,

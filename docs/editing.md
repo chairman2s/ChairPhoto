@@ -116,8 +116,10 @@ in memory (docs/plans/raw-foundation, slice 4), so a step shows the RAW at once.
 **Cover (the Library face).** A photo's face in the Library grid, the Bench and the
 filmstrip is the look of its **most recently changed version** — the one whose settings were
 written last: a settled edit, a proof adopted, a history step (undo/redo included), a new or
-duplicated version, a version merged in from a bundle. Opening or renaming a version is not a
-change. With no versions it is the original (owner decision, #252). "☆ Use as cover" on the
+duplicated version, the versions a bundle brings with a photo new to the catalog (the last in
+bundle order). Versions a bundle or catalog merge adds to a photo already here do not move its
+face: they were not changed here, and the face passes over them until one is edited here
+(decision on #252, 2026-10-06). Opening or renaming a version is not a change. With no versions it is the original (owner decision, #252). "☆ Use as cover" on the
 Darkroom bar **pins** what is shown as the face — the version being edited, or, with
 "Original" chosen on the shelf, the untouched original — and it stays the face whatever is
 edited later; "★ Cover" unpins it, and the face follows the latest change again. The bar says

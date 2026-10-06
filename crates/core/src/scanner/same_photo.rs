@@ -323,6 +323,23 @@ fn is_same_photo(a: &Path, sa: &CaptureStamp, b: &Path, sb: &CaptureStamp) -> bo
 /// against a read that failed on one side only, and stops within the first bytes for two
 /// genuinely different captures, whose headers differ.
 pub fn find_in_library(bytes: &[u8], candidates: &[PathBuf], abort: &AtomicBool) -> Option<Option<PathBuf>> {
+    Some(find_in_library_proving(bytes, candidates, abort)?.map(|found| found.path))
+}
+
+/// A library file [`find_in_library_proving`] found to be the arriving photo.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Found {
+    pub path: PathBuf,
+    /// The stamps prove the same capture by the strict rule a re-link needs
+    /// ([`same_capture_without_contents`]: a sub-second or a serial on both sides, equal) —
+    /// enough to treat a library row of another identity holding this file as the same photo
+    /// (#249). `false` when only #246's rule or identical contents matched.
+    pub proven: bool,
+}
+
+/// [`find_in_library`], saying whether the match is proven by the strict rule ([`Found`]).
+/// A candidate that proves it is preferred over one that only matches.
+pub fn find_in_library_proving(bytes: &[u8], candidates: &[PathBuf], abort: &AtomicBool) -> Option<Option<Found>> {
     // No collision is no decision: there is nothing for a stop to interrupt (the caller reads
     // `abort` between originals).
     if candidates.is_empty() {
@@ -333,16 +350,19 @@ pub fn find_in_library(bytes: &[u8], candidates: &[PathBuf], abort: &AtomicBool)
     }
     let (arriving, stamps) = read_stamps_with_bytes(bytes, candidates);
     let none = CaptureStamp::default();
-    let verdict = |c: &PathBuf| same_capture(&arriving, stamps.get(c).unwrap_or(&none));
-    if let Some(c) = candidates.iter().find(|c| verdict(c) == Some(true)) {
-        return Some(Some(c.clone()));
+    let stamp = |c: &PathBuf| stamps.get(c).unwrap_or(&none);
+    if let Some(c) = candidates.iter().find(|c| same_capture_without_contents(&arriving, stamp(c))) {
+        return Some(Some(Found { path: c.clone(), proven: true }));
+    }
+    if let Some(c) = candidates.iter().find(|c| same_capture(&arriving, stamp(c)) == Some(true)) {
+        return Some(Some(Found { path: c.clone(), proven: false }));
     }
     for c in candidates {
         if abort.load(Ordering::Relaxed) {
             return None;
         }
         if holds_bytes(c, bytes) {
-            return Some(Some(c.clone()));
+            return Some(Some(Found { path: c.clone(), proven: false }));
         }
     }
     Some(None)
@@ -444,6 +464,14 @@ impl FolderListings {
         out
     }
 
+    /// Forget `dir`'s listing, so the next question lists it afresh — what the bundle importer
+    /// does right before it copies an original (N-3 of the third #246 review): a ` (n)` another
+    /// program or import wrote there since the listing is then a candidate too, and a copy of
+    /// the same photo it already holds is skipped rather than made again.
+    pub fn relist(&mut self, dir: &Path) {
+        self.dirs.remove(dir);
+    }
+
     /// Record a file this run placed at `path`, so a later file of the run sees it.
     pub fn placed(&mut self, path: &Path) {
         let (Some(dir), Some(name)) = (path.parent(), path.file_name().and_then(|s| s.to_str())) else {
@@ -515,6 +543,15 @@ pub(crate) fn absent(path: &Path) -> bool {
     std::fs::symlink_metadata(path).is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound)
 }
 
+/// Whether a photo named like `path` can have its sidecar, `<name>.xmp`, beside it: the
+/// sidecar's name fits in [`NAME_MAX`] bytes. A photo whose sidecar can never be written
+/// could never carry its identity (`xmp:Identifier`), so card ingest and bundle import
+/// refuse such a file with that reason rather than import it with a debt no repair can pay
+/// (review of #231 N-4, LOW-5).
+pub fn sidecar_name_fits(path: &Path) -> bool {
+    path.file_name().is_some_and(|n| n.len() + ".xmp".len() <= NAME_MAX)
+}
+
 /// Create a new file at `wanted`, or at the next free ` (n)` name beside it, and fill it with
 /// `fill`; returns where it landed. Which name it takes is `names`'s answer for `arriving`
 /// ([`CatalogNames::destination`](super::free_name::CatalogNames::destination)): one with
@@ -581,18 +618,52 @@ pub(crate) const PART_TAG: &str = "chairphoto-part";
 
 /// A new hidden temporary file beside `wanted`, created exclusively under a name unique to
 /// this process and call.
+///
+/// The temporary name adds about 30 bytes to the file's own, so a name within that of the
+/// filesystem's 255-byte limit would fail with "file name too long" (N-4 of the third #246
+/// review). Such a name is shortened in the temporary name only — a prefix and a hash of the
+/// whole name — since nothing reads the original name back from a copy's temporary file (a
+/// sweep only removes it). The file still takes `wanted`'s full name when placed.
 pub(crate) fn create_part(wanted: &Path) -> std::io::Result<(PathBuf, std::fs::File)> {
-    create_hidden(wanted, PART_TAG)
+    let name = wanted.file_name().and_then(|s| s.to_str()).unwrap_or("file");
+    create_hidden_named(wanted, &part_name(name), PART_TAG)
+}
+
+/// The longest file name most filesystems take, in bytes (`NAME_MAX`).
+const NAME_MAX: usize = 255;
+
+/// `name` as a copy's temporary name carries it: unchanged when `.<name>.<PART_TAG>-<pid>-<n>`
+/// fits in [`NAME_MAX`] whatever the pid and counter, else its first bytes (on a character
+/// boundary), `~`, and 16 hex digits of its SHA-256.
+fn part_name(name: &str) -> String {
+    // `.` + name + `.` + tag + `-` + up to 10 pid digits + `-` + up to 20 counter digits.
+    let room = NAME_MAX - (1 + 1 + PART_TAG.len() + 1 + 10 + 1 + 20);
+    if name.len() <= room {
+        return name.to_string();
+    }
+    use sha2::Digest;
+    let hash = sha2::Sha256::digest(name.as_bytes());
+    let hex: String = hash.iter().take(8).map(|b| format!("{b:02x}")).collect();
+    let mut cut = room - 1 - hex.len();
+    while !name.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    format!("{}~{hex}", &name[..cut])
 }
 
 /// A new hidden file beside `wanted`, `.<name>.<tag>-<pid>-<n>`, created exclusively under a
 /// name unique to this process and call — a copy's temporary file ([`PART_TAG`]) or the name
 /// an offload moves a local file to while it checks it (`catalog::working_files`).
 pub(crate) fn create_hidden(wanted: &Path, tag: &str) -> std::io::Result<(PathBuf, std::fs::File)> {
+    let name = wanted.file_name().and_then(|s| s.to_str()).unwrap_or("file");
+    create_hidden_named(wanted, name, tag)
+}
+
+/// [`create_hidden`], with the name the hidden file carries given.
+fn create_hidden_named(wanted: &Path, name: &str, tag: &str) -> std::io::Result<(PathBuf, std::fs::File)> {
     use std::sync::atomic::AtomicU64;
     static NEXT: AtomicU64 = AtomicU64::new(0);
     let dir = wanted.parent().unwrap_or_else(|| Path::new("."));
-    let name = wanted.file_name().and_then(|s| s.to_str()).unwrap_or("file");
     loop {
         let n = NEXT.fetch_add(1, Ordering::Relaxed);
         let part = dir.join(format!(".{name}.{tag}-{}-{n}", std::process::id()));
@@ -1035,6 +1106,31 @@ mod tests {
         assert_eq!(placed, dir.join("DSC1 (2).ARW"));
         assert_eq!(std::fs::read(&placed).unwrap(), b"half and half");
         assert_eq!(names(&dir), ["DSC1 (2).ARW", "DSC1.ARW"]);
+    }
+
+    /// N-4 of the third #246 review: a name within the temporary name's ~30 bytes of the
+    /// 255-byte limit is still copied — its temporary file carries a shortened name — and
+    /// lands under its own full name. A 255-byte name with a multi-byte character at the cut
+    /// works too.
+    #[test]
+    fn a_name_near_the_length_limit_is_still_placed() {
+        let dir = temp("long-name");
+        for name in [format!("{}.ARW", "D".repeat(246)), format!("{}é{}.ARW", "D".repeat(188), "x".repeat(57))] {
+            assert!(name.len() > 240 && sidecar_name_fits(&dir.join(&name)), "{}", name.len());
+            let wanted = dir.join(&name);
+            let placed = create_new_with(&wanted, unique_dest, |f| {
+                use std::io::Write;
+                let during = names(&dir);
+                let part = during.iter().find(|n| n.contains(PART_TAG)).expect("a temporary file");
+                assert!(part.len() <= 255, "{}", part.len());
+                f.write_all(b"long")
+            })
+            .unwrap();
+            assert_eq!(placed, wanted);
+            assert_eq!(std::fs::read(&placed).unwrap(), b"long");
+        }
+        assert_eq!(names(&dir).len(), 2, "no temporary file left");
+        assert_eq!(part_name("DSC1.ARW"), "DSC1.ARW", "a short name is carried as it is");
     }
 
     /// Each way of placing the temporary file refuses a taken name and keeps both files.

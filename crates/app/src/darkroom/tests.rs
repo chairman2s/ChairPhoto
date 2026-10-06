@@ -1323,6 +1323,36 @@ fn a_banked_what_if_does_not_move_the_face(cx: &mut TestAppContext) {
     assert!(token(&rig).is_some_and(|t| t.starts_with(&format!("{v3}:"))), "+ New version moves the face");
 }
 
+/// Review of #252, N3: the pinned version deleted elsewhere (the Inspector's ✕, which then
+/// re-reads the rows) while Develop shows the photo lifts the pin, and the bar's ★ follows
+/// once the rows land — not only when the photo is opened again.
+#[gpui_kit::test]
+fn the_pin_follows_a_pinned_version_deleted_elsewhere(cx: &mut TestAppContext) {
+    let rig = rig("dk-pin-deleted", 1, cx);
+    let photo = rig.ids[0];
+    let pin = |rig: &Rig, cx: &mut TestAppContext| rig.darkroom(cx).read_with(cx, |d, _| d.open.as_ref().unwrap().pin);
+    rig.slide(Control::Tone(ToneKey::Ev), 0.5, cx);
+    rig.settle_and_save(cx);
+    let v1 = rig.versions()[0].id;
+    rig.darkroom(cx).update(cx, |d, cx| d.new_version(cx));
+    work(cx);
+    let v2 = rig.version_id(cx).unwrap();
+    rig.darkroom(cx).update(cx, |d, cx| d.switch_version(Some(v1), cx));
+    work(cx);
+    rig.darkroom(cx).update(cx, |d, cx| d.toggle_cover(cx));
+    work(cx);
+    assert_eq!(pin(&rig, cx), CoverPin::Version(v1));
+    rig.darkroom(cx).update(cx, |d, cx| d.switch_version(Some(v2), cx));
+    work(cx);
+    assert!(!rig.present("dk-face-auto", cx));
+    // Deleted from the Inspector: the catalog lifts the pin, and the rows are read again.
+    rig.catalog(|c| c.delete_version(v1).unwrap());
+    refresh_rows(&rig, cx);
+    assert_eq!(rig.catalog(|c| c.cover_pin(photo).unwrap()), CoverPin::Auto);
+    assert_eq!(pin(&rig, cx), CoverPin::Auto, "the pin follows the row");
+    assert!(rig.present("dk-face-auto", cx), "the bar says the face follows the latest edit again");
+}
+
 /// **Catalog identity.** Pinning the Original after the core switched to a catalog with
 /// colliding ids writes nothing there: refused with the event withheld; with it delivered,
 /// Develop has closed and there is nothing to pin.

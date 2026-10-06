@@ -1024,6 +1024,12 @@ impl ShellState {
         self.lists_from
     }
 
+    /// Whether a whole-library row read is in flight: the rows shown may predate a write
+    /// already made.
+    pub fn rows_in_flight(&self) -> bool {
+        self.rows_pending.is_some()
+    }
+
     /// Tests: the generation of the row read in flight, if any.
     #[cfg(all(test, feature = "edit"))]
     pub(crate) fn rows_pending(&self) -> Option<u64> {

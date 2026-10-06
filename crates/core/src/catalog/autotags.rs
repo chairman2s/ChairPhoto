@@ -456,12 +456,12 @@ impl Catalog {
 
     /// Record a tiled sharpness score for a photo (H16b). The score is the ~90th-percentile
     /// Laplacian-variance tile from the ~1024–2048px preview; `method` records how it was
-    /// computed (`'tile'` / `'face'` / `'afpoint'`). Called by the background indexer and by
-    /// the I7b analyzer hook on new imports.
+    /// computed (`'tile'` / `'face'` / `'afpoint'`). Stamped with
+    /// `sharpness_indexer::SHARPNESS_BASIS`, as every new score is (#245).
     pub fn set_sharpness(&self, photo_id: i64, score: f64, method: &str) -> Result<()> {
         self.conn.execute(
-            "UPDATE photos SET sharpness = ?1, sharpness_method = ?2 WHERE id = ?3",
-            params![score, method, photo_id],
+            "UPDATE photos SET sharpness = ?1, sharpness_method = ?2, sharpness_basis = ?3 WHERE id = ?4",
+            params![score, method, crate::sharpness_indexer::SHARPNESS_BASIS, photo_id],
         )?;
         Ok(())
     }

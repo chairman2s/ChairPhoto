@@ -425,6 +425,14 @@ impl Catalog {
         // (H16d) and burst-relative ranking (H16e) depend on them in core queries.
         self.ensure_column("photos", "sharpness", "REAL")?;
         self.ensure_column("photos", "sharpness_method", "TEXT")?;
+        // What the score was measured on (#245): `sharpness_indexer::SHARPNESS_BASIS` on every
+        // score written since, NULL beside a legacy score — one that may have been measured
+        // on a preview enlarged to 2048 px, settled the next time the photo's preview-tier
+        // decode is in hand. Added without a backfill: which path wrote an existing score is
+        // not recorded. No SCHEMA_VERSION bump: an older build ignores the column and writes
+        // only unscored rows (its `sharpness IS NULL` guards), leaving them NULL here, which
+        // is read as legacy and settled the same way.
+        self.ensure_column("photos", "sharpness_basis", "INTEGER")?;
         // 64-bit perceptual hash (dHash) of the photo, computed once from the cached
         // preview/thumbnail decode (H15a). NULL = not yet hashed. Core infra reused for
         // burst grouping (H15), near-duplicate detection, and auto-stacks — not a plugin

@@ -2,7 +2,8 @@
 //!
 //! [`run_index`] is the single entry point. It:
 //!
-//! 1. Queries all photos where `sharpness IS NULL` (unscored).
+//! 1. Queries all photos where `sharpness IS NULL` (unscored) or whose score carries no
+//!    [`SHARPNESS_BASIS`] stamp (a score from before #245, see below).
 //! 2. Resolves each photo to its cached ~2048px preview path via the catalog resolver.
 //! 3. Loads the preview bytes with the thumbnail pipeline (`preview_bytes`), which ensures
 //!    the preview is at 1024–2048px — the minimum resolution needed to see micro-blur.
@@ -38,9 +39,24 @@
 //!
 //! Newly imported photos are scored for free via the I7b analyzer hook in
 //! `thumbnails::register_analyzer`. The hook receives the freshly decoded image from the
-//! thumbnail/preview/warm-all pipeline and calls [`score_and_store`], so scoring rides the
-//! existing decode instead of re-reading the file. The background `index_sharpness` job
-//! handles the backfill for photos imported before this code was deployed.
+//! thumbnail/preview/warm-all pipeline and calls [`settle_from_decode`], so scoring rides the
+//! existing decode instead of re-reading the file. [`run_index`] is the batch backfill; since
+//! the Tauri shell's `index_sharpness` command went (#165) nothing in the GPUI app starts it,
+//! so the hook is the only writer that runs today.
+//!
+//! ## Scores from before #245
+//!
+//! Before #245 the preview tier enlarged a decode smaller than 2048 px to 2048 px, and the
+//! batch indexer scored that enlarged preview: interpolated pixels, a lower Laplacian
+//! variance than the photo's own. Every score written since carries
+//! `photos.sharpness_basis = `[`SHARPNESS_BASIS`]. A score without it (`NULL`) is *legacy*:
+//! written before the stamp existed, or by an older build, by a path that is not recorded.
+//! Whether it is stale depends on the size of the decode it came from, which the catalog does
+//! not hold (for a RAW it is the embedded preview's size, not the sensor's), so it is decided
+//! the next time that decode is in hand ([`legacy_score_is_stale`]): a decode under 2048 px
+//! was enlarged then, and the photo is scored again; one of 2048 px or more was only ever
+//! shrunk, and its score is kept and stamped. Either way the old score stays in place until
+//! that moment, so no culling signal goes blank while it waits.
 
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -52,6 +68,20 @@ use serde::Serialize;
 /// methods (`face` / `afpoint`, H16c) come from [`crate::sharpness_regions::Method`].
 pub const METHOD_TILE: &str = "tile";
 
+/// `photos.sharpness_basis` of every score written since #245: measured on a decode at its
+/// own size, never on one enlarged to the preview tier. `NULL` beside a score marks a legacy
+/// score (see the module doc). Raise it, and teach [`legacy_score_is_stale`] the old values,
+/// if what a score is measured on changes again.
+pub const SHARPNESS_BASIS: i64 = 1;
+
+/// Whether a legacy score (no [`SHARPNESS_BASIS`]) must be measured again, given the pixel
+/// size of the photo's preview-tier decode now. Under 2048 px on the long edge, the pre-#245
+/// preview enlarged it, so the score was measured on interpolated pixels; at 2048 px or more
+/// that preview was a plain downscale, as it is today, and the score stands.
+pub fn legacy_score_is_stale(width: u32, height: u32) -> bool {
+    width.max(height) < crate::thumbnails::PREVIEW_MAX
+}
+
 /// Progress event payload for `sharpness:progress`.
 #[derive(Debug, Clone, Serialize)]
 pub struct SharpnessProgress {
@@ -62,9 +92,11 @@ pub struct SharpnessProgress {
 /// How an index run ended.
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct IndexOutcome {
-    /// Photos actually scored in this run.
+    /// Photos actually scored in this run (legacy scores measured again included).
     pub done: usize,
-    /// Photos that were unscored when the run started (total queue length).
+    /// Legacy scores kept as they were and stamped, because their preview was never enlarged.
+    pub kept: usize,
+    /// Photos that were unscored, or held a legacy score, when the run started (the queue).
     pub total: usize,
     /// Photos whose preview could not be generated (unreadable/undecodable file).
     pub failed: usize,
@@ -115,8 +147,8 @@ where
 {
     use rayon::prelude::*;
 
-    // Collect all unscored photo ids. This is the implicit queue.
-    let queue = load_unscored(conn)?;
+    // Collect all unscored and legacy photo ids. This is the implicit queue.
+    let queue = load_queue(conn)?;
     let total = queue.len();
     let mut outcome = IndexOutcome { total, ..IndexOutcome::default() };
     let mut done = 0usize;
@@ -135,13 +167,13 @@ where
         // region inputs (face boxes / AF point) are read from the catalog *here*, in the
         // sequential pass, because the rusqlite `Connection` is not `Sync` and cannot be
         // touched from the parallel scoring workers below.
-        let mut to_score: Vec<(i64, std::path::PathBuf, RegionInputs)> =
+        let mut to_score: Vec<(i64, bool, std::path::PathBuf, RegionInputs)> =
             Vec::with_capacity(chunk.len());
-        for &photo_id in chunk {
+        for &(photo_id, legacy) in chunk {
             match resolve_path_fn(photo_id) {
                 Ok(Some(p)) => {
                     let regions = regions_fn(photo_id);
-                    to_score.push((photo_id, p, regions));
+                    to_score.push((photo_id, legacy, p, regions));
                 }
                 Ok(None) => {
                     // Photo is offline; leave unscored for next run.
@@ -165,18 +197,39 @@ where
         // No conn access here — pure I/O + pixel math over the pre-gathered regions.
         enum ScoreResult {
             Scored(f64, &'static str),
+            /// A legacy score whose preview was never enlarged: keep it, stamp it.
+            Kept,
             PreviewError(String),
         }
 
         let results: Vec<(i64, std::path::PathBuf, ScoreResult)> = to_score
             .par_iter()
-            .map(|(photo_id, path, regions)| {
+            .map(|(photo_id, legacy, path, regions)| {
                 let jpeg = match preview_fn(path) {
                     Ok(b) => b,
                     Err(e) => {
                         return (*photo_id, path.clone(), ScoreResult::PreviewError(e));
                     }
                 };
+                // A legacy score is measured again only when its preview was enlarged. The
+                // preview tier is the decode at its own size up to 2048 px, so its header
+                // says. A size that cannot be read decides nothing: the row stays as it is.
+                if *legacy {
+                    let dims = image::ImageReader::new(std::io::Cursor::new(&jpeg))
+                        .with_guessed_format()
+                        .ok()
+                        .and_then(|r| r.into_dimensions().ok());
+                    match dims {
+                        None => {
+                            let e = "preview size unreadable".to_string();
+                            return (*photo_id, path.clone(), ScoreResult::PreviewError(e));
+                        }
+                        Some((w, h)) if !legacy_score_is_stale(w, h) => {
+                            return (*photo_id, path.clone(), ScoreResult::Kept);
+                        }
+                        Some(_) => {}
+                    }
+                }
                 let result = match score_fn(&jpeg, regions) {
                     Some((s, method)) => ScoreResult::Scored(s, method),
                     None => ScoreResult::PreviewError("image decode failed".to_string()),
@@ -191,12 +244,18 @@ where
                 ScoreResult::PreviewError(e) => {
                     eprintln!("sharpness_index: preview/decode failed for photo {photo_id}: {e}");
                     outcome.failed += 1;
-                    // Leave sharpness IS NULL so the next run retries.
+                    // Leave the row as it was (unscored, or its legacy score) so the next
+                    // run retries.
                 }
                 ScoreResult::Scored(score, method) => {
                     write_sharpness(conn, photo_id, score, method)?;
                     done += 1;
-                    emit_progress(SharpnessProgress { done, total });
+                    emit_progress(SharpnessProgress { done: done + outcome.kept, total });
+                }
+                ScoreResult::Kept => {
+                    keep_legacy_sharpness(conn, photo_id)?;
+                    outcome.kept += 1;
+                    emit_progress(SharpnessProgress { done: done + outcome.kept, total });
                 }
             }
 
@@ -318,21 +377,26 @@ pub fn photo_af_point(conn: &Connection, photo_id: i64) -> Option<(f32, f32)> {
     crate::sharpness_regions::parse_focus_location(&loc, orientation)
 }
 
-/// Load all photo IDs where `sharpness IS NULL`, ordered by `id` for stable resumption.
-fn load_unscored(conn: &Connection) -> Result<Vec<i64>, String> {
+/// The queue: every photo that is unscored or holds a legacy score (no
+/// [`SHARPNESS_BASIS`]), as `(id, legacy)`, ordered by `id` for stable resumption.
+fn load_queue(conn: &Connection) -> Result<Vec<(i64, bool)>, String> {
     let mut stmt = conn
-        .prepare("SELECT id FROM photos WHERE sharpness IS NULL ORDER BY id ASC")
+        .prepare(
+            "SELECT id, sharpness IS NOT NULL FROM photos
+              WHERE sharpness IS NULL OR sharpness_basis IS NULL ORDER BY id ASC",
+        )
         .map_err(|e| e.to_string())?;
     let rows = stmt
-        .query_map([], |r| r.get::<_, i64>(0))
+        .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, bool>(1)?)))
         .map_err(|e| e.to_string())?
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| e.to_string())?;
     Ok(rows)
 }
 
-/// Write a sharpness score + method to the catalog for one photo. Caller holds the
-/// secondary catalog connection; there is no mutex around this call.
+/// Write a sharpness score + method to the catalog for one photo, stamped with
+/// [`SHARPNESS_BASIS`]. Caller holds the secondary catalog connection; there is no mutex
+/// around this call.
 pub fn write_sharpness(
     conn: &Connection,
     photo_id: i64,
@@ -340,11 +404,74 @@ pub fn write_sharpness(
     method: &str,
 ) -> Result<(), String> {
     conn.execute(
-        "UPDATE photos SET sharpness = ?1, sharpness_method = ?2 WHERE id = ?3",
-        rusqlite::params![score, method, photo_id],
+        "UPDATE photos SET sharpness = ?1, sharpness_method = ?2, sharpness_basis = ?3 WHERE id = ?4",
+        rusqlite::params![score, method, SHARPNESS_BASIS, photo_id],
     )
     .map_err(|e| e.to_string())?;
     Ok(())
+}
+
+/// Stamp a legacy score as current without changing it: its preview was never enlarged
+/// ([`legacy_score_is_stale`] said no). Touches only a legacy score.
+pub fn keep_legacy_sharpness(conn: &Connection, photo_id: i64) -> Result<(), String> {
+    conn.execute(
+        "UPDATE photos SET sharpness_basis = ?1
+          WHERE id = ?2 AND sharpness IS NOT NULL AND sharpness_basis IS NULL",
+        rusqlite::params![SHARPNESS_BASIS, photo_id],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// A photo's region inputs (H16c) from the catalog: its face boxes (with the `faces`
+/// feature) and its AF point.
+pub fn photo_regions(conn: &Connection, photo_id: i64) -> RegionInputs {
+    let af_point = photo_af_point(conn, photo_id);
+    #[cfg(feature = "faces")]
+    let face_boxes =
+        crate::plugins::faces::store::face_boxes_for_photo(conn, photo_id).unwrap_or_default();
+    #[cfg(not(feature = "faces"))]
+    let face_boxes = Vec::new();
+    RegionInputs { face_boxes, af_point }
+}
+
+/// What [`settle_from_decode`] did with one decode.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Settled {
+    /// Scored (an unscored photo, or a stale legacy score measured again), and stamped.
+    Scored,
+    /// A legacy score whose decode is 2048 px or more: kept as it was, and stamped.
+    Kept,
+}
+
+/// The decode hook's work for one preview-tier (or larger) decode of the file at `rel`
+/// (catalog-root-relative, as `photos.path`): score the photo when it is unscored, and
+/// settle a legacy score — measure it again when [`legacy_score_is_stale`] says the pre-#245
+/// preview enlarged this decode, else keep and stamp it. A stamped score is never touched,
+/// and neither is a path with no catalog row. `None` when there was nothing to do.
+pub fn settle_from_decode(
+    conn: &Connection,
+    rel: &str,
+    img: &image::DynamicImage,
+) -> Result<Option<Settled>, String> {
+    use rusqlite::OptionalExtension as _;
+    let row: Option<(i64, bool)> = conn
+        .query_row(
+            "SELECT id, sharpness IS NOT NULL FROM photos
+              WHERE path = ?1 AND (sharpness IS NULL OR sharpness_basis IS NULL)",
+            rusqlite::params![rel],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()
+        .map_err(|e| e.to_string())?;
+    let Some((id, legacy)) = row else { return Ok(None) };
+    if legacy && !legacy_score_is_stale(img.width(), img.height()) {
+        keep_legacy_sharpness(conn, id)?;
+        return Ok(Some(Settled::Kept));
+    }
+    let (score, method) = score_image_regions(img, &photo_regions(conn, id));
+    write_sharpness(conn, id, score, method)?;
+    Ok(Some(Settled::Scored))
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -366,7 +493,8 @@ mod tests {
                  uuid             TEXT NOT NULL DEFAULT '',
                  path             TEXT NOT NULL DEFAULT '',
                  sharpness        REAL,
-                 sharpness_method TEXT
+                 sharpness_method TEXT,
+                 sharpness_basis  INTEGER
              );",
         )
         .unwrap();
@@ -453,9 +581,9 @@ mod tests {
         for id in 1i64..=3 {
             insert_photo(&conn, id);
         }
-        // Pre-score photo 2 (simulating a prior completed run).
+        // Pre-score photo 2 (simulating a prior completed run, so stamped as current).
         conn.execute(
-            "UPDATE photos SET sharpness = 10.0, sharpness_method = 'tile' WHERE id = 2",
+            "UPDATE photos SET sharpness = 10.0, sharpness_method = 'tile', sharpness_basis = 1 WHERE id = 2",
             [],
         )
         .unwrap();
@@ -761,7 +889,7 @@ mod tests {
     }
 
     #[test]
-    fn load_unscored_excludes_already_scored() {
+    fn load_queue_excludes_already_scored() {
         let conn = mem_conn();
         for id in 1i64..=5 {
             insert_photo(&conn, id);
@@ -769,7 +897,196 @@ mod tests {
         write_sharpness(&conn, 2, 1.0, METHOD_TILE).unwrap();
         write_sharpness(&conn, 4, 2.0, METHOD_TILE).unwrap();
 
-        let unscored = load_unscored(&conn).unwrap();
-        assert_eq!(unscored, vec![1, 3, 5]);
+        let queue = load_queue(&conn).unwrap();
+        assert_eq!(queue, vec![(1, false), (3, false), (5, false)]);
+    }
+
+    // ── #245: scores measured on a preview enlarged to 2048 px ──────────────────
+
+    /// A score as the pre-#245 indexer left it: no basis stamp.
+    fn legacy_score(conn: &Connection, id: i64, score: f64) {
+        conn.execute(
+            "UPDATE photos SET sharpness = ?1, sharpness_method = 'tile', sharpness_basis = NULL WHERE id = ?2",
+            rusqlite::params![score, id],
+        )
+        .unwrap();
+    }
+
+    fn basis(conn: &Connection, id: i64) -> Option<i64> {
+        conn.query_row("SELECT sharpness_basis FROM photos WHERE id = ?1", [id], |r| r.get(0)).unwrap()
+    }
+
+    #[test]
+    fn a_decode_under_the_preview_tier_makes_a_legacy_score_stale() {
+        assert!(legacy_score_is_stale(1200, 800));
+        assert!(legacy_score_is_stale(800, 2047), "portrait: the long edge decides");
+        assert!(!legacy_score_is_stale(2048, 1365), "exactly the tier: never enlarged");
+        assert!(!legacy_score_is_stale(1365, 2048));
+        assert!(!legacy_score_is_stale(6000, 4000));
+    }
+
+    #[test]
+    fn load_queue_holds_legacy_scores_beside_unscored_ones() {
+        let conn = mem_conn();
+        for id in 1i64..=3 {
+            insert_photo(&conn, id);
+        }
+        legacy_score(&conn, 1, 5.0);
+        write_sharpness(&conn, 2, 6.0, METHOD_TILE).unwrap();
+        assert_eq!(load_queue(&conn).unwrap(), vec![(1, true), (3, false)]);
+    }
+
+    /// The backfill measures again only the legacy score whose preview is under 2048 px;
+    /// a legacy score from a 2048 px preview is kept and stamped without being scored, a
+    /// stamped score is not even loaded, and every write carries the stamp.
+    #[test]
+    fn run_index_rescores_only_legacy_scores_from_an_enlarged_preview() {
+        use std::sync::atomic::{AtomicUsize, Ordering as AOrdering};
+        use std::sync::Mutex;
+        let conn = mem_conn();
+        for id in 1i64..=4 {
+            insert_photo(&conn, id);
+        }
+        legacy_score(&conn, 1, 10.0); // small original: its old preview was enlarged
+        legacy_score(&conn, 2, 20.0); // large original: its old preview was a downscale
+        write_sharpness(&conn, 3, 30.0, METHOD_TILE).unwrap(); // current
+        // 4: unscored, small.
+        let small = jpeg_of(&GrayImage::new(1200, 800));
+        let large = jpeg_of(&GrayImage::new(2048, 1365));
+        let loaded = Mutex::new(Vec::new());
+        let scored = AtomicUsize::new(0);
+        let abort = AtomicBool::new(false);
+        let mut events = Vec::new();
+
+        let outcome = run_index(
+            &conn,
+            |id| Ok(Some(std::path::PathBuf::from(format!("/fake/{id}.jpg")))),
+            no_regions,
+            &|path: &Path| {
+                loaded.lock().unwrap().push(path.to_path_buf());
+                Ok(if path.ends_with("2.jpg") { large.clone() } else { small.clone() })
+            },
+            &|_jpeg: &[u8], _r: &RegionInputs| {
+                scored.fetch_add(1, AOrdering::Relaxed);
+                Some((42.0, METHOD_TILE))
+            },
+            &abort,
+            |p| events.push(p),
+        )
+        .unwrap();
+
+        assert_eq!((outcome.total, outcome.done, outcome.kept), (3, 2, 1));
+        assert_eq!(scored.load(AOrdering::Relaxed), 2, "only 1 and 4 are measured");
+        assert!(!loaded.lock().unwrap().iter().any(|p| p.ends_with("3.jpg")), "a stamped score is not queued");
+        assert_eq!(get_sharpness(&conn, 1).unwrap().0, 42.0, "the enlarged-preview score is replaced");
+        assert_eq!(get_sharpness(&conn, 2).unwrap().0, 20.0, "the downscaled-preview score is kept");
+        assert_eq!(get_sharpness(&conn, 3).unwrap().0, 30.0);
+        assert_eq!(get_sharpness(&conn, 4).unwrap().0, 42.0);
+        for id in 1..=4 {
+            assert_eq!(basis(&conn, id), Some(SHARPNESS_BASIS), "photo {id} is stamped");
+        }
+        assert_eq!(events.last().map(|p| (p.done, p.total)), Some((3, 3)), "kept counts as progress");
+        assert!(load_queue(&conn).unwrap().is_empty(), "nothing is left to settle");
+    }
+
+    /// A legacy score whose new preview cannot be made, or whose size cannot be read, stays
+    /// as it was — visible, and still queued — rather than being cleared or decided blind.
+    #[test]
+    fn a_failed_rescore_leaves_the_legacy_score_in_place() {
+        let conn = mem_conn();
+        insert_photo(&conn, 1);
+        insert_photo(&conn, 2);
+        legacy_score(&conn, 1, 10.0);
+        legacy_score(&conn, 2, 20.0);
+        let abort = AtomicBool::new(false);
+        let outcome = run_index(
+            &conn,
+            |id| Ok(Some(std::path::PathBuf::from(format!("/fake/{id}.jpg")))),
+            no_regions,
+            // 1: no preview; 2: a preview whose header gives no size.
+            &|path: &Path| {
+                if path.ends_with("1.jpg") { Err("unreadable".to_string()) } else { Ok(vec![0xFFu8, 0xD8, 0xFF, 0xE0]) }
+            },
+            &dummy_score,
+            &abort,
+            |_| {},
+        )
+        .unwrap();
+        assert_eq!((outcome.done, outcome.kept, outcome.failed), (0, 0, 2));
+        assert_eq!(get_sharpness(&conn, 1).unwrap().0, 10.0);
+        assert_eq!(get_sharpness(&conn, 2).unwrap().0, 20.0);
+        assert_eq!((basis(&conn, 1), basis(&conn, 2)), (None, None));
+        assert_eq!(load_queue(&conn).unwrap(), vec![(1, true), (2, true)]);
+    }
+
+    fn insert_at(conn: &Connection, id: i64, path: &str) {
+        conn.execute("INSERT INTO photos (id, path) VALUES (?1, ?2)", rusqlite::params![id, path]).unwrap();
+    }
+
+    /// The decode hook — the writer the GPUI app runs — settles a legacy score with the
+    /// decode in hand: measured again under 2048 px, kept at 2048 px or more. It scores an
+    /// unscored photo, and leaves a stamped score and an unknown path alone.
+    #[test]
+    fn the_decode_hook_settles_legacy_scores_by_the_decode_size() {
+        let conn = mem_conn();
+        insert_at(&conn, 1, "small.jpg");
+        insert_at(&conn, 2, "large.jpg");
+        insert_at(&conn, 3, "current.jpg");
+        insert_at(&conn, 4, "new.jpg");
+        legacy_score(&conn, 1, 0.5);
+        legacy_score(&conn, 2, 0.5);
+        write_sharpness(&conn, 3, 0.5, METHOD_TILE).unwrap();
+        let small = image::DynamicImage::ImageLuma8(sharp(1200, 800));
+        let large = image::DynamicImage::ImageLuma8(sharp(2048, 1365));
+
+        assert_eq!(settle_from_decode(&conn, "small.jpg", &small).unwrap(), Some(Settled::Scored));
+        assert_eq!(settle_from_decode(&conn, "large.jpg", &large).unwrap(), Some(Settled::Kept));
+        assert_eq!(settle_from_decode(&conn, "current.jpg", &small).unwrap(), None);
+        assert_eq!(settle_from_decode(&conn, "new.jpg", &large).unwrap(), Some(Settled::Scored));
+        assert_eq!(settle_from_decode(&conn, "elsewhere.jpg", &small).unwrap(), None);
+
+        let rescored = get_sharpness(&conn, 1).unwrap().0;
+        assert!(rescored != 0.5, "the stale score is replaced by a measurement, got {rescored}");
+        assert_eq!(get_sharpness(&conn, 2).unwrap().0, 0.5, "the large original's score is kept");
+        assert_eq!(get_sharpness(&conn, 3).unwrap().0, 0.5, "a stamped score is never touched");
+        assert!(get_sharpness(&conn, 4).is_some());
+        for id in 1..=4 {
+            assert_eq!(basis(&conn, id), Some(SHARPNESS_BASIS), "photo {id} is stamped");
+        }
+        // Settled once: the next decode of the same photo does nothing.
+        assert_eq!(settle_from_decode(&conn, "small.jpg", &small).unwrap(), None);
+    }
+
+    /// A catalog from before the stamp gains the column on open, its scores untouched and
+    /// read as legacy; `Catalog::set_sharpness` stamps; a reopen changes nothing.
+    #[test]
+    fn opening_an_older_catalog_keeps_its_scores_as_legacy() {
+        use crate::catalog::Catalog;
+        let dir = crate::test_support::TestTmpDir::new("sharpness-basis");
+        let root = dir.join("photos");
+        std::fs::create_dir_all(&root).unwrap();
+        let db = dir.join("catalog.chairphoto");
+        {
+            let c = Catalog::open(&db, &root).unwrap();
+            for (id, uuid) in [(1, "00000000-0000-4000-8000-000000000001"), (2, "00000000-0000-4000-8000-000000000002")] {
+                c.conn()
+                    .execute(
+                        "INSERT INTO photos(id, uuid, path, mtime_ns, size, extension, created_at, updated_at, sharpness, sharpness_method)
+                         VALUES (?1, ?2, ?3, 0, 0, 'jpg', 0, 0, 7.5, 'tile')",
+                        rusqlite::params![id, uuid, format!("{id}.jpg")],
+                    )
+                    .unwrap();
+            }
+            // As a build before the column left it.
+            c.conn().execute_batch("ALTER TABLE photos DROP COLUMN sharpness_basis;").unwrap();
+        }
+        let c = Catalog::open(&db, &root).unwrap();
+        assert_eq!(get_sharpness(c.conn(), 1).unwrap().0, 7.5, "the old score stays visible");
+        assert_eq!(load_queue(c.conn()).unwrap(), vec![(1, true), (2, true)]);
+        c.set_sharpness(2, 9.0, METHOD_TILE).unwrap();
+        assert_eq!(basis(c.conn(), 2), Some(SHARPNESS_BASIS));
+        drop(c);
+        let c = Catalog::open(&db, &root).unwrap();
+        assert_eq!(load_queue(c.conn()).unwrap(), vec![(1, true)], "a reopen is idempotent");
     }
 }

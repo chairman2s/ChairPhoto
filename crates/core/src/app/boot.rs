@@ -110,19 +110,17 @@ pub fn boot_with<T: Clone + Send + 'static>(state: &AppState, runner: image_pool
 ///
 /// Each closure captures a clone of the catalog `Arc`. When a decode fires (inside the pool's
 /// worker threads) it briefly locks the catalog to resolve the absolute path → photo id and
-/// writes only when the photo is not yet scored/hashed (`IS NULL` guard), so it never fights
-/// the batch indexer and never writes for a file with no catalog row. The lock scope is narrow
-/// (one SELECT + one UPDATE), and `run_analyzers` snapshots the registry before invoking, so
-/// the registry lock is not held during this work.
+/// writes only when the photo is not yet scored/hashed (`IS NULL` guard) — or, for sharpness,
+/// holds a legacy pre-#245 score, which the decode in hand settles
+/// (`sharpness_indexer::settle_from_decode`) — so it never overwrites a current score and
+/// never writes for a file with no catalog row. The lock scope is narrow (one SELECT + one
+/// UPDATE), and `run_analyzers` snapshots the registry before invoking, so the registry lock
+/// is not held during this work.
 fn register_decode_analyzers(state: &AppState) {
     use rusqlite::OptionalExtension as _;
 
     let catalog_arc = state.catalog.clone();
     crate::thumbnails::register_analyzer(Arc::new(move |img, path| {
-        use crate::sharpness_indexer::{
-            photo_af_point, score_image_regions, write_sharpness, RegionInputs,
-        };
-
         let guard = match catalog_arc.lock() {
             Ok(g) => g,
             Err(_) => return,
@@ -139,33 +137,10 @@ fn register_decode_analyzers(state: &AppState) {
             Ok(r) => r.to_string_lossy().to_string(),
             Err(_) => return,
         };
-        // Look up the photo only if it is not yet scored; don't overwrite an existing score
-        // (e.g. from the batch indexer) and don't write 0 for photos that have no catalog
-        // row yet (not imported).
-        let photo_id: Option<i64> = catalog
-            .conn()
-            .query_row(
-                "SELECT id FROM photos WHERE path = ?1 AND sharpness IS NULL",
-                rusqlite::params![rel],
-                |r| r.get(0),
-            )
-            .optional()
-            .ok()
-            .flatten();
-        if let Some(id) = photo_id {
-            // Region-aware scoring (H16c): faces → AF point → tiles. Regions are read under
-            // the same lock we already hold. Faces are only available with the `faces`
-            // feature; without it the chain falls through to AF/tile.
-            let af_point = photo_af_point(catalog.conn(), id);
-            #[cfg(feature = "faces")]
-            let face_boxes = crate::plugins::faces::store::face_boxes_for_photo(catalog.conn(), id)
-                .unwrap_or_default();
-            #[cfg(not(feature = "faces"))]
-            let face_boxes = Vec::new();
-            let regions = RegionInputs { face_boxes, af_point };
-            let (score, method) = score_image_regions(img, &regions);
-            let _ = write_sharpness(catalog.conn(), id, score, method);
-        }
+        // Score an unscored photo, settle a legacy score, and leave a current score and a
+        // file with no catalog row alone. Region-aware (H16c): faces → AF point → tiles,
+        // read under the lock already held.
+        let _ = crate::sharpness_indexer::settle_from_decode(catalog.conn(), &rel, img);
     }));
 
     // Unlike sharpness, the dHash is resolution-invariant, so any decode that reaches the

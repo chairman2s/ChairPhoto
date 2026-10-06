@@ -210,12 +210,59 @@ background index job: resumable queue, progress events, abort-safe, the same sha
 detection and pHash. New imports are scored when their preview is generated. Scoring never
 runs on the UI thread.
 
+Two writers exist. The **decode hook** (`app/boot.rs`, `sharpness_indexer::settle_from_decode`)
+rides every preview-tier or larger decode on the image pool; it is the one the GPUI app runs.
+The **batch backfill** (`sharpness_indexer::run_index`) has had no caller since the Tauri
+shell's `index_sharpness` command was removed (#165): a photo is scored when its preview is
+next generated, and not before.
+
+### Scores measured on an enlarged preview (#245)
+
+Before #245 the preview tier enlarged a decode smaller than 2048 px to 2048 px, and the batch
+indexer scored that preview: interpolated pixels, which read softer than the photo is. Those
+scores are re-measured, lazily:
+
+- Every score written now carries `photos.sharpness_basis = 1` (`SHARPNESS_BASIS`). A score
+  with `NULL` there is **legacy**: written before the column existed, or by an older build.
+  The column is added on open with no backfill, because which path wrote an existing score
+  was never recorded.
+- Whether a legacy score is stale depends on the size of the decode it came from, which the
+  catalog does not hold — for a RAW it is the embedded preview's size, not the sensor's
+  `width`/`height`, so a size rule over the catalog's dimensions would misjudge a RAW whose
+  largest embedded preview is under 2048 px. So it is decided when that decode is in hand
+  (`legacy_score_is_stale`): **under 2048 px on the long edge, the photo is scored again;
+  at 2048 px or more, the score is kept and stamped**, since that preview was a plain
+  downscale then as now. An unknown size decides nothing: a preview whose size cannot be
+  read leaves the row as it is, to be tried again.
+- Until then the legacy score stays where it is: the `soft` facet, the badge, the sort and
+  burst analysis keep reading it. Clearing it to force a re-score would blank culling
+  signals for photos that may never be viewed again.
+- Both writers queue `sharpness IS NULL OR sharpness_basis IS NULL`, and both decide the same
+  way: the hook from the decoded image, the backfill from the new preview's header.
+
+The re-measure therefore happens when a photo's preview is next generated. The #245 cache
+bump made every preview regenerate on its next request, so that is the next time a photo is
+opened in the loupe (or the cache is built with previews). A photo whose new preview was
+already generated before this change, and a photo never opened again, keeps its legacy score
+until a backfill runs; wiring one into the GPUI app is open.
+
+There is no `SCHEMA_VERSION` bump: an older build ignores the column and, by its own
+`sharpness IS NULL` guards, only ever writes unscored rows. Such a write is legacy here and is
+settled the same way, so an older build cannot leave a stale score marked current.
+
+**Derived signals.** `photos.burst_flag` is not recomputed when a score changes; re-running
+burst analysis is the explicit way to refresh it, as ever, and the inspector's Culling signals
+section already marks a stored flag that a fresh verdict no longer agrees with. Auto-stack
+proposals and their keeper are computed from the current scores each time they are asked
+for, and accepted stacks are the user's decision, so neither stores anything to refresh.
+
 ## Storage and surfacing
 
 - `photos.sharpness` (REAL), `photos.sharpness_method` (TEXT) and `photos.burst_flag`
   (TEXT) are core columns, not a plugin table. All are nullable — NULL means "not yet
   scored". Storing the method lets the UI qualify the badge and lets thresholds differ per
-  method.
+  method. `photos.sharpness_basis` (INTEGER) records what the score was measured on; `NULL`
+  beside a score marks a legacy one (see "Scores measured on an enlarged preview").
 - The `soft` facet appears once at least one photo has been scored; `soft-in-burst` and
   `sharpest-of-burst` appear once at least one burst has been flagged. All three compose
   with the rest of the filter bar.

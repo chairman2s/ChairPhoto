@@ -804,6 +804,9 @@ mod tests {
         let original = a_root.join("p.ARW");
         std::fs::write(&original, b"raw").unwrap();
         let pid = a.upsert_photo(&original, None, 0, 1).unwrap().id;
+        // `resolve` launches nothing; any existing path configures the editor, so the test
+        // does not depend on RapidRAW being installed (CI runners have none).
+        a.set_setting(BIN_SETTING, "/bin/false").unwrap();
         let state = AppState::default();
         *state.catalog.lock().unwrap() = Some(a);
         let a_identity = crate::app::catalog_identity(&state).unwrap();

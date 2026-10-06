@@ -15,7 +15,7 @@ use crate::catalog::{
     BackupReport, Catalog, DrainSummary, LocationRole, OffloadReport, PhotoBackup, PhotoRestore, RestoreReport,
     SkippedPhoto, VolumeKind,
 };
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -66,57 +66,135 @@ pub const IN_PROGRESS: &str = crate::catalog::IN_PROGRESS_REASON;
 /// Empty Trash claims each photo for its delete ([`destroy_planned_photos`]) and Relocate for
 /// its re-pointing ([`relocate_photo`]), refusing a held photo with [`IN_PROGRESS`] (#256).
 ///
-/// An IPTC sidecar write claims its photo too (`iptc::write_and_settle`, #256), so a save
-/// never writes a sidecar an offload of that photo is confirming and deleting: whichever
-/// claims first goes ahead, and the other is refused — the write stays owed for the next
-/// save or the repair pass, the offload fails with [`IN_PROGRESS`] (a drain leaves it
-/// pending). The identity-repair pass, face-region and GPS writes do not claim; offload's
-/// move-aside check (`catalog::lifecycle`) still keeps what they write.
+/// **Sidecar writes** (#256): an IPTC sidecar write holds a [`SidecarWriteClaim`] on its
+/// photo (`iptc::write_and_settle`), and only the operations that **remove the photo's local
+/// files** — offload and Empty Trash, [`ClaimKind::Frees`] — exclude it: such an operation
+/// deletes the local sidecar once it has confirmed it, and a write landing after that check
+/// would leave a newer sidecar beside a freed image, untracked, with the debt settled.
+/// Whichever claims first goes ahead; the write stays owed for the next save or the repair
+/// pass, the offload fails with [`IN_PROGRESS`] (a drain leaves it pending). Every other
+/// operation ([`ClaimKind::Keeps`]: backup, restore, relocate) leaves the
+/// sidecar where it is, so a save beside it goes ahead and is never reported pending
+/// because of it (review of #256, LOW-5) — a copy that reads the sidecar while it is being
+/// replaced fails its own verification rather than recording a mix. The identity-repair
+/// pass, face-region and GPS writes do not claim at all (see `docs/storage-and-import.md`,
+/// "A storage verb acts on the moment"); offload's move-aside check
+/// (`catalog::lifecycle`) still keeps what they write.
 ///
 /// **Lock order** (`app::jobs`): the set's mutex is a leaf — nothing is acquired while it
 /// is held, and it is taken with no lock held but, at most, the catalog lock or a sidecar's
-/// write turn. The claim it
-/// grants is taken *before* the op's plan and held across the op's catalog-lock
-/// acquisitions; since nothing ever blocks on a claim, holding one there cannot invert the
-/// order.
+/// write turn. The claim it grants is taken *before* the op's plan and held across the op's
+/// catalog-lock acquisitions; since nothing ever blocks on a claim, holding one there cannot
+/// invert the order.
 ///
 /// Keyed by the catalog's database path as well as the id: a verb bound to catalog A (its
 /// own connection) can still be finishing after a switch, and photo 7 in catalog B is a
 /// different photo.
 #[derive(Default)]
 pub struct StorageClaims {
-    held: Mutex<HashSet<(PathBuf, i64)>>,
+    held: Mutex<HashMap<(PathBuf, i64), Hold>>,
+}
+
+/// What holds one photo: at most one storage operation, and any number of sidecar writes.
+#[derive(Default, Clone, Copy)]
+struct Hold {
+    op: Option<ClaimKind>,
+    writes: usize,
+}
+
+impl Hold {
+    fn is_empty(&self) -> bool {
+        self.op.is_none() && self.writes == 0
+    }
+
+    /// Whether an operation of `kind` may take this photo now.
+    fn admits(&self, kind: ClaimKind) -> bool {
+        self.op.is_none() && (kind == ClaimKind::Keeps || self.writes == 0)
+    }
+}
+
+/// What a storage operation does to the photo's local files — which decides whether a
+/// sidecar write may run beside it ([`StorageClaims`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClaimKind {
+    /// Copies or re-points, and leaves the local files where they are: backup, restore,
+    /// relocate.
+    Keeps,
+    /// Removes the photo's local files, its sidecar with them: offload, Empty Trash.
+    Frees,
 }
 
 impl StorageClaims {
     /// The set. A panic while it was held cannot leave it half-changed (each change is one
-    /// insert or remove), so a poisoned lock is still usable — and must be, or one panicked
-    /// worker would refuse every storage op for the rest of the session.
-    fn held(&self) -> MutexGuard<'_, HashSet<(PathBuf, i64)>> {
+    /// insert, update or remove), so a poisoned lock is still usable — and must be, or one
+    /// panicked worker would refuse every storage op for the rest of the session.
+    fn held(&self) -> MutexGuard<'_, HashMap<(PathBuf, i64), Hold>> {
         self.held.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Claim `named` and whichever of `frames` are free, in catalog `db`. `None` — claiming
-    /// nothing — when `named` itself is held by another operation. A frame held elsewhere is
-    /// simply not part of the claim; the op leaves it ([`StorageClaim::holds`]).
+    /// Claim `named` and whichever of `frames` are free, in catalog `db`, for an operation
+    /// that keeps the local files ([`ClaimKind::Keeps`]). `None` — claiming nothing — when
+    /// `named` itself is held by another operation. A frame held elsewhere is simply not part
+    /// of the claim; the op leaves it ([`StorageClaim::holds`]).
     pub fn claim(self: &Arc<Self>, db: &Path, named: i64, frames: &[i64]) -> Option<StorageClaim> {
+        self.claim_as(ClaimKind::Keeps, db, named, frames)
+    }
+
+    /// [`Self::claim`] for an operation that removes the local files ([`ClaimKind::Frees`]):
+    /// a photo a sidecar write holds is not free for it either.
+    pub fn claim_to_free(self: &Arc<Self>, db: &Path, named: i64, frames: &[i64]) -> Option<StorageClaim> {
+        self.claim_as(ClaimKind::Frees, db, named, frames)
+    }
+
+    /// [`Self::claim`] for an operation of `kind`.
+    pub fn claim_as(self: &Arc<Self>, kind: ClaimKind, db: &Path, named: i64, frames: &[i64]) -> Option<StorageClaim> {
         let mut held = self.held();
-        if held.contains(&(db.to_path_buf(), named)) {
+        let key = |id: i64| (db.to_path_buf(), id);
+        if !held.get(&key(named)).copied().unwrap_or_default().admits(kind) {
             return None;
         }
-        let mut ids = vec![named];
-        held.insert((db.to_path_buf(), named));
-        for &frame in frames {
-            if held.insert((db.to_path_buf(), frame)) {
-                ids.push(frame);
+        let mut ids = Vec::with_capacity(1 + frames.len());
+        for id in std::iter::once(named).chain(frames.iter().copied()) {
+            let hold = held.entry(key(id)).or_default();
+            if hold.admits(kind) {
+                hold.op = Some(kind);
+                ids.push(id);
             }
         }
         Some(StorageClaim { claims: Arc::clone(self), db: db.to_path_buf(), ids })
     }
 
-    /// Whether some operation holds photo `id` of catalog `db`.
+    /// Hold photo `id` of catalog `db` for one sidecar write; `None` while an operation that
+    /// removes the photo's local files holds it ([`ClaimKind::Frees`]). Sidecar writes do
+    /// not exclude each other here — the sidecar's own write turn orders them.
+    pub fn claim_sidecar_write(self: &Arc<Self>, db: &Path, id: i64) -> Option<SidecarWriteClaim> {
+        let mut held = self.held();
+        let hold = held.entry((db.to_path_buf(), id)).or_default();
+        if hold.op == Some(ClaimKind::Frees) {
+            if hold.is_empty() {
+                held.remove(&(db.to_path_buf(), id));
+            }
+            return None;
+        }
+        hold.writes += 1;
+        Some(SidecarWriteClaim { claims: Arc::clone(self), db: db.to_path_buf(), id })
+    }
+
+    /// Whether some operation or sidecar write holds photo `id` of catalog `db`.
     pub fn is_claimed(&self, db: &Path, id: i64) -> bool {
-        self.held().contains(&(db.to_path_buf(), id))
+        self.held().get(&(db.to_path_buf(), id)).is_some_and(|h| !h.is_empty())
+    }
+
+    /// Change the hold of `(db, id)` by `f`, dropping the entry once nothing holds it.
+    fn release(&self, db: &Path, id: i64, f: impl FnOnce(&mut Hold)) {
+        let mut held = self.held();
+        let key = (db.to_path_buf(), id);
+        if let Some(hold) = held.get_mut(&key) {
+            f(hold);
+            if hold.is_empty() {
+                held.remove(&key);
+            }
+        }
     }
 }
 
@@ -136,20 +214,38 @@ impl StorageClaim {
 
 impl Drop for StorageClaim {
     fn drop(&mut self) {
-        let mut held = self.claims.held();
         for &id in &self.ids {
-            held.remove(&(self.db.clone(), id));
+            self.claims.release(&self.db, id, |h| h.op = None);
         }
     }
 }
 
-/// Claim `photo_id` and the frames stacked under it in the catalog `cat` reaches, before
-/// anything is planned — so the plan is made, and the work done, with every member it can
-/// take held. The stack is read under the catalog lock and the claim taken after it is
-/// released.
-fn claim_moment(cat: &impl CatalogAccess, claims: &Arc<StorageClaims>, photo_id: i64) -> Result<StorageClaim, String> {
+/// One sidecar write's hold on its photo ([`StorageClaims::claim_sidecar_write`]); released
+/// when dropped.
+pub struct SidecarWriteClaim {
+    claims: Arc<StorageClaims>,
+    db: PathBuf,
+    id: i64,
+}
+
+impl Drop for SidecarWriteClaim {
+    fn drop(&mut self) {
+        self.claims.release(&self.db, self.id, |h| h.writes = h.writes.saturating_sub(1));
+    }
+}
+
+/// Claim `photo_id` and the frames stacked under it in the catalog `cat` reaches, for an
+/// operation of `kind`, before anything is planned — so the plan is made, and the work done,
+/// with every member it can take held. The stack is read under the catalog lock and the
+/// claim taken after it is released.
+fn claim_moment(
+    cat: &impl CatalogAccess,
+    claims: &Arc<StorageClaims>,
+    kind: ClaimKind,
+    photo_id: i64,
+) -> Result<StorageClaim, String> {
     let (db, frames) = cat.with(|c| Ok((c.db_path().to_path_buf(), c.stack_frame_ids(photo_id)?)))?;
-    claims.claim(&db, photo_id, &frames).ok_or_else(|| IN_PROGRESS.to_string())
+    claims.claim_as(kind, &db, photo_id, &frames).ok_or_else(|| IN_PROGRESS.to_string())
 }
 
 /// Leave each planned frame the claim does not hold — held by another operation, or stacked
@@ -203,7 +299,7 @@ fn backup_in(
     backup_id: i64,
     abort: Option<&AtomicBool>,
 ) -> Result<BackupReport, String> {
-    let claim = claim_moment(cat, claims, photo_id)?;
+    let claim = claim_moment(cat, claims, ClaimKind::Keeps, photo_id)?;
     // Candidate rows under the lock; which copies are actually on disk is decided off it
     // (#85), so a slow NAS stalls this plan but no other catalog reader.
     let candidates = cat.with(|c| c.plan_backup_candidates(photo_id, backup_id))?;
@@ -333,7 +429,7 @@ fn offload_until(
 ) -> Result<OffloadReport, String> {
     // Held from before the plan until the commit: a restore of the same photo cannot add a
     // row between this plan and its commit, nor a second offload delete under it (#254).
-    let claim = claim_moment(cat, claims, photo_id)?;
+    let claim = claim_moment(cat, claims, ClaimKind::Frees, photo_id)?;
     // Candidate rows under the lock; the per-frame backup gate stats off it (#85). The stat
     // can go stale by the delete, but never destructively: `free_local_copies` re-hashes the
     // backup before anything is removed.
@@ -380,7 +476,7 @@ fn restore_in(
     local_id: i64,
     abort: Option<&AtomicBool>,
 ) -> Result<RestoreReport, String> {
-    let claim = claim_moment(cat, claims, photo_id)?;
+    let claim = claim_moment(cat, claims, ClaimKind::Keeps, photo_id)?;
     // Candidate rows under the lock; which frames are already home and which backup is
     // reachable are statted off it (#85).
     let candidates = cat.with(|c| c.plan_restore_candidates(photo_id, local_id))?;
@@ -1078,6 +1174,33 @@ mod stack_tests {
     /// [`IN_PROGRESS`], touching nothing; the offload then finishes, and a restore after it
     /// runs. Without the claim the restore would add a row the offload's commit could drop,
     /// and a second offload would race the first's deletes.
+    /// LOW-5 of the #256 review: a sidecar write and an operation that keeps the local files
+    /// (backup, restore, relocate) hold a photo side by side; only an operation that frees
+    /// them (offload, Empty Trash) and a sidecar write exclude each other, whichever came
+    /// first. Two operations still exclude each other whatever their kind.
+    #[test]
+    fn only_freeing_the_local_files_excludes_a_sidecar_write() {
+        let claims = Arc::new(StorageClaims::default());
+        let a = Path::new("/a.chairphoto");
+
+        let write = claims.claim_sidecar_write(a, 1).unwrap();
+        let backup = claims.claim(a, 1, &[]).expect("a backup goes ahead beside a write");
+        assert!(claims.claim_sidecar_write(a, 1).is_some(), "and a write beside a backup");
+        assert!(claims.claim_to_free(a, 1, &[]).is_none(), "an offload does not");
+        drop(backup);
+        assert!(claims.claim_to_free(a, 1, &[]).is_none(), "not while the write holds it");
+        let freeing = claims.claim_to_free(a, 2, &[1, 3]).unwrap();
+        assert!(!freeing.holds(1) && freeing.holds(3), "a frame being written is left");
+        drop(write);
+        let offload = claims.claim_to_free(a, 1, &[]).expect("free once the write is done");
+        assert!(claims.claim_sidecar_write(a, 1).is_none(), "a write is refused during it");
+        assert!(claims.claim(a, 1, &[]).is_none(), "and so is another operation");
+        drop(offload);
+        drop(freeing);
+        assert!(claims.claim(a, 1, &[]).is_some() && claims.claim_sidecar_write(a, 1).is_some());
+        assert!(!claims.is_claimed(a, 1) && !claims.is_claimed(a, 3), "every hold was released");
+    }
+
     #[test]
     fn a_second_verb_on_a_moment_in_flight_is_refused() {
         let (_dir, state, master, frame, raw, jpg) = stacked("claim-verbs");
@@ -1732,7 +1855,7 @@ pub fn empty_trash_as(
             &plans,
             &reachable,
             &abort,
-            &mut |id| claims.claim(&db, id, &[]),
+            &mut |id| claims.claim_to_free(&db, id, &[]),
             &mut |id| {
                 let guard = catalog.lock().map_err(|e| e.to_string())?;
                 let c = guard.as_ref().ok_or("No catalog is open")?;

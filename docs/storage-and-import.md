@@ -781,14 +781,20 @@ row, and holds the claim until the moved file's identity is recorded; a held pho
 refused and left pointing where it was — otherwise an offload's commit could drop the
 re-pointed row by id and leave the moved file with none.
 
-An IPTC sidecar write — a save, the debt panel's Retry, a geocode fill — claims its photo
-too, from before it opens the sidecar until it has settled (#256): an offload deletes the
-local sidecar once it has confirmed it at home, and a write landing after that check would
-leave a newer sidecar beside a freed image, untracked, with the debt settled. Whichever
-claims first goes ahead. A save that meets a claimed photo stores in the catalog and leaves
-the fields owed, reported "sidecar pending (a storage operation on this photo is already in
-progress)"; the next save or the repair pass writes them, to wherever the photo then
-resolves. An offload that meets a write is refused as in progress. The identity-repair pass,
+An IPTC sidecar write — a save, the debt panel's Retry, a geocode fill — holds a
+sidecar-write claim on its photo, from before it opens the sidecar until it has settled
+(#256), and only the operations that remove the photo's local files — offload and Empty
+Trash (`storage::ClaimKind::Frees`) — exclude it: an offload deletes the local sidecar once
+it has confirmed it at home, and a write landing after that check would leave a newer
+sidecar beside a freed image, untracked, with the debt settled. Whichever claims first goes
+ahead. A save that meets an offload stores in the catalog and leaves the fields owed,
+reported "sidecar pending (a storage operation on this photo is already in progress)"; the
+next save or the repair pass writes them, to wherever the photo then resolves. An offload
+that meets a write is refused as in progress. A backup, restore or relocate leaves the
+sidecar where it is, so a save beside one goes ahead and is written (review of #256, LOW-5:
+when every claim excluded it, a save during a long drain reported pending and nothing wrote
+it once the drain let go); a copy that reads a sidecar while it is being replaced fails its
+own verification rather than recording a mix, and the next carry takes the new one. The identity-repair pass,
 face-region and GPS writes do not claim. Each replaces the sidecar by a rename, so it
 either lands before the offload moves the sidecar aside — and fails its re-hash — or makes a
 new file at its name, which the offload keeps. In that second case the new file is built

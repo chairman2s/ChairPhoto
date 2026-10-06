@@ -388,8 +388,9 @@ impl Catalog {
     }
 
     /// Every photo that holds a name directly in `folder`, by file name (#247): its logical
-    /// path (`photos.path`, catalog-root-relative) names it, or one of its locations — any
-    /// role, on any volume — does. Trashed, missing and offline photos included: whether the
+    /// path (`photos.path`, catalog-root-relative) names it, or one of its locations does —
+    /// any role, on a volume whose base `folder` is under, the location's relative path read
+    /// under that volume's own base. Trashed, missing and offline photos included: whether the
     /// file is there is not asked. Two queries per volume at most, never one per name, so an
     /// import asks once per folder ([`crate::scanner::free_name::CatalogNames`]).
     ///
@@ -415,12 +416,11 @@ impl Catalog {
         for volume in self.volume_rows()? {
             let Ok(rel) = folder.strip_prefix(&volume.base_path) else { continue };
             let prefix = folder_prefix(rel);
-            let mut stmt = self.conn.prepare(
-                "SELECT l.photo_id, p.uuid, l.relative_path FROM photo_locations l
-                 JOIN photos p ON p.id = l.photo_id
-                 WHERE l.volume_id = ?1 AND l.relative_path >= ?2 AND (?3 IS NULL OR l.relative_path < ?3)",
-            )?;
-            let rows = stmt.query_map(params![volume.id, prefix, prefix_end(&prefix)], |r| {
+            let mut stmt = self.conn.prepare(LOCATIONS_IN_FOLDER_SQL)?;
+            // `folder` is the volume's base itself: every relative path is in range, up to
+            // `char::MAX`, the last code point (no stored path starts with it).
+            let end = prefix_end(&prefix).unwrap_or_else(|| char::MAX.to_string());
+            let rows = stmt.query_map(params![volume.id, prefix, end], |r| {
                 Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?))
             })?;
             for row in rows {
@@ -844,6 +844,12 @@ thread_local! {
 
 /// The single reachability stat for a volume base path, funnelled through one function so
 /// the test counter above sees every one of them.
+/// The locations on one volume (`?1`) whose relative path is in `[?2, ?3)`, with their
+/// photo's identity: a range over `idx_photo_locations_volume_path`.
+const LOCATIONS_IN_FOLDER_SQL: &str = "SELECT l.photo_id, p.uuid, l.relative_path FROM photo_locations l
+     JOIN photos p ON p.id = l.photo_id
+     WHERE l.volume_id = ?1 AND l.relative_path >= ?2 AND l.relative_path < ?3";
+
 /// A photo holding a name ([`Catalog::names_held_in`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NameHolder {
@@ -1175,6 +1181,26 @@ mod tests {
         );
         assert!(!is_missing(&catalog, plain_id));
         assert!(!is_missing(&catalog, backed_id));
+    }
+
+    /// F2 of the #247 review: the names a folder's locations hold are read by a range over
+    /// `idx_photo_locations_volume_path`, not a scan of every location in the catalog.
+    #[test]
+    fn the_names_locations_hold_are_read_by_index() {
+        let (catalog, _dir, _root) = temp_catalog("names-held-plan");
+        let plan: Vec<String> = catalog
+            .conn
+            .prepare(&format!("EXPLAIN QUERY PLAN {LOCATIONS_IN_FOLDER_SQL}"))
+            .unwrap()
+            .query_map(params![1, "2026/06/28/", "2026/06/280"], |r| r.get::<_, String>(3))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert!(
+            plan.iter().any(|step| step.contains("idx_photo_locations_volume_path") && step.contains("relative_path>?")),
+            "{plan:?}"
+        );
+        assert!(!plan.iter().any(|step| step.starts_with("SCAN l")), "{plan:?}");
     }
 
     /// Even with the NAS genuinely gone, a photo with a backup location is spared. This is

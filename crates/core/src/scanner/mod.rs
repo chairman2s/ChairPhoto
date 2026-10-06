@@ -51,6 +51,11 @@ pub struct ScanResult {
     /// Ingest only: source files the library already holds at their destination (the same
     /// name, size and capture, #246), skipped.
     pub skipped: usize,
+    /// Ingest only: copies that went back to the row still holding their name, its file
+    /// gone — the row re-linked, not a new one (#247) — and how many of those rows are in
+    /// the trash (so the photo stays hidden there).
+    pub restored: usize,
+    pub restored_trashed: usize,
 }
 
 /// Live progress of a scan, streamed to the UI via the `scan:progress` event. `total = 0`
@@ -849,6 +854,14 @@ pub(crate) fn index_ingested_with(
                     result.created += 1;
                     newly_created.push(photo_id);
                     newly_created_copies.push((photo_id, item.dest.clone()));
+                } else {
+                    // A copy placed at a name its row still held, its file gone: the row's
+                    // own capture came back and the row is re-linked (#247). Counted, with
+                    // whether it is in the trash, so it is not invisible in the grid.
+                    result.restored += 1;
+                    if catalog.is_trashed(photo_id).unwrap_or(false) {
+                        result.restored_trashed += 1;
+                    }
                 }
                 // Reuse the source file's metadata for the copy (same bytes).
                 if let Some(m) = &item.meta {
@@ -1338,9 +1351,15 @@ mod tests {
             }
             catalog.reconcile_missing_for(&[id]).unwrap();
             assert_eq!(row_at(&catalog, "2026/06/28/IMG.jpg").unwrap().3, 1, "missing before");
+            // One of the two is in the trash too: it is restored there, and the result says so.
+            let trashed = !sidecar_left;
+            if trashed {
+                catalog.conn().execute("UPDATE photos SET trashed_at = 1 WHERE id = ?1", [id]).unwrap();
+            }
 
             let again = ingest_from_card(&catalog, &card, &root, None).unwrap();
             assert_eq!((again.created, again.skipped, again.imported), (0, 0, 1), "{sidecar_left}: {again:?}");
+            assert_eq!((again.restored, again.restored_trashed), (1, usize::from(trashed)), "{again:?}");
             assert!(name.exists(), "{sidecar_left}: back at its name");
             assert!(!root.join("2026/06/28/IMG (2).jpg").exists(), "{sidecar_left}");
             assert_eq!(row_at(&catalog, "2026/06/28/IMG.jpg"), Some((id, uuid.clone(), 5, 0)), "{sidecar_left}");

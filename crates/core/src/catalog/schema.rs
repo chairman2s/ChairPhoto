@@ -494,6 +494,9 @@ CREATE INDEX IF NOT EXISTS idx_pending_sidecar_identity_photo ON pending_sidecar
 -- has both on its very first open, not just "eventually, next time".
 CREATE INDEX IF NOT EXISTS idx_pending_sidecar_identity_copy ON pending_sidecar_identity(photo_id, volume_id, relative_path);
 CREATE INDEX IF NOT EXISTS idx_photo_locations_photo  ON photo_locations(photo_id);
+-- The names a folder's locations hold on a volume (#247, `Catalog::names_held_in`): an
+-- import reads them once per date folder, a range on `relative_path` under one volume.
+CREATE INDEX IF NOT EXISTS idx_photo_locations_volume_path ON photo_locations(volume_id, relative_path);
 CREATE INDEX IF NOT EXISTS idx_photos_folder         ON photos(folder_id);
 CREATE INDEX IF NOT EXISTS idx_photos_missing        ON photos(missing);
 CREATE INDEX IF NOT EXISTS idx_photos_capture_time   ON photos(capture_time);

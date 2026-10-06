@@ -880,16 +880,21 @@ Two modes over the same core location model:
   nothing is at it and nothing at its sidecar's name (`<name>.xmp`) either: a sidecar with
   no original beside it (another tool's, or one whose original was removed) belongs to some
   other photo, and a new file placed beside it would adopt its identity and metadata. Nor is
-  a name free that a catalog row holds (#247) — by its logical path or by any of its
-  locations, any role, its file there or not (missing storage is normal): indexing matches
+  a name free that a catalog row holds (#247) — by its logical path, or by one of its
+  locations (any role) under that location's own volume base, its file there or not
+  (missing storage is normal): indexing matches
   by path, so a new file there would take that row's identity, rating and tags. The catalog
   is read once per date folder per import (`scanner::free_name::CatalogNames`), on the
   import's own connection to the catalog it started against, never the one open since.
   **One exception re-links instead of minting** (L-f of the third #246 review): a name whose
   file is gone, held by the logical path of exactly one row, goes to the arriving file that
-  *is* that row's photo — for a card's file, #246's rule says the same capture against the
-  capture metadata the row stores (no capture time on either side is no match: the row's
-  file is gone, there are no contents to compare); for a bundle's original, the bundle gives
+  *is* that row's photo — for a card's file, its stamp against the capture metadata the row
+  stores must prove it without contents to compare (the row's file is gone): #246's rule
+  says the same capture **and** a sub-second or a serial is present, and equal, on both
+  sides (`same_photo::same_capture_without_contents`). The same second with a serial
+  missing on either side (the catalog's `-fast2` extraction skips MakerNotes serials) and
+  no sub-second on both could be another body's shot, so it re-links nothing, and neither
+  does no capture time; for a bundle's original, the bundle gives
   it the row's identity — and only when the sidecar at that name, if any, carries the row's
   identity and no other (one of another identity, of none, or that does not parse keeps the
   name taken, and is left untouched). The file is placed at that name, even past a free

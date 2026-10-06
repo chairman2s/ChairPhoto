@@ -50,6 +50,10 @@ pub struct BundleImportResult {
     pub skipped_duplicate: usize,
     /// Originals that encountered a non-fatal error during extraction (metadata-only).
     pub errors: usize,
+    /// Originals unpacked back onto the row of their identity that had lost its file — the
+    /// row re-linked, not a new one (#247) — and how many of those rows are in the trash.
+    pub restored: usize,
+    pub restored_trashed: usize,
     /// What the F1c merge did (new photos, new tags, etc.).
     pub merge: MergeSummary,
 }
@@ -170,6 +174,8 @@ pub fn extract_originals_abortable(
         copied: 0,
         skipped_duplicate: 0,
         errors: 0,
+        restored: 0,
+        restored_trashed: 0,
         merge: MergeSummary::default(),
     };
     let mut extracted: Vec<ExtractedItem> = Vec::new();
@@ -579,6 +585,13 @@ pub(crate) fn index_bundle_with(
             .is_none_or(|identity| identity == upsert.uuid);
         if upsert.created {
             newly_created.push(upsert.id);
+        } else if !item.already_in_library {
+            // An original unpacked onto a row that had lost its file: restored, not added
+            // (#247). Counted with whether it is in the trash, so it is not invisible.
+            partial_result.restored += 1;
+            if catalog.is_trashed(upsert.id).unwrap_or(false) {
+                partial_result.restored_trashed += 1;
+            }
         }
         if upsert.created && bundles_own {
             fresh.insert(upsert.id);
@@ -1837,7 +1850,8 @@ mod tests {
             let (extracted, partial) = extract_originals(&catalog, &manifest, &mut archive, &root, |_, _| {}).unwrap();
             assert_eq!(partial.copied, 1, "{sidecar_left}");
             assert_eq!(extracted[0].dest, name, "{sidecar_left}");
-            index_bundle(&catalog, &manifest, &extracted, &root, partial).unwrap();
+            let result = index_bundle(&catalog, &manifest, &extracted, &root, partial).unwrap();
+            assert_eq!((result.restored, result.restored_trashed, result.merge.photos_added), (1, 0, 0), "{result:?}");
             assert_eq!(row_at(&catalog, "2026/06/28/DSC01234.ARW"), Some((id, UUID.to_string(), 0)), "{sidecar_left}");
             assert_eq!(photo_paths(&catalog), ["2026/06/28/DSC01234.ARW"], "{sidecar_left}");
             assert!(!root.join("2026/06/28/DSC01234 (2).ARW").exists(), "{sidecar_left}");

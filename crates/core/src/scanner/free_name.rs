@@ -1,8 +1,9 @@
 //! Which library name a file arriving by card ingest or bundle import takes (#247).
 //!
 //! A name is free only when nothing is on disk there ([`same_photo::name_free`]: no file, no
-//! sidecar) **and** no catalog row holds it — by its logical path or by any of its locations,
-//! whatever the role, whether its file is there or not. Missing storage is a normal state: a
+//! sidecar) **and** no catalog row holds it — by its logical path, or by one of its locations
+//! (any role) read under its own volume's base — whether its file is there or not. Missing
+//! storage is a normal state: a
 //! photo whose file was deleted outside ChairPhoto keeps its row, its rating and its tags,
 //! and a new file placed at its name would be indexed onto that row (the upsert matches by
 //! path), giving the old photo's identity and culling to another capture.
@@ -12,10 +13,12 @@
 //! whose file is gone, held by the logical path of exactly one row, is that row's to
 //! re-link when the arriving file **is** that row's photo —
 //!
-//! - a card's file: #246's rule ([`same_photo::same_capture`]) says the same capture, its
-//!   stamp against the one stored for the row (both read by `metadata::extract_batch`). No
-//!   capture time on either side is no match: the row's file is gone, so there are no
-//!   contents to compare.
+//! - a card's file: its stamp against the one stored for the row (both read by
+//!   `metadata::extract_batch`) proves the same capture without contents to compare
+//!   ([`same_photo::same_capture_without_contents`]): #246's rule says the same capture,
+//!   and a sub-second or a serial is on both sides (and equal). The same second with a
+//!   serial missing on either side and no sub-second on both is not proof — another body
+//!   can have shot the same name in that second — and no capture time is no match.
 //! - a bundle's original: the bundle gives it the row's identity.
 //!
 //! and nothing at the name's sidecar says otherwise: no sidecar, or one whose every
@@ -141,7 +144,7 @@ impl<'c> CatalogNames<'c> {
             Arriving::Identity(identity) => identity.as_deref() == Some(uuid.as_str()),
             Arriving::Capture(stamp) => {
                 let stored = self.stamp_of(dir, photo_id);
-                same_photo::same_capture(stamp, &stored) == Some(true)
+                same_photo::same_capture_without_contents(stamp, &stored)
             }
         }
     }
@@ -279,6 +282,45 @@ mod tests {
     }
 
     // --- re-linking (L-f of the third #246 review) -------------------------------------
+
+    /// F1 of the #247 review: with no contents left to compare, the stamps must tell this
+    /// capture from another body's in the same second. A serial missing on either side
+    /// (the catalog's `-fast2` extraction drops MakerNotes serials) with no sub-second on
+    /// both re-links nothing; a sub-second on both, or a serial on both, equal, re-links;
+    /// differing serials do not.
+    #[test]
+    fn a_re_link_needs_a_sub_second_or_a_serial_on_both_sides() {
+        let entries = |pairs: &[(&'static str, &'static str)]| -> Vec<(&'static str, &'static str, &'static str)> {
+            std::iter::once(("DateTimeOriginal", "EXIF", T)).chain(pairs.iter().map(|(k, v)| (*k, "EXIF", *v))).collect()
+        };
+        let cases: [(&[(&str, &str)], &[(&str, &str)], bool); 6] = [
+            (&[("SerialNumber", "S1")], &[], false),
+            (&[], &[("SerialNumber", "S2")], false),
+            (&[], &[], false),
+            (&[("SubSecTimeOriginal", "12")], &[("SubSecTimeOriginal", "12")], true),
+            (&[("SerialNumber", "S1")], &[("SerialNumber", "S1")], true),
+            (&[("SerialNumber", "S1")], &[("SerialNumber", "S2")], false),
+        ];
+        for (i, (stored, arriving, relinks)) in cases.into_iter().enumerate() {
+            let (_dir, catalog, day) = rig(&format!("proof-{i}"));
+            let name = day.join("IMG_0001.JPG");
+            std::fs::write(&name, b"the old capture").unwrap();
+            let id = catalog.upsert_photo_with_identity(&name, None, 1, 15, Some(ROW)).unwrap().id;
+            let stored: Vec<crate::catalog::MetadataEntry> = entries(stored)
+                .into_iter()
+                .map(|(key, group, value)| crate::catalog::MetadataEntry {
+                    key: key.into(),
+                    group_name: group.into(),
+                    value: value.into(),
+                })
+                .collect();
+            catalog.set_photo_metadata(id, &Default::default(), &stored).unwrap();
+            std::fs::remove_file(&name).unwrap();
+            let arriving = Arriving::Capture(same_photo::stamp_from_metadata(entries(arriving)));
+            let expected = if relinks { name.clone() } else { day.join("IMG_0001 (2).JPG") };
+            assert_eq!(CatalogNames::new(&catalog).destination(&name, &arriving), Some(expected), "case {i}");
+        }
+    }
 
     /// The row's own sidecar left behind does not stop its capture coming back to it; a
     /// sidecar of another identity, or of none, keeps the name taken.

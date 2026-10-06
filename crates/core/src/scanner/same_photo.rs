@@ -94,6 +94,23 @@ pub fn same_capture(a: &CaptureStamp, b: &CaptureStamp) -> Option<bool> {
     }
 }
 
+/// [`same_capture`] where no contents are left to compare — a re-link of a row whose file is
+/// gone (#247, `free_name`) — so the stamps must positively tell this capture apart from
+/// another body's in the same second: the same capture by [`same_capture`], **and** a
+/// sub-second on both sides (equal, as `same_capture` requires) or a serial tag on both
+/// sides (equal, likewise). A serial missing on either side — common: the catalog's
+/// `-fast2` extraction skips MakerNotes serials — with no sub-second on both is not proof,
+/// and re-links nothing. (#246's skip-duplicate rule keeps [`same_capture`]: there the file
+/// is still there to be compared.)
+pub fn same_capture_without_contents(a: &CaptureStamp, b: &CaptureStamp) -> bool {
+    if same_capture(a, b) != Some(true) {
+        return false;
+    }
+    let subsec_on_both = a.subsec.is_some() && b.subsec.is_some();
+    let serial_on_both = a.serials.keys().any(|tag| b.serials.contains_key(tag));
+    subsec_on_both || serial_on_both
+}
+
 /// The exiftool command both sides of a comparison are read with, so one file's bytes give
 /// one answer whether exiftool reads them from a path or from stdin.
 fn stamp_command() -> Command {

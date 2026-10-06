@@ -294,6 +294,8 @@ pub(crate) mod stub {
     }
 
     impl Captured {
+        /// Only SmugMug's tests read the path alone; a Flickr-only build would warn.
+        #[cfg(feature = "smugmug")]
         pub fn path(&self) -> &str {
             self.target.split('?').next().unwrap_or("")
         }

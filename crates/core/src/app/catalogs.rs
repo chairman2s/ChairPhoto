@@ -18,11 +18,13 @@ use std::sync::Arc;
 /// Open the default catalog (`<app data>/default.chairphoto`) and make it the open one.
 ///
 /// A fresh catalog is rooted at `~/Pictures/Raw` (created if missing); an existing catalog
-/// keeps its stored root (`Catalog::open` adopts it). Records the catalog as the most recent
-/// ("default"), then auto-resumes enrichment Phase B (I6d) if a previous run left pending rows
-/// — that worker reports through `state`'s event sink as `scan:progress`. Every blocking step
-/// runs on the blocking pool; call it from an async task, never the UI thread. Returns the
-/// catalog's database path.
+/// keeps its stored root (`Catalog::open` adopts it). Refused for a catalog that does not
+/// exist yet if `$HOME` is empty or unset (and `CHAIRPHOTO_LIBRARY_ROOT` is unset or not
+/// absolute too): never falls back to creating a relative root under the process's launch
+/// cwd. Records the catalog as the most recent ("default"), then auto-resumes enrichment
+/// Phase B (I6d) if a previous run left pending rows — that worker reports through `state`'s
+/// event sink as `scan:progress`. Every blocking step runs on the blocking pool; call it
+/// from an async task, never the UI thread. Returns the catalog's database path.
 pub async fn open_default_catalog(state: &AppState) -> Result<PathBuf, String> {
     let catalog_path = default_catalog_path()?;
     // Default library root for a *fresh* catalog (an existing catalog keeps its stored
@@ -43,16 +45,36 @@ pub async fn open_default_catalog(state: &AppState) -> Result<PathBuf, String> {
     // does not exist yet. `Catalog::open`'s `INSERT ... ON CONFLICT(key) DO NOTHING` means
     // an existing catalog keeps its stored root and never reads `default_root` at all, so
     // creating this directory for it would just leave a stray empty one behind.
-    let _ = spawn_blocking({
+    //
+    // `library_root_override` rejects a `CHAIRPHOTO_LIBRARY_ROOT` that is not absolute after
+    // `~` expansion (d73791e); the real default below it has no such guard. With `$HOME`
+    // empty or unset, `expand_home("~/Pictures/Raw")` cannot expand the `~` and returns it
+    // relative (a bare `Pictures/Raw`, or the literal `~/Pictures/Raw` when `HOME` is unset
+    // outright) — created under whatever the process's launch cwd happens to be, and then
+    // stored as that *fresh* catalog's `catalog_root` forever. Refused instead, for a
+    // catalog that does not exist yet: no directory is created, and `default_root` is never
+    // handed to `Catalog::open` to store.
+    let is_absolute = default_root.is_absolute();
+    spawn_blocking({
         let path = catalog_path.clone();
         let root = default_root.clone();
-        move || {
-            if !path.exists() {
-                std::fs::create_dir_all(&root).ok();
+        move || -> Result<(), String> {
+            if path.exists() {
+                return Ok(());
             }
+            if !is_absolute {
+                return Err(format!(
+                    "cannot create the default library root ({}): $HOME is empty or unset; \
+                     set HOME, or CHAIRPHOTO_LIBRARY_ROOT to an absolute path",
+                    root.display()
+                ));
+            }
+            std::fs::create_dir_all(&root).ok();
+            Ok(())
         }
     })
-    .await;
+    .await
+    .map_err(|e| e.to_string())??;
 
     let catalog = spawn_blocking({
         let path = catalog_path.clone();
@@ -900,6 +922,30 @@ mod catalog_registry_tests {
         let guard = state.catalog.lock().unwrap();
         let catalog = guard.as_ref().unwrap();
         assert_eq!(catalog.root(), scratch_home.join("Pictures/Raw").as_path());
+    }
+
+    /// catalogs.rs ~40 (#231 review): with `$HOME` empty, `expand_home("~/Pictures/Raw")`
+    /// cannot expand the `~`, and the real-default fallback used to resolve to a bare
+    /// relative `Pictures/Raw` regardless — created under whatever directory the process
+    /// happened to be launched from, then stored as that fresh catalog's permanent root
+    /// (the same class of bug `library_root_override`'s own absolute check already guards
+    /// `CHAIRPHOTO_LIBRARY_ROOT` against, two tests above). Refused instead: no catalog
+    /// opens, and the error names `$HOME`.
+    #[test]
+    fn an_empty_home_refuses_rather_than_create_a_relative_default_root() {
+        let xdg = temp_xdg("home-empty-refuses");
+        let _g = EnvGuard::set_all(&[
+            ("XDG_DATA_HOME", xdg.to_str().unwrap()),
+            ("HOME", ""),
+            ("CHAIRPHOTO_LIBRARY_ROOT", ""),
+        ]);
+
+        let state = AppState::default();
+        let result = crate::app::runtime().block_on(open_default_catalog(&state));
+
+        let err = result.expect_err("must refuse a relative default root rather than create one");
+        assert!(err.contains("HOME"), "the error should name HOME: {err}");
+        assert!(state.catalog.lock().unwrap().is_none(), "no catalog was opened");
     }
 }
 

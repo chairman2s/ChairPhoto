@@ -131,10 +131,11 @@ pub(crate) fn aside_label(aside: &Path) -> String {
 /// file there (`same_photo::place_no_replace_without_copy`). `Ok(false)` when the name is
 /// taken (a new file was written there meanwhile); the aside file is then still where it was.
 ///
-/// On a filesystem with neither a no-replace rename nor hard links (exFAT or FAT where the
-/// kernel offers no `RENAME_NOREPLACE`) it is put back by a plain rename once the name is seen
-/// free. A file created at that exact name between the look and the rename would be replaced
-/// there — a window of one syscall, against leaving the photo's file hidden for good.
+/// On a filesystem with neither a no-replace rename nor hard links (some FUSE mounts; current
+/// Linux vfat, exFAT and SMB drivers accept `RENAME_NOREPLACE`) it is put back by a plain
+/// rename once the name is seen free. A file created at that exact name between the look and
+/// the rename would be replaced there — a window of one syscall, against leaving the photo's
+/// file hidden for good.
 pub(crate) fn put_back(aside: &Path, original: &Path) -> std::io::Result<bool> {
     let back = put_back_file(aside, original);
     if matches!(back, Ok(true)) {

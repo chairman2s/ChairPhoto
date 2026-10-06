@@ -1262,8 +1262,9 @@ pub fn sha256_file(path: &Path) -> Result<String> {
 /// only if it hashes to the source's hash (another writer placed the same bytes, or they
 /// were already there); otherwise the copy fails and that file is left untouched.
 ///
-/// **On a filesystem with neither (exFAT, FAT)** the destination is claimed by an exclusive
-/// create and the verified temp copied into it — a second copy, so it is hashed again
+/// **On a filesystem with neither** (some FUSE mounts — current Linux vfat, exFAT and SMB
+/// drivers accept `RENAME_NOREPLACE`, and NFS has hard links) the destination is claimed by
+/// an exclusive create and the verified temp copied into it — a second copy, so it is hashed again
 /// (#256); one that does not match is removed (this call created it) and the copy fails.
 /// A crash during that second copy can leave a short file at `dst`, which a later copy then
 /// refuses as "already exists with different contents" until it is removed by hand; on
@@ -1885,8 +1886,8 @@ mod tests {
 
     // --- the copy fallback on a filesystem without no-replace rename or links (#256) --------
 
-    /// exFAT/FAT: the verified temp is copied a second time into the destination. That copy
-    /// is hashed too; one that does not match (damaged here by the test hook) is removed —
+    /// Neither (forced here): the verified temp is copied a second time into the destination.
+    /// That copy is hashed too; one that does not match (damaged here by the test hook) is removed —
     /// it is this call's own file — and the copy fails, leaving nothing behind. An intact one
     /// is accepted, also leaving no temp file.
     #[test]

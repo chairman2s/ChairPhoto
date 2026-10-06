@@ -833,8 +833,8 @@ sync a folder is not a failure. Two writers can never write into one file. A des
 the source (another writer placed the same bytes); otherwise the copy fails and that file is
 left untouched. This also means a Restore no longer overwrites a local file that differs
 from the backup: it fails and names the file instead. On a filesystem with neither a
-no-replace rename nor hard links (an exFAT or FAT backup drive) the destination is claimed by
-an exclusive create and the verified temp copied into it; that second copy is hashed too, and
+no-replace rename nor hard links the destination is claimed by an exclusive create and the
+verified temp copied into it; that second copy is hashed too, and
 one that does not match is removed (the copy created it) and the copy fails (#256). A crash
 during that second copy can leave a short file at the destination, which later copies refuse
 as "already exists with different contents" until it is removed by hand; on every other
@@ -843,6 +843,15 @@ a folder (once per folder per run) removes the temp files there whose process is
 running on this machine and that have gone an hour unwritten — the hour because a backup
 folder can be shared with another machine whose copy is still writing; a temp file only ever
 holds bytes that exist elsewhere.
+
+Which filesystems take the copy fallback is narrower than it sounds (review of #256,
+NIT-3). Current Linux kernels accept `RENAME_NOREPLACE` on vfat and exFAT drives and on
+SMB/CIFS mounts — each driver's rename handler takes that flag — so those place in one step;
+NFS refuses every rename flag but has hard links, so it places by a link. (A reading of the
+kernel sources' rename handlers from memory, the review's and this note's alike; not tested
+on this machine or pinned to a kernel version.) What is left for the exclusive create and
+copy is a filesystem whose driver refuses the flag and has no hard links either: some FUSE
+mounts, depending on the daemon (unverified which).
 
 Restore is the same rule pointing the other way: a stack that leaves as seven frames comes
 back as seven. It brings home only the frames that are *away* — a frame already local is
@@ -917,8 +926,9 @@ Two modes over the same core location model:
   replacing anything — `renameat2(RENAME_NOREPLACE)` on Linux, else a hard link — so a file
   that appears there after the name was found free sends the copy on to the next free name,
   and a crash mid-copy leaves at most the hidden temporary file, never a short original at
-  a library name. On a filesystem with neither (exFAT, FAT) the name is claimed by an
-  exclusive create and the temporary file copied in: still no overwrite, but without that
+  a library name. On a filesystem with neither (some FUSE mounts; current Linux vfat, exFAT
+  and SMB drivers accept the no-replace rename) the name is claimed by an exclusive create
+  and the temporary file copied in: still no overwrite, but without that
   crash guarantee. A name is free only when
   nothing is at it and nothing at its sidecar's name (`<name>.xmp`) either: a sidecar with
   no original beside it (another tool's, or one whose original was removed) belongs to some

@@ -529,7 +529,7 @@ pub(crate) fn absent(path: &Path) -> bool {
 ///   NFS mount) by a hard link and the removal of the temporary name. A name taken between
 ///   finding it free and placing the file — another import, another program — fails that
 ///   step with "exists", and the next free name is tried.
-/// - On a filesystem with neither (exFAT, FAT), the name is claimed by an exclusive create
+/// - On a filesystem with neither (some FUSE mounts), the name is claimed by an exclusive create
 ///   (`O_CREAT|O_EXCL`) and the synced temporary file copied into it: still never an
 ///   overwrite, but a crash mid-copy can leave a short file there, as before.
 ///
@@ -618,7 +618,7 @@ pub(crate) enum Placed {
     /// One step (`renameat2(RENAME_NOREPLACE)` or a hard link): `to` is the very file that
     /// was at `part`, never partly written.
     InOneStep,
-    /// The filesystem had neither (exFAT, FAT): `to` was created and the bytes copied into
+    /// The filesystem had neither (some FUSE mounts): `to` was created and the bytes copied into
     /// it. A caller that verified `part` must verify `to` again.
     Copied,
 }

@@ -248,6 +248,32 @@ fn claim_moment(
     claims.claim_as(kind, &db, photo_id, &frames).ok_or_else(|| IN_PROGRESS.to_string())
 }
 
+// ── What a crashed offload left, put back at start-up (#256 b) ───────────────────────
+
+/// Start the sweep of the library root for what a crashed run left
+/// ([`startup_sweep`]) on the blocking pool; nothing waits on it, and what it does is
+/// logged. A front end calls it once per process, after the start-up open of the catalog
+/// `from`.
+pub fn spawn_startup_sweep(state: &AppState, from: super::CatalogIdentity) {
+    let state = state.clone();
+    drop(super::spawn_blocking(move || {
+        if let Err(e) = startup_sweep(&state, from) {
+            eprintln!("storage: the start-up sweep of the library did not run: {e}");
+        }
+    }));
+}
+
+/// Sweep every folder under the library root of the catalog `from` — read only while it is
+/// still the open one — for what a crashed offload or copy left
+/// (`catalog::working_files::sweep_tree`): a local file an offload had moved to a hidden name
+/// goes back under its own name, never replacing one, rather than staying missing until a
+/// storage operation happens to plan in that folder (review of #256, (b)). File IO only, with
+/// no lock held; returns how many folders were swept.
+pub fn startup_sweep(state: &AppState, from: super::CatalogIdentity) -> Result<usize, String> {
+    let root = super::with_catalog_as(state, from, |c| Ok(c.root().to_path_buf()))?;
+    Ok(crate::catalog::working_files::sweep_tree(&root))
+}
+
 /// Leave each planned frame the claim does not hold — held by another operation, or stacked
 /// in the instant between the claim and the plan — reported with [`IN_PROGRESS`], so a
 /// drain requeues it as pending.
@@ -1199,6 +1225,40 @@ mod stack_tests {
         drop(freeing);
         assert!(claims.claim(a, 1, &[]).is_some() && claims.claim_sidecar_write(a, 1).is_some());
         assert!(!claims.is_claimed(a, 1) && !claims.is_claimed(a, 3), "every hold was released");
+    }
+
+    /// #256 (b): the start-up sweep puts back what a crashed offload left anywhere under the
+    /// library root, so the photo resolves again without a storage operation touching its
+    /// folder — and only for the catalog it was started for.
+    #[test]
+    fn the_startup_sweep_puts_back_a_crashed_offloads_file() {
+        if !cfg!(target_os = "linux") {
+            println!("SKIPPED: the_startup_sweep_puts_back_a_crashed_offloads_file — needs /proc");
+            return;
+        }
+        let (dir, state, master, _frame, raw, _jpg) = stacked("startup-sweep");
+        let folder = raw.parent().unwrap().to_path_buf();
+        let hidden = folder.join(format!(
+            ".DSC1.ARW.{}-{}-0",
+            crate::catalog::working_files::ASIDE_TAG,
+            crate::catalog::working_files::dead_pid()
+        ));
+        std::fs::rename(&raw, &hidden).unwrap();
+        crate::catalog::working_files::forget_swept(&folder); // the next run
+        let from = super::super::catalog_identity(&state).unwrap();
+        assert_eq!(with_catalog(&state, |c| c.resolve_photo_path(master)).unwrap(), None, "missing meanwhile");
+
+        let other = Catalog::open(&dir.join("other.chairphoto"), &dir.join("other")).unwrap();
+        let open = state.catalog.lock().unwrap().replace(other).unwrap();
+        assert_eq!(startup_sweep(&state, from).unwrap_err(), super::super::CATALOG_CHANGED);
+        assert!(hidden.exists(), "a sweep for a catalog no longer open does nothing");
+        *state.catalog.lock().unwrap() = Some(open);
+
+        assert!(startup_sweep(&state, from).unwrap() >= 3, "the root and its folders");
+
+        assert_eq!(std::fs::read(&raw).unwrap(), b"raw-bytes");
+        assert!(!hidden.exists());
+        assert_eq!(with_catalog(&state, |c| c.resolve_photo_path(master)).unwrap(), Some(raw));
     }
 
     #[test]

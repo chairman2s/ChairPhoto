@@ -521,9 +521,10 @@ Three rules govern carrying:
   deleted, and a queued offload is kept `failed`
   with the reason ("changed since its backup — refusing to offload; the copy at home is the
   earlier version"). A crash between the move and the delete leaves the file under its
-  hidden name; the next backup, offload or restore plan that looks in that folder (once per
-  folder per run, off the catalog lock) puts every such file whose process is no longer
-  running back under its name, again never replacing one — a file left by a crash is never
+  hidden name; at start-up every folder under the library root is swept, off the UI thread
+  (`storage::spawn_startup_sweep`, hidden folders not entered), and the next backup, offload
+  or restore plan that looks in a folder does the same (once per folder per run, off the
+  catalog lock): every such file whose process is no longer running goes back under its name, again never replacing one — a file left by a crash is never
   deleted, since it may hold the only copy of a local change. An empty one is not put back
   (it is most likely a name the offload claimed and never filled; putting it back would make
   a 0-byte original); it is removed only when a non-empty file holds its name. A second

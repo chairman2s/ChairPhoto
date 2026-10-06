@@ -233,6 +233,28 @@ pub(crate) fn sweep_beside<'a>(paths: impl IntoIterator<Item = &'a Path>) {
     }
 }
 
+/// Sweep every folder under `root`, `root` included ([`sweep_once`]): what a crashed run
+/// left anywhere in the library is put back at start-up (review of #256, (b)), rather than
+/// only once a storage operation happens to plan in that folder — until then the photo's
+/// file is missing under its own name. Hidden folders are not entered (a hidden folder a
+/// crashed offload made is recovered by the sweep of the folder holding it), and links are
+/// not followed. Returns how many folders were swept. File IO only, possibly long on a big
+/// library: a blocking worker, never the UI thread.
+pub fn sweep_tree(root: &Path) -> usize {
+    let mut swept = 0;
+    let folders = walkdir::WalkDir::new(root)
+        .follow_links(false)
+        .into_iter()
+        .filter_entry(|e| e.depth() == 0 || !e.file_name().to_str().is_some_and(|n| n.starts_with('.')))
+        .flatten()
+        .filter(|e| e.file_type().is_dir());
+    for folder in folders {
+        sweep_once(folder.path());
+        swept += 1;
+    }
+    swept
+}
+
 /// Recover what a crashed run left in `dir`, once per folder per run (see the module docs).
 /// Only names of the exact pattern, only regular files (a symlink is never followed or
 /// touched), and only those whose process is no longer running. Best effort: a folder that
@@ -423,6 +445,36 @@ mod tests {
 
         assert!(!returned_early, "the second caller returned while the sweep was still running");
         assert!(second.join().unwrap(), "and found the file put back when it returned");
+    }
+
+    // ── #256 (b): the library is swept at start-up ────────────────────────────────────
+
+    /// Every folder under the root is swept, however deep: a crashed offload's file goes back
+    /// under its name without any storage operation touching that folder. Hidden folders are
+    /// not entered.
+    #[test]
+    fn a_tree_sweep_puts_back_every_crashed_file_under_the_root() {
+        if !cfg!(target_os = "linux") {
+            println!("SKIPPED: a_tree_sweep_puts_back_every_crashed_file_under_the_root — needs /proc");
+            return;
+        }
+        let dir = TestTmpDir::new("working-files-tree");
+        let root = dir.join("library");
+        let deep = root.join("2026/08/01");
+        let hidden = root.join(".cache");
+        std::fs::create_dir_all(&deep).unwrap();
+        std::fs::create_dir_all(&hidden).unwrap();
+        let dead = dead_pid();
+        let aside = |folder: &Path, name: &str| folder.join(format!(".{name}.{ASIDE_TAG}-{dead}-0"));
+        std::fs::write(aside(&root, "TOP.ARW"), b"top").unwrap();
+        std::fs::write(aside(&deep, "DSC1.ARW"), b"deep").unwrap();
+        std::fs::write(aside(&hidden, "X.ARW"), b"hidden").unwrap();
+
+        assert_eq!(sweep_tree(&root), 4, "the root, 2026, 08, 01 — not .cache");
+
+        assert_eq!(std::fs::read(root.join("TOP.ARW")).unwrap(), b"top");
+        assert_eq!(std::fs::read(deep.join("DSC1.ARW")).unwrap(), b"deep");
+        assert!(aside(&hidden, "X.ARW").exists(), "a hidden folder is not entered");
     }
 
     #[test]

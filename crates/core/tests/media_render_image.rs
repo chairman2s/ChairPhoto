@@ -265,6 +265,39 @@ fn the_face_path_keeps_the_offline_fallback_current_after_a_rotation() {
     assert_eq!(kept(), q90.into_inner(), "rewritten for the new rotation");
 }
 
+/// #245 review NIT-3 (`media.rs`: a photo with a cover returned before the persistent
+/// thumbnail was written): a photo whose tile shows a hand-pinned cover still refreshes its
+/// offline fallback when the original changes — the fallback is the new original's own
+/// thumbnail, not the one kept before.
+#[cfg(feature = "edit")]
+#[test]
+fn a_pinned_covers_offline_fallback_follows_a_changed_original() {
+    let dir = Fixture::new("media-pinned-cover-fallback");
+    let (state, ids) = catalog_with(&dir, &["h.jpg"], |root, n| {
+        write_jpeg(root, n, 1600, 1000);
+    });
+    let id = ids[0];
+    let abs = dir.join("photos").join("h.jpg");
+    {
+        let guard = state.catalog.lock().unwrap();
+        let c = guard.as_ref().unwrap();
+        let v = c.create_version(id, "Warm").unwrap();
+        c.set_version_edit(v, r#"{"tone": {"ev": 0.5}}"#).unwrap();
+        c.set_cover_pin(id, chairphoto_core::catalog::CoverPin::Version(v)).unwrap();
+    }
+    assert!(render_image(&state, JobKey::photo(id, ImageKind::Thumb)).unwrap().cover);
+    let first = std::fs::read(kept_path(&state, id)).unwrap();
+    assert_eq!(first, cached_tier(&abs, ImageKind::Thumb));
+
+    // The original is replaced (another size, so another cache key and other pixels).
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    write_jpeg(&dir.join("photos"), "h.jpg", 1200, 1000);
+    assert!(render_image(&state, JobKey::photo(id, ImageKind::Thumb)).unwrap().cover, "still the cover's render");
+    let kept = std::fs::read(kept_path(&state, id)).unwrap();
+    assert_ne!(kept, first, "the fallback was refreshed");
+    assert_eq!(kept, cached_tier(&abs, ImageKind::Thumb), "to the new original's own thumbnail");
+}
+
 /// Original gone: the thumbnail tier falls back to the persistent copy; preview has no
 /// fallback and errors.
 #[test]

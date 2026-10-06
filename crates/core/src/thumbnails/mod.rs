@@ -1097,9 +1097,37 @@ pub fn cleanup_stale_caches() {
     remove_own_dir(&root.join(STALE_THUMB_DIR));
     remove_own_dir(&root.join(STALE_COVER_DIR));
     let previews = root.join(STALE_PREVIEW_DIR);
+    if !is_own_dir(&previews) {
+        return;
+    }
+    // Two processes sharing this cache (two data dirs, one cache: `single_instance` does not
+    // keep them apart) take turns here, the turn held until the old directory is gone: else
+    // one could read the sizes file before the other renamed its own over it, list the old
+    // directory while the other removes it, and rename a smaller set over the full one (review
+    // fix245b, INFO). With no turn to be had, nothing is done: the old directory stays for
+    // the next start.
+    let Ok(_turn) = preview_sizes_turn(&root) else { return };
     if is_own_dir(&previews) && keep_stale_preview_sizes(&root, &previews).is_ok() {
         remove_own_dir(&previews);
     }
+}
+
+/// The lock file whose `flock` [`cleanup_stale_caches`]'s preview-size pass holds.
+const STALE_PREVIEW_SIZES_LOCK: &str = "p2048v5.sizes.lock";
+
+/// Wait for, then hold, the preview-size pass's turn: an exclusive `flock` on
+/// [`STALE_PREVIEW_SIZES_LOCK`] under `root`, released when the file is dropped. `Err` when
+/// the lock file is not a regular file of ours (a symlink is never opened) or cannot be locked.
+fn preview_sizes_turn(root: &Path) -> std::io::Result<std::fs::File> {
+    let path = root.join(STALE_PREVIEW_SIZES_LOCK);
+    if let Ok(meta) = std::fs::symlink_metadata(&path) {
+        if !meta.file_type().is_file() {
+            return Err(std::io::Error::other("the preview-size lock is not a regular file"));
+        }
+    }
+    let file = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(&path)?;
+    file.lock()?;
+    Ok(file)
 }
 
 /// Whether `dir` is a real directory, not a symlink to one.
@@ -1144,9 +1172,10 @@ fn keep_stale_preview_sizes(root: &Path, previews: &Path) -> std::io::Result<()>
     // cache dir, so two XDG_DATA_HOMEs with one default cache can run this at once, #245
     // review LOW-2) never share a tmp name and so can never interleave through it:
     // `create_new` claims a name nothing else has, and only this attempt writes to or renames
-    // it. Another process's start-up sweep (`sweep_stale_tmp_sizes_files`) can unlink it
-    // mid-write; then this rename fails, this attempt returns `Err`, and `p2048v5` is kept
-    // for the next start — fail-safe, never a partial sizes file.
+    // it. Since the pass holds its turn (`preview_sizes_turn`), only a build from before the
+    // turn can sweep it mid-write (`sweep_stale_tmp_sizes_files`); then this rename fails,
+    // this attempt returns `Err`, and `p2048v5` is kept for the next start — fail-safe,
+    // never a partial sizes file.
     static NONCE: AtomicU64 = AtomicU64::new(0);
     let nonce = NONCE.fetch_add(1, Ordering::Relaxed);
     let tmp = root.join(format!("{STALE_PREVIEW_SIZES}.{}.{nonce}.tmp", std::process::id()));
@@ -1254,10 +1283,19 @@ fn unique_tmp_dir(path: &Path) -> PathBuf {
 
 /// Resolve the user cache dir (XDG_CACHE_HOME or ~/.cache), with a temp fallback.
 pub(crate) fn cache_dir() -> PathBuf {
-    if let Some(xdg) = std::env::var_os("XDG_CACHE_HOME") {
-        return PathBuf::from(xdg);
+    cache_dir_from(std::env::var_os("XDG_CACHE_HOME"), std::env::var_os("HOME"))
+}
+
+/// [`cache_dir`] from the two variables. An empty or relative `XDG_CACHE_HOME` is ignored,
+/// as the XDG Base Directory spec says ("All paths set in these environment variables must
+/// be absolute. If an implementation encounters a relative path in any of these variables it
+/// should consider the path invalid and ignore it"): it would put the cache wherever the
+/// process happened to be started (#245 review, same class as d73791e's library root).
+fn cache_dir_from(xdg: Option<std::ffi::OsString>, home: Option<std::ffi::OsString>) -> PathBuf {
+    if let Some(xdg) = xdg.map(PathBuf::from).filter(|p| p.is_absolute()) {
+        return xdg;
     }
-    if let Some(home) = std::env::var_os("HOME") {
+    if let Some(home) = home.filter(|h| !h.is_empty()) {
         return PathBuf::from(home).join(".cache");
     }
     std::env::temp_dir()
@@ -1519,6 +1557,42 @@ pub(crate) mod tests {
                 && !matches!(std::fs::symlink_metadata(e.path()), Ok(meta) if meta.file_type().is_dir())
         });
         assert!(!any_tmp_file_left, "no .tmp regular file remains after a successful cleanup");
+    }
+
+    /// #245 sizes-file review (INFO, the two-writer lost update): the preview-size pass waits
+    /// for its turn — a `flock` another process sharing the cache holds through its own pass —
+    /// so it never reads the sizes file or the old directory while that pass rewrites or
+    /// removes them. Here the turn is held by the test; the cleanup on another thread waits,
+    /// and runs once it is released. (Timing: "waits" is observed over 300 ms.)
+    #[test]
+    fn the_preview_size_pass_waits_for_its_turn() {
+        let _guard = test_lock();
+        let tmp_dir = TestTmpDir::new("stale-sizes-turn");
+        let cache = tmp_dir.path().join("cache");
+        std::env::set_var("XDG_CACHE_HOME", &cache);
+        let img = write_test_jpeg(tmp_dir.path(), "turn.jpg", 64, 48);
+        let root = cache.join("chairphoto");
+        let old_dir = root.join(STALE_PREVIEW_DIR);
+        let name = cache_path_for(&img, PREVIEW).unwrap().file_name().unwrap().to_owned();
+        plant_old_tier(&old_dir, &name, 2048, 1536);
+
+        let held = preview_sizes_turn(&root).unwrap();
+        let cleanup = std::thread::spawn(cleanup_stale_caches);
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        assert!(old_dir.is_dir() && !root.join(STALE_PREVIEW_SIZES).exists(), "waits while the turn is held");
+        drop(held);
+        cleanup.join().unwrap();
+        assert!(!old_dir.exists(), "then runs");
+        assert_eq!(cached_preview_size(&img), Some((2048, 1536)));
+
+        // A lock file that is not a regular file (a symlink) is never opened: the pass is
+        // skipped and the old directory kept for the next start.
+        plant_old_tier(&old_dir, &name, 2048, 1536);
+        std::fs::remove_file(root.join(STALE_PREVIEW_SIZES_LOCK)).unwrap();
+        std::os::unix::fs::symlink(tmp_dir.path().join("elsewhere"), root.join(STALE_PREVIEW_SIZES_LOCK)).unwrap();
+        cleanup_stale_caches();
+        assert!(old_dir.is_dir(), "kept");
+        assert!(!tmp_dir.path().join("elsewhere").exists(), "nothing created through the link");
     }
 
     /// Nit-1: [`cached_preview_size`]'s fallback refuses a symlinked old preview directory
@@ -1843,6 +1917,20 @@ pub(crate) mod tests {
         assert_ne!(persistent_thumb_path(&a), persistent_thumb_path(&b));
         assert!(persistent_thumb_path(&a).starts_with(persistent_thumb_dir()));
         assert_eq!(OfflineThumbKey::new(&cat_a.to_uppercase(), &photo), Some(a), "one spelling per UUID");
+    }
+
+    /// #245 review: an empty or relative `XDG_CACHE_HOME` is ignored (the XDG spec), never a
+    /// cache under whatever directory the process was started in.
+    #[test]
+    fn a_relative_xdg_cache_home_is_ignored() {
+        let os = |s: &str| Some(std::ffi::OsString::from(s));
+        assert_eq!(cache_dir_from(os("/x/cache"), os("/home/u")), PathBuf::from("/x/cache"));
+        assert_eq!(cache_dir_from(os("rel/cache"), os("/home/u")), PathBuf::from("/home/u/.cache"));
+        assert_eq!(cache_dir_from(os("./cache"), os("/home/u")), PathBuf::from("/home/u/.cache"));
+        assert_eq!(cache_dir_from(os(""), os("/home/u")), PathBuf::from("/home/u/.cache"));
+        assert_eq!(cache_dir_from(None, os("/home/u")), PathBuf::from("/home/u/.cache"));
+        assert_eq!(cache_dir_from(os("rel"), None), std::env::temp_dir());
+        assert_eq!(cache_dir_from(None, os("")), std::env::temp_dir(), "an empty HOME is no home");
     }
 
     #[test]

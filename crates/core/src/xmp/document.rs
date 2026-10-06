@@ -728,23 +728,23 @@ fn sweep_later(folder: Folder) {
 const SWEEPER_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
 #[cfg(not(test))]
-fn sweeper_idle_timeout() -> std::time::Duration {
+fn sweeper_idle_timeout(_device: Option<u64>) -> std::time::Duration {
     SWEEPER_IDLE_TIMEOUT
 }
 
-/// Test-only override, read once per thread *creation* (never mid-wait), so it only ever
-/// shrinks the timeout of a thread this test is about to spin up for a device key it owns —
-/// never an already-running thread another, concurrently executing test created for its own
-/// key. `0` (the default) means "unset: use the production timeout".
+/// Test-only overrides, per device key, read once per thread *creation* (never mid-wait):
+/// a test sets one for a device key it alone uses, so it only ever shrinks the timeout of the
+/// thread it spins up for that key — never a thread another, concurrently executing test
+/// creates for its own key meanwhile (relD L4). A key with no entry uses the production
+/// timeout.
 #[cfg(test)]
-static SWEEPER_IDLE_TIMEOUT_OVERRIDE_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static SWEEPER_IDLE_TIMEOUT_OVERRIDES: std::sync::Mutex<std::collections::BTreeMap<Option<u64>, std::time::Duration>> =
+    std::sync::Mutex::new(std::collections::BTreeMap::new());
 
 #[cfg(test)]
-fn sweeper_idle_timeout() -> std::time::Duration {
-    match SWEEPER_IDLE_TIMEOUT_OVERRIDE_MS.load(std::sync::atomic::Ordering::SeqCst) {
-        0 => SWEEPER_IDLE_TIMEOUT,
-        ms => std::time::Duration::from_millis(ms),
-    }
+fn sweeper_idle_timeout(device: Option<u64>) -> std::time::Duration {
+    let overrides = SWEEPER_IDLE_TIMEOUT_OVERRIDES.lock().unwrap_or_else(|e| e.into_inner());
+    overrides.get(&device).copied().unwrap_or(SWEEPER_IDLE_TIMEOUT)
 }
 
 /// One sweeper thread and queue per device (#221 L3), keyed by [`Folder::device_id`] (`None`
@@ -780,7 +780,7 @@ fn sweeper_for(device: Option<u64>) -> Option<std::sync::mpsc::SyncSender<Folder
         return Some(tx.clone());
     }
     let (tx, rx) = std::sync::mpsc::sync_channel::<Folder>(SWEEP_QUEUE);
-    let idle = sweeper_idle_timeout();
+    let idle = sweeper_idle_timeout(device);
     std::thread::Builder::new()
         .name("sidecar-temp-sweep".into())
         .spawn(move || loop {
@@ -1481,6 +1481,16 @@ mod tests {
         assert!(later.exists(), "the folder was listed again");
     }
 
+    /// Shrink (`Some`) or restore (`None`) the idle timeout of threads created from now on for
+    /// `device` — a key the calling test alone uses ([`sweeper_idle_timeout`]).
+    fn set_idle_timeout_override(device: Option<u64>, timeout: Option<Duration>) {
+        let mut overrides = SWEEPER_IDLE_TIMEOUT_OVERRIDES.lock().unwrap();
+        match timeout {
+            Some(t) => overrides.insert(device, t),
+            None => overrides.remove(&device),
+        };
+    }
+
     /// The sweeps of `folder` done so far, with the thread that listed it.
     fn sweeps_of(folder: &Path) -> Vec<std::thread::ThreadId> {
         SWEEPS_DONE.lock().unwrap().iter().filter(|(p, _)| p == folder).map(|(_, t)| *t).collect()
@@ -1550,13 +1560,13 @@ mod tests {
 
     /// #221 review: a device's sweeper thread exits once idle, rather than sitting blocked on
     /// its channel for the life of the process. The test-only override shrinks the wait so
-    /// this does not take the real `SWEEPER_IDLE_TIMEOUT`; it is read once, when this test's
-    /// own fresh thread is created for a device key no other test uses, so it cannot shrink
-    /// an already-running thread a concurrently executing test created for its own key.
+    /// this does not take the real `SWEEPER_IDLE_TIMEOUT`; it is set for a device key no other
+    /// test uses, and read when that key's thread is created, so it cannot shrink a thread
+    /// another, concurrently executing test creates for its own key (relD L4).
     #[test]
     fn an_idle_sweeper_thread_exits_and_a_later_folder_gets_a_fresh_one() {
         const DEVICE: Option<u64> = Some(0x2214_0d1e); // unique to this test
-        SWEEPER_IDLE_TIMEOUT_OVERRIDE_MS.store(50, std::sync::atomic::Ordering::SeqCst);
+        set_idle_timeout_override(DEVICE, Some(Duration::from_millis(50)));
         let dir = crate::test_support::TestTmpDir::new("doc-221-idle-exit");
         let send_to = |name: &str| {
             let sub = dir.join(name);
@@ -1568,10 +1578,32 @@ mod tests {
         let thread_first = wait_swept(&first);
 
         std::thread::sleep(Duration::from_millis(300)); // outlive the shrunk idle timeout
-        SWEEPER_IDLE_TIMEOUT_OVERRIDE_MS.store(0, std::sync::atomic::Ordering::SeqCst); // unset promptly
+        set_idle_timeout_override(DEVICE, None); // the fresh thread below keeps the production timeout
 
         let second = send_to("second");
         assert_ne!(wait_swept(&second), thread_first, "the idle thread exited; a fresh one took the next folder");
+    }
+
+    /// Review relD L4: a test's idle-timeout override is its own device key's, so it never
+    /// shrinks the thread another test creates for another key while it is set (which made
+    /// that thread exit between two of its sends, failing "reuses its sweeper thread").
+    #[test]
+    fn an_idle_timeout_override_reaches_only_its_own_device() {
+        const OVERRIDDEN: Option<u64> = Some(0x7e1d_0004); // unique to this test
+        const OTHER: Option<u64> = Some(0x7e1d_0005); // unique to this test
+        let dir = crate::test_support::TestTmpDir::new("doc-reld-l4-override");
+        let send_to = |name: &str| {
+            let sub = dir.join(name);
+            std::fs::create_dir_all(&sub).unwrap();
+            sweeper_for(OTHER).unwrap().send(Folder::open_dir(&sub).unwrap()).unwrap();
+            sub
+        };
+        set_idle_timeout_override(OVERRIDDEN, Some(Duration::from_millis(50)));
+        let first = send_to("first"); // OTHER's thread is created while OVERRIDDEN's override is set
+        set_idle_timeout_override(OVERRIDDEN, None);
+        let thread_first = wait_swept(&first);
+        std::thread::sleep(Duration::from_millis(300)); // outlive the override, were it applied
+        assert_eq!(wait_swept(&send_to("second")), thread_first, "OTHER's thread kept the production timeout");
     }
 
     /// #155 review L3: a write that commits under the catalog lock (here a GPS write, as

@@ -24,9 +24,36 @@ static COUNTER: AtomicU64 = AtomicU64::new(0);
 #[derive(Debug)]
 pub struct TestTmpDir(PathBuf);
 
+/// Point `XDG_CACHE_HOME` and `XDG_DATA_HOME` at this process's own directory unless they
+/// are absolute and keep the app's directory (`<dir>/chairphoto`) out of the real home's: the
+/// copy, for this directory, of `chairphoto_core::test_home::isolate`, which these binaries
+/// cannot call — that exists only with the core's `test-hooks` feature, which
+/// `cargo test -p chairphoto-core` leaves off.
+pub fn isolate_home() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let own = std::env::temp_dir().join(format!("chairphoto-test-home-{}", std::process::id()));
+        let home = std::env::var_os("CHAIRPHOTO_TEST_HOME")
+            .or_else(|| std::env::var_os("HOME"))
+            .filter(|h| !h.is_empty())
+            .map(PathBuf::from);
+        for (var, base) in [("XDG_CACHE_HOME", ".cache"), ("XDG_DATA_HOME", ".local/share")] {
+            let real = home.as_ref().map(|h| h.join(base).join("chairphoto"));
+            let current = std::env::var_os(var).map(PathBuf::from);
+            let keep = current.is_some_and(|p| p.is_absolute() && real.as_ref().is_none_or(|r| !p.join("chairphoto").starts_with(r)));
+            if !keep {
+                let dir = own.join(base.trim_start_matches('.').replace('/', "-"));
+                let _ = std::fs::create_dir_all(&dir);
+                std::env::set_var(var, &dir);
+            }
+        }
+    });
+}
+
 impl TestTmpDir {
     /// Create `<temp>/chairphoto-test-<tag>-<pid>-<seq>/`.
     pub fn new(tag: &str) -> Self {
+        isolate_home();
         let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
         let dir = std::env::temp_dir().join(format!(
             "chairphoto-test-{tag}-{}-{seq}",

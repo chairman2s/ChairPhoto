@@ -570,9 +570,11 @@ impl MergeCtx<'_> {
                 params![photo_id, name, value, ts],
             )?;
             // Not a change made here: an existing photo's face stays where it is (#252,
-            // decision 2026-10-06). The version keeps `changed_seq` 0 — never written in this
+            // decision 2026-10-06). The version is set aside, below 0 — never written in this
             // catalog — which the automatic face passes over until it is edited here
-            // (`edits::face_under`). A stale bundle never regresses the face to an older look.
+            // (`edits::face_under`). Not left at 0: that marks a row an older build inserted,
+            // which `heal_faces` promotes. A stale bundle never regresses the face.
+            super::edits::set_aside(self.tx, self.tx.last_insert_rowid(), photo_id)?;
             has.push(parsed);
             added += 1;
         }
@@ -895,7 +897,8 @@ mod tests {
     /// #252 (decision 2026-10-06; the merge test the #252 review found missing): versions
     /// merged into an EXISTING photo do not move its face. A photo showing its own edited
     /// version keeps showing it, rev unchanged; a photo with no versions keeps its original,
-    /// even when a later face refresh runs. Editing a merged version here makes it the face.
+    /// even when a later face refresh or an older build's heal runs. Editing a merged version
+    /// here makes it the face.
     #[test]
     fn versions_merged_into_an_existing_photo_leave_its_face_alone() {
         let face = |cat: &Catalog, id: i64| cat.cover_of(id).unwrap().map(|f| (f.0, f.1));
@@ -920,6 +923,10 @@ mod tests {
         let out = cat.merge_bundle_into(&sample_manifest(), &HashSet::new(), &HashSet::new()).unwrap();
         assert_eq!(out.summary.versions_added, 2);
         assert_eq!(face(&cat, id), before, "the face and its rev are unchanged");
+        // The merged versions are set aside, not left at 0, so the heal after an older build
+        // opened the catalog (which promotes 0s) does not make one the face either.
+        cat.heal_faces(true).unwrap();
+        assert_eq!(face(&cat, id), before, "an older build's heal leaves merged versions aside");
 
         // No versions of its own: the original stays the face, through a later refresh too.
         let (cat, _root) = temp_catalog("face-original");
@@ -931,6 +938,8 @@ mod tests {
         cat.delete_version(merged[0].id).unwrap();
         assert_eq!(face(&cat, id), None, "a refresh does not pick a merged version");
         assert_eq!(cat.cover_pin(id).unwrap(), crate::catalog::CoverPin::Auto, "and nothing was pinned");
+        cat.heal_faces(true).unwrap();
+        assert_eq!(face(&cat, id), None, "nor does the heal after an older build");
 
         // An edit here is a change here: the face follows it.
         cat.set_version_edit(merged[1].id, r#"{"crop":"4:5"}"#).unwrap();

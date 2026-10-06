@@ -476,6 +476,43 @@ fn a_reroot_renders_the_loupe_tier_again_rather_than_blanking_it(cx: &mut TestAp
     assert_eq!(drawn(&app, cx), Some((ids[1], Drawn::Preview)), "and drawn: the loupe is not left blank");
 }
 
+/// Review of #258, L1: after a re-root the loupe's preload window is asked for again, and the
+/// neighbours it had preloaded under the old identity are rendered again then — not when they
+/// are stepped onto — so stepping onto one draws it at once, with no second ask.
+#[gpui_kit::test]
+fn a_reroot_preloads_the_loupe_window_again(cx: &mut TestAppContext) {
+    let (app, pool, dir, ids) = app_with(3, "loupe-preload-reroot", cx);
+    select(&app, ids[1], cx);
+    press(&app, "enter", cx);
+    for id in [ids[1], ids[2], ids[0]] {
+        pool.finish(&preview(id), Ok(pixels(30, 20)));
+    }
+    cx.run_until_parked();
+    assert_eq!(drawn(&app, cx), Some((ids[1], Drawn::Preview)));
+    let asks = sent(&pool, &preview(ids[2]));
+
+    let a = app.wired.shell.read_with(cx, |s, _| s.rows_from()).unwrap();
+    chairphoto_core::app::catalogs::reroot_open_catalog_as(&app.state, a, dir.0.join("newroot")).unwrap();
+    app.wired.model.update(cx, |m, cx| m.refresh(cx));
+    cx.run_until_parked();
+    assert_ne!(app.wired.shell.read_with(cx, |s, _| s.rows_from()).unwrap(), a, "the rows are the reopened catalog's");
+    if active(&app, cx) != Some(ids[1]) || stage(&app, cx) != StageView::Loupe {
+        // The re-read rows may have dropped the selection: the user picks the photo again.
+        select(&app, ids[1], cx);
+        if stage(&app, cx) != StageView::Loupe {
+            press(&app, "enter", cx);
+        }
+    }
+    render(&app, cx);
+    assert_eq!(sent(&pool, &preview(ids[2])), asks + 1, "the neighbour preloaded under the old identity is asked for again");
+    pool.finish(&preview(ids[2]), Ok(pixels(30, 20)));
+    cx.run_until_parked();
+    press(&app, "right", cx);
+    assert_eq!(active(&app, cx), Some(ids[2]));
+    assert_eq!(drawn(&app, cx), Some((ids[2], Drawn::Preview)), "stepped onto, it is drawn at once");
+    assert_eq!(sent(&pool, &preview(ids[2])), asks + 1, "and not asked for again");
+}
+
 /// #258 for the cull session: its photos were read from one catalog, and a preview rendered
 /// after the core switched to a catalog with colliding ids is not drawn under them.
 #[gpui_kit::test]

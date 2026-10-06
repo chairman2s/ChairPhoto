@@ -321,9 +321,37 @@ pub fn write_version_then_refresh_monochrome<T>(
     version_id: i64,
     write: impl FnOnce(&Catalog) -> crate::catalog::Result<T>,
 ) -> Result<T, String> {
+    write_then_refresh_monochrome(state, from, |c| Ok((write(c)?, version_id)))
+}
+
+/// A new version holding `edit_json` — created, its settings and its face written in one
+/// catalog hold (review of #252, N2) — then the monochrome refresh its first record owes.
+/// Answers its id and the photo's versions, read in that same hold.
+#[cfg(feature = "edit")]
+pub fn create_version_then_refresh_monochrome(
+    state: &AppState,
+    from: Option<CatalogIdentity>,
+    photo_id: i64,
+    name: &str,
+    edit_json: &str,
+    kind: crate::catalog::NewVersion,
+) -> Result<(i64, Vec<crate::catalog::PhotoVersion>), String> {
+    write_then_refresh_monochrome(state, from, |c| {
+        let id = c.create_version_with(photo_id, name, edit_json, kind)?;
+        Ok(((id, c.list_versions(photo_id)?), id))
+    })
+}
+
+/// [`write_version_then_refresh_monochrome`] for a write that answers the version it wrote.
+#[cfg(feature = "edit")]
+fn write_then_refresh_monochrome<T>(
+    state: &AppState,
+    from: Option<CatalogIdentity>,
+    write: impl FnOnce(&Catalog) -> crate::catalog::Result<(T, i64)>,
+) -> Result<T, String> {
     // Save + gather everything the monochrome refresh needs under one brief lock.
     let (written, photo_id, any_bw, stored_gray, candidates) = with_catalog_from(state, from, |catalog| {
-        let written = write(catalog)?;
+        let (written, version_id) = write(catalog)?;
         let photo_id = catalog.version_photo_id(version_id)?;
         let any_bw = catalog.list_versions(photo_id)?.iter().any(|v| crate::plugins::edit::is_bw(&v.edit_json));
         let stored = catalog.is_grayscale(photo_id)?;

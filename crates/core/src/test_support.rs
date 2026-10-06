@@ -50,6 +50,9 @@ pub(crate) struct TestTmpDir(PathBuf);
 impl TestTmpDir {
     /// Create `<temp>/chairphoto-test-<tag>-<pid>-<seq>/`.
     pub(crate) fn new(tag: &str) -> Self {
+        // Every test with a temp dir of its own also keeps out of the real cache and data
+        // directories (`test_home`).
+        crate::test_home::isolate();
         let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
         let dir = std::env::temp_dir().join(format!(
             "chairphoto-test-{tag}-{}-{seq}",

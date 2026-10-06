@@ -117,9 +117,14 @@ in memory (docs/plans/raw-foundation, slice 4), so a step shows the RAW at once.
 filmstrip is the look of its **most recently changed version** — the one whose settings were
 written last: a settled edit, a proof adopted, a history step (undo/redo included), a new or
 duplicated version, the versions a bundle brings with a photo new to the catalog (the last in
-bundle order). Versions a bundle or catalog merge adds to a photo already here do not move its
-face: they were not changed here, and the face passes over them until one is edited here
-(decision on #252, 2026-10-06). Opening or renaming a version is not a change. With no versions it is the original (owner decision, #252). "☆ Use as cover" on the
+bundle order). Opening or renaming a version
+is not a change, and neither is a version merged into an existing photo from a bundle or
+another catalog: it is set aside (`catalog::edits::set_aside`), like a What-if below
+(#252 decision 2). With no versions it is the original (owner decision, #252). A Duel's "What-if"
+variant is a side branch, not a change: it is banked beside the version being edited and the
+face stays where it was — on another version or on the original — until the variant itself is
+edited ("+ New version" does move it, as editing continues there; #252 decision 2026-10-06,
+`catalog::NewVersion::Aside`). "☆ Use as cover" on the
 Darkroom bar **pins** what is shown as the face — the version being edited, or, with
 "Original" chosen on the shelf, the untouched original — and it stays the face whatever is
 edited later; "★ Cover" unpins it, and the face follows the latest change again. The bar says
@@ -145,9 +150,39 @@ Stored in the core table `photo_cover` (one row per photo): `version_id` is the 
 kept current in the transaction of every write that can move it (`catalog::edits`,
 `settings_written` / `refresh_face`), `pin` says how it is chosen (0 automatic, 1 the
 version, 2 the original), and `rev` counts. Versions order by `photo_versions.changed_seq`,
-which each settings write sets one past the photo's highest. Covers set before #252 migrate
+which each settings write sets one past the photo's highest; only a version above 0 is a
+candidate, and a version banked aside goes below every other and below 0, so it never is
+until it is written. Covers set before #252 migrate
 as pinned. Local to this catalog like the history: catalog merge and bundle export do not
 carry it.
+
+**An older build on the same catalog** (review of #252, L1; schema v28). A trigger in the
+catalog file keeps `changed_seq` true whichever build changes a version's settings
+(`Catalog::ensure_face_trigger`): the version becomes the photo's latest change, and the
+face's `rev` rises when its own settings change. A version a build that does not know the
+column creates is left at `changed_seq` 0, no candidate (this build never leaves one at 0:
+a version that must not be a change — a What-if, a version merged into an existing photo —
+is stored below 0, `catalog::edits::set_aside`); when an open finds the catalog
+stamped below v28 since this build last opened it (every build stamps its own schema on
+open), those versions become their photos' latest changes, in `updated_at` order — after
+everything else that build did, whatever the order it did it in. Every open then moves each
+face left behind (`Catalog::heal_faces`: an automatic face that is not the latest change, a
+version pin whose version is gone). What older builds do with a v28 catalog:
+
+- The packaged **2026.8.0** (schema 19, the Tauri shell) opens it without complaint — it has
+  no newer-schema check — and stamps it back to 19. It knows nothing of faces: it never reads
+  or writes `photo_cover`, so it shows the original everywhere. Its edits are ordered by the
+  trigger, its new, duplicated and merged versions by the next open; its deletion of a face's
+  version leaves a NULL face (`ON DELETE SET NULL`). The next open by this build heals the faces. Because of
+  the stamp, that open also re-runs the backfills gated on v23, v24 and v26, each of which
+  touches only rows not yet migrated.
+- A **pre-#252 GPUI build** (schema 26) does the same, and its "Use as cover" writes
+  `photo_cover.version_id` without `pin`: on a photo that had no row, or an automatic one,
+  that cover reads as automatic and the next open moves it to the latest change. A cover it
+  sets on a photo already pinned stays pinned.
+- From this build on, a catalog stamped with a **newer** schema than the build knows is
+  refused on open (`CatalogError::NewerSchema`), nothing written; a later build that changes
+  what an older one would misread bumps `SCHEMA_VERSION`.
 
 Storage: core tables `photo_version_history` and `photo_version_history_head`
 (`catalog/schema.rs`), both cascading with their version. They are local to the catalog:

@@ -86,11 +86,11 @@
 use super::stage::{DarkroomStage, FrameTier, SETTLE};
 use crate::image_store::{ClaimId, ImageStore, Submit};
 use crate::model::{AppModel, AppModelEvent};
-use crate::shell::state::{ShellState, Surface};
+use crate::shell::state::{RowsLanded, ShellState, Surface};
 use crate::storage::Runner;
 use chairphoto_core::app::editing::{self, DevelopTicket};
 use chairphoto_core::app::{with_catalog_as, AppState, CatalogIdentity, CoreEvent};
-use chairphoto_core::catalog::{CoverPin, Photo, PhotoVersion, VersionHistory};
+use chairphoto_core::catalog::{CoverPin, NewVersion, Photo, PhotoVersion, VersionHistory};
 use chairphoto_core::develop_source::DevelopSource;
 use chairphoto_core::plugins::edit::SourceToken;
 use chairphoto_model::darkroom::develop_source::{is_preparing, reduce_source, SourceState};
@@ -387,7 +387,7 @@ pub struct Darkroom {
     /// rebuilt the strip's wanted list, rather than reusing it (#191 N1).
     #[cfg(test)]
     strip_rebuild_count: u32,
-    _subscriptions: [Subscription; 2],
+    _subscriptions: [Subscription; 3],
 }
 
 impl Darkroom {
@@ -401,6 +401,7 @@ impl Darkroom {
         let app = model.read(cx).state().clone();
         let _subscriptions = [
             cx.observe(&shell, |this, _, cx| this.sync(cx)),
+            cx.subscribe(&shell, |this, _, _: &RowsLanded, cx| this.adopt_row_pin(cx)),
             cx.subscribe(model, |this, _, event: &AppModelEvent, cx| {
                 if let AppModelEvent::Core(e) = event {
                     this.on_core_event(e, cx);
@@ -995,6 +996,25 @@ impl Darkroom {
         match self.open.as_mut() {
             Some(o) if o.seq == seq => Some(o),
             _ => self.leaving.iter_mut().find(|o| o.seq == seq),
+        }
+    }
+
+    /// Rows landed: the open photo's pin is taken from its row, read from the open photo's
+    /// catalog after whatever changed it — a pinned version deleted from the Inspector lifts
+    /// the pin (review of #252, N3), and the bar's ★ must say so. Only once a whole page has
+    /// landed and none is in flight: a pin the Darkroom set is followed by its own row read,
+    /// and until that lands the rows still carry the pin before it (a face read for another
+    /// photo also says rows landed).
+    fn adopt_row_pin(&mut self, cx: &mut Context<Self>) {
+        let shell = self.shell.read(cx);
+        let Some(open) = self.open.as_mut() else { return };
+        if shell.rows_from() != Some(open.from) || shell.rows_in_flight() {
+            return;
+        }
+        let Some(pin) = shell.library.photos().iter().find(|p| p.id == open.photo.id).map(|p| p.cover_pin) else { return };
+        if open.pin != pin {
+            open.pin = pin;
+            cx.notify();
         }
     }
 

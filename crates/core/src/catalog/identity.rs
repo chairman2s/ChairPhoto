@@ -2296,6 +2296,7 @@ mod tests {
 
     impl TestTmpDir {
         fn new(tag: &str) -> Self {
+            crate::test_home::isolate();
             let dir = std::env::temp_dir().join(format!(
                 "chairphoto-identity-test-{tag}-{}",
                 std::process::id()

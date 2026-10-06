@@ -240,19 +240,18 @@ impl Darkroom {
         );
     }
 
-    /// Create a version named `name` holding `json`, with the monochrome refresh its first
-    /// record owes; answers its id and the photo's versions.
+    /// Create a version named `name` holding `json` — in one catalog write, so the Library
+    /// never sees it empty (review of #252, N2) — with the monochrome refresh its first
+    /// record owes; answers its id and the photo's versions. `kind` says whether the
+    /// automatic face moves to it.
     fn create_with(
         from: CatalogIdentity,
         photo_id: i64,
         name: String,
         json: String,
+        kind: NewVersion,
     ) -> impl FnOnce(&AppState) -> Result<Created, String> + Send + 'static {
-        move |state| {
-            let id = with_catalog_as(state, from, |c| c.create_version(photo_id, &name))?;
-            editing::write_version_then_refresh_monochrome(state, Some(from), id, |c| c.set_version_edit(id, &json))?;
-            Ok((id, with_catalog_as(state, from, |c| c.list_versions(photo_id))?))
-        }
+        move |state| editing::create_version_then_refresh_monochrome(state, Some(from), photo_id, &name, &json, kind)
     }
 
     /// "+ New version": the current settings copied into a new version, which is edited
@@ -287,7 +286,7 @@ impl Darkroom {
         self.run_op(
             seq,
             new_engine,
-            Self::create_with(from, photo_id, name, json),
+            Self::create_with(from, photo_id, name, json, NewVersion::Change),
             // Left while the copy was written: a change made meanwhile is committed after it
             // (`commit_again`) into the new version, as it would have been had the photo
             // stayed open — not into the version it was copied from (#202).
@@ -341,7 +340,7 @@ impl Darkroom {
                 this.run_op(
                     seq,
                     false,
-                    Self::create_with(from, photo_id, name, json),
+                    Self::create_with(from, photo_id, name, json, NewVersion::Aside),
                     // The version edited stays the same.
                     |_, _| {},
                     move |this, result, cx| match result {

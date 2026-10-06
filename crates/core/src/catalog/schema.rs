@@ -5,7 +5,13 @@
 //!  2. Photo `path` is stored RELATIVE to the catalog root (see the
 //!     `catalog_root` setting), so a catalog can be remapped on import.
 
-pub const SCHEMA_VERSION: i64 = 27;
+/// The catalog schema this build writes. A catalog stamped with a higher one was last opened by a
+/// newer build, and `Catalog::open` refuses it (`CatalogError::NewerSchema`) rather than write
+/// into a schema it does not know. Bump it whenever an older build would misread or corrupt
+/// what a change stores. v28 (#252): the automatic Library face (`photo_versions.changed_seq`,
+/// `photo_cover.pin`, the `photo_versions_settings_changed` trigger, and the heal of what an
+/// older build wrote). (v27 is the import batch's `bundle_merges`.)
+pub const SCHEMA_VERSION: i64 = 28;
 
 pub const SCHEMA_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS settings (
@@ -356,10 +362,11 @@ CREATE TABLE IF NOT EXISTS photo_location_companions (
 -- a commit, a history step, a new or duplicated version) — not a rename or a reorder, which
 -- bump `updated_at`. Each write sets it one past the photo's highest, so the most recently
 -- changed version has the largest; the automatic Library face is that version (#252,
--- `photo_cover`). A counter, not a time: two writes in one second still order. 0 = never
--- written in this catalog: a version a bundle or catalog merge added to an existing photo,
--- which the automatic face passes over until it is edited here (#252). Added to older
--- catalogs by `ensure_column` and backfilled from `updated_at` there (from 1).
+-- `photo_cover`). A counter, not a time: two writes in one second still order. Only a
+-- version above 0 is a candidate: one banked aside (a Duel's "What-if", or a version a
+-- bundle or catalog merge adds to a photo already here) is stored below every other and
+-- below 0 until its settings are written (`edits::set_aside`). Added to older catalogs by
+-- `ensure_column` and backfilled from `updated_at` there.
 CREATE TABLE IF NOT EXISTS photo_versions (
     id         INTEGER PRIMARY KEY,
     photo_id   INTEGER NOT NULL REFERENCES photos(id) ON DELETE CASCADE,

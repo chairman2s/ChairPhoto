@@ -95,18 +95,72 @@ pub async fn open_default_catalog(state: &AppState) -> Result<PathBuf, String> {
 }
 
 /// Start the one-time migration of the pre-#258 offline thumbnails to the catalog `from` — the
-/// one the front end opened at start-up ([`open_default_catalog`]) — on the blocking pool;
-/// nothing waits on it, and the outcome is logged. A front end calls it once per process,
-/// after the start-up open (not from tests: it works on the real cache directory).
+/// one the front end opened at start-up ([`open_default_catalog`]) — and then the store's
+/// cleanup ([`prune_offline_thumbnails`]), on the blocking pool; nothing waits on them, and the
+/// outcomes are logged. A front end calls it once per process, after the start-up open (not
+/// from tests: it works on the real cache directory).
 pub fn spawn_offline_thumbnail_migration(state: &AppState, from: CatalogIdentity) {
     let state = state.clone();
-    drop(spawn_blocking(move || match adopt_offline_thumbnails(&state, from) {
-        Ok(done) if done != crate::thumbnails::Adopted::default() => {
-            eprintln!("offline thumbnails: migrated the pre-#258 store: {done:?}")
+    drop(spawn_blocking(move || {
+        match adopt_offline_thumbnails(&state, from) {
+            Ok(done) if done != crate::thumbnails::Adopted::default() => {
+                eprintln!("offline thumbnails: migrated the pre-#258 store: {done:?}")
+            }
+            Ok(_) => {}
+            Err(e) => eprintln!("offline thumbnails: pre-#258 store not migrated, kept for the next start: {e}"),
         }
-        Ok(_) => {}
-        Err(e) => eprintln!("offline thumbnails: pre-#258 store not migrated, kept for the next start: {e}"),
+        match prune_offline_thumbnails(&state, from) {
+            Ok(done) if done != crate::thumbnails::Pruned::default() => {
+                eprintln!("offline thumbnails: cleaned up: {done:?}")
+            }
+            Ok(_) => {}
+            Err(e) => eprintln!("offline thumbnails: not cleaned up: {e}"),
+        }
     }));
+}
+
+/// Clean up the offline thumbnail store for the catalog `from` (`thumbnails::
+/// prune_offline_thumbs`), reading its photos only while it is still the open one; the walk
+/// runs off the catalog lock. Its files for photos it does not have are pruned only when
+/// [`orphans_are_its_own`] says no other catalog the app knows may share them.
+pub fn prune_offline_thumbnails(state: &AppState, from: CatalogIdentity) -> Result<crate::thumbnails::Pruned, String> {
+    let Some((open, path)) = super::with_catalog_as(state, from, |c| {
+        Ok(c.offline_thumb_owner()?.map(|o| (o, c.db_path().to_path_buf())))
+    })?
+    else {
+        return Ok(crate::thumbnails::Pruned::default());
+    };
+    let known = load_recent_catalogs().unwrap_or_default();
+    let open = if orphans_are_its_own(&path, open.catalog_uuid(), &known) { open } else { open.keep_orphans() };
+    crate::thumbnails::prune_offline_thumbs(&open).map_err(|e| e.to_string())
+}
+
+/// Whether the open catalog at `path`, whose UUID is `uuid`, is the only catalog among the
+/// `known` ones (the recent-catalogs list) that may hold its offline thumbnails — so the files
+/// of photos it does not have are nobody's (review of release/face-thumbs, LOW 2). A copy of
+/// a catalog file shares its UUID, and so its thumbnail directory: pruning the photos the
+/// copy dropped would take the original's tiles, which cannot be rendered again while its
+/// originals are offline. So: `false` when another known catalog has the same UUID, and —
+/// conservatively — when another known catalog's UUID cannot be read (missing, on an
+/// unmounted drive, locked). Each is read-only opened and asked one setting; nothing is
+/// written to it. A copy the app was never shown (not in the list) cannot be seen: the
+/// orphan age (30 days) is the remaining margin. **Blocking**: off the UI thread.
+pub fn orphans_are_its_own(path: &Path, uuid: uuid::Uuid, known: &[RecentCatalog]) -> bool {
+    use rusqlite::OpenFlags;
+    let same_file = |other: &Path| match (std::fs::canonicalize(other), std::fs::canonicalize(path)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => other == path,
+    };
+    known.iter().map(|k| Path::new(&k.catalog_path)).filter(|other| !same_file(other)).all(|other| {
+        let read = rusqlite::Connection::open_with_flags(other, OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX)
+            .and_then(|conn| crate::catalog::read_catalog_uuid(&conn));
+        match read {
+            Ok(Some(theirs)) => uuid::Uuid::parse_str(&theirs).map_or(true, |theirs| theirs != uuid),
+            // No UUID minted: it has never been opened by a build that keys thumbnails by one.
+            Ok(None) => true,
+            Err(_) => false,
+        }
+    })
 }
 
 /// Migrate the pre-#258 offline thumbnails (`thumbnails::adopt_id_keyed_thumbs`) to the
@@ -304,6 +358,11 @@ pub fn switch_catalog_in(
         std::fs::create_dir_all(root).map_err(|e| e.to_string())?;
     }
     let catalog = Catalog::open(catalog_path, root).map_err(|e| e.to_string())?;
+    // Its offline thumbnails are in use: a start-up cleanup elsewhere must not take them for
+    // an abandoned catalog's (`thumbnails::prune_offline_thumbs`).
+    if let Ok(uuid) = crate::catalog::catalog_uuid(catalog.conn()) {
+        crate::thumbnails::mark_offline_catalog_opened(&uuid);
+    }
 
     // The name for the registry: caller-supplied, else inferred from the filename.
     let catalog_name = name.unwrap_or_else(|| {
@@ -654,6 +713,33 @@ mod catalog_registry_tests {
     /// Create a unique temp dir for a test's `XDG_DATA_HOME` override.
     fn temp_xdg(tag: &str) -> crate::test_support::TestTmpDir {
         crate::test_support::TestTmpDir::new(&format!("registry-{tag}"))
+    }
+
+    // --- whose offline thumbnails a catalog's orphans are (review of release/face-thumbs) ---
+
+    fn entry(path: &Path) -> RecentCatalog {
+        RecentCatalog { name: "c".into(), catalog_path: path.to_string_lossy().into(), root: String::new(), last_opened: 0 }
+    }
+
+    /// A copy of the open catalog's file in the list (same UUID) keeps its orphans; another
+    /// catalog does not; one whose UUID cannot be read keeps them too; the open file itself,
+    /// listed, is not "another".
+    #[test]
+    fn orphans_are_pruned_only_when_no_known_catalog_may_share_them() {
+        let dir = temp_xdg("orphans-own");
+        let a_path = dir.join("a.chairphoto");
+        let a = Catalog::open(&a_path, &dir.join("pa")).unwrap();
+        let uuid = uuid::Uuid::parse_str(&a.catalog_uuid().unwrap()).unwrap();
+        drop(a);
+        let b_path = dir.join("b.chairphoto");
+        drop(Catalog::open(&b_path, &dir.join("pb")).unwrap());
+        let copy = dir.join("copy.chairphoto");
+        std::fs::copy(&a_path, &copy).unwrap();
+
+        assert!(orphans_are_its_own(&a_path, uuid, &[entry(&a_path), entry(&b_path)]), "another catalog");
+        assert!(!orphans_are_its_own(&a_path, uuid, &[entry(&a_path), entry(&copy)]), "a copy shares them");
+        assert!(!orphans_are_its_own(&a_path, uuid, &[entry(&dir.join("gone/x.chairphoto"))]), "unreadable: kept");
+        assert!(orphans_are_its_own(&a_path, uuid, &[]));
     }
 
     // -----------------------------------------------------------------

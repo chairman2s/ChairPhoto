@@ -363,6 +363,165 @@ pub fn read_persistent_thumb(key: &OfflineThumbKey) -> Option<Vec<u8>> {
     std::fs::read(persistent_thumb_path(key)).ok()
 }
 
+/// One catalog's offline thumbnails as the store names them: the catalog's UUID and every
+/// photo UUID it has ([`crate::catalog::Catalog::offline_thumb_owner`]).
+#[derive(Clone, Debug)]
+pub struct OfflineCatalog {
+    catalog: uuid::Uuid,
+    photos: std::collections::HashSet<uuid::Uuid>,
+    /// Whether [`prune_offline_thumbs`] may remove this catalog's files for photos it does
+    /// not have ([`Self::keep_orphans`]).
+    prune_orphans: bool,
+}
+
+impl OfflineCatalog {
+    /// `None` unless `catalog` is a UUID; photo values that are not are left out (they keep
+    /// no offline thumbnail, [`OfflineThumbKey::new`]).
+    pub fn new(catalog: &str, photos: impl IntoIterator<Item = String>) -> Option<Self> {
+        let catalog = uuid::Uuid::parse_str(catalog).ok()?;
+        let photos = photos.into_iter().filter_map(|p| uuid::Uuid::parse_str(&p).ok()).collect();
+        Some(Self { catalog, photos, prune_orphans: true })
+    }
+
+    /// The catalog's UUID, as the store names its directory.
+    pub fn catalog_uuid(&self) -> uuid::Uuid {
+        self.catalog
+    }
+
+    /// Keep every file in this catalog's directory, whatever photos it has: another catalog
+    /// may share its UUID (a copy of the file), and the photos this one dropped may be that
+    /// one's — offline, its only tile (review of release/face-thumbs, LOW 2).
+    pub fn keep_orphans(mut self) -> Self {
+        self.prune_orphans = false;
+        self
+    }
+}
+
+/// What [`prune_offline_thumbs`] removed.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Pruned {
+    /// The open catalog's files for photos it no longer has.
+    pub files: usize,
+    /// Other catalogs' directories, not opened for [`UNOPENED_CATALOG_AGE`].
+    pub catalogs: usize,
+}
+
+/// How long the open catalog keeps the offline thumbnail of a photo it no longer has (removed,
+/// or re-minted under a new UUID) before a prune removes it. A file written since the photo
+/// list was read is never that old, so a photo imported meanwhile keeps its file; and a copy
+/// of this catalog file (which shares its UUID) gets a month to render its own again.
+pub const ORPHAN_AGE: std::time::Duration = std::time::Duration::from_secs(30 * 24 * 3600);
+
+/// How long another catalog's offline thumbnails are kept after it was last opened (its
+/// directory's [`OPENED_MARKER`], else its newest file): a year. Conservative on purpose: an
+/// archive catalog opened once a year whose photos all sit on an unmounted NAS has nothing
+/// else to show, and its files are rewritten on its next open only where an original is
+/// reachable. What it frees is a deleted or trial catalog's directory.
+pub const UNOPENED_CATALOG_AGE: std::time::Duration = std::time::Duration::from_secs(365 * 24 * 3600);
+
+/// The file a prune writes in the open catalog's directory, whose mtime says when the catalog
+/// was last opened.
+const OPENED_MARKER: &str = ".opened";
+
+/// Mark the catalog `catalog_uuid`'s offline thumbnails as in use now (its directory's
+/// [`OPENED_MARKER`]), when it has any: a catalog opened by a switch, not at start-up, is not
+/// pruned then, but must not look abandoned to the next start's [`prune_offline_thumbs`].
+/// Best-effort.
+pub fn mark_offline_catalog_opened(catalog_uuid: &str) {
+    let Ok(catalog) = uuid::Uuid::parse_str(catalog_uuid) else { return };
+    let dir = persistent_thumb_dir().join(catalog.hyphenated().to_string());
+    if is_own_dir(&dir) {
+        let _ = write_opened_marker(&dir);
+    }
+}
+
+/// Write `dir`'s [`OPENED_MARKER`] afresh: whatever is at the name is removed first — a
+/// symlink as the link itself, never its target — and the marker is made with `create_new`,
+/// which does not follow a symlink planted meanwhile (review of release/face-thumbs, LOW 1:
+/// a plain write followed one and truncated its target). Another writer marking it at the
+/// same moment is as good (`AlreadyExists` is success).
+fn write_opened_marker(dir: &Path) -> std::io::Result<()> {
+    let marker = dir.join(OPENED_MARKER);
+    match std::fs::remove_file(&marker) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
+    match std::fs::OpenOptions::new().write(true).create_new(true).open(&marker) {
+        Ok(_) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
+/// Clean up the offline thumbnail store (review of #258, N2) for the catalog `open`, opened
+/// now: its files for photos it no longer has, older than [`ORPHAN_AGE`]; and the directories
+/// of other catalogs not opened for [`UNOPENED_CATALOG_AGE`]. Marks `open`'s directory as
+/// opened now. Never follows a symlink, and touches only names the store writes (UUID
+/// directories, `<uuid>.jpg` files). **Blocking** (walks the store): off the UI thread.
+pub fn prune_offline_thumbs(open: &OfflineCatalog) -> std::io::Result<Pruned> {
+    prune_offline_thumbs_in(&persistent_thumb_dir(), open, std::time::SystemTime::now())
+}
+
+fn prune_offline_thumbs_in(store: &Path, open: &OfflineCatalog, now: std::time::SystemTime) -> std::io::Result<Pruned> {
+    use std::time::SystemTime;
+    let mut pruned = Pruned::default();
+    if !is_own_dir(store) {
+        return Ok(pruned);
+    }
+    let older_than = |at: SystemTime, age| now.duration_since(at).is_ok_and(|d| d > age);
+    let own = store.join(open.catalog.hyphenated().to_string());
+    if is_own_dir(&own) {
+        write_opened_marker(&own)?;
+    }
+    if open.prune_orphans && is_own_dir(&own) {
+        for entry in std::fs::read_dir(&own)? {
+            let entry = entry?;
+            let name = entry.file_name();
+            let Some(photo) = name.to_str().and_then(|n| n.strip_suffix(".jpg")).and_then(|n| uuid::Uuid::parse_str(n).ok())
+            else {
+                continue;
+            };
+            let Ok(meta) = std::fs::symlink_metadata(entry.path()) else { continue };
+            if meta.file_type().is_file()
+                && !open.photos.contains(&photo)
+                && meta.modified().is_ok_and(|m| older_than(m, ORPHAN_AGE))
+                && std::fs::remove_file(entry.path()).is_ok()
+            {
+                pruned.files += 1;
+            }
+        }
+    }
+    for entry in std::fs::read_dir(store)? {
+        let entry = entry?;
+        let Some(catalog) = entry.file_name().to_str().and_then(|n| uuid::Uuid::parse_str(n).ok()) else { continue };
+        let dir = entry.path();
+        if catalog == open.catalog || !is_own_dir(&dir) {
+            continue;
+        }
+        let modified = |p: &Path| std::fs::symlink_metadata(p).and_then(|m| m.modified()).ok();
+        // When it was last opened: its marker, else (a directory from before markers) the
+        // newest of the directory and its files.
+        let last = match modified(&dir.join(OPENED_MARKER)) {
+            Some(at) => Some(at),
+            None => std::fs::read_dir(&dir)?
+                .filter_map(|e| e.ok().and_then(|e| modified(&e.path())))
+                .chain(modified(&dir))
+                .max(),
+        };
+        // Read the marker again just before removing: a catalog switch may have marked it
+        // since (`mark_offline_catalog_opened`), and an opened catalog keeps its files.
+        let still_unopened = || modified(&dir.join(OPENED_MARKER)).is_none_or(|at| older_than(at, UNOPENED_CATALOG_AGE));
+        if last.is_some_and(|at| older_than(at, UNOPENED_CATALOG_AGE))
+            && still_unopened()
+            && std::fs::remove_dir_all(&dir).is_ok()
+        {
+            pruned.catalogs += 1;
+        }
+    }
+    Ok(pruned)
+}
+
 /// Generate a thumbnail from `path` and persist it under `key` — called at offload time so
 /// the grid keeps an image after the original leaves local disk.
 pub fn ensure_persistent_thumb(key: &OfflineThumbKey, path: &Path) -> Result<(), String> {
@@ -981,9 +1140,37 @@ pub fn cleanup_stale_caches() {
     remove_own_dir(&root.join(STALE_THUMB_DIR));
     remove_own_dir(&root.join(STALE_COVER_DIR));
     let previews = root.join(STALE_PREVIEW_DIR);
+    if !is_own_dir(&previews) {
+        return;
+    }
+    // Two processes sharing this cache (two data dirs, one cache: `single_instance` does not
+    // keep them apart) take turns here, the turn held until the old directory is gone: else
+    // one could read the sizes file before the other renamed its own over it, list the old
+    // directory while the other removes it, and rename a smaller set over the full one (review
+    // fix245b, INFO). With no turn to be had, nothing is done: the old directory stays for
+    // the next start.
+    let Ok(_turn) = preview_sizes_turn(&root) else { return };
     if is_own_dir(&previews) && keep_stale_preview_sizes(&root, &previews).is_ok() {
         remove_own_dir(&previews);
     }
+}
+
+/// The lock file whose `flock` [`cleanup_stale_caches`]'s preview-size pass holds.
+const STALE_PREVIEW_SIZES_LOCK: &str = "p2048v5.sizes.lock";
+
+/// Wait for, then hold, the preview-size pass's turn: an exclusive `flock` on
+/// [`STALE_PREVIEW_SIZES_LOCK`] under `root`, released when the file is dropped. `Err` when
+/// the lock file is not a regular file of ours (a symlink is never opened) or cannot be locked.
+fn preview_sizes_turn(root: &Path) -> std::io::Result<std::fs::File> {
+    let path = root.join(STALE_PREVIEW_SIZES_LOCK);
+    if let Ok(meta) = std::fs::symlink_metadata(&path) {
+        if !meta.file_type().is_file() {
+            return Err(std::io::Error::other("the preview-size lock is not a regular file"));
+        }
+    }
+    let file = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(&path)?;
+    file.lock()?;
+    Ok(file)
 }
 
 /// Whether `dir` is a real directory, not a symlink to one.
@@ -1028,9 +1215,10 @@ fn keep_stale_preview_sizes(root: &Path, previews: &Path) -> std::io::Result<()>
     // cache dir, so two XDG_DATA_HOMEs with one default cache can run this at once, #245
     // review LOW-2) never share a tmp name and so can never interleave through it:
     // `create_new` claims a name nothing else has, and only this attempt writes to or renames
-    // it. Another process's start-up sweep (`sweep_stale_tmp_sizes_files`) can unlink it
-    // mid-write; then this rename fails, this attempt returns `Err`, and `p2048v5` is kept
-    // for the next start — fail-safe, never a partial sizes file.
+    // it. Since the pass holds its turn (`preview_sizes_turn`), only a build from before the
+    // turn can sweep it mid-write (`sweep_stale_tmp_sizes_files`); then this rename fails,
+    // this attempt returns `Err`, and `p2048v5` is kept for the next start — fail-safe,
+    // never a partial sizes file.
     static NONCE: AtomicU64 = AtomicU64::new(0);
     let nonce = NONCE.fetch_add(1, Ordering::Relaxed);
     let tmp = root.join(format!("{STALE_PREVIEW_SIZES}.{}.{nonce}.tmp", std::process::id()));
@@ -1138,10 +1326,26 @@ fn unique_tmp_dir(path: &Path) -> PathBuf {
 
 /// Resolve the user cache dir (XDG_CACHE_HOME or ~/.cache), with a temp fallback.
 pub(crate) fn cache_dir() -> PathBuf {
-    if let Some(xdg) = std::env::var_os("XDG_CACHE_HOME") {
-        return PathBuf::from(xdg);
+    // This crate's unit tests: isolated before the first resolution, whichever test it is.
+    #[cfg(test)]
+    crate::test_home::isolate();
+    let dir = cache_dir_from(std::env::var_os("XDG_CACHE_HOME"), std::env::var_os("HOME"));
+    // Tests never use the real one (`test_home`).
+    #[cfg(any(test, feature = "test-hooks"))]
+    crate::test_home::check(&dir.join("chairphoto"), ".cache", "XDG_CACHE_HOME");
+    dir
+}
+
+/// [`cache_dir`] from the two variables. An empty or relative `XDG_CACHE_HOME` is ignored,
+/// as the XDG Base Directory spec says ("All paths set in these environment variables must
+/// be absolute. If an implementation encounters a relative path in any of these variables it
+/// should consider the path invalid and ignore it"): it would put the cache wherever the
+/// process happened to be started (#245 review, same class as d73791e's library root).
+fn cache_dir_from(xdg: Option<std::ffi::OsString>, home: Option<std::ffi::OsString>) -> PathBuf {
+    if let Some(xdg) = xdg.map(PathBuf::from).filter(|p| p.is_absolute()) {
+        return xdg;
     }
-    if let Some(home) = std::env::var_os("HOME") {
+    if let Some(home) = home.filter(|h| !h.is_empty()) {
         return PathBuf::from(home).join(".cache");
     }
     std::env::temp_dir()
@@ -1405,6 +1609,42 @@ pub(crate) mod tests {
         assert!(!any_tmp_file_left, "no .tmp regular file remains after a successful cleanup");
     }
 
+    /// #245 sizes-file review (INFO, the two-writer lost update): the preview-size pass waits
+    /// for its turn — a `flock` another process sharing the cache holds through its own pass —
+    /// so it never reads the sizes file or the old directory while that pass rewrites or
+    /// removes them. Here the turn is held by the test; the cleanup on another thread waits,
+    /// and runs once it is released. (Timing: "waits" is observed over 300 ms.)
+    #[test]
+    fn the_preview_size_pass_waits_for_its_turn() {
+        let _guard = test_lock();
+        let tmp_dir = TestTmpDir::new("stale-sizes-turn");
+        let cache = tmp_dir.path().join("cache");
+        std::env::set_var("XDG_CACHE_HOME", &cache);
+        let img = write_test_jpeg(tmp_dir.path(), "turn.jpg", 64, 48);
+        let root = cache.join("chairphoto");
+        let old_dir = root.join(STALE_PREVIEW_DIR);
+        let name = cache_path_for(&img, PREVIEW).unwrap().file_name().unwrap().to_owned();
+        plant_old_tier(&old_dir, &name, 2048, 1536);
+
+        let held = preview_sizes_turn(&root).unwrap();
+        let cleanup = std::thread::spawn(cleanup_stale_caches);
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        assert!(old_dir.is_dir() && !root.join(STALE_PREVIEW_SIZES).exists(), "waits while the turn is held");
+        drop(held);
+        cleanup.join().unwrap();
+        assert!(!old_dir.exists(), "then runs");
+        assert_eq!(cached_preview_size(&img), Some((2048, 1536)));
+
+        // A lock file that is not a regular file (a symlink) is never opened: the pass is
+        // skipped and the old directory kept for the next start.
+        plant_old_tier(&old_dir, &name, 2048, 1536);
+        std::fs::remove_file(root.join(STALE_PREVIEW_SIZES_LOCK)).unwrap();
+        std::os::unix::fs::symlink(tmp_dir.path().join("elsewhere"), root.join(STALE_PREVIEW_SIZES_LOCK)).unwrap();
+        cleanup_stale_caches();
+        assert!(old_dir.is_dir(), "kept");
+        assert!(!tmp_dir.path().join("elsewhere").exists(), "nothing created through the link");
+    }
+
     /// Nit-1: [`cached_preview_size`]'s fallback refuses a symlinked old preview directory
     /// just as [`cleanup_stale_caches`] does — never following it to read a header.
     #[test]
@@ -1449,6 +1689,7 @@ pub(crate) mod tests {
 
     impl TestTmpDir {
         pub(crate) fn new(name: &str) -> Self {
+            crate::test_home::isolate();
             let dir = std::env::temp_dir()
                 .join(format!("cp-thumb-{name}-{}", std::process::id()));
             let _ = std::fs::remove_dir_all(&dir);
@@ -1642,6 +1883,122 @@ pub(crate) mod tests {
         assert_eq!(std::fs::read(elsewhere.join("1.jpg")).unwrap(), b"not ours");
     }
 
+    // --- the offline store's cleanup (review of #258, N2) ----------------------------------
+
+    /// Set `path`'s mtime `age` before `now`.
+    fn aged(path: &Path, now: std::time::SystemTime, age: std::time::Duration) {
+        let file = std::fs::File::options().read(true).open(path).unwrap();
+        file.set_modified(now - age).unwrap();
+    }
+
+    /// A prune removes the open catalog's files for photos it no longer has once they are
+    /// older than `ORPHAN_AGE` — never a photo's it has, nor a fresh one (a photo imported
+    /// since the list was read); another catalog's directory only once it has not been opened
+    /// for `UNOPENED_CATALOG_AGE`; and nothing that is not the store's own (a non-UUID name, a
+    /// symlink). It marks the open catalog's directory as opened.
+    #[test]
+    fn a_prune_removes_only_gone_photos_and_long_unopened_catalogs() {
+        let tmp = TestTmpDir::new("offline-prune");
+        let store = tmp.path().join(PERSIST_DIR);
+        let now = std::time::SystemTime::now();
+        let day = std::time::Duration::from_secs(24 * 3600);
+        let (open_cat, recent_cat, stale_cat, marked_cat) =
+            (uuid::Uuid::new_v4(), uuid::Uuid::new_v4(), uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
+        let (kept, gone_old, gone_new) = (uuid::Uuid::new_v4(), uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
+        let file = |cat: uuid::Uuid, photo: uuid::Uuid, age: std::time::Duration| {
+            let dir = store.join(cat.hyphenated().to_string());
+            std::fs::create_dir_all(&dir).unwrap();
+            let p = dir.join(format!("{}.jpg", photo.hyphenated()));
+            std::fs::write(&p, b"jpeg").unwrap();
+            aged(&p, now, age);
+            p
+        };
+        let kept_old = file(open_cat, kept, 400 * day);
+        let gone_old = file(open_cat, gone_old, ORPHAN_AGE + day);
+        let gone_new = file(open_cat, gone_new, day);
+        let foreign_name = store.join(open_cat.hyphenated().to_string()).join("notes.jpg");
+        std::fs::write(&foreign_name, b"x").unwrap();
+        aged(&foreign_name, now, 400 * day);
+        // Another catalog browsed last month; one untouched for over a year; one whose files
+        // are old but which was opened lately (its marker).
+        let recent = file(recent_cat, uuid::Uuid::new_v4(), 30 * day);
+        let stale = file(stale_cat, uuid::Uuid::new_v4(), UNOPENED_CATALOG_AGE + day);
+        aged(stale.parent().unwrap(), now, UNOPENED_CATALOG_AGE + day);
+        let marked = file(marked_cat, uuid::Uuid::new_v4(), UNOPENED_CATALOG_AGE + day);
+        std::fs::write(marked.parent().unwrap().join(OPENED_MARKER), b"").unwrap();
+        aged(marked.parent().unwrap(), now, UNOPENED_CATALOG_AGE + day);
+        // Not the store's: a non-UUID directory, and a symlinked "catalog" pointing elsewhere.
+        let other = store.join("not-a-catalog");
+        std::fs::create_dir_all(&other).unwrap();
+        aged(&other, now, UNOPENED_CATALOG_AGE + day);
+        let elsewhere = tmp.path().join("elsewhere");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        std::fs::write(elsewhere.join("keep.jpg"), b"x").unwrap();
+        aged(&elsewhere.join("keep.jpg"), now, UNOPENED_CATALOG_AGE + day);
+        let link = store.join(uuid::Uuid::new_v4().hyphenated().to_string());
+        std::os::unix::fs::symlink(&elsewhere, &link).unwrap();
+
+        let open = OfflineCatalog::new(&open_cat.to_string(), [kept.to_string()]).unwrap();
+        let done = prune_offline_thumbs_in(&store, &open, now).unwrap();
+
+        assert_eq!(done, Pruned { files: 1, catalogs: 1 });
+        assert!(kept_old.is_file(), "a photo the catalog has keeps its file, however old");
+        assert!(!gone_old.exists(), "a gone photo's old file is removed");
+        assert!(gone_new.is_file(), "a fresh file is kept: it may be a photo imported meanwhile");
+        assert!(foreign_name.is_file(), "a name the store never writes is left");
+        assert!(recent.is_file(), "a catalog opened lately keeps its files");
+        assert!(!stale.parent().unwrap().exists(), "one not opened for a year is removed");
+        assert!(marked.is_file(), "its marker says when it was opened, not its files' age");
+        assert!(other.is_dir() && link.exists() && elsewhere.join("keep.jpg").is_file(), "nothing not the store's");
+        assert!(store.join(open_cat.hyphenated().to_string()).join(OPENED_MARKER).is_file(), "the open catalog is marked");
+        // A second prune finds nothing more.
+        assert_eq!(prune_offline_thumbs_in(&store, &open, now).unwrap(), Pruned::default());
+    }
+
+    /// Review of release/face-thumbs, LOW 1: a symlink planted at the `.opened` name is
+    /// replaced by a marker of the store's own; its target is never written through.
+    #[test]
+    fn a_symlinked_opened_marker_never_touches_its_target() {
+        let tmp = TestTmpDir::new("offline-marker-symlink");
+        let store = tmp.path().join(PERSIST_DIR);
+        let cat = uuid::Uuid::new_v4();
+        let dir = store.join(cat.hyphenated().to_string());
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = tmp.path().join("precious.txt");
+        std::fs::write(&target, b"keep me").unwrap();
+        std::os::unix::fs::symlink(&target, dir.join(OPENED_MARKER)).unwrap();
+        let open = OfflineCatalog::new(&cat.to_string(), []).unwrap();
+        prune_offline_thumbs_in(&store, &open, std::time::SystemTime::now()).unwrap();
+        assert_eq!(std::fs::read(&target).unwrap(), b"keep me", "the prune's marker");
+        let meta = std::fs::symlink_metadata(dir.join(OPENED_MARKER)).unwrap();
+        assert!(meta.file_type().is_file(), "a marker of its own now");
+        std::fs::remove_file(dir.join(OPENED_MARKER)).unwrap();
+        std::os::unix::fs::symlink(&target, dir.join(OPENED_MARKER)).unwrap();
+        write_opened_marker(&dir).unwrap();
+        assert_eq!(std::fs::read(&target).unwrap(), b"keep me", "a switch's marker");
+        assert!(std::fs::symlink_metadata(dir.join(OPENED_MARKER)).unwrap().file_type().is_file());
+    }
+
+    /// Review of release/face-thumbs, LOW 2: a catalog whose UUID another known catalog shares
+    /// (`keep_orphans`) keeps the files of photos it does not have, however old.
+    #[test]
+    fn a_catalog_that_keeps_orphans_prunes_none() {
+        let tmp = TestTmpDir::new("offline-keep-orphans");
+        let store = tmp.path().join(PERSIST_DIR);
+        let now = std::time::SystemTime::now();
+        let cat = uuid::Uuid::new_v4();
+        let dir = store.join(cat.hyphenated().to_string());
+        std::fs::create_dir_all(&dir).unwrap();
+        let orphan = dir.join(format!("{}.jpg", uuid::Uuid::new_v4().hyphenated()));
+        std::fs::write(&orphan, b"jpeg").unwrap();
+        aged(&orphan, now, ORPHAN_AGE * 2);
+        let open = OfflineCatalog::new(&cat.to_string(), []).unwrap().keep_orphans();
+        assert_eq!(prune_offline_thumbs_in(&store, &open, now).unwrap(), Pruned::default());
+        assert!(orphan.is_file());
+        let open = OfflineCatalog::new(&cat.to_string(), []).unwrap();
+        assert_eq!(prune_offline_thumbs_in(&store, &open, now).unwrap().files, 1, "without it, pruned");
+    }
+
     /// The offline thumbnail's key (#258) takes UUIDs only, so nothing else ever reaches its
     /// path; and a photo of one catalog never shares a file with its namesake in another.
     #[test]
@@ -1655,6 +2012,20 @@ pub(crate) mod tests {
         assert_ne!(persistent_thumb_path(&a), persistent_thumb_path(&b));
         assert!(persistent_thumb_path(&a).starts_with(persistent_thumb_dir()));
         assert_eq!(OfflineThumbKey::new(&cat_a.to_uppercase(), &photo), Some(a), "one spelling per UUID");
+    }
+
+    /// #245 review: an empty or relative `XDG_CACHE_HOME` is ignored (the XDG spec), never a
+    /// cache under whatever directory the process was started in.
+    #[test]
+    fn a_relative_xdg_cache_home_is_ignored() {
+        let os = |s: &str| Some(std::ffi::OsString::from(s));
+        assert_eq!(cache_dir_from(os("/x/cache"), os("/home/u")), PathBuf::from("/x/cache"));
+        assert_eq!(cache_dir_from(os("rel/cache"), os("/home/u")), PathBuf::from("/home/u/.cache"));
+        assert_eq!(cache_dir_from(os("./cache"), os("/home/u")), PathBuf::from("/home/u/.cache"));
+        assert_eq!(cache_dir_from(os(""), os("/home/u")), PathBuf::from("/home/u/.cache"));
+        assert_eq!(cache_dir_from(None, os("/home/u")), PathBuf::from("/home/u/.cache"));
+        assert_eq!(cache_dir_from(os("rel"), None), std::env::temp_dir());
+        assert_eq!(cache_dir_from(None, os("")), std::env::temp_dir(), "an empty HOME is no home");
     }
 
     #[test]

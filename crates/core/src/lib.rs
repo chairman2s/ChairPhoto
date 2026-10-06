@@ -50,6 +50,8 @@ pub mod slideshow;
 #[cfg(feature = "smugmug")]
 pub mod smugmug;
 pub mod stack_proposals;
+#[cfg(any(test, feature = "test-hooks"))]
+pub mod test_home;
 #[cfg(test)]
 mod test_support;
 pub mod thumbnails;

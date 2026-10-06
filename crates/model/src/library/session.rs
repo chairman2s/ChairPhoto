@@ -329,6 +329,12 @@ impl LibrarySession {
         self.library.patch_face(id, cover_token, cover_pin)
     }
 
+    /// The newest refresh's generation ([`LibraryQuery::generation`]): bumped when a refresh
+    /// is asked for, before its rows land.
+    pub fn generation(&self) -> u64 {
+        self.library.generation()
+    }
+
     /// Re-run the query: perform the returned request, then [`Self::apply_page`].
     pub fn refresh(&mut self) -> RefreshRequest {
         let query = self.query();

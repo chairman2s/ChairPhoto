@@ -718,7 +718,18 @@ drained when the NAS volume is detected:
   leaves it for the next start). Nothing records which catalog wrote a file, so another
   catalog's photo can be adopted — the same tile the old layout showed — until the next
   render of the reachable original replaces it. An offload whose thumbnail keys cannot be
-  read fails before deleting anything.
+  read fails before deleting anything. After that migration, each start cleans the store up
+  for the start-up catalog (`thumbnails::prune_offline_thumbs`, off the UI thread, review of
+  #258 N2): that catalog's files for photos it no longer has (removed, or re-minted under a
+  new UUID) once they are 30 days old, and the directories of other catalogs not opened for
+  a year (each start and each catalog switch marks that catalog's directory with `.opened`;
+  a directory without one goes by its newest file). Conservative on purpose: an archive
+  catalog opened once a year with every original on an unmounted NAS has nothing else to
+  show. For the same reason the first kind is skipped when another catalog in the
+  recent-catalogs list shares the open one's UUID (a copy of the file shares it, and the
+  photos the copy dropped are the original's) or cannot be read
+  (`app::catalogs::orphans_are_its_own`). Never through a symlink — the `.opened` marker
+  included — and only names the store writes.
 - `restore(photo)` — pull an archived original back to local (e.g. to edit it)
 
 **The ops and verification**: `catalog/lifecycle.rs` + the `app/storage.rs` service bodies

@@ -7,7 +7,7 @@
 //!   camera preview (`edit` feature), with its hi-res render fetched on the first zoom-in.
 //! - **Navigation order.** When the target changes the image layer is asked for the target's
 //!   preview first, then N+1 and N−1, then N+2…N+5 and N−2 — one pool batch
-//!   (`ImageStore::navigate_window_as`), superseding the old window's queued requests. A zoom
+//!   (`ImageStore::navigate_window_in`), superseding the old window's queued requests. A zoom
 //!   tier wanted for the previous photo is released. Each loupe holds its own claim on what
 //!   it navigated to, so it releases only what no other loupe still wants: the inline loupe
 //!   closing leaves the pop-out's preloads alone, and the other way round (#110).
@@ -119,6 +119,9 @@ pub struct LoupeView {
     follow: Follow,
     /// The target the last navigation was for.
     navigated: Option<i64>,
+    /// The catalog the last navigation's photo ids were read from: a re-root reopens the
+    /// catalog under a new identity with the same target, and the window is asked for again.
+    navigated_from: Option<CatalogIdentity>,
     /// This view's hold on the images it navigated to (`ImageStore::set_claim`): another
     /// loupe over the same store — the inline one and the pop-out — keeps its own.
     claim: ClaimId,
@@ -170,6 +173,7 @@ impl LoupeView {
             focus: cx.focus_handle(),
             follow,
             navigated: None,
+            navigated_from: None,
             claim,
             released: false,
             #[cfg(feature = "edit")]
@@ -268,28 +272,33 @@ impl LoupeView {
         let target = self.target(cx).map(|p| p.id);
         let from = self.target_from(cx);
         self.zoom.update(cx, |z, cx| z.set_photo(target, from, cx));
-        if target != self.navigated {
-            let left = std::mem::replace(&mut self.navigated, target);
+        if target != self.navigated || from != self.navigated_from {
+            let left = std::mem::replace(&mut self.navigated, target).filter(|&left| Some(left) != target);
+            self.navigated_from = from;
             let rows = self.shell.read(cx).library.photo_ids();
             let claim = self.claim;
             self.images.update(cx, |store, cx| {
                 match target {
                     // This view's claim becomes the new window and the target's zoom tier:
-                    // what it held before is released unless another view holds it too.
+                    // what it held before is released unless another view holds it too. A
+                    // tier of the window another catalog rendered (preloaded before a re-root)
+                    // is asked for again now, not when it is stepped onto.
                     Some(id) => {
                         let zoom = [(id, ImageKind::Zoom)];
                         match rows.iter().position(|&r| r == id) {
-                            Some(index) => store.navigate_window_as(
+                            Some(index) => store.navigate_window_in(
                                 claim,
+                                from,
                                 &rows,
                                 index,
                                 ImageKind::Preview,
                                 PRELOAD_AHEAD,
                                 PRELOAD_BEHIND,
                                 &zoom,
+                                cx,
                             ),
                             // Off-grid (a stacked child): just this one.
-                            None => store.navigate_window_as(claim, &[id], 0, ImageKind::Preview, 0, 0, &zoom),
+                            None => store.navigate_window_in(claim, from, &[id], 0, ImageKind::Preview, 0, 0, &zoom, cx),
                         }
                     }
                     // Closed: nothing of this view's is wanted any more.

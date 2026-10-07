@@ -210,17 +210,23 @@ background index job: resumable queue, progress events, abort-safe, the same sha
 detection and pHash. New imports are scored when their preview is generated. Scoring never
 runs on the UI thread.
 
-Two writers exist. The **decode hook** (`app/boot.rs`, `sharpness_indexer::settle_from_decode`)
-rides every preview-tier or larger decode on the image pool; it is the one the GPUI app runs.
-The **batch backfill** (`sharpness_indexer::run_index`) has had no caller since the Tauri
-shell's `index_sharpness` command was removed (#165): a photo is scored when its preview is
-next generated, and not before.
+Three writers exist. The **decode hook** (`app/boot.rs`, `sharpness_indexer::settle_from_decode`)
+rides every preview-tier or larger decode on the image pool; it is what scores a new photo.
+The **legacy re-measure** (`app/sharpness.rs`, `sharpness_indexer::run_legacy_rescore`, #262)
+settles the scores measured on an enlarged preview, below; the GPUI app starts it once a
+catalog is open. The **batch backfill** (`sharpness_indexer::run_index`) has had no caller
+since the Tauri shell's `index_sharpness` command was removed (#165): an unscored photo is
+scored when its preview is next generated, and not before.
 
 ### Scores measured on an enlarged preview (#245)
 
 Before #245 the preview tier enlarged a decode smaller than 2048 px to 2048 px, and the batch
-indexer scored that preview: interpolated pixels, which read softer than the photo is. Those
-scores are re-measured, lazily:
+indexer scored that preview: interpolated pixels, which read softer than the photo is. Only
+the batch indexer's scores were measured that way: the decode hook has always scored the
+decode it was handed, at the decode's own size, never the enlarged preview made from it. Which
+writer left a legacy score is not recorded, though, so a correct hook-written score is
+treated like any other legacy one; at worst it is measured again on the same pixels, which
+changes nothing. Those scores are re-measured:
 
 - Every score written now carries `photos.sharpness_basis = 1` (`SHARPNESS_BASIS`). A score
   with `NULL` there is **legacy**: written before the column existed, or by an older build.
@@ -237,14 +243,24 @@ scores are re-measured, lazily:
 - Until then the legacy score stays where it is: the `soft` facet, the badge, the sort and
   burst analysis keep reading it. Clearing it to force a re-score would blank culling
   signals for photos that may never be viewed again.
-- Both writers queue `sharpness IS NULL OR sharpness_basis IS NULL`, and both decide the same
-  way: the hook from the decoded image, the backfill from the new preview's header.
+- The hook and the backfill queue `sharpness IS NULL OR sharpness_basis IS NULL`, the legacy
+  re-measure the legacy scores alone, and all three decide the same way: the hook from the
+  decoded image, the other two from the new preview's header.
 
-The re-measure therefore happens when a photo's preview is next generated. The #245 cache
-bump made every preview regenerate on its next request, so that is the next time a photo is
-opened in the loupe (or the cache is built with previews). A photo whose new preview was
-already generated before this change, and a photo never opened again, keeps its legacy score
-until a backfill runs; wiring one into the GPUI app is open.
+The decode hook settles a legacy score when a photo's preview is next generated, which the
+#245 cache bump made the next time it is opened in the loupe (or the cache is built with
+previews). That leaves out a photo whose new preview was generated before the stamp existed,
+a photo never opened again, and a photo readable only from a copy outside the catalog root
+(the hook maps a decoded file to its row by its path under the root). The **legacy
+re-measure** job (#262) covers them: once a catalog is open, the GPUI app
+(`storage::StorageState`) runs `app::sharpness::rescore_legacy_claimed` on a worker. It
+queues `sharpness IS NOT NULL AND sharpness_basis IS NULL` only — unscored photos stay with the
+hook — resolves each photo through the catalog's locations, makes (or reads the cached)
+preview and settles it by the preview's size as above. A photo that is offline, or whose
+preview fails, keeps its legacy score and is tried again on the next open; a catalog with
+none left finishes at once. It is an owned job (`JobRegistry::sharpness`): a newer start or a
+catalog switch trips it, its events carry its job id, it writes through a secondary connection
+to the catalog it read, and its own result is the terminal signal the status line reports.
 
 There is no `SCHEMA_VERSION` bump: an older build ignores the column and, by its own
 `sharpness IS NULL` guards, only ever writes unscored rows. Such a write is legacy here and is

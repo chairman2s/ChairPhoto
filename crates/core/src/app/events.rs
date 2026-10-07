@@ -191,11 +191,13 @@ pub struct SharpnessProgressEvent {
     pub job: u64,
 }
 
-/// Terminal event for the sharpness-indexing job.
+/// Terminal event for the sharpness job (`app::sharpness`, the legacy re-measure).
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct SharpnessIndexDone {
     pub ok: bool,
     pub done: usize,
+    /// Legacy scores kept as they were and stamped (#262): their preview was never enlarged.
+    pub kept: usize,
     pub total: usize,
     pub failed: usize,
     pub offline: usize,

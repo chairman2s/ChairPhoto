@@ -41,6 +41,7 @@ pub mod publications;
 #[cfg(feature = "localsend")]
 pub mod localsend;
 pub mod scans;
+pub mod sharpness;
 #[cfg(feature = "smarttags")]
 pub mod smarttags;
 #[cfg(feature = "slideshow")]

@@ -474,7 +474,7 @@ impl MapState {
     /// has not run yet — merges nothing and only retries the clear: merging it again would let
     /// its old Deny win over an Allow the user gave in between. Once an empty read confirms
     /// the clear ([`Self::confirm_clear`], [`HostConsent::confirm_cleared`]), a *later*
-    /// non-empty read of the same UUID is treated as new content — a pre-#231 build writing
+    /// non-empty read of the same UUID is treated as new content — a build from before consent moved to machine prefs (4203b66) writing
     /// into the copy again — so its Denies are folded in, never an Allow (the safe direction
     /// for content with no known provenance), and the catalog goes back to pending for the
     /// clear this content now needs. Those Denies only block a host with no answer; they never

@@ -2657,6 +2657,34 @@ fn a_click_inside_the_panel_off_a_cell_leaves_the_backdrop_focused(cx: &mut Test
     assert_eq!(focused(&rig, &sheet, cx), Some(0), "the backdrop, not the Darkroom root, kept focus");
 }
 
+/// **#265**: the Duel overlay mounts in the same Darkroom root as the proof sheet, so a click
+/// on it must not reach the root's catch-all mouse-down, which would move focus off the duel
+/// and silently break its arrow and Esc keys.
+#[gpui_kit::test]
+fn a_click_on_the_duel_leaves_the_duel_focused(cx: &mut TestAppContext) {
+    use super::view::Overlay;
+    let rig = rig("dk-duel-click", 2, cx);
+    work(cx);
+    rig.with_view(cx, |v, window, cx| v.open_duel(window, cx));
+    let duel = rig.view(cx).read_with(cx, |v, _| match v.overlay() {
+        Some(Overlay::Duel(d)) => d.clone(),
+        _ => panic!("the duel is mounted"),
+    });
+    let focused = |rig: &Rig, cx: &mut TestAppContext| {
+        cx.update_window(rig.app.window(), |_, window, cx| duel.read(cx).focus_handle().is_focused(window)).unwrap()
+    };
+    cx.update_window(rig.app.window(), |_, window, cx| {
+        duel.read(cx).focus_handle().clone().focus(window, cx);
+        window.render_frame(cx);
+    })
+    .unwrap();
+    assert!(focused(&rig, cx), "the duel starts focused");
+    let at = gpui_kit::point(gpui_kit::px(20.), gpui_kit::px(20.));
+    cx.update_window(rig.app.window(), |_, window, cx| window.click_at("duel", at, cx)).unwrap();
+    cx.run_until_parked();
+    assert!(focused(&rig, cx), "the Darkroom root did not steal focus");
+}
+
 /// The proof sheet's keys, as React's proof cells were buttons: Enter on the sheet as dealt
 /// (the backdrop focused, no proof) neither declines nor adopts; Tab / Shift+Tab move focus
 /// through the proofs, wrapping; Enter adopts the focused proof. A pointer click on the

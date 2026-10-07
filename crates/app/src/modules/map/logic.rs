@@ -149,7 +149,7 @@ impl HostConsent {
     /// record (unknown history, read as still pending): a later non-empty read of it is then
     /// a retry of the very clear that has not landed yet, and must not be re-merged — that
     /// would undo, "denied wins", an Allow the user gave since (#229). Once `true`, a later
-    /// non-empty read is treated as new content — a pre-#231 build writing into the copy
+    /// non-empty read is treated as new content — a build from before consent moved to machine prefs (4203b66) writing into the copy
     /// again — and [`Self::merge_legacy_denies_except`] folds in only its Denies, and only for
     /// hosts with no answer (#231). The flag is per UUID, not per file: a file copy sharing
     /// the UUID may still hold the content already merged, which is why that re-merge never

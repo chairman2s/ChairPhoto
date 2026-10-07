@@ -1,0 +1,104 @@
+[package]
+name = "chairphoto-app"
+# Never published on its own. Its version is the workspace's single source
+# (`[workspace.package] version` at the repository root, #167), which `packaging/PKGBUILD`'s
+# `pkgver` must match.
+version.workspace = true
+publish = false
+description = "ChairPhoto's native GPUI front end (docs/plans/gpui)"
+authors = ["Andreas Henden <chairman2s.ah+github@gmail.com>"]
+license = "GPL-3.0-only"
+readme = "../../README.md"
+edition = "2021"
+
+# The GPUI shell: a window over `chairphoto-core`, with no Tauri and no webview (issue #99).
+# The library holds everything testable; the binary is `run()`.
+[lib]
+name = "chairphoto_app"
+
+# Renamed from `chairphoto-gpui` at the GPUI cutover (#167): the GPUI app is the only front
+# end now, so it takes the name the Tauri shell's binary used to own.
+[[bin]]
+name = "chairphoto"
+path = "src/main.rs"
+
+# The Map module's offline CPU bench (#119): needs the map backend.
+[[example]]
+name = "map_bench"
+required-features = ["map"]
+
+# The Tag graph's measurement path (#121); it needs the module.
+[[example]]
+name = "tag_graph_bench"
+required-features = ["tag-graph"]
+
+# The Darkroom's drag-frame measurement path (#111); it needs the edit engine.
+[[example]]
+name = "darkroom_bench"
+required-features = ["edit"]
+
+[features]
+# The same names as the core's features, forwarded one by one, with the core's default set plus
+# the app-only `tag-graph`.
+default = ["ai", "edit", "raw", "instagram", "collage", "slideshow", "localsend", "map", "faces", "smarttags", "tag-graph"]
+ai = ["chairphoto-core/ai"]
+localsend = ["chairphoto-core/localsend"]
+flickr = ["chairphoto-core/flickr"]
+smugmug = ["chairphoto-core/smugmug"]
+instagram = ["chairphoto-core/instagram"]
+edit = ["chairphoto-core/edit"]
+map = ["chairphoto-core/map"]
+collage = ["chairphoto-core/collage"]
+faces = ["chairphoto-core/faces"]
+faces-cuda = ["faces", "chairphoto-core/faces-cuda"]
+smarttags = ["chairphoto-core/smarttags"]
+smarttags-cuda = ["smarttags", "chairphoto-core/smarttags-cuda"]
+slideshow = ["chairphoto-core/slideshow"]
+raw = ["chairphoto-core/raw"]
+# The module registry's dev module (`modules::dev_module`), which contributes to every slot:
+# for looking at the slots in the running app. Never in `default`; tests get it anyway.
+dev-module = []
+# The Tag graph module (`modules::tag_graph`, #121). App-only: its data (`library_graph`) is in
+# every core build, so it forwards no core feature; it brings tiny-skia for the edge raster.
+tag-graph = ["dep:tiny-skia"]
+
+[dependencies]
+# Features are forwarded one by one above, so `--no-default-features` here builds no backend.
+chairphoto-core = { path = "../core", default-features = false }
+# The UI logic without a toolkit: here, the theme tokens and the Omarchy mapping (#102).
+chairphoto-model = { path = "../model" }
+# One dependency for GPUI (`gpui-pre =0.3.7`, which this version pins), gpui-base, the
+# gpui-component widgets and the default icon assets. Exact pin: the Phase 0 spike (3e13e1b)
+# and docs/plans/gpui/shell-apis.md were verified against this version.
+gpui-kit = "=0.7.0"
+# `mpsc` for the event bridge (`events.rs`): the core's worker threads send, a foreground
+# task receives. Already in gpui's own dependency graph.
+futures = "0.3"
+# The last-event line renders a `CoreEvent`'s payload as JSON (`model.rs`); both are already
+# the core's dependencies.
+serde = "1"
+serde_json = "1"
+# `RenderImage` frames are `image::Frame`s; the image layer converts the core's decoded
+# `DynamicImage` to BGRA (`image_store::to_bgra`). The core's and gpui's version (0.25).
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+# Map tile loads run on the core's tokio runtime; a load's `AbortHandle` cancels it when its
+# tile leaves the view (`modules::map::tiles`). Already the core's dependency.
+tokio = { version = "1", default-features = false, features = ["rt"] }
+# A user preset's id (`darkroom::session::rails`, TS `crypto.randomUUID()`). Already the core's dependency.
+uuid = { version = "1", features = ["v4"] }
+# The quit-signal handlers (`signals.rs`: sigaction, a self-pipe, `_exit`). Already in the
+# lockfile through the core and gpui.
+libc = "0.2"
+# The Tag graph's base edge raster (`modules::tag_graph::raster`). Already in the lockfile
+# through gpui's resvg, at this version and with its default features.
+tiny-skia = { version = "0.11.4", optional = true }
+
+[dev-dependencies]
+# The headless test platform: `#[gpui_kit::test]`, `TestAppContext`, `VisualTestContext`.
+gpui-kit = { version = "=0.7.0", features = ["test-support"] }
+# Turns on the core's `test-hooks` feature (its slideshow frame-root override, #228) for this
+# crate's own test binary only. Cargo unifies a path dependency's features across
+# `[dependencies]` and `[dev-dependencies]` for a compilation that pulls in both — a test
+# target does, the `chairphoto` binary does not — so the feature never reaches the
+# shipped binary even though it is declared here unconditionally.
+chairphoto-core = { path = "../core", default-features = false, features = ["test-hooks"] }

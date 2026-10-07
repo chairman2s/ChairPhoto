@@ -1,0 +1,53 @@
+# Every id here is one this dependency graph (chairphoto-app, default features + flickr,
+# smugmug — the set packaging/PKGBUILD actually builds) resolves to today; see the "Regenerating"
+# section of packaging/README.md for the survey command. Deliberately not listed, because
+# nothing in the graph currently resolves to them: Unicode-DFS-2016 (superseded by Unicode-3.0
+# in the unicode-ident/ICU4X crates that used to carry it), BSL-1.0, and the OpenSSL license
+# (the `ring` crate's Cargo.toml declares "Apache-2.0 AND ISC" for this version, not the older
+# combined OpenSSL-derived text). A future dependency bump that needs one of those should add
+# it back as a conscious, reviewed change, not find it silently pre-approved.
+#
+# MPL-2.0 (`option-ext`) is the one weak-copyleft entry: MPL's share-alike obligation attaches
+# only to the MPL-covered file itself, not to code linked against it, so it does not extend
+# GPL-3.0-only ChairPhoto's own terms. CDLA-Permissive-2.0 (`webpki-roots`) licenses a data
+# bundle (Mozilla's CA root certificates), not code, and is permissive. Both are accepted as
+# understood exceptions, not oversights.
+accepted = [
+  "MIT",
+  "Apache-2.0",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "ISC",
+  "Zlib",
+  "Unicode-3.0",
+  "MPL-2.0",
+  "CC0-1.0",
+  "0BSD",
+  "bzip2-1.0.6",
+  "CDLA-Permissive-2.0",
+]
+
+ignore-build-dependencies = true
+ignore-dev-dependencies = true
+
+# Without a cap, cargo-about recurses into every crate's `src/` and scores each source file's
+# header comment against the license corpus. For a crate like `ring`, whose Cargo.toml-declared
+# expression ("Apache-2.0 AND ISC") is already satisfied, that recursive scan still runs (it is
+# the only place cargo-about looks for license *text*, not just the expression) and askalono
+# occasionally classifies a short per-file header plus the code below it as the license's
+# "Original" text rather than a "Header" excerpt, which would otherwise be dropped — pulling
+# literal Rust source into a licence-notices file. Capping the scan to each crate's own root
+# (depth 1: the root dir's immediate files, no `src/`) keeps the normal LICENSE/LICENSE-MIT/
+# LICENSE-APACHE discovery (verified empirically: every crate in this graph still resolves)
+# while eliminating that failure mode.
+max-depth = 1
+
+targets = [
+  "x86_64-unknown-linux-gnu",
+]
+
+# Path/workspace members (chairphoto-app, chairphoto-core, chairphoto-model) are GPL-3.0-only
+# and not published to any registry; they are ChairPhoto itself, not a third-party dependency,
+# so they are excluded from this notice rather than added to `accepted`.
+[private]
+ignore = true

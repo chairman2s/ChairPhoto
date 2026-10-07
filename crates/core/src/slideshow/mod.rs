@@ -1,0 +1,742 @@
+//! The slideshow **engine** (behind the `slideshow` Cargo feature): turns an ordered list of
+//! still images into a single `.mp4` movie by shelling out to the external **ffmpeg** binary
+//! (detected on PATH at runtime, like exiftool / Chrome — the established "shell out to a
+//! trusted tool" pattern). Catalog-free: it works on file paths the caller has already
+//! resolved + rendered (the `make_slideshow` command renders each photo's Original to a temp
+//! full-size JPEG via the export path, then hands the paths here). See docs/slideshow.md.
+//!
+//! Filtergraph: one ffmpeg invocation with one looped still per clip. Each clip is
+//! `scale=W:H:force_original_aspect_ratio=decrease` then `pad=W:H:-1:-1:color=black`
+//! (letterbox — never crop), at the chosen `fps`; with Ken Burns a slow `zoompan` zoom over
+//! `duration*fps` frames is applied. Clips are then chained with `xfade` (each transition's
+//! offset accumulates: clip k starts where clip k-1's visible part ends, minus the overlap)
+//! for crossfades, or simply `concat`enated when transitions are off. Encoded with `libx264`,
+//! `-pix_fmt yuv420p`, `-movflags +faststart` for broad compatibility.
+
+use std::io::{BufRead, BufReader};
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc;
+use std::time::Duration;
+
+/// All knobs for one slideshow render. The output path + the resolved still paths are passed
+/// separately to [`build_args`] / [`render`]; this is the user-facing option set mirrored by
+/// the frontend dialog (docs/slideshow.md → Options).
+#[derive(Clone, Copy, Debug)]
+pub struct SlideshowOptions {
+    /// Seconds each photo is shown (the full clip length, transition overlap included).
+    pub duration_per_photo: f64,
+    /// Whether to crossfade between clips (ffmpeg `xfade`); `false` = hard cuts (`concat`).
+    pub transition: bool,
+    /// Crossfade length in seconds (ignored when `transition` is false). Clamped below
+    /// `duration_per_photo` so a clip always has some non-overlapping visible time.
+    pub transition_duration: f64,
+    /// Apply a slow Ken Burns zoom (ffmpeg `zoompan`) to each clip.
+    pub ken_burns: bool,
+    /// Output frame rate.
+    pub fps: u32,
+    /// Output width in pixels.
+    pub width: u32,
+    /// Output height in pixels.
+    pub height: u32,
+}
+
+impl Default for SlideshowOptions {
+    fn default() -> Self {
+        SlideshowOptions {
+            duration_per_photo: 3.0,
+            transition: true,
+            transition_duration: 0.5,
+            ken_burns: false,
+            fps: 30,
+            width: 1920,
+            height: 1080,
+        }
+    }
+}
+
+/// Locate the `ffmpeg` binary on `PATH`. Returns the resolved absolute path, or `None` when
+/// it is not installed (the caller surfaces a clear "ffmpeg required" error).
+pub fn ffmpeg_path() -> Option<String> {
+    which("ffmpeg")
+}
+
+/// Locate the `ffprobe` binary on `PATH` (used by tests / optional duration probing).
+pub fn ffprobe_path() -> Option<String> {
+    which("ffprobe")
+}
+
+/// A PATH lookup for `bin` done in Rust rather than by shelling out to the external `which`
+/// binary (#211) — one external process fewer, and it works even where `which` itself isn't
+/// installed (some minimal containers ship `ffmpeg` without it).
+fn which(bin: &str) -> Option<String> {
+    which_in(bin, std::env::var_os("PATH")?)
+}
+
+/// [`which`] searching `path_var` (a `PATH`-style, `:`-separated list) instead of the real
+/// environment — so a test can check the lookup without mutating process-wide state. Walks
+/// the entries in order and returns the first one that is a regular, executable file.
+fn which_in(bin: &str, path_var: impl AsRef<std::ffi::OsStr>) -> Option<String> {
+    std::env::split_paths(&path_var).filter(|dir| is_searchable_path_entry(dir)).find_map(|dir| {
+        let candidate = dir.join(bin);
+        is_executable_file(&candidate).then(|| candidate.to_string_lossy().into_owned())
+    })
+}
+
+/// Whether a `PATH` entry (as [`std::env::split_paths`] yields it) is one [`which_in`]
+/// searches (#211 L3): only an absolute directory. An empty entry, `.`, or any other relative
+/// entry resolves against the process's current working directory — shells and `exec*(3)`
+/// treat a relative/empty `PATH` component that way, so without this gate `which_in` could
+/// "find" ffmpeg/ffprobe as whatever same-named file happens to sit in the CWD, which for a
+/// GUI app launched from an arbitrary directory is attacker-influenceable and never what a
+/// `PATH` lookup is supposed to mean.
+fn is_searchable_path_entry(dir: &Path) -> bool {
+    dir.is_absolute()
+}
+
+#[cfg(unix)]
+fn is_executable_file(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(path).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+}
+
+#[cfg(not(unix))]
+fn is_executable_file(path: &Path) -> bool {
+    path.is_file()
+}
+
+/// The effective transition overlap (seconds): the requested `transition_duration` when
+/// transitions are on, clamped to leave at least ~0.1s of non-overlapping clip. `0.0` when
+/// transitions are off.
+fn overlap(opts: &SlideshowOptions) -> f64 {
+    if !opts.transition {
+        return 0.0;
+    }
+    let max = (opts.duration_per_photo - 0.1).max(0.0);
+    opts.transition_duration.clamp(0.0, max)
+}
+
+/// Build the per-clip filter chain (everything after the input label, up to its output label)
+/// for one still: scale to fit, letterbox-pad, set SAR/fps, optional Ken Burns zoom. The clip
+/// is `duration_per_photo` seconds long (`duration*fps` frames).
+fn clip_filter(opts: &SlideshowOptions) -> String {
+    let SlideshowOptions {
+        width: w,
+        height: h,
+        fps,
+        duration_per_photo: dur,
+        ..
+    } = *opts;
+    let frames = ((dur * fps as f64).round() as i64).max(1);
+    let mut chain = String::new();
+    if opts.ken_burns {
+        // Slow zoom from 1.0 to ~1.15 over the clip. zoompan needs an oversized input so the
+        // zoomed crop has pixels to sample: upscale to 2x the target first, zoompan emits the
+        // target size. `d` = frames per still, `fps` sets the clip rate. CRITICAL: zoompan
+        // emits `d` frames *per input frame*, and the looped `-i` still feeds a stream of
+        // frames — so we `select='eq(n,0)'` to pass exactly ONE frame in, making the clip
+        // exactly `d/fps` seconds long (otherwise the duration blows up by the loop rate).
+        chain.push_str(&format!(
+            "scale={w2}:{h2}:force_original_aspect_ratio=decrease,\
+             pad={w2}:{h2}:-1:-1:color=black,\
+             select='eq(n\\,0)',\
+             zoompan=z='min(zoom+0.0015,1.15)':d={frames}:x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':s={w}x{h}:fps={fps},\
+             setsar=1",
+            w2 = w * 2,
+            h2 = h * 2,
+            w = w,
+            h = h,
+            frames = frames,
+            fps = fps,
+        ));
+    } else {
+        chain.push_str(&format!(
+            "scale={w}:{h}:force_original_aspect_ratio=decrease,\
+             pad={w}:{h}:-1:-1:color=black,\
+             fps={fps},setsar=1",
+            w = w,
+            h = h,
+            fps = fps,
+        ));
+    }
+    chain
+}
+
+/// Build the `filter_complex` graph for `n` clips. Returns the graph string and the label of
+/// the final video stream to map (`[vN]`, or `[outv]` for the xfade/concat result).
+fn filter_complex(n: usize, opts: &SlideshowOptions) -> (String, String) {
+    let mut parts: Vec<String> = Vec::new();
+    let per = clip_filter(opts);
+    for i in 0..n {
+        parts.push(format!("[{i}:v]{per}[v{i}]", i = i, per = per));
+    }
+
+    if n == 1 {
+        return (parts.join(";"), "[v0]".to_string());
+    }
+
+    if opts.transition {
+        let ov = overlap(opts);
+        let dur = opts.duration_per_photo;
+        // xfade chains pairwise. Clip i contributes (dur - ov) of unique visible time before
+        // the next transition begins, so offset_k = k*(dur - ov) for the k-th xfade (k>=1).
+        let mut prev = "[v0]".to_string();
+        let mut acc = 0.0_f64;
+        for i in 1..n {
+            acc += dur - ov;
+            let out = if i == n - 1 {
+                "[outv]".to_string()
+            } else {
+                format!("[x{i}]")
+            };
+            parts.push(format!(
+                "{prev}[v{i}]xfade=transition=fade:duration={ov}:offset={off}{out}",
+                prev = prev,
+                i = i,
+                ov = fmt_secs(ov),
+                off = fmt_secs(acc),
+                out = out,
+            ));
+            prev = out;
+        }
+        (parts.join(";"), "[outv]".to_string())
+    } else {
+        // Hard cuts: concat the per-clip streams.
+        let labels: String = (0..n).map(|i| format!("[v{i}]")).collect();
+        parts.push(format!(
+            "{labels}concat=n={n}:v=1:a=0[outv]",
+            labels = labels,
+            n = n
+        ));
+        (parts.join(";"), "[outv]".to_string())
+    }
+}
+
+/// Format seconds without trailing-zero noise / locale issues (ffmpeg wants a `.`-decimal).
+fn fmt_secs(s: f64) -> String {
+    // Up to 3 decimals, trim trailing zeros.
+    let mut t = format!("{:.3}", s);
+    while t.contains('.') && (t.ends_with('0') || t.ends_with('.')) {
+        t.pop();
+    }
+    t
+}
+
+/// Build the full ffmpeg argument vector (everything after the binary name) for the given
+/// ordered `frame_paths`, options, and output file. Each still is a looped input held for
+/// `duration_per_photo` seconds; the `filter_complex` does scale/pad/fps (+ optional zoompan)
+/// and chains the clips with xfade (or concat). Encodes libx264 / yuv420p / +faststart.
+///
+/// `-progress pipe:1` is appended so the caller can parse progress from stdout.
+pub fn build_args(frame_paths: &[PathBuf], opts: &SlideshowOptions, out: &Path) -> Vec<String> {
+    let mut args: Vec<String> = Vec::new();
+    args.push("-y".to_string());
+
+    let dur = fmt_secs(opts.duration_per_photo);
+    for p in frame_paths {
+        args.push("-loop".to_string());
+        args.push("1".to_string());
+        args.push("-t".to_string());
+        args.push(dur.clone());
+        args.push("-i".to_string());
+        args.push(file_url(p));
+    }
+
+    let (graph, map) = filter_complex(frame_paths.len(), opts);
+    args.push("-filter_complex".to_string());
+    args.push(graph);
+    args.push("-map".to_string());
+    args.push(map);
+
+    args.push("-r".to_string());
+    args.push(opts.fps.to_string());
+    args.push("-c:v".to_string());
+    args.push("libx264".to_string());
+    args.push("-pix_fmt".to_string());
+    args.push("yuv420p".to_string());
+    args.push("-movflags".to_string());
+    args.push("+faststart".to_string());
+    // `-progress`/`-nostats` must come BEFORE the output file — ffmpeg ignores options that
+    // follow the output filename, which would silently disable progress reporting.
+    args.push("-progress".to_string());
+    args.push("pipe:1".to_string());
+    args.push("-nostats".to_string());
+    args.push(file_url(out));
+
+    args
+}
+
+/// A path as ffmpeg's `file:` protocol: never read as an option (a leading `-`) or as another
+/// protocol (`ftp://…`, `pipe:`), whatever the path's spelling.
+fn file_url(path: &Path) -> String {
+    format!("file:{}", path.to_string_lossy())
+}
+
+/// Total expected output frame count (used to turn ffmpeg's `frame=` counter into a fraction).
+fn total_frames(n: usize, opts: &SlideshowOptions) -> u32 {
+    if n == 0 {
+        return 0;
+    }
+    let per = opts.duration_per_photo * opts.fps as f64;
+    let ov_frames = overlap(opts) * opts.fps as f64;
+    // n clips, each `per` frames, overlapped by `ov_frames` at (n-1) joins.
+    let total = per * n as f64 - ov_frames * (n.saturating_sub(1)) as f64;
+    total.round().max(1.0) as u32
+}
+
+/// Render `frame_paths` to the `.mp4` at `out` using ffmpeg. Reports progress as
+/// `(done_frames, total_frames)` via `on_progress` while encoding (parsed from ffmpeg's
+/// `-progress pipe:1` `frame=` lines). Returns `Err` with a tail of ffmpeg's stderr on
+/// failure, or a clear message when ffmpeg is not installed / no frames were given.
+pub fn render(
+    frame_paths: &[PathBuf],
+    opts: &SlideshowOptions,
+    out: &Path,
+    on_progress: impl Fn(u32, u32),
+) -> Result<(), String> {
+    if frame_paths.is_empty() {
+        return Err("slideshow: no photos to render".to_string());
+    }
+    let bin = ffmpeg_path().ok_or_else(|| FFMPEG_MISSING.to_string())?;
+    render_with(Path::new(&bin), frame_paths, opts, out, &AtomicBool::new(false), on_progress)
+}
+
+/// What a render answers when ffmpeg is not installed.
+pub const FFMPEG_MISSING: &str = "ffmpeg not found on PATH — install ffmpeg to render slideshows";
+
+/// What a render answers when its abort flag was tripped (Cancel, a newer render, or a
+/// catalog switch).
+pub const SLIDESHOW_CANCELLED: &str = "Slideshow cancelled";
+
+/// How often the encode loop looks at the abort flag while ffmpeg runs.
+const ABORT_POLL: Duration = Duration::from_millis(50);
+
+/// [`render`] with an explicit ffmpeg binary and an abort flag. Tripping `abort` kills the
+/// ffmpeg process within [`ABORT_POLL`] and answers [`SLIDESHOW_CANCELLED`]; the partial
+/// output is the caller's to remove. Blocking.
+///
+/// ffmpeg's stdout is read on a helper thread and its `frame=` counts sent back here, so this
+/// thread can watch `abort` while ffmpeg is quiet (a long zoompan clip writes nothing for a
+/// while) and `on_progress` runs on the caller's thread.
+pub fn render_with(
+    bin: &Path,
+    frame_paths: &[PathBuf],
+    opts: &SlideshowOptions,
+    out: &Path,
+    abort: &AtomicBool,
+    on_progress: impl Fn(u32, u32),
+) -> Result<(), String> {
+    if frame_paths.is_empty() {
+        return Err("slideshow: no photos to render".to_string());
+    }
+    if abort.load(Ordering::Relaxed) {
+        return Err(SLIDESHOW_CANCELLED.to_string());
+    }
+    let total = total_frames(frame_paths.len(), opts);
+    let args = build_args(frame_paths, opts, out);
+
+    let mut child = Command::new(bin)
+        .args(&args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("failed to launch ffmpeg: {e}"))?;
+
+    // Drain stderr on a separate thread so a full stderr pipe can never deadlock the
+    // stdout/progress loop (ffmpeg writes verbose diagnostics to stderr on long renders).
+    let stderr_handle = child.stderr.take().map(|mut err| {
+        std::thread::spawn(move || {
+            use std::io::Read;
+            let mut buf = String::new();
+            let _ = err.read_to_string(&mut buf);
+            buf
+        })
+    });
+
+    // Parse `-progress pipe:1` from stdout. ffmpeg writes blocks of `key=value` lines; we
+    // care about `frame=` (current output frame) and the terminal `progress=end`.
+    let (tx, rx) = mpsc::channel::<u32>();
+    let stdout_handle = child.stdout.take().map(|stdout| {
+        std::thread::spawn(move || {
+            for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+                let frame = if let Some(v) = line.strip_prefix("frame=") {
+                    v.trim().parse::<u32>().ok()
+                } else if line == "progress=end" {
+                    Some(u32::MAX)
+                } else {
+                    None
+                };
+                if let Some(f) = frame {
+                    if tx.send(f).is_err() {
+                        break;
+                    }
+                }
+            }
+        })
+    });
+
+    let mut aborted = false;
+    if stdout_handle.is_some() {
+        loop {
+            if abort.load(Ordering::Relaxed) {
+                aborted = true;
+                let _ = child.kill();
+                break;
+            }
+            match rx.recv_timeout(ABORT_POLL) {
+                Ok(f) => on_progress(f.min(total), total),
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => break, // ffmpeg closed stdout
+            }
+        }
+    }
+
+    let status = child.wait().map_err(|e| format!("ffmpeg wait failed: {e}"))?;
+    if let Some(h) = stdout_handle {
+        let _ = h.join();
+    }
+    let stderr_buf = stderr_handle.and_then(|h| h.join().ok()).unwrap_or_default();
+
+    if aborted {
+        return Err(SLIDESHOW_CANCELLED.to_string());
+    }
+    if !status.success() {
+        let tail: String = stderr_buf
+            .lines()
+            .rev()
+            .take(20)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect::<Vec<_>>()
+            .join("\n");
+        return Err(format!(
+            "ffmpeg exited with {} —\n{}",
+            status.code().map(|c| c.to_string()).unwrap_or_else(|| "signal".into()),
+            tail
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn opts() -> SlideshowOptions {
+        SlideshowOptions {
+            duration_per_photo: 3.0,
+            transition: false,
+            transition_duration: 0.5,
+            ken_burns: false,
+            fps: 30,
+            width: 1920,
+            height: 1080,
+        }
+    }
+
+    fn paths(n: usize) -> Vec<PathBuf> {
+        (0..n).map(|i| PathBuf::from(format!("/tmp/f{i}.jpg"))).collect()
+    }
+
+    /// #211: a pure-Rust `PATH` lookup (no `which` binary). It skips a same-named file that
+    /// exists but isn't executable, and finds the real one later on the path; no match
+    /// anywhere on `PATH` is `None`. `which_in` takes an explicit path string so this never
+    /// touches the process's real `PATH` (shared, racy under parallel tests).
+    #[test]
+    #[cfg(unix)]
+    fn which_skips_a_non_executable_and_finds_the_real_binary_on_path() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = crate::test_support::TestTmpDir::new("slideshow-which");
+        let decoy_dir = dir.join("decoy");
+        let real_dir = dir.join("real");
+        std::fs::create_dir_all(&decoy_dir).unwrap();
+        std::fs::create_dir_all(&real_dir).unwrap();
+        // A same-named file earlier on the path, but not executable: must be skipped.
+        let decoy = decoy_dir.join("myffmpeg");
+        std::fs::write(&decoy, "not executable").unwrap();
+        let real = real_dir.join("myffmpeg");
+        std::fs::write(&real, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let search = format!("{}:{}", decoy_dir.display(), real_dir.display());
+        assert_eq!(which_in("myffmpeg", &search), Some(real.to_string_lossy().into_owned()));
+        assert_eq!(which_in("nonexistent-binary-xyz", &search), None);
+    }
+
+    /// #211 L3 (review probe P2): an empty `PATH` entry, `.`, and any other relative entry
+    /// all mean "resolve against the CWD" — `which_in` must never search any of them, only
+    /// absolute directories. Pure and CWD-independent: it checks the gate `which_in` filters
+    /// through, not the filesystem, so it cannot pass by accident of wherever the test runner's
+    /// working directory happens to be.
+    /// (Mutation-checked: `is_searchable_path_entry` returning `true` unconditionally — the
+    /// pre-fix behavior, equivalent to no filter at all — fails every assertion but the last.)
+    #[test]
+    fn which_in_only_searches_absolute_path_entries() {
+        assert!(!is_searchable_path_entry(Path::new("")), "an empty PATH entry means the CWD");
+        assert!(!is_searchable_path_entry(Path::new(".")), "\".\" means the CWD");
+        assert!(!is_searchable_path_entry(Path::new("src/..")), "any relative entry resolves against the CWD");
+        assert!(is_searchable_path_entry(Path::new("/usr/bin")), "an absolute directory is searched");
+    }
+
+    /// #211 L3, end-to-end: a `PATH` string carrying an empty entry and `.` ahead of the real
+    /// absolute one must not error or short-circuit — `which_in` skips the bad entries and
+    /// still finds the real binary.
+    /// (Mutation-checked: dropping the `.filter(...)` in `which_in` still passes this
+    /// particular case — on most machines the real `myffmpeg` isn't sitting in the CWD either
+    /// — which is exactly why `which_in_only_searches_absolute_path_entries` above is the test
+    /// that actually pins the gate; this one just confirms the gate doesn't break the good
+    /// path.)
+    #[test]
+    #[cfg(unix)]
+    fn which_in_skips_empty_and_dot_entries_and_still_finds_the_real_binary() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = crate::test_support::TestTmpDir::new("slideshow-which-relative");
+        let real_dir = dir.join("real");
+        std::fs::create_dir_all(&real_dir).unwrap();
+        let real = real_dir.join("myffmpeg2");
+        std::fs::write(&real, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let search = format!(".::{}", real_dir.display());
+        assert_eq!(which_in("myffmpeg2", &search), Some(real.to_string_lossy().into_owned()));
+    }
+
+    #[test]
+    fn clip_filter_letterboxes_without_crop() {
+        let f = clip_filter(&opts());
+        assert!(f.contains("scale=1920:1080:force_original_aspect_ratio=decrease"));
+        assert!(f.contains("pad=1920:1080:-1:-1:color=black"));
+        assert!(f.contains("fps=30"));
+        assert!(!f.contains("zoompan"));
+    }
+
+    #[test]
+    fn clip_filter_ken_burns_uses_zoompan() {
+        let mut o = opts();
+        o.ken_burns = true;
+        let f = clip_filter(&o);
+        assert!(f.contains("zoompan="));
+        assert!(f.contains("s=1920x1080"));
+        // Oversampled input so the zoom crop has pixels.
+        assert!(f.contains("scale=3840:2160:force_original_aspect_ratio=decrease"));
+        // Exactly one frame fed into zoompan (otherwise the looped input multiplies duration).
+        assert!(f.contains("select='eq(n\\,0)'"));
+    }
+
+    #[test]
+    fn concat_graph_no_transition() {
+        let (graph, map) = filter_complex(3, &opts());
+        assert_eq!(map, "[outv]");
+        assert!(graph.contains("[0:v]"));
+        assert!(graph.contains("[v0][v1][v2]concat=n=3:v=1:a=0[outv]"));
+        assert!(!graph.contains("xfade"));
+    }
+
+    #[test]
+    fn xfade_graph_accumulates_offsets() {
+        let mut o = opts();
+        o.transition = true;
+        o.transition_duration = 0.5; // overlap 0.5, unique = 2.5
+        let (graph, map) = filter_complex(3, &o);
+        assert_eq!(map, "[outv]");
+        // First xfade: offset = 2.5, into intermediate [x1].
+        assert!(
+            graph.contains("[v0][v1]xfade=transition=fade:duration=0.5:offset=2.5[x1]"),
+            "graph was: {graph}"
+        );
+        // Second xfade: offset = 5.0, into [outv].
+        assert!(
+            graph.contains("[x1][v2]xfade=transition=fade:duration=0.5:offset=5[outv]"),
+            "graph was: {graph}"
+        );
+    }
+
+    #[test]
+    fn xfade_two_inputs_single_join() {
+        let mut o = opts();
+        o.transition = true;
+        let (graph, map) = filter_complex(2, &o);
+        assert_eq!(map, "[outv]");
+        assert!(graph.contains("[v0][v1]xfade=transition=fade:duration=0.5:offset=2.5[outv]"));
+    }
+
+    #[test]
+    fn single_clip_maps_v0() {
+        let (_graph, map) = filter_complex(1, &opts());
+        assert_eq!(map, "[v0]");
+    }
+
+    #[test]
+    fn build_args_loops_each_input_and_encodes() {
+        let a = build_args(&paths(2), &opts(), Path::new("/tmp/out.mp4"));
+        assert_eq!(a.iter().filter(|x| *x == "-loop").count(), 2);
+        assert_eq!(a.iter().filter(|x| *x == "-i").count(), 2);
+        assert!(a.iter().any(|x| x == "libx264"));
+        assert!(a.iter().any(|x| x == "yuv420p"));
+        assert!(a.iter().any(|x| x == "+faststart"));
+        assert_eq!(a.last().map(String::as_str), Some("file:/tmp/out.mp4"));
+        assert!(a.iter().any(|x| x == "file:/tmp/f0.jpg"));
+        assert!(a.iter().any(|x| x == "-progress"));
+    }
+
+    /// However the output is spelled, ffmpeg sees a `file:` path: a leading `-` is not an
+    /// option and a URL is not a network output.
+    #[test]
+    fn build_args_passes_every_path_through_the_file_protocol() {
+        for out in ["-x/slideshow.mp4", "ftp://example.com/slideshow.mp4"] {
+            let a = build_args(&[PathBuf::from("-frame.jpg")], &opts(), Path::new(out));
+            assert_eq!(a.last().unwrap(), &format!("file:{out}"));
+            let i = a.iter().position(|x| x == "-i").unwrap();
+            assert_eq!(a[i + 1], "file:-frame.jpg");
+        }
+    }
+
+    #[test]
+    fn render_rejects_empty_input() {
+        // No frames → a clear error, and ffmpeg is never launched (checked before detection).
+        let err = render(&[], &opts(), Path::new("/tmp/out.mp4"), |_, _| {})
+            .expect_err("empty input must error");
+        assert!(err.contains("no photos"), "error was: {err}");
+    }
+
+    #[test]
+    fn fmt_secs_trims_trailing_zeros() {
+        assert_eq!(fmt_secs(2.5), "2.5");
+        assert_eq!(fmt_secs(5.0), "5");
+        assert_eq!(fmt_secs(0.0), "0");
+        assert_eq!(fmt_secs(0.123), "0.123");
+        // Always a `.`-decimal regardless of locale (ffmpeg requires it).
+        assert!(!fmt_secs(2.5).contains(','));
+    }
+
+    #[test]
+    fn build_args_single_input_maps_v0_and_no_xfade() {
+        // A one-photo slideshow still encodes (maps [v0], no transition graph).
+        let a = build_args(&paths(1), &opts(), Path::new("/tmp/out.mp4"));
+        let i = a.iter().position(|x| x == "-map").expect("has -map");
+        assert_eq!(a[i + 1], "[v0]");
+        let fc = a.iter().position(|x| x == "-filter_complex").unwrap();
+        assert!(!a[fc + 1].contains("xfade"));
+        assert!(!a[fc + 1].contains("concat"));
+    }
+
+    #[test]
+    fn build_args_holds_each_still_for_duration() {
+        // Every looped input is held for `-t duration_per_photo`.
+        let a = build_args(&paths(2), &opts(), Path::new("/tmp/out.mp4"));
+        let t_vals: Vec<&String> = a
+            .iter()
+            .enumerate()
+            .filter(|(i, x)| *x == "-t" && *i + 1 < a.len())
+            .map(|(i, _)| &a[i + 1])
+            .collect();
+        assert_eq!(t_vals.len(), 2);
+        assert!(t_vals.iter().all(|v| *v == "3"), "got {t_vals:?}");
+    }
+
+    #[test]
+    fn total_frames_zero_inputs_is_zero() {
+        assert_eq!(total_frames(0, &opts()), 0);
+    }
+
+    #[test]
+    fn overlap_clamped_below_clip_duration() {
+        let mut o = opts();
+        o.transition = true;
+        o.duration_per_photo = 1.0;
+        o.transition_duration = 5.0;
+        // Cannot exceed dur - 0.1 = 0.9.
+        assert!((overlap(&o) - 0.9).abs() < 1e-9);
+    }
+
+    #[test]
+    fn total_frames_accounts_for_overlap() {
+        let mut o = opts();
+        o.transition = false;
+        // 3 clips * 3s * 30fps = 270.
+        assert_eq!(total_frames(3, &o), 270);
+        o.transition = true;
+        o.transition_duration = 0.5;
+        // 270 - 0.5*30*2 = 270 - 30 = 240.
+        assert_eq!(total_frames(3, &o), 240);
+    }
+
+    /// Real ffmpeg render — skips gracefully when ffmpeg/ffprobe are not installed.
+    #[test]
+    fn real_render_produces_correct_mp4() {
+        let (Some(_ff), Some(probe)) = (ffmpeg_path(), ffprobe_path()) else {
+            eprintln!(
+                "SKIPPED: real_render_produces_correct_mp4 — ffmpeg/ffprobe not on PATH, so no \
+                 real render was exercised"
+            );
+            return;
+        };
+
+        let dir = std::env::temp_dir().join(format!("chairphoto_slideshow_test_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Write 3 solid-color PNGs.
+        let colors = [[255u8, 0, 0], [0, 255, 0], [0, 0, 255]];
+        let mut frame_paths = Vec::new();
+        for (i, c) in colors.iter().enumerate() {
+            let p = dir.join(format!("c{i}.png"));
+            let img = image::RgbImage::from_pixel(640, 480, image::Rgb(*c));
+            img.save(&p).unwrap();
+            frame_paths.push(p);
+        }
+
+        let opts = SlideshowOptions {
+            duration_per_photo: 2.0,
+            transition: true,
+            transition_duration: 0.5,
+            ken_burns: true,
+            fps: 30,
+            width: 1280,
+            height: 720,
+        };
+        let out = dir.join("slideshow.mp4");
+
+        let last = std::sync::atomic::AtomicU32::new(0);
+        render(&frame_paths, &opts, &out, |done, _total| {
+            last.store(done, std::sync::atomic::Ordering::SeqCst);
+        })
+        .expect("render should succeed");
+
+        assert!(out.exists(), "output mp4 should exist");
+        assert!(std::fs::metadata(&out).unwrap().len() > 0, "output mp4 should be non-empty");
+        // Progress must actually be reported (guards against -progress being placed where
+        // ffmpeg ignores it, which would leave the UI bar stuck at 0%).
+        assert!(
+            last.load(std::sync::atomic::Ordering::SeqCst) > 0,
+            "render should report progress via on_progress"
+        );
+
+        // Probe dimensions (exact) and duration (~ within 0.4s).
+        let dims = Command::new(&probe)
+            .args([
+                "-v", "error", "-select_streams", "v:0",
+                "-show_entries", "stream=width,height",
+                "-of", "csv=p=0:s=x",
+            ])
+            .arg(&out)
+            .output()
+            .unwrap();
+        let dims_s = String::from_utf8_lossy(&dims.stdout);
+        assert_eq!(dims_s.trim(), "1280x720", "dimensions should match preset");
+
+        let durout = Command::new(&probe)
+            .args([
+                "-v", "error", "-show_entries", "format=duration",
+                "-of", "default=noprint_wrappers=1:nokey=1",
+            ])
+            .arg(&out)
+            .output()
+            .unwrap();
+        let dur: f64 = String::from_utf8_lossy(&durout.stdout).trim().parse().unwrap();
+        // Expected: 3*2 - 0.5*2 = 5.0s.
+        assert!((dur - 5.0).abs() < 0.5, "duration {dur} should be ~5.0s");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}

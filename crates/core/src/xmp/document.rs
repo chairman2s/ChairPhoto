@@ -1,0 +1,1911 @@
+//! Internal sidecar-document transaction (issue #14).
+//!
+//! Every public writer in `xmp::mod` used to hand-roll the same frame: load the sidecar or
+//! create a fresh one, ensure `rdf:RDF`/`rdf:Description` exist, decide whether to back up a
+//! foreign sidecar before touching it, declare namespaces, mutate the properties it owns, and
+//! serialize back to disk. The load/backup/namespace/write plumbing is identical across
+//! writers; only *which* nodes a writer owns and what replaces them differs. This module is
+//! that shared frame — writers become thin adapters over it (see `mod.rs`).
+//!
+//! `SidecarDocument` is not `pub`: it is an implementation detail of this module, reached only
+//! from `xmp::mod`'s writers.
+//!
+//! ## Backup-once policy (AGENTS.md, "XMP safety")
+//!
+//! Before ChairPhoto's first in-library write to an existing sidecar, back it up if it lacks
+//! `chairphoto:LastWrite` — i.e. a sidecar chairphoto has never written to before is presumed
+//! foreign (hand-authored, or written by darktable/Lightroom/digiKam) and is preserved verbatim
+//! at `<sidecar>.chairphoto-backup` before the first mutation. This is a *document-level* fact
+//! (has chairphoto ever committed to this file?), not a per-writer one, so it is decided once,
+//! here, at [`SidecarDocument::open`] — before any writer-specific mutation happens.
+//!
+//! Export-only destination copies are not subject to this rule (AGENTS.md): a destination
+//! sidecar produced by export is a throwaway copy, not the in-library original, so
+//! [`SidecarDocument::open_no_backup`] skips the backup entirely. Only [`super::write_keywords`]
+//! (the export keyword writer) uses it today.
+//!
+//! One writer needs the *stronger* rule: resolving an identity conflict by Overwrite (issue
+//! #33) deliberately destroys the `xmp:Identifier` another tool put in the file, which the
+//! `chairphoto:LastWrite` test alone would not protect — a sidecar chairphoto has already
+//! written can still carry a foreign identifier (a file duplicated after import is the
+//! ordinary way that happens). [`SidecarDocument::open_forcing_backup`] therefore backs up
+//! regardless of `chairphoto:LastWrite`. It still never *replaces* an existing backup: the
+//! backup slot holds the earliest state we ever saw, which is strictly more valuable than
+//! the current one.
+//!
+//! A sidecar a pre-#138 release rewrote has lost its attribute prefixes (`parseType=` for
+//! `rdf:parseType=`, …). [`SidecarDocument::open`] restores them in memory when the repair is
+//! unambiguous (`repair.rs`, #143), and a repair counts as a first write: the sidecar is backed
+//! up as it was on disk unless a backup already exists, which again is never replaced.
+//!
+//! ## One writer at a time, and never a half-written file (issue #149)
+//!
+//! [`SidecarDocument::open`] takes the sidecar's file lock (`lock::FILE_TURNS`) before it
+//! reads the file, and the document holds it until it is committed or dropped: two writers
+//! on one sidecar run their read-modify-writes one after the other, so neither's change is
+//! lost. [`SidecarDocument::commit`] never writes the sidecar in place: it writes a hidden
+//! temp file beside it, syncs it, and renames it over the sidecar, so a reader — another
+//! tool, or a crash at any point — sees the old file or the new one, never a mix.
+//!
+//! ## One folder from read to commit (#155, F1 of the #149 review)
+//!
+//! [`SidecarDocument::open`] also opens the original's folder ([`Folder`]) and holds it until
+//! the commit: the sidecar is read, and the temp file created, renamed and synced, relative to
+//! that handle (`openat`/`renameat` on Unix). Checking the original by path and then creating
+//! the temp by path left a gap in which an unmount could send the temp file to the disk under
+//! the empty mount point; through the handle it can only land in the folder the original was
+//! read from. While the handle is open a plain unmount of that volume fails as busy.
+
+use std::io::Write as _;
+use std::path::{Path, PathBuf};
+use xmltree::{Element, XMLNode};
+
+use super::{attr_is, child_mut, declare_namespaces, is_xmp_root, new_root, now, ns_attr, parse_xml,
+    plain, rdf_of_mut, sidecar_backup_path, sidecar_path, NS_CHAIRPHOTO, NS_RDF};
+
+/// When [`SidecarDocument::open`] copies the existing sidecar to `<sidecar>.chairphoto-backup`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum BackupPolicy {
+    /// AGENTS.md "XMP safety": back up an existing sidecar that lacks `chairphoto:LastWrite`
+    /// — i.e. one chairphoto has never written — before the first mutation. Every in-library
+    /// writer uses this.
+    BeforeFirstWrite,
+    /// Back up an existing sidecar even if chairphoto has written it before, because this
+    /// write destroys data no other writer touches (see the module docs). Never overwrites a
+    /// backup that already exists.
+    Always,
+    /// Never back up — export destination copies only (AGENTS.md).
+    Never,
+}
+
+/// A parsed (or freshly created) XMP sidecar document, mid-transaction.
+///
+/// Lifecycle: [`Self::open`] (or [`Self::open_no_backup`]) → zero or more mutations against
+/// [`Self::description_mut`] / [`Self::rdf_mut`] / [`Self::replace_owned`] →
+/// [`Self::commit`]. Dropping without calling `commit` writes nothing (an error before the
+/// commit leaves the sidecar untouched) and releases the sidecar's file lock.
+pub(super) struct SidecarDocument {
+    /// The original photo the sidecar belongs to. It must still be there at commit.
+    original: PathBuf,
+    path: PathBuf,
+    /// The original's folder, open from before the read to the commit (see the module docs).
+    folder: Folder,
+    root: Element,
+    /// Where this open copied the pre-existing sidecar, if it did. Reported so a
+    /// destructive writer can tell the user what it preserved and where.
+    backup: Option<PathBuf>,
+    /// Where [`Self::force_pending_backup`] will copy the pre-existing sidecar, if asked —
+    /// computed at open, but not acted on until then (#222 L1). `None` once decided there is
+    /// nothing to back up (no sidecar existed, the policy did not want one, or a backup
+    /// already exists), the same as `backup` is for the ordinary, at-open timing.
+    pending_backup: Option<PathBuf>,
+    /// This sidecar's file lock, held from before the read until the commit's rename (or
+    /// the drop). A leaf in the lock order: see `lock`'s module docs.
+    _turn: super::lock::Ticket,
+}
+
+/// When [`SidecarDocument::open_impl`] performs the backup copy it decided on (#222 L1): at
+/// open, with every other policy, or deferred until [`SidecarDocument::force_pending_backup`]
+/// is called — [`SidecarDocument::open_checking_before_backup`], whose caller has a guard to
+/// run on the identifiers already in the file before committing to destroying any of them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BackupTiming {
+    AtOpen,
+    Deferred,
+}
+
+impl SidecarDocument {
+    /// Load `photo_path`'s sidecar, or create a fresh one if absent. Ensures `rdf:RDF` and
+    /// `rdf:Description` exist (creating them for a fresh document), ensures `rdf:about` is
+    /// present (defaulting to `""`), applies the backup-once policy (see module docs), and
+    /// declares the base chairphoto namespace set every writer needs.
+    pub(super) fn open(photo_path: &Path) -> Result<Self, String> {
+        Self::open_impl(photo_path, BackupPolicy::BeforeFirstWrite, BackupTiming::AtOpen)
+    }
+
+    /// Same as [`Self::open`], but never backs up — for export destination writers, which are
+    /// not subject to the in-library backup-once rule (AGENTS.md: "Export-only destination
+    /// copies are not subject to this rule").
+    pub(super) fn open_no_backup(photo_path: &Path) -> Result<Self, String> {
+        Self::open_impl(photo_path, BackupPolicy::Never, BackupTiming::AtOpen)
+    }
+
+    /// Same as [`Self::open`], but backs up an existing sidecar even when chairphoto has
+    /// written it before — for the one writer that destroys a field it does not own
+    /// ([`super::overwrite_identifier`], issue #33's Overwrite). See the module docs.
+    pub(super) fn open_forcing_backup(photo_path: &Path) -> Result<Self, String> {
+        Self::open_impl(photo_path, BackupPolicy::Always, BackupTiming::AtOpen)
+    }
+
+    /// Same backup policy as [`Self::open_forcing_backup`] — an identity Overwrite's — but
+    /// the copy itself waits for [`Self::force_pending_backup`] (#222 L1): for
+    /// [`super::overwrite_identifier_checked`], whose `guard` must run, under this same file
+    /// lock, before any file I/O happens at all. Before this, a refused guard still left a
+    /// `.chairphoto-backup` beside the sidecar, because the backup was copied here at open —
+    /// before the caller had even looked at what it was about to destroy.
+    pub(super) fn open_checking_before_backup(photo_path: &Path) -> Result<Self, String> {
+        Self::open_impl(photo_path, BackupPolicy::Always, BackupTiming::Deferred)
+    }
+
+    fn open_impl(photo_path: &Path, backup_policy: BackupPolicy, timing: BackupTiming) -> Result<Self, String> {
+        let path = sidecar_path(photo_path);
+        // Before the read: the read-modify-write is one turn (issue #149).
+        let turn = super::lock::FILE_TURNS.lock(super::lock::key(&path));
+        // An unmounted volume makes the sidecar look absent; never start a fresh one then.
+        let folder = Folder::open(photo_path)?;
+        folder.require_original(photo_path)?;
+        let name = file_name(&path)?;
+        let existed = folder.exists(name);
+
+        let mut root = if existed {
+            let file = folder.open_read(name).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+            parse_xml(file).map_err(|e| format!("cannot parse {}: {e}", path.display()))?
+        } else {
+            new_root()
+        };
+        // Anything but an XMP packet is not ours to put an `rdf:RDF` into (#147 L4).
+        if !is_xmp_root(&root) {
+            return Err(format!(
+                "{}: not written, its root element {{{}}}{} is not an XMP packet",
+                path.display(),
+                root.namespace.as_deref().unwrap_or(""),
+                root.name
+            ));
+        }
+
+        let rdf = rdf_of_mut(&mut root);
+        // Decided before the writer adds anything: has ChairPhoto written this file before?
+        let written_before = has_chairphoto_last_write(rdf);
+        // A file a pre-#138 release rewrote has lost its attribute prefixes; restore them
+        // before anything looks for `rdf:about` (see `repair`). Only ours to repair.
+        let repaired = existed
+            && written_before
+            && super::repair::repair_dropped_prefixes(rdf).unwrap_or_else(|why| {
+                eprintln!("xmp: {}: dropped attribute prefixes not repaired: {why}", path.display());
+                false
+            });
+        let desc = child_mut(rdf, "rdf", NS_RDF, "Description");
+        if ns_attr(desc, NS_RDF, "about").is_none() {
+            desc.attributes.insert("rdf:about".to_string(), String::new());
+        }
+
+        // Back up the existing sidecar before any writer-specific mutation runs — a
+        // document-level decision (see module docs), not a per-writer one.
+        // A repair rewrites attributes no writer owns, so it is backed up like a first write.
+        let wants_backup = existed
+            && match backup_policy {
+                BackupPolicy::BeforeFirstWrite => !written_before || repaired,
+                BackupPolicy::Always => true,
+                BackupPolicy::Never => false,
+            };
+        let backup_path = sidecar_backup_path(&path);
+        // An existing backup is never replaced: it is the earliest state we ever saw, and
+        // `BackupPolicy::Always` must not trade that away for a newer, chairphoto-written
+        // one. `BeforeFirstWrite` reaches an existing backup only through a repair (the first
+        // write stamps `chairphoto:LastWrite`): the backup from that first write is older.
+        let backup_name = file_name(&backup_path)?;
+        let should_copy = wants_backup && !folder.exists(backup_name);
+        // `AtOpen` copies now, exactly as before; `Deferred` only remembers that it would —
+        // the copy itself waits for `force_pending_backup`, so a caller that refuses before
+        // calling it (#222 L1) never touched the filesystem for this at all.
+        let (backup, pending_backup) = match timing {
+            BackupTiming::AtOpen if should_copy => (folder.copy(name, backup_name).ok().map(|_| backup_path), None),
+            BackupTiming::AtOpen => (None, None),
+            BackupTiming::Deferred => (None, should_copy.then_some(backup_path)),
+        };
+
+        declare_namespaces(desc);
+
+        Ok(Self { original: photo_path.to_path_buf(), path, folder, root, backup, pending_backup, _turn: turn })
+    }
+
+    /// Where this open copied the pre-existing sidecar, if it did. `None` when nothing was
+    /// backed up — a fresh sidecar, a policy that skipped it, or a backup that already
+    /// existed and was therefore left alone.
+    pub(super) fn backup(&self) -> Option<&Path> {
+        self.backup.as_deref()
+    }
+
+    /// Perform the backup copy [`Self::open_checking_before_backup`] decided on but did not
+    /// yet make — called once a caller's guard has passed and a write is actually about to
+    /// happen (#222 L1), so a refusal before this is called leaves no `.chairphoto-backup`
+    /// beside the sidecar. A no-op when nothing was pending (no sidecar existed, or a backup
+    /// already exists — the same "never replaced" rule as the at-open timing).
+    pub(super) fn force_pending_backup(&mut self) -> Result<(), String> {
+        let Some(backup_path) = self.pending_backup.take() else { return Ok(()) };
+        let name = file_name(&self.path)?;
+        let backup_name = file_name(&backup_path)?;
+        self.backup = self.folder.copy(name, backup_name).ok().map(|_| backup_path);
+        Ok(())
+    }
+
+    /// The `rdf:Description` element every writer mutates.
+    pub(super) fn description_mut(&mut self) -> &mut Element {
+        let rdf = rdf_of_mut(&mut self.root);
+        child_mut(rdf, "rdf", NS_RDF, "Description")
+    }
+
+    /// The `rdf:RDF` element, for a writer that has to look past the first Description: the
+    /// face-region writer edits `mwg-rs:Regions` in whichever top-level Description holds it.
+    pub(super) fn rdf_mut(&mut self) -> &mut Element {
+        rdf_of_mut(&mut self.root)
+    }
+
+    /// Remove every existing Description child matching one of `owned` (namespace, local-name)
+    /// pairs — and the same property in compact attribute form (`xmp:Identifier="…"` on the
+    /// Description), which another tool may have written — and append `replacements` in
+    /// their place. This is the "declare what I own, add replacements" shape shared by the
+    /// plain-property writers (IPTC, keywords, identifier, import batch, GPS): every other
+    /// element and attribute — foreign namespaces, develop history, anything this writer
+    /// doesn't list in `owned` — is left exactly as parsed.
+    ///
+    /// Not used by the face-region writer, which has its own Name+Area matching rule for
+    /// deciding what to keep (see `write_face_regions` in `mod.rs`).
+    ///
+    /// The owned properties are removed from **every** top-level `rdf:Description` — exiftool
+    /// writes one per namespace, so a stale value can sit in any of them (#142) — and the
+    /// replacements go into the first.
+    pub(super) fn replace_owned(&mut self, owned: &[(&str, &str)], replacements: Vec<XMLNode>) {
+        self.remove_owned_everywhere(owned);
+        self.description_mut().children.extend(replacements);
+    }
+
+    fn remove_owned_everywhere(&mut self, owned: &[(&str, &str)]) {
+        for node in &mut self.rdf_mut().children {
+            if let XMLNode::Element(desc) = node {
+                if desc.namespace.as_deref() == Some(NS_RDF) && desc.name == "Description" {
+                    remove_owned(desc, owned);
+                }
+            }
+        }
+    }
+
+    /// Commit the transaction: re-stamp `chairphoto:LastWrite` (removing any prior instance —
+    /// this is the single path every writer's completion timestamp goes through), serialize,
+    /// and replace the sidecar on disk atomically ([`write_atomically`]). The file lock is
+    /// released after the rename.
+    ///
+    /// The sidecar is written only next to an original that is still there: if the original
+    /// or its folder has gone since [`Self::open`] — a volume unmounted while the writer
+    /// waited its turn — the commit fails and creates nothing (no directory is ever made, so
+    /// a write cannot land on the disk under an empty mount point). The original is checked
+    /// at open and again just before the temp file is created, and the temp file is created
+    /// and renamed through the folder handle held since open ([`Folder`]), so a change after
+    /// that check can at worst put the sidecar beside the original in the folder it was read
+    /// from, never in another folder at the same path (#155 F1; on Unix — elsewhere the
+    /// operations go by path and the gap between check and create remains).
+    ///
+    /// A sidecar in a folder this process cannot create files in is refused too, even when
+    /// the sidecar itself is writable: the temp file cannot be made, and there is no fallback
+    /// to a non-atomic in-place write (decided in the #149 review, F3). The write stays as
+    /// debt with the caller — a pending identity field, an IPTC save's error — and the sidecar
+    /// stays as it was (docs/storage-and-import.md, "How a sidecar is written").
+    pub(super) fn commit(mut self) -> Result<(), String> {
+        let stamp = plain("chairphoto", NS_CHAIRPHOTO, "LastWrite", &now().to_string());
+        self.replace_owned(&[(NS_CHAIRPHOTO, "LastWrite")], vec![stamp]);
+
+        let buf = super::emit::serialize(&mut self.root)?;
+        let written = write_atomically(&self.folder, &self.original, &self.path, &buf);
+        let Self { folder, _turn, .. } = self;
+        drop(_turn);
+        // The folder the temp file was made in; swept off this thread, as a caller may hold
+        // the catalog lock (#155 review, L3).
+        let temp_folder = written?.unwrap_or(folder);
+        sweep_later(temp_folder);
+        Ok(())
+    }
+}
+
+fn file_name(path: &Path) -> Result<&std::ffi::OsStr, String> {
+    path.file_name().ok_or_else(|| format!("{} has no file name", path.display()))
+}
+
+fn missing_folder(original: &Path) -> String {
+    format!("not writing the sidecar of {}: its folder is missing (offline or moved)", original.display())
+}
+
+/// A folder held open for one sidecar transaction: the original's (see the module docs), or
+/// a symlinked sidecar's target's. On Unix every operation is relative to the open handle, so
+/// it reaches the folder that was opened even if its path now names another one (a volume
+/// unmounted, a folder moved); elsewhere it falls back to paths under the folder's path.
+struct Folder {
+    path: PathBuf,
+    #[cfg(unix)]
+    fd: rustix::fd::OwnedFd,
+    /// Whether the folder could be opened for reading. A folder we may create files in and
+    /// traverse but not list (mode `-wx`, a drop-box share) is held as an `O_PATH` handle on
+    /// Linux: enough for `openat`/`renameat`/`unlinkat`/`fstatat`, not for listing or fsync,
+    /// so it is never swept and its sync is skipped (#155 review, L2).
+    listable: bool,
+    /// This folder's device, cached from the `fstat` [`Self::require_original`] already does
+    /// (#221 review): [`Self::device_id`] reads this instead of doing its own `fstat`, so
+    /// `sweep_later` never blocks on a hung mount's handle just to learn its device.
+    #[cfg(unix)]
+    device: std::cell::Cell<Option<u64>>,
+}
+
+impl Folder {
+    /// The folder `original` is in. A folder that is not there fails as missing, so an
+    /// unmounted volume reads as one.
+    fn open(original: &Path) -> Result<Self, String> {
+        let dir = match original.parent() {
+            Some(d) if d.as_os_str().is_empty() => Path::new("."),
+            Some(d) => d,
+            None => return Err(format!("{} has no folder", original.display())),
+        };
+        Self::open_dir(dir).map_err(|e| match e.kind() {
+            std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory => missing_folder(original),
+            _ => format!("cannot open the folder of {}: {e}", original.display()),
+        })
+    }
+
+    fn open_dir(dir: &Path) -> std::io::Result<Self> {
+        #[cfg(unix)]
+        {
+            use rustix::fs::{Mode, OFlags};
+            let open = |flags: OFlags| rustix::fs::open(dir, flags | OFlags::DIRECTORY | OFlags::CLOEXEC, Mode::empty());
+            match open(OFlags::RDONLY) {
+                Ok(fd) => Ok(Self { path: dir.to_path_buf(), fd, listable: true, device: std::cell::Cell::new(None) }),
+                #[cfg(any(target_os = "linux", target_os = "android"))]
+                Err(rustix::io::Errno::ACCESS) => Ok(Self {
+                    path: dir.to_path_buf(),
+                    fd: open(OFlags::PATH)?,
+                    listable: false,
+                    device: std::cell::Cell::new(None),
+                }),
+                Err(e) => Err(e.into()),
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            if !dir.is_dir() {
+                return Err(std::io::ErrorKind::NotFound.into());
+            }
+            Ok(Self { path: dir.to_path_buf(), listable: true })
+        }
+    }
+
+    /// Fail unless the folder's path still names this folder and `original` is a file in it:
+    /// a sidecar is only ever written beside its original (AGENTS.md "Sidecars are
+    /// `<original_filename>.xmp`, alongside the original"). A folder whose path is gone or now
+    /// names another folder (an unmount, a move) is reported missing, as the path check before
+    /// the handle was; a removal after this check still cannot redirect the write, because
+    /// the write goes through the handle.
+    ///
+    /// A folder we may traverse but not search (the `O_PATH` fallback in [`Self::open_dir`],
+    /// or — pre-existing — one we opened `O_RDONLY` with read but no execute bit) fails the
+    /// `statat` below with `EACCES`, not `ENOENT`: we cannot tell whether the original is there
+    /// or not, which is a different fact from it being offline or moved. Report that as a
+    /// permission error instead of folding it into "missing" (#221 L2): a permission error
+    /// tells the user to fix the folder's mode, while "missing" tells them to look for an
+    /// unplugged volume — the wrong advice here, and nothing is written either way.
+    fn require_original(&self, original: &Path) -> Result<(), String> {
+        let name = file_name(original)?;
+        #[cfg(unix)]
+        let (in_place, is_file) = {
+            let same = |a: &rustix::fs::Stat, b: &rustix::fs::Stat| a.st_dev == b.st_dev && a.st_ino == b.st_ino;
+            let here = rustix::fs::fstat(&self.fd).map_err(|e| e.to_string())?;
+            self.device.set(Some(here.st_dev as u64)); // #221: device_id() reads this, no second fstat
+            let in_place = rustix::fs::stat(&self.path).is_ok_and(|at_path| same(&at_path, &here));
+            let is_file = match rustix::fs::statat(&self.fd, name, rustix::fs::AtFlags::empty()) {
+                Ok(st) => rustix::fs::FileType::from_raw_mode(st.st_mode) == rustix::fs::FileType::RegularFile,
+                Err(rustix::io::Errno::ACCESS) => {
+                    return Err(format!(
+                        "cannot check {}: permission denied reading its folder",
+                        original.display()
+                    ));
+                }
+                Err(_) => false,
+            };
+            (in_place, is_file)
+        };
+        #[cfg(not(unix))]
+        let (in_place, is_file) = (self.path.is_dir(), self.path.join(name).is_file());
+        if !in_place {
+            return Err(missing_folder(original));
+        }
+        if !is_file {
+            return Err(format!(
+                "not writing the sidecar of {}: the original is missing (offline or moved)",
+                original.display()
+            ));
+        }
+        Ok(())
+    }
+
+    /// Whether `name` exists here (a symlink counts by its target, as `Path::exists`).
+    fn exists(&self, name: &std::ffi::OsStr) -> bool {
+        #[cfg(unix)]
+        return rustix::fs::statat(&self.fd, name, rustix::fs::AtFlags::empty()).is_ok();
+        #[cfg(not(unix))]
+        return self.path.join(name).exists();
+    }
+
+    /// Whether `name` is a symbolic link.
+    fn is_symlink(&self, name: &std::ffi::OsStr) -> bool {
+        #[cfg(unix)]
+        return rustix::fs::statat(&self.fd, name, rustix::fs::AtFlags::SYMLINK_NOFOLLOW)
+            .is_ok_and(|st| rustix::fs::FileType::from_raw_mode(st.st_mode) == rustix::fs::FileType::Symlink);
+        #[cfg(not(unix))]
+        return std::fs::symlink_metadata(self.path.join(name)).is_ok_and(|m| m.file_type().is_symlink());
+    }
+
+    /// `name`'s permissions, when it exists.
+    fn permissions(&self, name: &std::ffi::OsStr) -> Option<std::fs::Permissions> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let st = rustix::fs::statat(&self.fd, name, rustix::fs::AtFlags::empty()).ok()?;
+            Some(std::fs::Permissions::from_mode(u32::from(st.st_mode) & 0o7777))
+        }
+        #[cfg(not(unix))]
+        std::fs::metadata(self.path.join(name)).ok().map(|m| m.permissions())
+    }
+
+    fn open_with(&self, name: &std::ffi::OsStr, flags: OpenFor) -> std::io::Result<std::fs::File> {
+        #[cfg(unix)]
+        {
+            use rustix::fs::{Mode, OFlags};
+            let (flags, mode) = match flags {
+                OpenFor::Read => (OFlags::RDONLY, Mode::empty()),
+                OpenFor::WriteExisting => (OFlags::WRONLY, Mode::empty()),
+                OpenFor::CreateNew => (OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL, Mode::from_raw_mode(0o666)),
+                OpenFor::Replace => (OFlags::WRONLY | OFlags::CREATE | OFlags::TRUNC, Mode::from_raw_mode(0o666)),
+            };
+            Ok(rustix::fs::openat(&self.fd, name, flags | OFlags::CLOEXEC, mode)?.into())
+        }
+        #[cfg(not(unix))]
+        {
+            let mut options = std::fs::OpenOptions::new();
+            match flags {
+                OpenFor::Read => options.read(true),
+                OpenFor::WriteExisting => options.write(true),
+                OpenFor::CreateNew => options.write(true).create_new(true),
+                OpenFor::Replace => options.write(true).create(true).truncate(true),
+            };
+            options.open(self.path.join(name))
+        }
+    }
+
+    fn open_read(&self, name: &std::ffi::OsStr) -> std::io::Result<std::fs::File> {
+        self.open_with(name, OpenFor::Read)
+    }
+
+    /// Copy `from` to `to`, permissions included, replacing `to` (as `std::fs::copy`).
+    fn copy(&self, from: &std::ffi::OsStr, to: &std::ffi::OsStr) -> std::io::Result<()> {
+        let mut source = self.open_read(from)?;
+        let mut copy = self.open_with(to, OpenFor::Replace)?;
+        std::io::copy(&mut source, &mut copy)?;
+        copy.set_permissions(source.metadata()?.permissions())
+    }
+
+    fn rename(&self, from: &std::ffi::OsStr, to: &std::ffi::OsStr) -> std::io::Result<()> {
+        #[cfg(unix)]
+        return Ok(rustix::fs::renameat(&self.fd, from, &self.fd, to)?);
+        #[cfg(not(unix))]
+        return std::fs::rename(self.path.join(from), self.path.join(to));
+    }
+
+    fn remove(&self, name: &std::ffi::OsStr) -> std::io::Result<()> {
+        #[cfg(unix)]
+        return Ok(rustix::fs::unlinkat(&self.fd, name, rustix::fs::AtFlags::empty())?);
+        #[cfg(not(unix))]
+        return std::fs::remove_file(self.path.join(name));
+    }
+
+    /// Make a rename in this folder durable. Best effort: not every platform or filesystem
+    /// lets a directory be synced, and the new contents are already safe in the file.
+    fn sync(&self) {
+        #[cfg(unix)]
+        if self.listable {
+            let _ = rustix::fs::fsync(&self.fd);
+        }
+    }
+
+    /// This folder's filesystem device id, so the sidecar-temp sweeper can give each volume
+    /// its own thread and queue ([`sweeper_for`], #221 L3). `None` when the platform cannot
+    /// report one cheaply from the handle already open (non-Unix), which then shares the
+    /// fallback queue keyed by `None`.
+    ///
+    /// Reads the device [`Self::require_original`] already cached from its own `fstat`, when
+    /// it ran on this folder: a *second* `fstat` here would be on this very handle, which a
+    /// folder whose mount is hung may block indefinitely — and that call would run on whatever
+    /// thread calls `sweep_later`, which may hold the catalog lock. [`SidecarDocument::commit`]
+    /// sweeps the photo's own folder, which [`write_atomically`] ran `require_original` on, so
+    /// that common case has it cached. Not every sweep does: for a symlinked sidecar the temp
+    /// is made in the link target's folder (`linked`, opened by `write_atomically` itself),
+    /// which `require_original` never sees, so it falls back to a fresh `fstat` on the
+    /// committing thread — right after that thread created, wrote, synced and renamed the temp
+    /// through the same handle, so it adds no handle the write had not just used (review
+    /// relD L2). Tests calling this directly fall back the same way.
+    fn device_id(&self) -> Option<u64> {
+        #[cfg(unix)]
+        return self.device.get().or_else(|| rustix::fs::fstat(&self.fd).ok().map(|st| st.st_dev as u64));
+        #[cfg(not(unix))]
+        return None;
+    }
+}
+
+#[derive(Clone, Copy)]
+enum OpenFor {
+    Read,
+    /// For writing, neither creating nor truncating: asks whether we may write the file.
+    WriteExisting,
+    CreateNew,
+    Replace,
+}
+
+/// Replace `path` with `bytes` so that no reader ever sees a partial file: write a temp file
+/// in the same directory, sync it, rename it over `path`, then sync the directory.
+///
+/// * **Same directory** — a rename is atomic only within one filesystem. POSIX, NFS and SMB2+
+///   (the Linux CIFS client and Windows' `MoveFileEx` with replace) all replace an existing
+///   target in one step. A volume that refuses the rename fails the write; it never falls
+///   back to an in-place write.
+/// * **The temp file** ([`temp_path`]) is a dotfile ending in `.chairphoto-tmp`, so the
+///   scanner's walks (which skip hidden entries and keep only image extensions) never import
+///   it, and nothing takes it for a sidecar (`<original>.xmp`). Its name is unique to this
+///   write (process id and a random suffix) and it is created exclusively, so a second
+///   ChairPhoto process writing the same sidecar — which the in-process file lock cannot
+///   stop — never touches this writer's temp file, nor this one its. The writes then race
+///   only at the rename: the last one wins whole.
+/// * **On failure** this writer's own temp file is removed and the sidecar is untouched — a
+///   read-only volume fails at the temp file's creation, before anything changed. No other
+///   temp file is removed here: a fresh one left by a crash (killed between the write and the
+///   rename) cannot be told apart from another process's write in progress. Once it is a day
+///   old it can, and a later successful write to its folder removes it
+///   ([`Folder::sweep_stale_temps`]).
+/// * **Permissions** of an existing sidecar are carried over (best effort: a filesystem that
+///   cannot set them, such as some SMB mounts, keeps its own). A sidecar this process may not
+///   write is refused, as the in-place write it replaces was — a rename would otherwise
+///   replace it.
+///   The owner becomes the writing user, and hard links to the old file keep the old
+///   contents: a rename makes a new file.
+/// * **A symlinked sidecar** is written through to its target, as the in-place write was;
+///   the link stays a link. The temp file then goes beside the target, in the target's folder
+///   (opened by path); the original is still checked through `folder`.
+/// * **Through the folder handle** (`folder`, the original's, held since the sidecar was read):
+///   the original is checked, and the temp file created, renamed over the sidecar and synced,
+///   relative to it — see the module docs.
+///
+/// Returns the link target's folder when the sidecar is a symlink into another one: that is
+/// where the temp file was made, so it is the folder to sweep (#155 review, N2).
+fn write_atomically(folder: &Folder, original: &Path, path: &Path, bytes: &[u8]) -> Result<Option<Folder>, String> {
+    let (linked, target) = if folder.is_symlink(file_name(path)?) {
+        let target = std::fs::canonicalize(path).map_err(|e| format!("cannot resolve {}: {e}", path.display()))?;
+        let target_dir = target.parent().ok_or_else(|| format!("{} has no folder", target.display()))?;
+        let linked = Folder::open_dir(target_dir).map_err(|e| format!("cannot open {}: {e}", target_dir.display()))?;
+        (Some(linked), target)
+    } else {
+        (None, path.to_path_buf())
+    };
+    let dir = linked.as_ref().unwrap_or(folder);
+    let name = file_name(&target)?;
+    let existing = dir.permissions(name);
+    if existing.is_some() {
+        // The in-place write this replaces needed write access to the file itself; a rename
+        // needs only the directory's. Ask the filesystem the old question — open for writing,
+        // without truncating or writing anything — so a sidecar we may not write (no write bit
+        // for us, another user's file in a shared folder, an ACL) is still refused rather than
+        // replaced.
+        if let Err(e) = dir.open_with(name, OpenFor::WriteExisting) {
+            return Err(format!("cannot write {}: the file is read-only for us ({e})", target.display()));
+        }
+    }
+    let temp = temp_path(&target);
+    let temp_name = file_name(&temp)?;
+    folder.require_original(original)?;
+    #[cfg(test)]
+    if let Some(hook) = tests::AFTER_THE_LAST_CHECK.with(|h| h.take()) {
+        hook();
+    }
+    let file = dir
+        .open_with(temp_name, OpenFor::CreateNew)
+        .map_err(|e| format!("cannot create {}: {e}", temp.display()))?;
+    // From here the temp file is ours, and only ours is removed on failure.
+    let written = write_temp_then_rename(dir, file, &temp, &target, bytes, existing);
+    if written.is_err() {
+        let _ = dir.remove(temp_name);
+    }
+    written.map(|()| linked)
+}
+
+fn write_temp_then_rename(
+    dir: &Folder,
+    mut file: std::fs::File,
+    temp: &Path,
+    target: &Path,
+    bytes: &[u8],
+    existing: Option<std::fs::Permissions>,
+) -> Result<(), String> {
+    let fail = |what: &str, e: std::io::Error| format!("cannot {what} {}: {e}", temp.display());
+    file.write_all(bytes).map_err(|e| fail("write", e))?;
+    if let Some(permissions) = existing {
+        let _ = file.set_permissions(permissions);
+    }
+    // A network filesystem may report a failed write only here; a filesystem without
+    // fsync says so with Unsupported/InvalidInput, which is no reason to fail the write.
+    if let Err(e) = file.sync_all() {
+        if !matches!(e.kind(), std::io::ErrorKind::Unsupported | std::io::ErrorKind::InvalidInput) {
+            return Err(fail("sync", e));
+        }
+    }
+    drop(file);
+    #[cfg(test)]
+    if tests::FAIL_BEFORE_RENAME.with(|f| f.get()) {
+        return Err("simulated failure before the rename".to_string());
+    }
+    dir.rename(file_name(temp)?, file_name(target)?)
+        .map_err(|e| format!("cannot replace {}: {e}", target.display()))?;
+    dir.sync();
+    Ok(())
+}
+
+/// `<dir>/.<sidecar name>.<pid>-<random>.chairphoto-tmp`, a new name on every call — see
+/// [`write_atomically`].
+fn temp_path(sidecar: &Path) -> PathBuf {
+    let mut name = std::ffi::OsString::from(".");
+    name.push(sidecar.file_name().unwrap_or_default());
+    let random = uuid::Uuid::new_v4().simple().to_string();
+    name.push(format!(".{}-{}{TEMP_SUFFIX}", std::process::id(), &random[..TEMP_RANDOM_LEN]));
+    sidecar.with_file_name(name)
+}
+
+const TEMP_SUFFIX: &str = ".chairphoto-tmp";
+/// Hex digits of the random part of [`temp_path`].
+const TEMP_RANDOM_LEN: usize = 12;
+
+/// The longest file name most filesystems take, in bytes (`NAME_MAX`).
+const NAME_MAX: usize = 255;
+
+/// The longest name, in bytes, the sidecar writer creates beside a sidecar whose own name is
+/// `sidecar_len` bytes: its temp file ([`temp_path`], with the widest pid a `u32` prints) or
+/// its pre-chairphoto backup (`<sidecar>.chairphoto-backup`). Built from the same constants
+/// those names are, so the budget cannot drift from them.
+fn longest_working_name(sidecar_len: usize) -> usize {
+    let pid_digits = u32::MAX.to_string().len();
+    let temp = 1 + sidecar_len + 1 + pid_digits + 1 + TEMP_RANDOM_LEN + TEMP_SUFFIX.len();
+    let backup = sidecar_len + crate::companions::SIDECAR_BACKUP_SUFFIX.len();
+    temp.max(backup)
+}
+
+/// Whether the sidecar of a photo at `photo` (`<name>.xmp`, [`super::sidecar_path`]) can be
+/// written: the sidecar's own name, its writer's temp name and its backup all fit in
+/// [`NAME_MAX`] bytes. A photo whose sidecar cannot be written could never carry its identity
+/// (`xmp:Identifier`), so imports refuse it (`scanner::same_photo::sidecar_name_fits`).
+pub fn sidecar_fits(photo: &Path) -> bool {
+    let Some(sidecar) = super::sidecar_path(photo).file_name().map(|n| n.len()) else { return false };
+    sidecar <= NAME_MAX && longest_working_name(sidecar) <= NAME_MAX
+}
+
+/// Whether `name` is a temp file [`temp_path`] made: `.<name>.<pid>-<12 hex>.chairphoto-tmp`.
+/// Nothing else is ever swept.
+fn is_temp_name(name: &std::ffi::OsStr) -> bool {
+    let Some(rest) = name.to_str().and_then(|n| n.strip_prefix('.')).and_then(|n| n.strip_suffix(TEMP_SUFFIX)) else {
+        return false;
+    };
+    let Some((sidecar, tag)) = rest.rsplit_once('.') else { return false };
+    let Some((pid, random)) = tag.split_once('-') else { return false };
+    !sidecar.is_empty()
+        && !pid.is_empty()
+        && pid.bytes().all(|b| b.is_ascii_digit())
+        && random.len() == 12
+        && random.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+/// How old a temp file must be before [`Folder::sweep_stale_temps`] removes it. A write holds
+/// its temp file for the time it takes to write and sync one sidecar; a day leaves room for
+/// any clock skew between the machines sharing a NAS folder.
+const STALE_TEMP_AGE: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
+
+/// The folders this process has swept or queued for a sweep (by the path they were opened
+/// at): each is listed at most once per run, so a folder of thousands of photos is not
+/// listed on every save.
+static SWEPT: std::sync::Mutex<std::collections::BTreeSet<PathBuf>> =
+    std::sync::Mutex::new(std::collections::BTreeSet::new());
+
+/// How many folders may wait for one device's sweeper at once. Each holds its directory
+/// handle while it waits, so each device's queue is bounded; a folder that finds its queue
+/// full is not marked swept and is queued again by a later write.
+const SWEEP_QUEUE: usize = 64;
+
+/// Queue `folder` for a sweep ([`Folder::sweep_stale_temps`]) on its device's sweeper thread,
+/// unless it was swept or queued before in this run. Never blocks and never lists: the sweep
+/// runs on a thread of its own, so it never holds a lock its caller holds — a face-region, GPS
+/// or identity-Overwrite write commits under the catalog lock, and listing a large folder on a
+/// NAS there would stall every other catalog user (#155 review, L3).
+fn sweep_later(folder: Folder) {
+    if !folder.listable {
+        return;
+    }
+    let path = folder.path.clone();
+    if !SWEPT.lock().unwrap_or_else(|e| e.into_inner()).insert(path.clone()) {
+        return;
+    }
+    let device = folder.device_id();
+    let queued = sweeper_for(device).is_some_and(|tx| tx.try_send(folder).is_ok());
+    if !queued {
+        SWEPT.lock().unwrap_or_else(|e| e.into_inner()).remove(&path);
+    }
+}
+
+/// How long a device's sweeper thread waits for the next folder before exiting (#221 review):
+/// without this, one thread per distinct `st_dev` ever seen — a btrfs subvolume, an NFS/FUSE
+/// remount, a USB re-plug — would sit blocked on its channel for the life of the process,
+/// however briefly that device was ever touched. Shrunk in test builds
+/// ([`sweeper_idle_timeout`]) so a test can wait one out without a minute-long sleep.
+const SWEEPER_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+#[cfg(not(test))]
+fn sweeper_idle_timeout(_device: Option<u64>) -> std::time::Duration {
+    SWEEPER_IDLE_TIMEOUT
+}
+
+/// Test-only overrides, per device key, read once per thread *creation* (never mid-wait):
+/// a test sets one for a device key it alone uses, so it only ever shrinks the timeout of the
+/// thread it spins up for that key — never a thread another, concurrently executing test
+/// creates for its own key meanwhile (relD L4). A key with no entry uses the production
+/// timeout.
+#[cfg(test)]
+static SWEEPER_IDLE_TIMEOUT_OVERRIDES: std::sync::Mutex<std::collections::BTreeMap<Option<u64>, std::time::Duration>> =
+    std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+#[cfg(test)]
+fn sweeper_idle_timeout(device: Option<u64>) -> std::time::Duration {
+    let overrides = SWEEPER_IDLE_TIMEOUT_OVERRIDES.lock().unwrap_or_else(|e| e.into_inner());
+    overrides.get(&device).copied().unwrap_or(SWEEPER_IDLE_TIMEOUT)
+}
+
+/// One sweeper thread and queue per device (#221 L3), keyed by [`Folder::device_id`] (`None`
+/// on a platform that cannot report one, which then shares a single queue).
+///
+/// Before this, every folder shared one thread and one 64-entry queue. A listing stuck on a
+/// hung NFS/SMB mount — [`Folder::sweep_stale_temps`]'s `temp_names()`, a blocking syscall this
+/// code cannot safely time out or cancel from another thread — then stalled every later sweep
+/// on every volume, and the folders already queued behind it kept their directory handles
+/// open (up to 64 of them) for as long as the run lasted, which can hold an unrelated volume
+/// busy enough to refuse a clean unmount. A time or entry budget inside the listing was the
+/// other option, but there is no safe way to abort a blocking directory read mid-syscall
+/// without risking the fd; per-device isolation instead bounds the damage to the one volume
+/// that is actually hung — its own queue can still fill and its own unmount can still wait on
+/// it (a residual, not a regression: before 96d0d8f the same hang blocked the committing
+/// writer, which was worse), but every other volume's sweeps keep running.
+///
+/// A thread idle for [`SWEEPER_IDLE_TIMEOUT`] exits and drops its own entry from this map
+/// (#221 review), so a device touched once early in a long session does not hold a thread for
+/// the rest of it; the next folder on that device spins up a fresh one. The drop happens under
+/// this function's own lock, so no new sender is handed out after it; the thread then drains
+/// its queue with a *blocking* receive until the channel disconnects — until every sender
+/// handed out before the drop is gone — so a `try_send` that returns `Ok` is always swept,
+/// however late it lands (relD L1). Each such sender is a short-lived clone ([`sweep_later`]
+/// drops it right after its one `try_send`), so the drain ends promptly.
+fn sweeper_for(device: Option<u64>) -> Option<std::sync::mpsc::SyncSender<Folder>> {
+    type Sweepers = std::collections::HashMap<Option<u64>, std::sync::mpsc::SyncSender<Folder>>;
+    static SWEEPERS: std::sync::OnceLock<std::sync::Mutex<Sweepers>> = std::sync::OnceLock::new();
+    let registry = SWEEPERS.get_or_init(|| std::sync::Mutex::new(Sweepers::new()));
+    let mut sweepers = registry.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(tx) = sweepers.get(&device) {
+        return Some(tx.clone());
+    }
+    let (tx, rx) = std::sync::mpsc::sync_channel::<Folder>(SWEEP_QUEUE);
+    let idle = sweeper_idle_timeout(device);
+    std::thread::Builder::new()
+        .name("sidecar-temp-sweep".into())
+        .spawn(move || loop {
+            match rx.recv_timeout(idle) {
+                Ok(folder) => folder.sweep_stale_temps(),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    let mut sweepers = registry.lock().unwrap_or_else(|e| e.into_inner());
+                    sweepers.remove(&device);
+                    drop(sweepers);
+                    #[cfg(test)]
+                    sweeper_exit_point(device, "removed");
+                    // Blocking, until every sender is gone: a `sweep_later` that got its sender
+                    // before the removal may still `try_send` (and see `Ok`) until it drops it.
+                    while let Ok(folder) = rx.recv() {
+                        folder.sweep_stale_temps();
+                    }
+                    #[cfg(test)]
+                    sweeper_exit_point(device, "drained");
+                    break;
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+        })
+        .ok()?;
+    sweepers.insert(device, tx.clone());
+    Some(tx)
+}
+
+/// Test-only: pause one device key's idle-exiting sweeper thread at a named point of its exit
+/// ([`sweeper_exit_point`]): the thread reports the point on the first channel and waits (5 s
+/// at most) for the test's go on the second, so a test can land a send exactly there.
+#[cfg(test)]
+type SweeperExitHook = (std::sync::mpsc::Sender<&'static str>, std::sync::mpsc::Receiver<()>);
+
+#[cfg(test)]
+static SWEEPER_EXIT_HOOKS: std::sync::Mutex<std::collections::BTreeMap<Option<u64>, SweeperExitHook>> =
+    std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+#[cfg(test)]
+fn sweeper_exit_point(device: Option<u64>, point: &'static str) {
+    let hook = SWEEPER_EXIT_HOOKS.lock().unwrap_or_else(|e| e.into_inner()).remove(&device);
+    if let Some((events, go)) = hook {
+        let _ = events.send(point);
+        let _ = go.recv_timeout(std::time::Duration::from_secs(5));
+        SWEEPER_EXIT_HOOKS.lock().unwrap_or_else(|e| e.into_inner()).insert(device, (events, go));
+    }
+}
+
+#[cfg(test)]
+pub(super) static SWEEPS_DONE: std::sync::Mutex<Vec<(PathBuf, std::thread::ThreadId)>> =
+    std::sync::Mutex::new(Vec::new());
+
+impl Folder {
+    /// Remove the temp files ([`is_temp_name`]) older than [`STALE_TEMP_AGE`] in this folder:
+    /// left by a write killed between its create and its rename, never another write in
+    /// progress (#155 R4). Runs on the sweeper thread ([`sweep_later`]), queued by a
+    /// successful commit once per folder per run, with no lock held. Best effort: a file that
+    /// cannot be read or removed is left.
+    fn sweep_stale_temps(&self) {
+        let now = std::time::SystemTime::now();
+        for name in self.temp_names() {
+            if self.is_stale_temp(&name, now) {
+                let _ = self.remove(&name);
+            }
+        }
+        #[cfg(test)]
+        SWEEPS_DONE.lock().unwrap().push((self.path.clone(), std::thread::current().id()));
+    }
+
+    /// Whether `name` is a regular file last modified more than [`STALE_TEMP_AGE`] before
+    /// `now`. Decided from its metadata alone (a symlink is not followed), never by opening
+    /// it: a FIFO or device node with a temp's name would block an open (#155 review, L1).
+    fn is_stale_temp(&self, name: &std::ffi::OsStr, now: std::time::SystemTime) -> bool {
+        let old = |modified: std::time::SystemTime| now.duration_since(modified).is_ok_and(|age| age > STALE_TEMP_AGE);
+        #[cfg(unix)]
+        {
+            use rustix::fs::{AtFlags, FileType};
+            let Ok(st) = rustix::fs::statat(&self.fd, name, AtFlags::SYMLINK_NOFOLLOW) else { return false };
+            let Ok(secs) = u64::try_from(st.st_mtime) else { return false };
+            FileType::from_raw_mode(st.st_mode) == FileType::RegularFile
+                && old(std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs))
+        }
+        #[cfg(not(unix))]
+        std::fs::symlink_metadata(self.path.join(name))
+            .is_ok_and(|m| m.is_file() && m.modified().is_ok_and(old))
+    }
+
+    /// The names in this folder that are ChairPhoto temp files.
+    fn temp_names(&self) -> Vec<std::ffi::OsString> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt as _;
+            let Ok(dir) = rustix::fs::Dir::read_from(&self.fd) else { return Vec::new() };
+            dir.filter_map(Result::ok)
+                .map(|e| std::ffi::OsStr::from_bytes(e.file_name().to_bytes()).to_os_string())
+                .filter(|n| is_temp_name(n))
+                .collect()
+        }
+        #[cfg(not(unix))]
+        {
+            let Ok(entries) = std::fs::read_dir(&self.path) else { return Vec::new() };
+            entries.filter_map(Result::ok).map(|e| e.file_name()).filter(|n| is_temp_name(n)).collect()
+        }
+    }
+}
+
+/// Whether any top-level `rdf:Description` carries `chairphoto:LastWrite`: exiftool keeps one
+/// Description per namespace, so the stamp need not sit in the first (#147).
+pub(super) fn has_chairphoto_last_write(rdf: &Element) -> bool {
+    rdf.children.iter().any(|d| {
+        matches!(d, XMLNode::Element(desc)
+            if desc.namespace.as_deref() == Some(NS_RDF) && desc.name == "Description"
+                && desc.children.iter().any(|n| matches!(n, XMLNode::Element(e)
+                    if e.namespace.as_deref() == Some(NS_CHAIRPHOTO) && e.name == "LastWrite")))
+    })
+}
+
+/// Drop the `owned` (namespace, local-name) properties from `desc`, in element form and in
+/// compact attribute form alike. Leaving the attribute form behind would give the property two
+/// values once the replacement element lands — and readers such as `read_identifier` check
+/// the attribute first, so an Overwrite would not take.
+fn remove_owned(desc: &mut Element, owned: &[(&str, &str)]) {
+    desc.children.retain(|n| !matches_owned(n, owned));
+    let doomed: Vec<String> = desc
+        .attributes
+        .keys()
+        .filter(|k| owned.iter().any(|(ns, name)| attr_is(desc, k, ns, name)))
+        .cloned()
+        .collect();
+    for key in doomed {
+        desc.attributes.shift_remove(&key);
+    }
+}
+
+fn matches_owned(node: &XMLNode, owned: &[(&str, &str)]) -> bool {
+    matches!(node, XMLNode::Element(e)
+        if owned.iter().any(|(ns, name)| e.namespace.as_deref() == Some(*ns) && e.name == *name))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::xmp::sidecar_backup_path;
+    use std::time::Duration;
+
+    thread_local! {
+        /// Makes this thread's next commits fail after the temp file is written and synced,
+        /// before the rename — where a crash or a full disk would stop it.
+        pub(super) static FAIL_BEFORE_RENAME: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        /// Runs once in this thread's next commit, after its last check that the original is
+        /// there and before the temp file is created — the gap #155 F1 is about.
+        pub(super) static AFTER_THE_LAST_CHECK: std::cell::Cell<Option<Box<dyn FnOnce()>>> =
+            const { std::cell::Cell::new(None) };
+    }
+
+    const FOREIGN: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<x:xmpmeta xmlns:x="adobe:ns:meta/">
+ <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
+  <rdf:Description rdf:about="" xmlns:darktable="http://darktable.sf.net/">
+   <darktable:history_end>7</darktable:history_end>
+  </rdf:Description>
+ </rdf:RDF>
+</x:xmpmeta>"#;
+
+    fn photo(tag: &str, name: &str) -> (crate::test_support::TestTmpDir, PathBuf) {
+        let dir = crate::test_support::TestTmpDir::new(tag);
+        let photo = dir.join(name);
+        std::fs::write(&photo, b"raw").unwrap();
+        (dir, photo)
+    }
+
+    // --- the name budget (#231 N-4, relB2 LOW-1) ---------------------------------------------
+
+    /// `sidecar_fits` budgets for every name the writer makes: at the longest photo name it
+    /// allows, an identity is written into a fresh sidecar and into a foreign one (which is
+    /// backed up first) — the temp file and the backup both fit. One byte longer and it says
+    /// no. The temp name the writer makes is never longer than the budget it is checked by.
+    #[test]
+    fn the_longest_name_sidecar_fits_allows_can_have_its_sidecar_written() {
+        let limit = (1..=NAME_MAX).rev().find(|n| sidecar_fits(Path::new(&"D".repeat(*n)))).unwrap();
+        assert!(!sidecar_fits(Path::new(&"D".repeat(limit + 1))));
+        for foreign in [false, true] {
+            let (_dir, p) = photo(&format!("doc-name-budget-{foreign}"), &format!("{}.ARW", "D".repeat(limit - 4)));
+            assert_eq!(p.file_name().unwrap().len(), limit);
+            let sidecar = sidecar_path(&p);
+            if foreign {
+                std::fs::write(&sidecar, FOREIGN).unwrap();
+            }
+            let temp = temp_path(&sidecar);
+            assert!(temp.file_name().unwrap().len() <= longest_working_name(sidecar.file_name().unwrap().len()));
+            crate::xmp::write_identifier(&p, "11111111-1111-4111-8111-111111111111").unwrap();
+            assert_eq!(
+                crate::xmp::read_identifier(&p).as_deref(),
+                Some("11111111-1111-4111-8111-111111111111"),
+                "{foreign}: the identity is in the sidecar"
+            );
+            assert_eq!(sidecar_backup_path(&sidecar).exists(), foreign, "{foreign}: the backup");
+        }
+    }
+
+    /// A fresh (non-existent) sidecar: `open` creates RDF/Description with `rdf:about=""` and
+    /// does not attempt a backup (there is nothing to back up).
+    #[test]
+    fn open_creates_description_for_absent_sidecar() {
+        let (_dir, p) = photo("doc-fresh", "A.ARW");
+        let mut doc = SidecarDocument::open(&p).unwrap();
+        let desc = doc.description_mut();
+        assert_eq!(desc.name, "Description");
+        assert_eq!(desc.attributes.get("rdf:about").map(String::as_str), Some(""));
+        assert!(!sidecar_backup_path(&sidecar_path(&p)).exists());
+    }
+
+    /// A pre-existing sidecar that chairphoto has never written to (no `chairphoto:LastWrite`)
+    /// is backed up byte-for-byte before `open` returns.
+    #[test]
+    fn open_backs_up_foreign_sidecar_once() {
+        let (_dir, p) = photo("doc-backup", "B.ARW");
+        std::fs::write(sidecar_path(&p), FOREIGN).unwrap();
+        let _doc = SidecarDocument::open(&p).unwrap();
+
+        let backup = sidecar_backup_path(&sidecar_path(&p));
+        assert!(backup.exists(), "foreign sidecar must be backed up on first open");
+        assert_eq!(std::fs::read_to_string(&backup).unwrap(), FOREIGN);
+    }
+
+    /// A sidecar chairphoto has already written to (carries `chairphoto:LastWrite`) is not
+    /// re-backed-up on a later open — the once-only half of "backup-once".
+    #[test]
+    fn open_does_not_reback_already_written_sidecar() {
+        let (_dir, p) = photo("doc-no-reback", "C.ARW");
+        SidecarDocument::open(&p).unwrap().commit().unwrap(); // first write stamps LastWrite
+        let backup = sidecar_backup_path(&sidecar_path(&p));
+        std::fs::remove_file(&backup).unwrap_or(());
+
+        let _doc = SidecarDocument::open(&p).unwrap();
+        assert!(!backup.exists(), "a sidecar chairphoto already wrote must not be re-backed-up");
+    }
+
+    /// `open_forcing_backup` backs up a sidecar chairphoto has already written — the case
+    /// `BeforeFirstWrite` deliberately skips — and reports where. This is what makes
+    /// Overwrite (issue #33) safe when the conflicting identifier sits in a sidecar we wrote.
+    #[test]
+    fn open_forcing_backup_backs_up_even_after_chairphoto_wrote() {
+        let (_dir, p) = photo("doc-force-backup", "H.ARW");
+        SidecarDocument::open(&p).unwrap().commit().unwrap(); // stamps LastWrite
+        let backup = sidecar_backup_path(&sidecar_path(&p));
+        assert!(!backup.exists());
+        let written = std::fs::read_to_string(sidecar_path(&p)).unwrap();
+
+        let doc = SidecarDocument::open_forcing_backup(&p).unwrap();
+        assert_eq!(doc.backup(), Some(backup.as_path()), "must report the backup it took");
+        assert_eq!(std::fs::read_to_string(&backup).unwrap(), written);
+    }
+
+    /// `open_forcing_backup` never replaces an existing backup — the earliest state we saw
+    /// outranks the current one — and says so by reporting `None`.
+    #[test]
+    fn open_forcing_backup_keeps_an_existing_backup() {
+        let (_dir, p) = photo("doc-force-keep", "I.ARW");
+        std::fs::write(sidecar_path(&p), FOREIGN).unwrap();
+        SidecarDocument::open(&p).unwrap().commit().unwrap(); // backs FOREIGN up
+        let backup = sidecar_backup_path(&sidecar_path(&p));
+        assert_eq!(std::fs::read_to_string(&backup).unwrap(), FOREIGN);
+
+        let doc = SidecarDocument::open_forcing_backup(&p).unwrap();
+        assert_eq!(doc.backup(), None, "no NEW backup was taken");
+        assert_eq!(std::fs::read_to_string(&backup).unwrap(), FOREIGN,
+            "the pre-chairphoto snapshot must not be traded for a newer one");
+    }
+
+    /// Nothing to preserve, nothing to report: forcing a backup on a photo with no sidecar
+    /// yet must not invent an empty one.
+    #[test]
+    fn open_forcing_backup_does_nothing_without_an_existing_sidecar() {
+        let (_dir, p) = photo("doc-force-fresh", "J.ARW");
+        let doc = SidecarDocument::open_forcing_backup(&p).unwrap();
+        assert_eq!(doc.backup(), None);
+        assert!(!sidecar_backup_path(&sidecar_path(&p)).exists());
+    }
+
+    /// `open_no_backup` never backs up, even when the sidecar is foreign — the export
+    /// destination-copy exemption (AGENTS.md).
+    #[test]
+    fn open_no_backup_never_backs_up() {
+        let (_dir, p) = photo("doc-export", "D.ARW");
+        std::fs::write(sidecar_path(&p), FOREIGN).unwrap();
+        let _doc = SidecarDocument::open_no_backup(&p).unwrap();
+        assert!(!sidecar_backup_path(&sidecar_path(&p)).exists());
+    }
+
+    /// `replace_owned` removes only the listed (namespace, name) pairs and leaves every other
+    /// element — including foreign namespaces — untouched.
+    #[test]
+    fn replace_owned_touches_only_listed_fields() {
+        let (_dir, p) = photo("doc-replace", "E.ARW");
+        std::fs::write(sidecar_path(&p), FOREIGN).unwrap();
+        let mut doc = SidecarDocument::open(&p).unwrap();
+        doc.replace_owned(
+            &[(NS_CHAIRPHOTO, "Foo")],
+            vec![plain("chairphoto", NS_CHAIRPHOTO, "Foo", "bar")],
+        );
+        let desc = doc.description_mut();
+        assert!(desc.children.iter().any(|n| matches!(n, XMLNode::Element(e) if e.name == "history_end")),
+            "foreign element must survive replace_owned");
+        doc.commit().unwrap();
+
+        let xmp = std::fs::read_to_string(sidecar_path(&p)).unwrap();
+        assert!(xmp.contains("history_end"), "darktable data clobbered by commit");
+        assert!(xmp.contains("<chairphoto:Foo>bar</chairphoto:Foo>"));
+    }
+
+    /// `commit` stamps `chairphoto:LastWrite` exactly once even across repeated commits — no
+    /// duplication, and the field is always present after a commit.
+    #[test]
+    fn commit_stamps_last_write_exactly_once_across_rewrites() {
+        let (_dir, p) = photo("doc-stamp", "F.ARW");
+        SidecarDocument::open(&p).unwrap().commit().unwrap();
+        SidecarDocument::open(&p).unwrap().commit().unwrap();
+        SidecarDocument::open(&p).unwrap().commit().unwrap();
+
+        let xmp = std::fs::read_to_string(sidecar_path(&p)).unwrap();
+        assert_eq!(xmp.matches("chairphoto:LastWrite").count(), 2, "one open + one close tag only");
+    }
+
+    /// Issue #149 F1 (with #148): a sidecar is never written where the original is not. With
+    /// the original's folder gone (an unmounted volume) or the original itself gone, `open`
+    /// refuses, and a `commit` whose original vanished after `open` refuses too — and no
+    /// directory is created in either case.
+    #[test]
+    fn commit_refuses_when_the_original_or_its_directory_is_missing() {
+        let dir = crate::test_support::TestTmpDir::new("doc-mkdir");
+        let photo = dir.join("nested/deep/G.ARW");
+        let folder = photo.parent().unwrap().to_path_buf();
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::write(&photo, b"raw").unwrap();
+
+        // The folder vanishes between open and commit.
+        let doc = SidecarDocument::open(&photo).unwrap();
+        std::fs::rename(&folder, dir.join("away")).unwrap();
+        let err = doc.commit().unwrap_err();
+        assert!(err.contains("folder is missing"), "{err}");
+        assert!(!folder.exists(), "commit must not recreate the original's folder");
+
+        // Opened with the folder already gone.
+        let err = SidecarDocument::open(&photo).err().expect("open must refuse a missing folder");
+        assert!(err.contains("folder is missing"), "{err}");
+        assert!(!folder.exists());
+
+        // The folder is back but the original is not: refused at open and at commit.
+        std::fs::rename(dir.join("away"), &folder).unwrap();
+        let doc = SidecarDocument::open(&photo).unwrap();
+        std::fs::remove_file(&photo).unwrap();
+        let err = doc.commit().unwrap_err();
+        assert!(err.contains("original is missing"), "{err}");
+        assert!(SidecarDocument::open(&photo).is_err());
+        assert!(!sidecar_path(&photo).exists(), "no sidecar for a missing original");
+    }
+
+    /// Every writer refuses a missing original and creates nothing — identifier, import batch,
+    /// Overwrite, GPS, faces and IPTC — while the export keyword writer and the bundle
+    /// importer's identifier write, whose targets exist, still write.
+    #[test]
+    fn every_writer_refuses_a_missing_original_and_existing_targets_still_work() {
+        use crate::catalog::IptcFields;
+        use crate::xmp::FaceRegion;
+        let dir = crate::test_support::TestTmpDir::new("doc-149-writers");
+        let gone = dir.join("unmounted").join("A.ARW");
+        let uuid = "8d0a2c1e-4f5b-4c6d-9e7f-0a1b2c3d4e5f";
+        let face = [FaceRegion { face_id: 1, name: "Ada".into(), bbox: (0.1, 0.1, 0.2, 0.2) }];
+        let frame = crate::xmp::RegionFrame { orientation: None, stored_size: Some((600, 400)), ..Default::default() };
+        let title = IptcFields { title: "T".into(), ..Default::default() };
+        let writes: Vec<(&str, Box<dyn Fn(&Path) -> Result<(), String>>)> = vec![
+            ("identifier", Box::new(|p| crate::xmp::write_identifier(p, uuid))),
+            ("import batch", Box::new(|p| crate::xmp::write_import_batch(p, uuid))),
+            ("overwrite", Box::new(|p| crate::xmp::overwrite_identifier(p, uuid).map(|_| ()))),
+            ("gps", Box::new(|p| crate::xmp::write_gps(p, 59.9, 10.7))),
+            ("faces", Box::new(move |p| {
+                let written = crate::xmp::write_face_regions(p, uuid, &face, &[], &[], frame);
+                // Missing originals are offline, not a sidecar that refuses: tried again later.
+                if let Err(e) = &written {
+                    assert!(matches!(e, crate::xmp::RegionWriteError::Failed(_)), "{e:?}");
+                }
+                written.map_err(|e| e.to_string())
+            })),
+            ("iptc", Box::new(move |p| crate::xmp::write_iptc(p, &IptcFields::default(), &title))),
+        ];
+        for (name, write) in &writes {
+            assert!(write(&gone).is_err(), "{name}: a missing folder must be refused");
+            assert!(!gone.parent().unwrap().exists(), "{name}: the folder was created");
+        }
+        std::fs::create_dir_all(gone.parent().unwrap()).unwrap();
+        for (name, write) in &writes {
+            assert!(write(&gone).is_err(), "{name}: a missing original must be refused");
+            assert!(!sidecar_path(&gone).exists(), "{name}: a sidecar was created");
+        }
+
+        // An export destination and a bundle-imported photo exist before their sidecar write.
+        let exported = dir.join("export").join("A.jpg");
+        std::fs::create_dir_all(exported.parent().unwrap()).unwrap();
+        std::fs::write(&exported, b"jpeg").unwrap();
+        crate::xmp::write_keywords(&exported, &["a".into()], &["x|a".into()]).unwrap();
+        crate::xmp::write_identifier(&exported, uuid).unwrap();
+        let xml = std::fs::read_to_string(sidecar_path(&exported)).unwrap();
+        assert!(xml.contains(uuid) && xml.contains(">a<"), "{xml}");
+    }
+
+    fn set_prop(doc: &mut SidecarDocument, name: &str, value: &str) {
+        doc.replace_owned(&[(NS_CHAIRPHOTO, name)], vec![plain("chairphoto", NS_CHAIRPHOTO, name, value)]);
+    }
+
+    /// The temp files in `sidecar`'s directory.
+    fn temps_beside(sidecar: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(sidecar.parent().unwrap())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|n| n.ends_with(TEMP_SUFFIX))
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// Review F2 of #149: two processes write one sidecar. The in-process file lock does not
+    /// reach across processes, so two threads call `write_atomically` directly, as two
+    /// processes would. No commit may fail (a shared temp name made the loser's rename fail
+    /// with ENOENT), the sidecar always parses, and no temp file is left.
+    #[test]
+    fn two_writers_past_the_lock_never_fail_or_leave_a_partial_sidecar() {
+        use std::sync::{Arc, Barrier};
+        let (_dir, p) = photo("doc-149-procs", "S.ARW");
+        let xmp = sidecar_path(&p);
+        std::fs::write(&xmp, FOREIGN).unwrap();
+        let barrier = Arc::new(Barrier::new(2));
+        let writers: Vec<_> = (0..2)
+            .map(|w| {
+                let (p, xmp, barrier) = (p.clone(), xmp.clone(), barrier.clone());
+                std::thread::spawn(move || {
+                    let body = FOREIGN.replace("<darktable:history_end>7", &format!(
+                        "<darktable:history_end>{}", "7".repeat(256 * 1024 + w)));
+                    barrier.wait();
+                    let folder = Folder::open(&p).unwrap();
+                    for i in 0..60 {
+                        write_atomically(&folder, &p, &xmp, body.as_bytes())
+                            .unwrap_or_else(|e| panic!("writer {w}, commit {i}: {e}"));
+                    }
+                })
+            })
+            .collect();
+        for w in writers {
+            w.join().unwrap();
+        }
+        assert_parses(&std::fs::read_to_string(&xmp).unwrap());
+        assert_eq!(temps_beside(&xmp), Vec::<String>::new());
+    }
+
+    fn assert_parses(xml: &str) {
+        parse_xml(xml.as_bytes()).unwrap_or_else(|e| panic!("sidecar does not parse ({e}):\n{xml}"));
+    }
+
+    /// Issue #149: a commit that fails after the temp file is written but before the rename
+    /// leaves the sidecar byte-identical and no temp file behind.
+    #[test]
+    fn a_failure_before_the_rename_leaves_the_sidecar_untouched_and_no_temp() {
+        let (_dir, p) = photo("doc-149-crash", "K.ARW");
+        let xmp = sidecar_path(&p);
+        std::fs::write(&xmp, FOREIGN).unwrap();
+        let mut doc = SidecarDocument::open(&p).unwrap();
+        set_prop(&mut doc, "Foo", "bar");
+
+        FAIL_BEFORE_RENAME.with(|f| f.set(true));
+        let err = doc.commit().unwrap_err();
+        FAIL_BEFORE_RENAME.with(|f| f.set(false));
+
+        assert!(err.contains("before the rename"), "{err}");
+        assert_eq!(std::fs::read(&xmp).unwrap(), FOREIGN.as_bytes(), "the sidecar must be untouched");
+        assert_eq!(temps_beside(&xmp), Vec::<String>::new(), "the temp file must be removed");
+        // The lock went with the failed document: the next write goes through.
+        let mut doc = SidecarDocument::open(&p).unwrap();
+        set_prop(&mut doc, "Foo", "bar");
+        doc.commit().unwrap();
+        assert!(std::fs::read_to_string(&xmp).unwrap().contains("<chairphoto:Foo>bar</chairphoto:Foo>"));
+    }
+
+    /// A temp file a crash left behind (killed between write and rename) — or another
+    /// process's write in progress, which looks the same — neither blocks the next write nor is
+    /// read as the sidecar, and while fresh is left alone (F2 of the #149 review; a day-old one
+    /// is swept, see `a_write_sweeps_day_old_temps_of_its_folder_once`).
+    #[test]
+    fn a_temp_left_by_a_crash_is_left_alone_and_does_not_block_the_next_write() {
+        let (_dir, p) = photo("doc-149-sweep", "L.ARW");
+        let xmp = sidecar_path(&p);
+        std::fs::write(&xmp, FOREIGN).unwrap();
+        let stale = temp_path(&xmp);
+        std::fs::write(&stale, "<x:xmpmeta><half").unwrap();
+
+        let mut doc = SidecarDocument::open(&p).unwrap();
+        set_prop(&mut doc, "Foo", "bar");
+        doc.commit().unwrap();
+
+        assert_eq!(std::fs::read_to_string(&stale).unwrap(), "<x:xmpmeta><half", "another writer's temp was touched");
+        assert_eq!(temps_beside(&xmp).len(), 1, "only the stale temp may remain");
+        let xml = std::fs::read_to_string(&xmp).unwrap();
+        assert_parses(&xml);
+        assert!(xml.contains("history_end") && xml.contains("<chairphoto:Foo>bar</chairphoto:Foo>"), "{xml}");
+    }
+
+    /// The temp file is invisible to the scanner (a dotfile — its walks skip hidden entries —
+    /// with no image extension), is not a sidecar name (`<original>.xmp`), and is new for
+    /// every write.
+    #[test]
+    fn the_temp_file_is_neither_scanned_nor_a_sidecar() {
+        let xmp = sidecar_path(Path::new("/library/2026/DSC1.ARW"));
+        let temp = temp_path(&xmp);
+        assert_ne!(temp, temp_path(&xmp), "two writes must not share a temp name");
+        let name = temp.file_name().unwrap().to_str().unwrap();
+        let pid = format!(".DSC1.ARW.xmp.{}-", std::process::id());
+        assert!(name.starts_with(&pid) && name.ends_with(TEMP_SUFFIX), "{name}");
+        assert_eq!(temp.parent(), xmp.parent(), "same directory, so the rename stays on one volume");
+        let name = temp.file_name().unwrap().to_str().unwrap();
+        assert!(name.starts_with('.'), "{name}");
+        assert!(!crate::scanner::is_supported_image(&temp), "{name}");
+        assert_ne!(temp.extension().and_then(|e| e.to_str()), Some("xmp"), "{name}");
+    }
+
+    /// Issue #149: while one writer holds a sidecar open, a second waits; it then reads the
+    /// first one's committed file, so both changes survive.
+    #[test]
+    fn a_second_writer_waits_for_the_first_to_commit() {
+        let (_dir, p) = photo("doc-149-wait", "M.ARW");
+        std::fs::write(sidecar_path(&p), FOREIGN).unwrap();
+        let mut first = SidecarDocument::open(&p).unwrap();
+        set_prop(&mut first, "First", "1");
+
+        let second = {
+            let p = p.clone();
+            std::thread::spawn(move || {
+                let mut doc = SidecarDocument::open(&p).unwrap();
+                set_prop(&mut doc, "Second", "2");
+                doc.commit().unwrap();
+            })
+        };
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(!second.is_finished(), "the second writer must wait for the first's commit");
+        first.commit().unwrap();
+        second.join().unwrap();
+
+        let xml = std::fs::read_to_string(sidecar_path(&p)).unwrap();
+        assert_parses(&xml);
+        assert!(xml.contains("<chairphoto:First>1</chairphoto:First>"), "first change lost:\n{xml}");
+        assert!(xml.contains("<chairphoto:Second>2</chairphoto:Second>"), "second change lost:\n{xml}");
+        assert!(xml.contains("history_end"), "{xml}");
+    }
+
+    /// Issue #149, probe P3: two IPTC writes with disjoint changes ({title}, {city}), released
+    /// together by a barrier on a Lightroom sidecar, many times over. Both changes survive
+    /// every round and the file always parses.
+    #[test]
+    fn concurrent_disjoint_iptc_writes_both_survive_and_the_file_parses() {
+        use crate::catalog::IptcFields;
+        use crate::xmp::test_fixtures::{property_values, LIGHTROOM};
+        use std::sync::{Arc, Barrier};
+
+        let (_dir, p) = photo("doc-149-race", "N.ARW");
+        let xmp = sidecar_path(&p);
+        for round in 0..200 {
+            std::fs::write(&xmp, LIGHTROOM).unwrap();
+            let barrier = Arc::new(Barrier::new(2));
+            let writers: Vec<_> = [
+                IptcFields { title: format!("T{round}"), ..Default::default() },
+                IptcFields { city: format!("C{round}"), ..Default::default() },
+            ]
+            .into_iter()
+            .map(|after| {
+                let (p, barrier) = (p.clone(), barrier.clone());
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    crate::xmp::write_iptc(&p, &IptcFields::default(), &after)
+                })
+            })
+            .collect();
+            for w in writers {
+                w.join().unwrap().unwrap();
+            }
+            let xml = std::fs::read_to_string(&xmp).unwrap();
+            assert_parses(&xml);
+            assert_eq!(property_values(&xml, super::super::NS_DC, "title"), vec![format!("T{round}")],
+                "round {round}: title lost:\n{xml}");
+            assert_eq!(property_values(&xml, super::super::NS_PHOTOSHOP, "City"), vec![format!("C{round}")],
+                "round {round}: city lost:\n{xml}");
+        }
+    }
+
+    /// Readers take no lock (`read_identifier`, `read_gps`, a scan, another tool), so the
+    /// sidecar must never be visible half-written: a reader racing a stream of commits always
+    /// finds a complete document — the old one or the new one.
+    #[test]
+    fn a_reader_racing_commits_never_sees_a_partial_file() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        let (_dir, p) = photo("doc-149-reader", "R.ARW");
+        let xmp = sidecar_path(&p);
+        std::fs::write(&xmp, FOREIGN).unwrap();
+        let done = Arc::new(AtomicBool::new(false));
+        let reader = {
+            let (xmp, done) = (xmp.clone(), done.clone());
+            std::thread::spawn(move || {
+                let mut reads = 0usize;
+                while !done.load(Ordering::Relaxed) {
+                    let xml = std::fs::read_to_string(&xmp).unwrap();
+                    parse_xml(xml.as_bytes())
+                        .unwrap_or_else(|e| panic!("read {reads}: a partial sidecar ({e}):\n{xml}"));
+                    reads += 1;
+                }
+                reads
+            })
+        };
+        for i in 0..150 {
+            let mut doc = SidecarDocument::open(&p).unwrap();
+            set_prop(&mut doc, "Foo", &"x".repeat(i * 37));
+            doc.commit().unwrap();
+        }
+        done.store(true, Ordering::Relaxed);
+        assert!(reader.join().unwrap() > 0, "the reader never ran");
+    }
+
+    /// The rename makes a new file; the old one's permissions carry over to it.
+    #[cfg(unix)]
+    #[test]
+    fn a_commit_keeps_the_sidecars_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let (_dir, p) = photo("doc-149-mode", "O.ARW");
+        let xmp = sidecar_path(&p);
+        std::fs::write(&xmp, FOREIGN).unwrap();
+        std::fs::set_permissions(&xmp, std::fs::Permissions::from_mode(0o640)).unwrap();
+        SidecarDocument::open(&p).unwrap().commit().unwrap();
+        assert_eq!(std::fs::metadata(&xmp).unwrap().permissions().mode() & 0o777, 0o640);
+    }
+
+    /// A sidecar the user made read-only is refused, as the in-place write was — the rename
+    /// must not replace it — and no temp file is left.
+    #[cfg(unix)]
+    #[test]
+    fn a_read_only_sidecar_is_refused_and_left_alone() {
+        use std::os::unix::fs::PermissionsExt;
+        let (_dir, p) = photo("doc-149-ro", "P.ARW");
+        let xmp = sidecar_path(&p);
+        std::fs::write(&xmp, FOREIGN).unwrap();
+        std::fs::set_permissions(&xmp, std::fs::Permissions::from_mode(0o444)).unwrap();
+        let err = SidecarDocument::open(&p).unwrap().commit().unwrap_err();
+        assert!(err.contains("read-only"), "{err}");
+        assert_eq!(std::fs::read(&xmp).unwrap(), FOREIGN.as_bytes());
+        assert_eq!(temps_beside(&xmp), Vec::<String>::new());
+    }
+
+    /// Review F4 of #149: a sidecar with a write bit, but not one that lets us write it — mode
+    /// 0464, group-writable, not owner-writable, owned by us — is refused, as the in-place
+    /// write was. `Permissions::readonly()` alone (no write bit at all) let the rename replace
+    /// it.
+    #[cfg(unix)]
+    #[test]
+    fn a_sidecar_writable_only_by_others_is_refused_and_left_alone() {
+        use std::os::unix::fs::PermissionsExt;
+        let (_dir, p) = photo("doc-149-0464", "P2.ARW");
+        let xmp = sidecar_path(&p);
+        std::fs::write(&xmp, FOREIGN).unwrap();
+        std::fs::set_permissions(&xmp, std::fs::Permissions::from_mode(0o464)).unwrap();
+        if std::fs::OpenOptions::new().write(true).open(&xmp).is_ok() {
+            println!("SKIPPED: a_sidecar_writable_only_by_others_is_refused_and_left_alone — running with privileges that ignore the mode");
+            return;
+        }
+        let err = crate::xmp::write_identifier(&p, "8d0a2c1e-4f5b-4c6d-9e7f-0a1b2c3d4e5f").unwrap_err();
+        assert!(err.contains("read-only"), "{err}");
+        assert_eq!(std::fs::read(&xmp).unwrap(), FOREIGN.as_bytes());
+        assert_eq!(std::fs::metadata(&xmp).unwrap().permissions().mode() & 0o777, 0o464);
+        assert_eq!(temps_beside(&xmp), Vec::<String>::new());
+    }
+
+    /// #155 F1: the volume is swapped out in the gap between the commit's last check that the
+    /// original is there and the temp file's creation — the library folder moved away and an
+    /// empty folder left at its path, as an unmount leaves its mount point. The write goes
+    /// through the folder handle held since open, so it lands beside the original in the
+    /// folder it was read from; nothing is created in the folder now at the old path. (By
+    /// path, the temp file and then the sidecar were created in that empty folder.)
+    #[cfg(unix)]
+    #[test]
+    fn a_folder_swapped_after_the_last_check_cannot_redirect_the_write() {
+        let dir = crate::test_support::TestTmpDir::new("doc-155-f1");
+        let library = dir.join("library");
+        std::fs::create_dir_all(&library).unwrap();
+        let p = library.join("R.ARW");
+        std::fs::write(&p, b"raw").unwrap();
+        std::fs::write(sidecar_path(&p), FOREIGN).unwrap();
+        let mut doc = SidecarDocument::open(&p).unwrap();
+        set_prop(&mut doc, "Foo", "bar");
+
+        let away = dir.join("away");
+        let (from, to) = (library.clone(), away.clone());
+        AFTER_THE_LAST_CHECK.with(|h| h.set(Some(Box::new(move || {
+            std::fs::rename(&from, &to).unwrap();
+            std::fs::create_dir(&from).unwrap(); // the empty mount point
+        }))));
+        doc.commit().unwrap();
+
+        let stub: Vec<_> = std::fs::read_dir(&library).unwrap().map(|e| e.unwrap().file_name()).collect();
+        assert!(stub.is_empty(), "the write went to the folder now at the old path: {stub:?}");
+        let xml = std::fs::read_to_string(sidecar_path(&away.join("R.ARW"))).unwrap();
+        assert!(xml.contains("history_end") && xml.contains("<chairphoto:Foo>bar</chairphoto:Foo>"), "{xml}");
+        assert_eq!(temps_beside(&sidecar_path(&away.join("R.ARW"))), Vec::<String>::new());
+    }
+
+    /// #155 R4: a successful write removes the temp files a crash left in its folder once they
+    /// are a day old — only names of the temp pattern, never a fresh one (another write may be
+    /// in progress), never anything else — and lists a folder only once per run.
+    #[test]
+    fn a_write_sweeps_day_old_temps_of_its_folder_once() {
+        let (dir, p) = photo("doc-155-sweep", "T.ARW");
+        let xmp = sidecar_path(&p);
+        std::fs::write(&xmp, FOREIGN).unwrap();
+        let aged = |path: &Path| {
+            std::fs::write(path, "<x:xmpmeta><half").unwrap();
+            let file = std::fs::File::options().write(true).open(path).unwrap();
+            file.set_modified(std::time::SystemTime::now() - STALE_TEMP_AGE - std::time::Duration::from_secs(60)).unwrap();
+        };
+        let crashed = temp_path(&xmp);
+        aged(&crashed);
+        let other_sidecars = temp_path(&dir.join("U.ARW.xmp"));
+        aged(&other_sidecars);
+        let fresh = temp_path(&xmp);
+        std::fs::write(&fresh, "<x:xmpmeta><in progress").unwrap();
+        let not_ours = [dir.join(".T.ARW.xmp.chairphoto-tmp"), dir.join(".T.ARW.xmp.12-notahexsuffix.chairphoto-tmp"),
+            dir.join("T.ARW.xmp.12-0123456789ab.chairphoto-tmp")];
+        for path in &not_ours {
+            aged(path);
+        }
+
+        let mut doc = SidecarDocument::open(&p).unwrap();
+        set_prop(&mut doc, "Foo", "bar");
+        doc.commit().unwrap();
+        wait_swept(&dir);
+
+        assert!(!crashed.exists() && !other_sidecars.exists(), "a day-old temp stayed");
+        assert!(fresh.exists(), "a fresh temp (a write in progress?) was removed");
+        for path in &not_ours {
+            assert!(path.exists(), "{} is not a temp name of ours", path.display());
+        }
+
+        // Listed once per run: a stale temp that appears later stays through the next write.
+        let later = temp_path(&xmp);
+        aged(&later);
+        SidecarDocument::open(&p).unwrap().commit().unwrap();
+        std::thread::sleep(Duration::from_millis(200));
+        assert_eq!(sweeps_of(&dir).len(), 1, "the folder was listed again");
+        assert!(later.exists(), "the folder was listed again");
+    }
+
+    /// Shrink (`Some`) or restore (`None`) the idle timeout of threads created from now on for
+    /// `device` — a key the calling test alone uses ([`sweeper_idle_timeout`]).
+    fn set_idle_timeout_override(device: Option<u64>, timeout: Option<Duration>) {
+        let mut overrides = SWEEPER_IDLE_TIMEOUT_OVERRIDES.lock().unwrap();
+        match timeout {
+            Some(t) => overrides.insert(device, t),
+            None => overrides.remove(&device),
+        };
+    }
+
+    /// The sweeps of `folder` done so far, with the thread that listed it.
+    fn sweeps_of(folder: &Path) -> Vec<std::thread::ThreadId> {
+        SWEEPS_DONE.lock().unwrap().iter().filter(|(p, _)| p == folder).map(|(_, t)| *t).collect()
+    }
+
+    /// Wait (5 s at most) for `folder`'s sweep; the thread that ran it.
+    fn wait_swept(folder: &Path) -> std::thread::ThreadId {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some(t) = sweeps_of(folder).first() {
+                return *t;
+            }
+            assert!(std::time::Instant::now() < deadline, "{} was never swept", folder.display());
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// #221 L3: each device gets its own sweeper thread and queue, so a hang on one volume's
+    /// listing cannot stall another's. Two distinct device keys land their folders' sweeps on
+    /// two distinct threads; the same device key reuses the thread it already has. Goes
+    /// straight at `sweeper_for` (real multiple mounts are not available to a test), which is
+    /// the isolation decision itself; [`sweep_later_forwards_the_folders_device`] separately
+    /// pins that `sweep_later` is what actually feeds it `Folder::device_id()`.
+    #[test]
+    fn each_device_gets_its_own_sweeper_thread() {
+        let dir = crate::test_support::TestTmpDir::new("doc-221-sweeper-devices");
+        let send_to = |device: Option<u64>, name: &str| {
+            let sub = dir.join(name);
+            std::fs::create_dir_all(&sub).unwrap();
+            let folder = Folder::open_dir(&sub).unwrap();
+            sweeper_for(device).unwrap().send(folder).unwrap();
+            sub
+        };
+
+        let a = send_to(Some(101), "a");
+        let b = send_to(Some(202), "b");
+        let thread_a = wait_swept(&a);
+        let thread_b = wait_swept(&b);
+        assert_ne!(thread_a, thread_b, "two different devices must not share a sweeper thread");
+
+        let a2 = send_to(Some(101), "a2");
+        assert_eq!(wait_swept(&a2), thread_a, "the same device reuses its sweeper thread");
+    }
+
+    /// Review relD L2, pinning what `device_id`'s doc says: a folder `write_atomically` opens
+    /// itself (a symlinked sidecar's `linked` target folder) never had `require_original` run
+    /// on it, so it has no cached device and `device_id` falls back to a fresh `fstat`.
+    #[cfg(unix)]
+    #[test]
+    fn a_folder_without_require_original_falls_back_to_fstat_for_its_device() {
+        use std::os::unix::fs::MetadataExt as _;
+        let dir = crate::test_support::TestTmpDir::new("doc-reld-l2-linked");
+        let folder = Folder::open_dir(&dir).unwrap();
+        assert!(folder.device.get().is_none(), "open_dir caches nothing; only require_original does");
+        assert_eq!(folder.device_id(), Some(std::fs::metadata(&*dir).unwrap().dev()));
+    }
+
+    /// #221 review coverage gap: the test above goes straight at `sweeper_for`, so a mutation
+    /// making `sweep_later` pass `None` instead of `folder.device_id()` passes every existing
+    /// test. Proven environment-agnostically (a test machine has one real device, not several
+    /// to compare): a folder swept through `sweep_later` — which must report a real device id
+    /// on `cfg(unix)`, never `None` — lands on a thread distinct from `None`'s own queue.
+    #[test]
+    fn sweep_later_forwards_the_folders_device() {
+        let dir = crate::test_support::TestTmpDir::new("doc-221-sweep-later-device");
+        let real = dir.join("real");
+        std::fs::create_dir_all(&real).unwrap();
+        let folder = Folder::open_dir(&real).unwrap();
+        assert!(folder.device_id().is_some(), "precondition: this platform reports a device id");
+        sweep_later(folder);
+        let thread_real = wait_swept(&real);
+
+        let none_dir = dir.join("none-queue");
+        std::fs::create_dir_all(&none_dir).unwrap();
+        sweeper_for(None).unwrap().send(Folder::open_dir(&none_dir).unwrap()).unwrap();
+        let thread_none = wait_swept(&none_dir);
+
+        assert_ne!(thread_real, thread_none, "sweep_later used the folder's real device, not None's queue");
+    }
+
+    /// #221 review: a device's sweeper thread exits once idle, rather than sitting blocked on
+    /// its channel for the life of the process. The test-only override shrinks the wait so
+    /// this does not take the real `SWEEPER_IDLE_TIMEOUT`; it is set for a device key no other
+    /// test uses, and read when that key's thread is created, so it cannot shrink a thread
+    /// another, concurrently executing test creates for its own key (relD L4).
+    #[test]
+    fn an_idle_sweeper_thread_exits_and_a_later_folder_gets_a_fresh_one() {
+        const DEVICE: Option<u64> = Some(0x2214_0d1e); // unique to this test
+        set_idle_timeout_override(DEVICE, Some(Duration::from_millis(50)));
+        let dir = crate::test_support::TestTmpDir::new("doc-221-idle-exit");
+        let send_to = |name: &str| {
+            let sub = dir.join(name);
+            std::fs::create_dir_all(&sub).unwrap();
+            sweeper_for(DEVICE).unwrap().send(Folder::open_dir(&sub).unwrap()).unwrap();
+            sub
+        };
+        let first = send_to("first");
+        let thread_first = wait_swept(&first);
+
+        std::thread::sleep(Duration::from_millis(300)); // outlive the shrunk idle timeout
+        set_idle_timeout_override(DEVICE, None); // the fresh thread below keeps the production timeout
+
+        let second = send_to("second");
+        assert_ne!(wait_swept(&second), thread_first, "the idle thread exited; a fresh one took the next folder");
+    }
+
+    /// Review relD L4: a test's idle-timeout override is its own device key's, so it never
+    /// shrinks the thread another test creates for another key while it is set (which made
+    /// that thread exit between two of its sends, failing "reuses its sweeper thread").
+    #[test]
+    fn an_idle_timeout_override_reaches_only_its_own_device() {
+        const OVERRIDDEN: Option<u64> = Some(0x7e1d_0004); // unique to this test
+        const OTHER: Option<u64> = Some(0x7e1d_0005); // unique to this test
+        let dir = crate::test_support::TestTmpDir::new("doc-reld-l4-override");
+        let send_to = |name: &str| {
+            let sub = dir.join(name);
+            std::fs::create_dir_all(&sub).unwrap();
+            sweeper_for(OTHER).unwrap().send(Folder::open_dir(&sub).unwrap()).unwrap();
+            sub
+        };
+        set_idle_timeout_override(OVERRIDDEN, Some(Duration::from_millis(50)));
+        let first = send_to("first"); // OTHER's thread is created while OVERRIDDEN's override is set
+        set_idle_timeout_override(OVERRIDDEN, None);
+        let thread_first = wait_swept(&first);
+        std::thread::sleep(Duration::from_millis(300)); // outlive the override, were it applied
+        assert_eq!(wait_swept(&send_to("second")), thread_first, "OTHER's thread kept the production timeout");
+    }
+
+    /// Review relD L1: a `try_send` through a sender `sweep_later` got while the device's entry
+    /// still existed, landing after the idle-exiting thread removed that entry and drained its
+    /// queue but before the receiver dropped, must still be swept — or `try_send` returns `Ok`,
+    /// the folder is dropped unswept, and `SWEPT` keeps it marked for the rest of the run.
+    /// The thread is paused at its exit points ([`sweeper_exit_point`]); the send lands after
+    /// the drain when the thread reaches one before the sender is dropped.
+    #[test]
+    fn a_send_landing_while_an_idle_sweeper_exits_is_still_swept() {
+        const DEVICE: Option<u64> = Some(0x7e1d_0001); // unique to this test
+        let dir = crate::test_support::TestTmpDir::new("doc-reld-l1-late-send");
+        let late = dir.join("late");
+        std::fs::create_dir_all(&late).unwrap();
+        let (events_tx, events) = std::sync::mpsc::channel();
+        let (go, go_rx) = std::sync::mpsc::channel();
+        SWEEPER_EXIT_HOOKS.lock().unwrap().insert(DEVICE, (events_tx, go_rx));
+
+        set_idle_timeout_override(DEVICE, Some(Duration::from_millis(50)));
+        let tx = sweeper_for(DEVICE).unwrap(); // as sweep_later holds it, between lookup and send
+        set_idle_timeout_override(DEVICE, None);
+
+        assert_eq!(events.recv_timeout(Duration::from_secs(5)), Ok("removed"), "the idle thread dropped its entry");
+        go.send(()).unwrap();
+        // Before the fix the drain finishes now; after it, the drain waits for this sender.
+        let drained_first = events.recv_timeout(Duration::from_millis(500)).is_ok();
+
+        assert!(SWEPT.lock().unwrap().insert(late.clone()));
+        let queued = tx.try_send(Folder::open_dir(&late).unwrap()).is_ok();
+        if !queued {
+            SWEPT.lock().unwrap().remove(&late); // sweep_later's own handling of a failed send
+        }
+        drop(tx);
+        go.send(()).unwrap();
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while sweeps_of(&late).is_empty() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let swept = !sweeps_of(&late).is_empty();
+        let marked = SWEPT.lock().unwrap().contains(&late);
+        SWEEPER_EXIT_HOOKS.lock().unwrap().remove(&DEVICE);
+        assert!(
+            swept || !marked,
+            "lost: queued={queued}, drained before the send={drained_first}, never swept, still marked swept"
+        );
+        assert!(!drained_first, "the exiting thread waits for every sender before it stops draining");
+    }
+
+    /// #155 review L3: a write that commits under the catalog lock (here a GPS write, as
+    /// `map` makes it) returns without listing its folder; the sweep runs on another thread,
+    /// which holds no lock of the caller's.
+    #[test]
+    fn the_sweep_never_runs_on_the_committing_thread() {
+        let (dir, p) = photo("doc-155-l3", "W.ARW");
+        let stale = temp_path(&sidecar_path(&p));
+        std::fs::write(&stale, "<half").unwrap();
+        std::fs::File::options().write(true).open(&stale).unwrap()
+            .set_modified(std::time::SystemTime::now() - STALE_TEMP_AGE - Duration::from_secs(60)).unwrap();
+        let catalog = crate::catalog::Catalog::open(&dir.join("c.chairphoto"), &dir).unwrap();
+        let state = crate::app::AppState::default();
+        *state.catalog.lock().unwrap() = Some(catalog);
+
+        let committer = std::thread::current().id();
+        crate::app::with_catalog(&state, |_| {
+            crate::xmp::write_gps(&p, 59.9, 10.7).unwrap();
+            assert!(sweeps_of(&dir).iter().all(|t| *t != committer), "the commit listed its folder under the catalog lock");
+            Ok(())
+        })
+        .unwrap();
+        assert_ne!(wait_swept(&dir), committer, "the sweep ran on the committing thread");
+        assert!(!stale.exists(), "the day-old temp stayed");
+    }
+
+    /// #155 review L2: a folder we may create files in and traverse but not list (0300, a
+    /// drop-box share) still takes the write — through an `O_PATH` handle — as it did when
+    /// the write went by path; it is just never swept.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn a_folder_we_may_write_but_not_list_still_takes_the_write() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = crate::test_support::TestTmpDir::new("doc-155-wx");
+        let drop_box = dir.join("dropbox");
+        std::fs::create_dir_all(&drop_box).unwrap();
+        let p = drop_box.join("X.ARW");
+        std::fs::write(&p, b"raw").unwrap();
+        std::fs::write(sidecar_path(&p), FOREIGN).unwrap();
+        std::fs::set_permissions(&drop_box, std::fs::Permissions::from_mode(0o300)).unwrap();
+        if std::fs::read_dir(&drop_box).is_ok() {
+            std::fs::set_permissions(&drop_box, std::fs::Permissions::from_mode(0o755)).unwrap();
+            println!("SKIPPED: a_folder_we_may_write_but_not_list_still_takes_the_write — running with privileges that ignore the mode (root?)");
+            return;
+        }
+        let written = SidecarDocument::open(&p).and_then(|mut doc| {
+            set_prop(&mut doc, "Foo", "bar");
+            doc.commit()
+        });
+        std::fs::set_permissions(&drop_box, std::fs::Permissions::from_mode(0o755)).unwrap();
+        written.unwrap();
+        let xml = std::fs::read_to_string(sidecar_path(&p)).unwrap();
+        assert!(xml.contains("history_end") && xml.contains("<chairphoto:Foo>bar</chairphoto:Foo>"), "{xml}");
+        assert_eq!(temps_beside(&sidecar_path(&p)), Vec::<String>::new());
+    }
+
+    /// #221 L2: a folder we may neither list nor search (0000) still opens via the `O_PATH`
+    /// fallback (#155 review L2), but `require_original`'s `statat` on the original's name
+    /// then fails `EACCES`, not `ENOENT`. That must read as a permission error, not folded
+    /// into "the original is missing (offline or moved)" — which tells the user to look for
+    /// an unplugged volume, the wrong advice for a folder that is right there but locked down.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn a_folder_with_no_access_reports_a_permission_error_not_missing() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = crate::test_support::TestTmpDir::new("doc-221-eacces");
+        let locked = dir.join("locked");
+        std::fs::create_dir_all(&locked).unwrap();
+        let p = locked.join("X.ARW");
+        std::fs::write(&p, b"raw").unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::read_dir(&locked).is_ok() {
+            std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+            println!("SKIPPED: a_folder_with_no_access_reports_a_permission_error_not_missing — running with privileges that ignore the mode (root?)");
+            return;
+        }
+        let err = SidecarDocument::open(&p).err();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let err = err.expect("open must refuse a folder we cannot search");
+        assert!(err.contains("permission denied"), "{err}");
+        assert!(!err.contains("offline or moved"), "{err}");
+    }
+
+    /// #155 review L1: a FIFO named like a day-old temp neither hangs the commit's sweep (an
+    /// open of it would block until a writer came) nor is removed: only regular files are.
+    #[cfg(unix)]
+    #[test]
+    fn a_fifo_named_like_a_temp_neither_hangs_the_sweep_nor_is_removed() {
+        let (dir, p) = photo("doc-155-fifo", "V.ARW");
+        let fifo = dir.join(".V.ARW.xmp.1-abcdefabcdef.chairphoto-tmp");
+        let folder = rustix::fs::open(&*dir, rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::DIRECTORY, rustix::fs::Mode::empty()).unwrap();
+        rustix::fs::mknodat(&folder, fifo.file_name().unwrap(), rustix::fs::FileType::Fifo, rustix::fs::Mode::from_raw_mode(0o644), 0).unwrap();
+        SidecarDocument::open(&p).and_then(|d| d.commit()).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while sweeps_of(&dir).is_empty() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        if sweeps_of(&dir).is_empty() {
+            let _ = std::fs::OpenOptions::new().write(true).open(&fifo); // release the stuck open
+            panic!("the sweep hung on a FIFO named like a temp");
+        }
+        let kind = std::fs::symlink_metadata(&fifo).expect("the FIFO was removed").file_type();
+        assert!(std::os::unix::fs::FileTypeExt::is_fifo(&kind));
+    }
+
+    #[test]
+    fn only_the_temp_pattern_is_a_temp_name() {
+        let made = temp_path(Path::new("/library/DSC1.ARW.xmp"));
+        assert!(is_temp_name(made.file_name().unwrap()), "{made:?}");
+        for name in [".DSC1.ARW.xmp.chairphoto-tmp", ".DSC1.ARW.xmp.1-0123456789ab.chairphoto-tmpx",
+            ".DSC1.ARW.xmp.x1-0123456789ab.chairphoto-tmp", ".DSC1.ARW.xmp.1-0123456789AB.chairphoto-tmp",
+            "..1-0123456789ab.chairphoto-tmp", "DSC1.ARW.xmp", ".DSC1.ARW.xmp.-0123456789ab.chairphoto-tmp"] {
+            assert!(!is_temp_name(std::ffi::OsStr::new(name)), "{name}");
+        }
+    }
+
+    /// #155 review N2: for a symlinked sidecar the temp file goes beside the link's target, so
+    /// that is the folder swept — a day-old temp left there goes.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_sidecars_write_sweeps_the_targets_folder() {
+        let (dir, p) = photo("doc-155-n2", "Y.ARW");
+        let elsewhere = dir.join("elsewhere");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        let real = elsewhere.join("Y.xmp");
+        std::fs::write(&real, FOREIGN).unwrap();
+        std::os::unix::fs::symlink(&real, sidecar_path(&p)).unwrap();
+        let stale = temp_path(&real);
+        std::fs::write(&stale, "<half").unwrap();
+        std::fs::File::options().write(true).open(&stale).unwrap()
+            .set_modified(std::time::SystemTime::now() - STALE_TEMP_AGE - Duration::from_secs(60)).unwrap();
+
+        let mut doc = SidecarDocument::open(&p).unwrap();
+        set_prop(&mut doc, "Foo", "bar");
+        doc.commit().unwrap();
+
+        wait_swept(&std::fs::canonicalize(&elsewhere).unwrap());
+        assert!(!stale.exists(), "the day-old temp beside the link's target stayed");
+    }
+
+    /// A symlinked sidecar is written through to its target; the link stays a link.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_sidecar_is_written_through() {
+        let (dir, p) = photo("doc-149-link", "Q.ARW");
+        let real = dir.join("elsewhere").join("Q.xmp");
+        std::fs::create_dir_all(real.parent().unwrap()).unwrap();
+        std::fs::write(&real, FOREIGN).unwrap();
+        let xmp = sidecar_path(&p);
+        std::os::unix::fs::symlink(&real, &xmp).unwrap();
+
+        let mut doc = SidecarDocument::open(&p).unwrap();
+        set_prop(&mut doc, "Foo", "bar");
+        doc.commit().unwrap();
+
+        assert!(std::fs::symlink_metadata(&xmp).unwrap().file_type().is_symlink(), "the link was replaced");
+        let xml = std::fs::read_to_string(&real).unwrap();
+        assert!(xml.contains("history_end") && xml.contains("<chairphoto:Foo>bar</chairphoto:Foo>"), "{xml}");
+        assert!(temps_beside(&real).is_empty() && temps_beside(&xmp).is_empty());
+    }
+}

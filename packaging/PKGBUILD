@@ -1,45 +1,87 @@
 # Maintainer: Andreas Henden <chairman2s.ah+github@gmail.com>
 
 pkgname=chairphoto
-pkgver=2026.8.0
-pkgrel=2
+pkgver=2026.10.0
+pkgrel=1
 pkgdesc="Catalog-first photo organizer for large RAW collections"
 arch=('x86_64')
 url="https://github.com/chairman2s/ChairPhoto"
-license=('GPL-3.0-only')
+# GPL-3.0-only: the project itself. LGPL-2.1-only: vendored LibRaw. MIT: the lens-correction
+# reader ported from RAWmakase, and a Feather-derived subset of the embedded Lucide icons.
+# ISC: the rest of the embedded Lucide icons. Apache-2.0: gpui-kit-assets' own 6 non-Lucide
+# icon SVGs. OFL-1.1: the embedded Instrument Sans/Serif fonts. See MODULE_LICENSING.md.
+#
+# The rest (BSD-2-Clause, BSD-3-Clause, Zlib, Unicode-3.0, CC0-1.0, 0BSD, MPL-2.0,
+# CDLA-Permissive-2.0, bzip2-1.0.6) cover the ~600 Rust crates chairphoto-app links at build
+# time (MIT/Apache-2.0 for almost all of them, already listed above) — THIRD_PARTY_LICENSES.txt,
+# installed below, has the per-crate breakdown and text; see MODULE_LICENSING.md and
+# packaging/README.md ("Third-party notices").
+license=('GPL-3.0-only' 'LGPL-2.1-only' 'MIT' 'ISC' 'Apache-2.0' 'OFL-1.1' 'BSD-2-Clause'
+          'BSD-3-Clause' 'Zlib' 'Unicode-3.0' 'CC0-1.0' '0BSD' 'MPL-2.0' 'CDLA-Permissive-2.0'
+          'bzip2-1.0.6')
 
-# Every direct library dependency is listed, per the packaging guidelines: several of these
-# would also arrive through gtk3 or webkit2gtk-4.1, but relying on a transitive edge breaks
-# the moment that intermediate package drops it. Regenerate after changing linked libraries:
+# Every direct library dependency is listed, per the packaging guidelines: relying on a
+# transitive edge (another depends pulling one of these in) breaks the moment that
+# intermediate package drops it. Regenerate after changing linked libraries:
 #   readelf -d usr/bin/chairphoto | grep NEEDED   ->   pacman -Qoq /usr/lib/<soname>
 #
-#   libraw          full-resolution RAW decode, linked at build time by the `raw` feature
+#   (LibRaw is vendored — crates/core/vendor/LibRaw, compiled into the binary by build.rs — so it
+#   is a second source tarball below, not a depends entry.)
 #   hicolor-icon-theme  owns the /usr/share/icons/hicolor directories this package installs into.
+#   libgcc/libstdc++/libgomp  LibRaw's C++ and its OpenMP use (readelf: libgcc_s.so.1,
+#     libstdc++.so.6, libgomp.so.1). zlib is LibRaw's too (libz.so.1).
+#   libxcb/libxkbcommon/libxkbcommon-x11  the GPUI window/input backend (gpui-pre-linux),
+#     linked unconditionally; an X11 (or XWayland) session always works.
+#   vulkan-icd-loader  every GPUI frame renders through wgpu/ash over Vulkan. It is not in
+#     `readelf -d`'s NEEDED list — `strings` shows `libvulkan.so.1` and ash's own "Unable to
+#     load ..." messages, so it is dlopen'd, not link-time NEEDED — but the app cannot open a
+#     window without it, so it belongs here regardless. An actual GPU driver's Vulkan ICD
+#     (mesa-vulkan-*, nvidia-utils, …) is hardware-specific and left to the user/metapackage.
+#   wayland  gpui-pre-linux builds a WaylandClient unconditionally whenever WAYLAND_DISPLAY is
+#     set, with no X11 fallback in that case (linux.rs): on a Wayland session without it, the
+#     app panics rather than falling back to X11/XWayland. Same shape as vulkan-icd-loader
+#     above: not in NEEDED, but `strings` shows `libwayland-client.so.0`/`libwayland-egl.so.1`
+#     as dlopen targets with their own "could not be loaded" error strings. A Wayland
+#     compositor always pulls this in anyway, so in practice it's rarely the missing piece —
+#     listed regardless, per the same "every direct dependency is listed" rule as everything
+#     else here.
 #
-# librsvg is deliberately absent. Tauri's Linux prerequisites name it, but this package ships
-# only PNG icons and nothing links it, so namcap flags it as unneeded. gtk3 depends on it
-# regardless, so it remains installed for anything that does want it.
+# Tauri/webkit2gtk's dependents (cairo, dbus, gdk-pixbuf2, glib2, gtk3, libsoup3,
+# webkit2gtk-4.1) are gone along with Tauri (#165): none of them appear in NEEDED any more.
+# librsvg is also absent for the same reason it already was: this package ships only PNG
+# icons and nothing links it.
+#
+# fontconfig and freetype are deliberately absent too, despite `zed-font-kit` (gpui's font
+# matcher) pulling in `yeslogic-fontconfig-sys` and `freetype-sys`: neither symbol shows up in
+# `readelf -d` NEEDED, and neither a `libfontconfig.so`/`libfreetype.so` dlopen string nor a
+# real `FT_*`/`Fc*` call site shows up in `strings` on the release binary either (the
+# "FreeTypeScaler" strings that do appear are `skrifa`'s own pure-Rust hinting code, unrelated
+# to the real library) — so on this build neither is reachable at runtime, only probed while
+# building (their crates' build scripts want the headers; see makedepends below).
 depends=(
-  'cairo'
-  'dbus'
-  'gdk-pixbuf2'
-  'glib2'
   'glibc'
-  'gtk3'
   'hicolor-icon-theme'
   'libgcc'
-  'libraw'
-  'libsoup3'
-  'webkit2gtk-4.1'
+  'libgomp'
+  'libstdc++'
+  'libxcb'
+  'libxkbcommon'
+  'libxkbcommon-x11'
+  'vulkan-icd-loader'
+  'wayland'
+  'zlib'
 )
 
-# clang/pkgconf are for the LibRaw bindgen step in src-tauri/build.rs, which reads the
-# installed header so the struct ABI matches the linked library exactly.
+# clang is for the LibRaw bindgen step in crates/core/build.rs, which reads the vendored header
+# so the struct ABI matches the compiled library exactly; the C++ compiler builds LibRaw itself.
+# fontconfig and freetype (headers + pkg-config files) are for `yeslogic-fontconfig-sys` and
+# `freetype-sys`'s own build scripts (`zed-font-kit`, gpui's font matcher) — probed while
+# building only; see the note above depends for why neither ends up a runtime dependency.
 makedepends=(
   'cargo'
   'clang'
-  'nodejs>=24'
-  'npm'
+  'fontconfig'
+  'freetype2'
   'pkgconf'
 )
 
@@ -64,20 +106,48 @@ optdepends=(
 # are unaffected, which is why only these two show up.
 options=(!lto)
 
+# The vendored LibRaw is a git submodule, which a release tarball does not contain; fetch
+# the pinned snapshot as its own tarball and place it in prepare(). Keep `_libraw_commit` in
+# step with `git -C crates/core/vendor/LibRaw rev-parse HEAD` at the tagged release.
+_libraw_commit=dde798dd
 source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz"
+        "libraw-$_libraw_commit.tar.gz::https://github.com/LibRaw/LibRaw/archive/$_libraw_commit.tar.gz"
         "$pkgname.desktop")
 # Regenerate with `updpkgsums` after every pkgver bump; see README.md in this directory.
+#
+# Index 0 is still v2026.8.0's hash: this recipe targets the *next* tag (v2026.10.0, not yet
+# created — see README.md "Cutting a release" and its note on preparing a recipe ahead of the
+# tag it names), so there is no real v2026.10.0 tarball to hash yet. Left as a visible,
+# known-wrong placeholder rather than a guess; a plain `makepkg` will fail integrity on it
+# until the actual release's `updpkgsums` run replaces it. Index 2 (chairphoto.desktop) is
+# current — that file lives in this repo, not behind a tag, so `sha256sum
+# packaging/chairphoto.desktop` could be computed for real, offline, right now.
 sha256sums=('9243bce8e428bf534228c598f0b5e78cb932684adf4fa91965d583bd1ebb2ebf'
-            'f886deeefb89b0ac96497bf02e6307539175fbb99a498ba3f40ed8ff14e10f00')
+            'SKIP'
+            '1472df45baa14daafd92f4bfda8796fecdb0d8f938742fe19484a816bb14702e')
 
 prepare() {
   cd "ChairPhoto-$pkgver"
 
-  # Both fetches need network, and are kept here so build() can run entirely offline.
+  # Drop the (empty) submodule directory from the tarball and put the pinned snapshot there.
+  rm -rf crates/core/vendor/LibRaw
+  cp -r "$srcdir/LibRaw-$_libraw_commit"* crates/core/vendor/LibRaw
+
+  # The workspace's `[workspace.package] version` (Cargo.toml, #167) is the one version
+  # source every crate pulls with `version.workspace = true`; AGENTS.md "Versioning" says it
+  # must match pkgver. Catch a maintainer bumping one and not the other here, loudly, rather
+  # than shipping a binary whose own crates disagree with the package that carries them.
+  local ws_version
+  ws_version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)
+  if [[ $ws_version != "$pkgver" ]]; then
+    echo "==> ERROR: Cargo.toml's [workspace.package] version ($ws_version) != pkgver ($pkgver)" >&2
+    return 1
+  fi
+
+  # Needs network, and is kept here so build() can run entirely offline.
   # --locked pins the Cargo.lock versions; --target limits the fetch to this host.
   export RUSTUP_TOOLCHAIN=stable
-  npm ci
-  cargo fetch --locked --manifest-path src-tauri/Cargo.toml \
+  cargo fetch --locked --manifest-path Cargo.toml \
     --target "$(rustc -vV | sed -n 's/host: //p')"
 }
 
@@ -85,22 +155,22 @@ build() {
   cd "ChairPhoto-$pkgver"
 
   export RUSTUP_TOOLCHAIN=stable
-  export CARGO_TARGET_DIR=target
-  # Equivalent to cargo's --frozen, which cannot be passed through the Tauri CLI: the build
-  # may only use what prepare() already fetched, so dependency resolution cannot drift.
+  # Absolute, so the output is always the workspace root's target/ (which check() and
+  # package() read) regardless of the directory cargo itself resolves a relative path against.
+  export CARGO_TARGET_DIR="$PWD/target"
+  # Belt-and-suspenders with --locked below: the build may only use what prepare() already
+  # fetched, so dependency resolution cannot drift.
   export CARGO_NET_OFFLINE=true
 
   # Upstream defaults: ai, edit, raw, instagram, collage, slideshow, localsend, map, faces,
-  # smarttags — plus flickr and smugmug, which are opt-in upstream but shipped here.
+  # smarttags, tag-graph — plus flickr and smugmug, which are opt-in upstream but shipped here.
   #
   # Their Rust backends are compiled in (docs/plugin-system.md: no hot-loading), so a user
   # cannot add them later without rebuilding, and splitting them into their own package would
   # mean a second conflicting build of the same binary. Enabling them costs one pure-Rust
   # crate (hmac) and no new system libraries — `cargo tree` adds no -sys crates — so depends
   # is unaffected and the only price is a slightly larger binary.
-  #
-  # --no-bundle stops Tauri from also producing deb/rpm/AppImage images we would discard.
-  npm run tauri build -- --no-bundle --features flickr,smugmug
+  cargo build --release -p chairphoto-app --locked --features flickr,smugmug
 }
 
 check() {
@@ -115,9 +185,9 @@ check() {
   # readelf, not ldd: ldd prints the whole resolved closure, so it would also fire on a
   # dependency that pulled ONNX Runtime in transitively — a binary this recipe has no quarrel
   # with. NEEDED is the invariant, so read NEEDED.
-  if readelf -d "src-tauri/target/release/$pkgname" | grep NEEDED | grep -q 'libonnxruntime'; then
+  if readelf -d "target/release/$pkgname" | grep NEEDED | grep -q 'libonnxruntime'; then
     echo "==> ERROR: the binary links libonnxruntime; it must dlopen it instead." >&2
-    echo "    Check that the ort dependency in src-tauri/Cargo.toml still sets" >&2
+    echo "    Check that the ort dependency in crates/core/Cargo.toml still sets" >&2
     echo "    default-features = false with the \`load-dynamic\` feature." >&2
     return 1
   fi
@@ -148,7 +218,7 @@ check() {
   # what prepare() already fetched.
   echo "==> Checking the dynamic ONNX Runtime path (present and absent)..."
   export RUSTUP_TOOLCHAIN=stable
-  cargo test --locked --offline --manifest-path src-tauri/Cargo.toml \
+  cargo test --locked --offline -p chairphoto-core \
     --features flickr,smugmug --lib -- --nocapture \
     plugins::onnx::tests::missing_runtime_reports_an_error \
     plugins::onnx::tests::probe_accepts_an_installed_runtime \
@@ -158,16 +228,40 @@ check() {
 package() {
   cd "ChairPhoto-$pkgver"
 
-  install -Dm755 "src-tauri/target/release/$pkgname" "$pkgdir/usr/bin/$pkgname"
+  install -Dm755 "target/release/$pkgname" "$pkgdir/usr/bin/$pkgname"
   install -Dm644 "$srcdir/$pkgname.desktop" "$pkgdir/usr/share/applications/$pkgname.desktop"
   install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+  # The vendored LibRaw is compiled in under its LGPL-2.1 option (MODULE_LICENSING.md).
+  install -Dm644 crates/core/vendor/LibRaw/COPYRIGHT "$pkgdir/usr/share/licenses/$pkgname/LibRaw-COPYRIGHT"
+  install -Dm644 crates/core/vendor/LibRaw/LICENSE.LGPL "$pkgdir/usr/share/licenses/$pkgname/LibRaw-LICENSE.LGPL"
+  # The lens-correction reader is ported from RAWmakase, MIT (MODULE_LICENSING.md).
+  install -Dm644 crates/core/src/lens/LICENSE-RAWmakase "$pkgdir/usr/share/licenses/$pkgname/RAWmakase-LICENSE"
+  # Lucide icons (ISC; a Feather-derived subset MIT) and the Instrument Sans/Serif fonts
+  # (SIL OFL 1.1) the GPUI app embeds (#177; MODULE_LICENSING.md).
+  install -Dm644 crates/app/assets/icons/LICENSE-LUCIDE "$pkgdir/usr/share/licenses/$pkgname/LICENSE-LUCIDE"
+  install -Dm644 crates/app/assets/fonts/OFL-InstrumentSans.txt \
+    "$pkgdir/usr/share/licenses/$pkgname/OFL-InstrumentSans.txt"
+  install -Dm644 crates/app/assets/fonts/OFL-InstrumentSerif.txt \
+    "$pkgdir/usr/share/licenses/$pkgname/OFL-InstrumentSerif.txt"
+  # gpui-kit-assets' own 6 non-Lucide SVGs (github, the 4 window-control glyphs,
+  # resize-corner) are the crate's own Apache-2.0 work, not Lucide's (MODULE_LICENSING.md).
+  # The crate ships no LICENSE-APACHE of its own, unlike LICENSE-LUCIDE above, so this is the
+  # plain upstream Apache License 2.0 text, kept at a fixed path for the same reason
+  # LICENSE-RAWmakase/LICENSE-LUCIDE are: no reliable path into a Cargo registry cache from a
+  # release tarball.
+  install -Dm644 crates/app/assets/icons/LICENSE-APACHE-GPUI-KIT-ASSETS \
+    "$pkgdir/usr/share/licenses/$pkgname/LICENSE-APACHE-GPUI-KIT-ASSETS"
+  # The ~600 third-party Rust crates chairphoto-app links at build time (#244; MODULE_LICENSING.md,
+  # packaging/README.md "Third-party notices"). Committed and regenerated with `cargo about`,
+  # not built here, so this build stays offline.
+  install -Dm644 THIRD_PARTY_LICENSES.txt "$pkgdir/usr/share/licenses/$pkgname/THIRD_PARTY_LICENSES.txt"
 
-  install -Dm644 "src-tauri/icons/32x32.png" \
+  install -Dm644 "packaging/icons/32x32.png" \
     "$pkgdir/usr/share/icons/hicolor/32x32/apps/$pkgname.png"
-  install -Dm644 "src-tauri/icons/128x128.png" \
+  install -Dm644 "packaging/icons/128x128.png" \
     "$pkgdir/usr/share/icons/hicolor/128x128/apps/$pkgname.png"
-  install -Dm644 "src-tauri/icons/128x128@2x.png" \
+  install -Dm644 "packaging/icons/128x128@2x.png" \
     "$pkgdir/usr/share/icons/hicolor/256x256/apps/$pkgname.png"
-  install -Dm644 "src-tauri/icons/icon.png" \
+  install -Dm644 "packaging/icons/icon.png" \
     "$pkgdir/usr/share/icons/hicolor/512x512/apps/$pkgname.png"
 }

@@ -68,6 +68,77 @@ the identifier it has, and the divergence stays visible for a human rather than 
 resolved by clobbering somebody else's identity. A sidecar failure never aborts a
 scan: one unwritable file must not cost the user the other 99,999 rows.
 
+### How a sidecar is written, and when it is refused
+
+Every sidecar write (`xmp::document::SidecarDocument`, issue #149) reads the file, changes
+only what that writer owns, and replaces the whole file at once: a temp file in the same
+folder (a dotfile ending `.chairphoto-tmp`, unique to that write), synced, then renamed over
+the sidecar. A reader, another tool or a crash sees the old sidecar or the new one, never a
+mix. A temp file left by a write killed before its rename stays until it is a day old; the
+next successful write to its folder after that has it removed, on a background thread (each
+folder is checked once per run, only regular files with names of that exact pattern are
+touched, and a folder ChairPhoto may write but not list is never checked). Writers of one
+sidecar in one process take turns, and an IPTC save and a geocode fill store and write in
+one order. A write is **refused, leaving the sidecar as it was**, when:
+
+- the original or its folder is missing — an unmounted volume; no folder is ever created.
+  On Unix the original's folder is held open from the read to the rename, and the temp file
+  is created and renamed through that handle, so a volume that goes away after the last
+  check cannot redirect the write into the empty mount point (#155);
+- the sidecar exists but this process may not write it (permissions, ownership, ACL);
+- **the folder is not writable**, even if the sidecar itself is (a share that grants
+  modify but not create, a mount ACL). The rename needs a new file in the folder, and
+  ChairPhoto keeps failing safe here rather than falling back to a non-atomic in-place
+  write (decided in the #149 review, F3).
+
+A refused write stays as debt, not as a silent success. An identity or import-batch field
+lands in `pending_sidecar_identity` and the repair pass retries it once the folder is
+writable. A refused IPTC write after the catalog stored the values leaves those fields owed
+in `pending_sidecar_iptc`; the next save or the repair pass writes them (see IPTC that fails
+to reach the disk). The save reports the sidecar pending, a single-photo geocode returns an
+error saying so, and geocode-all does not count that photo as filled.
+Face-region and GPS writes log the failure, and the catalog stays authoritative.
+
+### Sidecars damaged by releases before #138
+
+Every release before #138 parsed and wrote sidecars with `xmltree` 0.11, which drops attribute
+prefixes. Each write it made turned `rdf:parseType="Resource"` into `parseType="Resource"`,
+turned `rdf:about` into both an unprefixed `about` (with the original value) and an empty
+`rdf:about=""` (the writer re-inserted one after parsing), and an attribute-form MWG `AppliedToDimensions` or `Area`
+(`stDim:w`, `stArea:x`, …) into no-namespace `w`, `x`, …. The same happened to every other
+prefixed attribute in the file, foreign ones included (`digiKam:Confidence`). On such a file
+the face-region writer refuses every write ("mwg-rs:Regions is not a struct") and the reader
+finds no regions.
+
+When a writer opens a sidecar that carries `chairphoto:LastWrite`, which means a ChairPhoto
+release wrote the damage, `SidecarDocument::open` restores those known attributes in memory
+before the writer runs (`xmp/repair.rs`, #143). The table below lists every attribute it
+restores; nothing else is touched:
+
+| Unprefixed | On | Restored as |
+|---|---|---|
+| `about` | `rdf:Description` | `rdf:about`, replacing an empty or equal `rdf:about` |
+| `parseType` | a property element or `rdf:li` | `rdf:parseType` |
+| `w`, `h`, `unit` | `mwg-rs:AppliedToDimensions` | `stDim:` |
+| `x`, `y`, `w`, `h`, `unit` | `mwg-rs:Area` | `stArea:` |
+| `Name`, `Type`, `Rotation` | a region's nested `rdf:Description` (digiKam's form) | `mwg-rs:` |
+| `lang` | an `rdf:li` of an `rdf:Alt` | `xml:lang` |
+
+The first two are how RDF/XML itself reads an unqualified `about` or `parseType`. The MWG
+fields have no other meaning on those elements, and a Lang Alt item's `lang` can only be
+`xml:lang`. The last two rows are skipped, rather than treated as ambiguous, where the prefixed
+counterpart is already there. Attributes whose namespace is lost for good,
+such as `Confidence`, stay as they are. The repair runs only when it is unambiguous. If any
+element already carries the attribute that would be restored (`parseType` beside
+`rdf:parseType`, `x` beside `stArea:x`, `about` beside a different non-empty `rdf:about`),
+nothing is repaired and the write is refused as
+before. A repair counts as a first write for the backup rule: the damaged file is copied to
+`<sidecar>.chairphoto-backup` first, unless a backup already exists, and an existing backup is
+never replaced. Readers (face regions, GPS, identifier, IPTC presence) apply the same repair in
+memory to a sidecar with `chairphoto:LastWrite`, writing nothing and taking no backup, so face
+import reads the regions of a damaged sidecar before any write. The file itself is healed by the
+first ChairPhoto write to it.
+
 ### The repair pass is a job
 
 The queue reached 74,488 rows on the 100k harness shape, and every row is a sidecar parse
@@ -101,9 +172,86 @@ compare-and-set can replace — Adopt rewrites `photos.uuid` and leaves the phot
 copies' queue rows untouched when they carry no identifier, so a stale plan would write the
 photo's previous identity into one of those sidecars.
 
+**A locked catalog is waited out, not fatal** (#182). Another connection can hold the write
+lock longer than the 5 s busy timeout — the bundle importer keeps one transaction open across
+its whole index phase. A catalog step of the pass (or of the bulk resolution below) that meets
+such a lock is retried after growing pauses (`catalog/busy.rs`, about 20 s in all, cut short
+by the abort flag). Only the catalog step is retried, never the sidecar IO before it, so the
+record is the same compare-and-set the first attempt would have made. A row still locked after
+that is left exactly as it was — still queued, or its IPTC still owed — counted `busy`, and
+the pass carries on with the next. Its sidecar may already hold what the pass wrote; the next
+pass reads that and records it bound. Only a page read that stays locked ends the pass, and
+under WAL a read does not wait for a writer.
+
 A resolution deliberately does **not** stop a running pass. Killing a 74k-row pass because
 one row got a decision is a worse trade than dropping that row's result, and the per-row
 ownership above is what makes coexistence safe.
+
+### IPTC that fails to reach the disk
+
+Authored IPTC has the same two halves, but not the same shape of debt. An IPTC save writes
+only the managed fields whose catalog value changed (#144: a field the catalog never changed
+keeps whatever another tool wrote), and it writes after the catalog commit. So a sidecar
+write that fails after the store — read-only storage, an unparseable sidecar, a volume
+unmounting mid-save — would leave values in the catalog that no later write carries: a re-save
+of the same values changes nothing, and the next save writes only its own change.
+
+The debt is therefore a **set of fields per photo**, in `pending_sidecar_iptc`
+(`catalog/iptc_owed.rs`, #148):
+
+- **Owed in the store.** `Catalog::set_iptc` ORs the fields it changed into the photo's
+  `owed` mask and bumps its `generation`, in the transaction (a savepoint) that stores the
+  values. It is the only way to change an existing row's IPTC, so no store can skip it.
+- **Written as owed ∪ changed.** `set_iptc` returns the write that pays everything owed,
+  with the catalog's values now: a cleared field is removed from the sidecar, a field never
+  owed is not touched. The path is resolved before the store, so an unreachable original
+  still fails the save closed with nothing stored. A volume that goes away after the store
+  fails the write (the sidecar document refuses a missing original or folder, #149), so the
+  fields stay owed.
+- **Cleared by compare-and-set.** `settle_iptc_write` clears the mask only while
+  `generation` is still the one the write read, and only for the photo with that UUID. A
+  newer store keeps its fields owed. A superseded write that *succeeded* owes again each
+  field it wrote with a value the catalog no longer holds: those older values may have
+  reached the disk after the newer write's, and only another write can prove otherwise. A
+  field it wrote with the current value is right whichever write landed last, so it is not
+  owed again, and when nothing is left owed the settle reports written. Rows stay at `owed = 0` rather than being deleted, so
+  a photo's generation only grows.
+- **Retried by the repair pass.** After the identity queue, `run_identity_repair` drains the
+  photos owing IPTC under the same job, abort flag and progress (`iptcWritten`,
+  `iptcUnreachable`, `iptcFailed` in its summary; `iptcOwed` in the panel's summary). The
+  per-photo record writes the sidecar of the copy the resolver picks, as a save does. The
+  title-bar "identity debt" chip and menu badge count copies owing identity plus photos owing
+  IPTC, and the panel's Start is enabled by either.
+- **Listed, dismissed, retried one at a time (#153).** The identity-debt panel lists the
+  photos owing IPTC (`list_owed_iptc_page`: id, UUID, path, owed fields, last error,
+  generation; paged) with **Retry** and **Dismiss** per row (`app::iptc_owed`). Retry writes the
+  photo's owed fields as a save does: it takes the sidecar's write turn, reads what is owed
+  now with the turn held, and writes and settles through the save's compare-and-set; an
+  unreachable original is recorded on the row and stays owed. Dismiss clears the owed set
+  without writing — for a photo kept on read-only media — by compare-and-set on the UUID and
+  generation the row was read with, so a store since then (whose debt the user has not seen)
+  or another photo that took the id is never dismissed. The catalog keeps its values; a later
+  save owes only what it changes. Both are bound to the photo's UUID and to the catalog
+  their row was read from (`with_catalog_as`): the GPUI panel binds them to the catalog of
+  the page it drew, and the identity queue's `list_pending_identity` /
+  `summarize_pending_identity` / `resolve_identity_conflict` are bound the same way,
+  closing on `catalog:switched`. A byte copy of the catalog has the same ids, UUIDs and
+  generations; only the catalog identity tells them apart. Each re-reads the panel's and
+  the title bar's counts.
+- **Reported honestly.** A save that reached only the catalog answers `pending` with the
+  reason (`IptcSaveOutcome`, returned by `Catalog::set_iptc` and shown by both
+  inspectors as "Saved to catalog; sidecar pending (…)"); `unchanged` when nothing was owed.
+- **Bundle import** stores each new photo's manifest IPTC through `set_iptc_carried`, which
+  owes only the fields the sidecar beside the extracted file has no value for. A value that
+  sidecar does carry may be another tool's edit the source catalog never imported, so the
+  import leaves it, as a save would (#144). The importer writes the owed fields right after
+  its transaction commits, and anything that fails stays owed; a sidecar that does not parse
+  owes every field. A catalog merge's insert of
+  a new row (`catalog/merge.rs`, typically a metadata-only photo with no original here)
+  carries the source's IPTC without owing it.
+
+No migration backfills the table: which writes failed before v25 is unknown, and owing every
+photo's IPTC would rewrite every sidecar in the library on the next pass.
 
 ### Resolving a conflict
 
@@ -130,6 +278,125 @@ queue row's recorded reason, which describes the last attempt, not the file now.
 **Adopt is refused if another photo already holds that identity**, naming the photo that
 does. `photos.uuid` is `UNIQUE`, so the write would fail regardless — but as an opaque
 constraint error, and resolving one conflict must not manufacture another.
+
+**Only a UUID is an identity.** A sidecar `xmp:Identifier` that is not a non-nil UUID in the
+hyphenated form (`catalog::is_photo_identity`) belongs to another tool: a DAM asset id, say,
+which several files may share. A scan or bundle import never adopts it as `photos.uuid` or
+uses it to re-home a row; the file gets its own minted UUID, and the foreign value stays in
+the sidecar as a conflict. Adopt refuses it; Overwrite (after the backup) or Dismiss resolve
+it. A value spelled as a URI (`urn:uuid:<uuid>`) is foreign for the same reason —
+`is_photo_identity` requires the bare hyphenated form — so a bulk Overwrite replaces it like
+any other single non-UUID value, after the same backup (#222 N2); ChairPhoto itself never
+writes that spelling.
+
+**Non-UUID conflicts can be resolved in bulk** (#150). A DAM-managed library can hold them by
+the thousand — schema v23 queues every re-minted row's copies — so Overwrite and Dismiss
+also run over all of them at once as a job (`Catalog::run_resolve_foreign_conflicts`, owned
+by `JobRegistry::identity_resolve` through `app::identity::claim_resolve_foreign_conflicts`;
+over IPC `resolve_foreign_identity_conflicts`, `identity_resolve_cancel`,
+`identity_resolve_status`, with `identity:resolve_progress` and the terminal
+`identity:resolve_done`). It acts only on un-dismissed copies whose recorded conflict is a
+non-UUID, and decides each exactly as a single resolution does: the queue row is re-read,
+Overwrite re-reads the sidecar and backs it up first, and a copy that is no longer a non-UUID
+conflict — resolved meanwhile, its sidecar now carrying a UUID or nothing, its file
+unreachable — is skipped, never acted on. A UUID conflict names another photo's identity and
+is never resolved in bulk. Overwrite replaces every `xmp:Identifier` value while a conflict
+records only the first, so a bulk Overwrite also skips a sidecar holding more than one value
+(a Bag a DAM appended to, a second `rdf:Description`): another photo's UUID may sit beside the
+DAM id (`xmp::read_identifiers`). The run is its own job family, so it neither stops nor is stopped
+by a repair pass (each queue row has an owner); a newer run, Cancel or a catalog switch stops
+it before its next copy, a copy whose record stays locked through every retry is left queued
+and counted `busy` (#182; an Overwrite counted there may already have written the sidecar, which
+a later run skips and the repair pass binds), and a front end's start is bound to the catalog it read
+(`CATALOG_CHANGED` otherwise). The GPUI identity-debt panel does not offer it yet.
+
+Before #141 a scan did adopt such a value, so an older catalog can hold rows whose
+`photos.uuid` is a DAM id. Schema v23 (#146) re-mints each of them, keeps the old value in
+`photo_legacy_identifiers`, and queues every copy it records as a conflict; it writes no
+sidecar. Until that conflict is resolved the sidecar's foreign value is the file's only link
+to its row, so a scan re-homes a moved file onto the row holding it as a legacy identifier —
+only when no other row holds it and every primary copy the row records is gone (present
+storage, no file; an unmounted volume does not count). A backup, cache or export copy still in
+place does not hold it back: it is the same row's copy, not evidence of another photo. The
+scanned file must also be the row's size: an offloaded photo has no primary copy left to be
+"gone", and an export or derivative carrying the same DAM id must not take it over, while an
+original is never modified and keeps its size wherever it is moved or restored.
+Otherwise the file is a different photo and gets its own row, as above.
+
+This size guard is a deliberate trade-off (#146), not a loss: a file another tool rewrites in
+place — a DAM or digiKam writing metadata into a JPEG or DNG, changing its byte size — and
+that is then moved before the next scan no longer comes home, because its size no longer
+matches. It gets a new row instead, the pre-#146 duplicate, and nothing is deleted. Only a
+modify-then-move *between* scans hits this: a rescan at the file's unchanged path refreshes
+`photos.size` first, so the guard only ever sees it stale when the file has also moved.
+
+A scan that mints a UUID for a file whose sidecar holds such a foreign value records it the
+same way (#150), so a file catalogued after #141 re-homes under the same guards when it
+moves. The value is recorded whichever way the scan matched the row, so a row catalogued
+before #150 gains it at its next rescan. A legacy value has at most one owner: a scan, merge
+or bundle import never records a value another row already holds — the first holder is
+v23's re-mint or the first file seen carrying it, and a later one is a duplicate or another
+file sharing a DAM id. Two owners would make every scan refuse both.
+
+**A re-home never leaves a file behind** (#150). A scan or bundle import that finds a file
+carrying an identity some row already holds re-homes that row onto the file only when the
+row's own copy is gone: its primary location on the file's volume, and, for a file under the
+catalog root, the file at its `photos.path`. If that copy is still in place, the new file is
+another copy carrying the same identity — a bundle's copy at another relative path, a
+duplicate made outside ChairPhoto, the other half of a v24 case collision — so it gets a row
+of its own with a minted UUID, and its sidecar's identity is queued as a conflict for a
+person (Overwrite or Dismiss). Re-homing it would leave the original with no row: the next
+scan would catalogue it afresh without its ratings, tags and faces, or the two files would
+take turns owning the row. A row whose primary copies are all on other volumes still gains a
+file found on a volume indexed in place as another location; that moves nothing. A bundle
+whose photo lands as such a separate copy puts none of its data on the copy's row (#185): its
+culling, IPTC, edits, versions and tags go onto the existing row, which merge matches by
+identity, the way a bundle photo already in the library does (see "Photo (existing)" below).
+The copy's row is a file of this import (its batch, its queued backup) and nothing more.
+
+"Still in place" is a question about the file, not the name (#184). On a case-insensitive
+filesystem (APFS and HFS+ by default, exFAT and vfat drives, a casefold directory) the old
+name of a case-only rename, `IMG.ARW` → `img.arw`, still opens the renamed file, so testing
+the recorded path with `exists()` kept the file apart from its own row. The guard therefore
+asks whether the recorded path opens the very file being scanned (same device and inode;
+the canonical path off Unix) and, if it does, whether the recorded name — and each folder
+name it does not share with the scanned path — is still in its folder's listing. A name the
+filesystem only folds onto the renamed file is not, so the row re-homes; a second hard link
+is, so it stays a copy of its own. An unreadable listing counts as listed. The legacy-identifier
+re-home (`every_primary_copy_is_gone`) still tests `exists()`.
+
+**A re-minted legacy identity is a UUID v5, not v4.** This is the one exception to "a UUID v4
+on first import": a photo imported fresh still gets a random v4, but a value that already
+served as a photo's identity is re-minted as `catalog::legacy_photo_identity` — UUID v5 of the
+value under the fixed `catalog::LEGACY_IDENTITY_NAMESPACE`, which must never change. Two
+catalogs that each held a photo as `dam:asset/1` migrate independently and must still agree on
+its identity, because identity is the merge key and a bundle does not carry the legacy value; a
+random v4 per catalog would split that photo in two at the next merge. For the same reason
+merge and bundle import map an old bundle's non-UUID id through the same function
+(`catalog::photo_identity_for`) and record it as the row's legacy identifier: no path stores a
+non-UUID `photos.uuid` any more. An empty or whitespace-only value is no identity at all, not
+a legacy one: v23 gives such a row a random v4, merge never matches it to another catalog's,
+and no lookup finds it. Nor is a blank-uuid bundle photo matched to the photo at its path,
+which can be a different one (#150): the importer renames a different-size collision to
+` (n)`, so the user's own photo is what sits at the bundle's path. The importer tells merge
+which row it indexed each such original into, and the bundle's tags land there. A blank-uuid
+photo with no original in the bundle is inserted with a v4 if its path is free, and otherwise
+skipped and counted (`MergeSummary::photos_skipped`). If v23 finds the v5 already held by another row (a migrated
+catalog's bundle merged in first), the two rows claim one photo and it cannot tell which is
+right, so that row gets a v4 and its copies stay queued as conflicts. The legacy value itself
+is never a merge key or a deep-link target. Settings keyed by the photo's uuid (today only the
+Obsidian module's note record, `obsidian.note.<uuid>`) move to the new identity in the same
+transaction, in v23 and in v24 alike; Adopt does not move them. If the new identity already
+has such a record, the one with content wins (#150): a blank record (what Forget leaves) is
+replaced by the real one or dropped beside it, and two real records both stay — the new
+key's is the one shown, the old one is logged — so no record with content is lost.
+
+A UUID is one identity in either case. `photos.uuid` holds it lowercase, as ChairPhoto mints
+it (`catalog::canonical_photo_identity`): a scan, a bundle import, a merge, Adopt and a deep
+link all canonicalise before they store or look up, and schema v24 lowercased the rows an
+older scan stored as the sidecar spelled them. A sidecar that spells the identity upper-case
+is bound as it is and never rewritten for the case alone. If lowercasing a row would give it
+another row's identity, v24 re-mints it instead and queues its copies as conflicts.
 
 **Adopt changes what merge matches on.** Identity is the merge key (`merge_photo` looks up
 `photos WHERE uuid = ?`), so a catalog that has already been merged or bundled elsewhere
@@ -190,6 +457,10 @@ and the backup transition is **deferred** until the NAS reappears.
 - **Offline** → NAS-only *and* NAS unreachable → browse/cull/tag still work; edit/export blocked
 - **Missing** → no known copy anywhere
 
+The inspector also shows **Changed since backup** for a backed-up photo whose local version
+moved on from its verified backup (#257, [below](#a-local-version-that-moved-on-from-its-backup-257)).
+It is computed on a worker when the Storage section is open, not on the grid's hot path.
+
 `Catalog::photo_storage_status` (+ a batch `photo_storage_statuses` for the grid)
 derives this from the photo's locations' volume kinds and reachability. A backup
 *record* counts as backed-up even while the NAS is unmounted (reachability only
@@ -204,7 +475,7 @@ history into `<raw>.xmp`, RawTherapee into `.pp3`, ART into `.arp`, and RapidRAW
 be reported **BACKED UP** while every edit decision made on it existed in exactly one
 place (issue #80).
 
-The set is **declared, never guessed** (`src-tauri/src/companions.rs`). An integration names
+The set is **declared, never guessed** (`crates/core/src/companions.rs`). An integration names
 its extension; the catalog does not sweep arbitrary neighbouring files, because backup must
 not behave differently depending on what happens to share a folder with the photo.
 
@@ -231,15 +502,123 @@ Three rules govern carrying:
   reference point for answering "has the local file moved on since we copied it".
 - **Offload carries before it deletes.** Invariant 1 covers edit state too: freeing the
   local image must not strand the history beside it. Companions go home first, then the
-  local ones are freed with the image, and `restore` brings them back.
-- **Divergence refuses; it never resolves.** A companion present on both sides with
-  different contents is two unreconciled edits. Backup leaves it untouched and does not
-  claim it as carried; offload refuses outright. Choosing a side would silently destroy
-  work.
+  local ones are freed with the image, and `restore` brings them back. A basename companion
+  another image beside it shares — darktable's `DSC1.xmp` is the sidecar of `DSC1.ARW` and
+  of `DSC1.JPG` alike — is carried home but not freed while that image is still there
+  (#231 d): offloading the RAW master of a RAW+JPEG stack whose JPEG frame stays local (no
+  backup of its own, or held by another operation) leaves the frame its sidecar, and the
+  offload of the last image naming it frees it. A folder that cannot be listed counts as
+  shared.
+- **Offload deletes only what home holds byte for byte (#255).** Re-hashing the backup
+  proves home is intact, not that it holds what is here. So offload checks each local file
+  **after moving it to a hidden name** in its folder (`.<name>.chairphoto-offload-<pid>-<n>`,
+  #256; a name too long for that to fit in 255 bytes goes, under its own name, into a new
+  hidden folder `.chairphoto-offload-<pid>-<n>/` beside it instead — never a shortened name,
+  which a crash would leave with nothing to say what it was called; a copy's temporary
+  `.chairphoto-part` name, which nothing needs to put back, is cut to fit instead, so such a
+  name can be backed up at all): companions first, then the image, each re-hashed there — the image against the
+  verified backup hash, a companion against the hash the carry confirmed at home — and
+  freed only with exactly the companions the carry confirmed, never a fresh listing. Then
+  it looks at every name it emptied once more, and only then deletes the hidden files. A
+  write through the photo's name either landed before the move (the moved file holds it and
+  its hash says so) or comes after it and makes a new file at that name (the last look finds
+  it); what is deleted is the hidden file, which no other writer knows by name, so nothing
+  written after its check is deleted. A local JPEG or DNG rewritten in place after its
+  backup, a sidecar edited after the carry, a companion that appeared after it, or any new
+  file at an emptied name refuses the photo: every moved file goes back under its name
+  (never replacing a file there — one that cannot go back, because a new file took its name
+  or the rename failed, is never deleted, confirmed or not: it stays under its hidden name
+  beside the photo, and the refusal names it and why; where the filesystem has neither a no-replace rename nor
+  hard links, a file goes back by a plain rename once its name is seen free), nothing is
+  deleted, and a queued offload is kept `failed`
+  with the reason ("changed since its backup — refusing to offload; the copy at home is the
+  earlier version"). A crash between the move and the delete leaves the file under its
+  hidden name; at start-up every folder under the library root is swept, off the UI thread
+  (`storage::spawn_startup_sweep`, hidden folders not entered), and the next backup, offload
+  or restore plan that looks in a folder does the same (once per folder per run, off the
+  catalog lock): every such file whose process is no longer running goes back under its name, again never replacing one — a file left by a crash is never
+  deleted, since it may hold the only copy of a local change. An empty one is not put back
+  (it is most likely a name the offload claimed and never filled; putting it back would make
+  a 0-byte original); it is removed only when a non-empty file holds its name. A second
+  operation in a folder whose sweep is still running waits for it to finish. The cost is one sequential
+  read of each local copy, on a local disk, beside the NAS read of the backup offload
+  already made; size or mtime would be cheaper and are not content checks (an in-place
+  rewrite can keep the size, and `exiftool -P` keeps the mtime). Back up does not replace a
+  verified backup that is present by itself; how a changed local version reaches home is
+  [below](#a-local-version-that-moved-on-from-its-backup-257).
+- **Divergence refuses; it never resolves** — with one exception, ChairPhoto's own sidecar
+  (below). A companion present on both sides with different contents is two unreconciled
+  edits. Backup leaves it untouched and does not claim it as carried; offload refuses
+  outright. Choosing a side would silently destroy work.
 
 Carrying is idempotent — an identical file already at the destination is adopted rather
 than rewritten — so a companion placed there by any other means is absorbed on the next
 pass instead of being re-copied or causing a conflict.
+
+### A local version that moved on from its backup (#257)
+
+Since #255 an offload refuses a photo whose local image or a carried companion changed
+after its verified backup, and Back up never replaces a backup that is present — it may be
+the only copy of the earlier version. Such a photo used to stay local for good, and the
+common case was ChairPhoto's own IPTC or GPS write to the sidecar after the backup. The
+owner's decision (#257, 2026-10-06), implemented as follows:
+
+- **ChairPhoto's own sidecar goes home by itself.** When the local `<image>.xmp` differs
+  from the copy at home only because ChairPhoto rewrote it (`lifecycle::rewritten_by_chairphoto`)
+  — **home still hashes to what the last carry confirmed** there (`carried_hash`, recorded with
+  every carried companion: a copy edited at home since, by another machine or program, is a
+  two-sided divergence and waits for Replace backup; a row recorded before the hash was kept
+  has none and counts as changed until a check finds both sides byte-identical — the
+  inspector's comparison or a Back up records that hash then, so such rows heal by
+  themselves, and only one whose sides already differ waits for Replace backup), the local file carries a `chairphoto:LastWrite` no earlier
+  than that confirmation (`carried_at`, else the backup's `created_at`), and **the two differ
+  only in properties ChairPhoto's writers own** (IPTC, GPS, identifier, import batch, face
+  regions, the stamp; `xmp::differs_only_in_chairphoto_fields`, compared as trees by
+  namespace, not by layout or prefix; text is kept exactly, and everything outside the first
+  `rdf:RDF` must match too; foreign content inside an owned property — another tool's
+  `dc:title` alternative or region — counts as ChairPhoto's, and the copy at home is kept) — the carry of Back up (an existing backup's companion pass, a drained
+  backup op included) and of Offload copies it home again (`carry_companions_home`). A stamp
+  and an mtime alone could not tell ChairPhoto's write from another program's that kept both
+  (tools preserve unknown namespaces; `exiftool -P`, `rsync -t` and `touch -r` keep the
+  mtime), so the content decides. The copy at home is first renamed
+  to `<name>.chairphoto-prev-<n>` beside it (the next free `n`, never over a file there and
+  never by a copy), then the local version is copied in and verified like any lifecycle
+  copy; a copy that fails puts the previous file back under its name. Offload then goes
+  ahead. A basename sidecar (`DSC1.xmp`) is darktable's, never ChairPhoto's, and one with no
+  stamp, or with a change outside what ChairPhoto owns, is treated like an image.
+- **An image, and a companion another program changed, wait for the owner.** The inspector
+  offers **Replace backup with the local version** for a backed-up photo whose image no
+  longer hashes to its verified backup, or whose companions differ at home for any other
+  reason (`storage::replace_backup_as`). It asks first — the question names the files and
+  says the copy at home is kept — and the backend refuses without that confirmation. It
+  claims the photo (another storage operation on it is refused, as in progress), keeps each
+  file the check listed at home as `<name>.chairphoto-prev-<n>` — the image only when the
+  local one moved on from its recorded hash, so a sidecar-only Replace neither reads nor
+  touches home's image — copies and verifies the local
+  version into its name, carries any companion not yet there, and records the image's new
+  verified hash; offload is then allowed. The image goes first; if a companion fails
+  afterwards the image's new hash is still recorded (home holds it by then) and the error
+  says what was already replaced. It acts on the photo alone, not its stack: each frame has
+  its own copy at home to answer for. A replace interrupted after keeping the earlier image
+  but before copying leaves home without it: Replace and Offload then say so, name the kept
+  `.chairphoto-prev-<n>`, and point to Back up, which copies the local version home again.
+  One interrupted after copying only records when run again — home already holds the local
+  version, so no second copy of it is kept.
+- **"Changed since backup" is a storage status.** With the Storage section open, the
+  inspector compares a backed-up photo's local copy with its backup on a worker
+  (`storage::backup_drift_as`: the local image hashed against the recorded hash — no read
+  at home — and each carried companion against the file at home when home is reachable)
+  and shows "Changed since backup" instead of "Backed up", with which files, and whether
+  the next Back up or Offload takes them home (ChairPhoto's metadata — a Back up button is
+  shown for it) or only Replace backup does. The image's hash is kept for the session by
+  (path, size, mtime), so showing a photo again reads nothing (a rewrite that keeps both the
+  size and the mtime is missed until the next session — Offload still re-hashes), and a
+  comparison the user moved on from stops before or while it reads the image.
+
+**Nothing at home is overwritten or deleted.** A `.chairphoto-prev-<n>` file is visible on
+purpose, so the owner can find the earlier version; it is no image or companion extension,
+so no scan indexes it and no carry takes it. Nothing removes it, and the catalog does not
+track it: deleting the photo (Empty Trash) leaves it at home.
 
 **A sidecar backup is not a companion.** `<sidecar>.chairphoto-backup` — the copy the XMP
 safety rule takes before ChairPhoto's first write — is **per copy** by construction: each
@@ -332,11 +711,35 @@ Because actions can't run while the NAS is away, pending operations are queued a
 drained when the NAS volume is detected:
 
 - `backup(photo)` — copy local → NAS, hash-verify, mark Backed up
-- `offload(photo)` — only after verified backup; frees local space
+- `offload(photo)` — only after verified backup; frees local space. It first keeps an
+  **offline thumbnail** of each frame so the grid still shows the photo while home is away
+  (`thumbnails::ensure_persistent_thumb`; every thumbnail rendered from a reachable original
+  refreshes it too). The file is keyed by the catalog's UUID and the photo's UUID —
+  `<cache>/chairphoto/persist-v2/<catalog uuid>/<photo uuid>.jpg` — never by photo id, which
+  another catalog reuses for another photo, and never by the per-open `CatalogIdentity`, which
+  a restart changes (#258). The id-keyed files before #258 (`persist/<id>.jpg`) are migrated
+  once, to the catalog opened at start-up (`thumbnails::adopt_id_keyed_thumbs`, off the UI
+  thread): each is copied to that catalog's photo of the id unless the photo already has its
+  own, and `persist/` is removed only once every copy has landed (a failed or interrupted run
+  leaves it for the next start). Nothing records which catalog wrote a file, so another
+  catalog's photo can be adopted — the same tile the old layout showed — until the next
+  render of the reachable original replaces it. An offload whose thumbnail keys cannot be
+  read fails before deleting anything. After that migration, each start cleans the store up
+  for the start-up catalog (`thumbnails::prune_offline_thumbs`, off the UI thread, review of
+  #258 N2): that catalog's files for photos it no longer has (removed, or re-minted under a
+  new UUID) once they are 30 days old, and the directories of other catalogs not opened for
+  a year (each start and each catalog switch marks that catalog's directory with `.opened`;
+  a directory without one goes by its newest file). Conservative on purpose: an archive
+  catalog opened once a year with every original on an unmounted NAS has nothing else to
+  show. For the same reason the first kind is skipped when another catalog in the
+  recent-catalogs list shares the open one's UUID (a copy of the file shares it, and the
+  photos the copy dropped are the original's) or cannot be read
+  (`app::catalogs::orphans_are_its_own`). Never through a symlink — the `.opened` marker
+  included — and only names the store writes.
 - `restore(photo)` — pull an archived original back to local (e.g. to edit it)
 
-**The ops and verification**: `catalog/lifecycle.rs` + async `backup_photo` /
-`offload_photo` / `restore_photo` commands. SHA-256 (`photo_locations.verified_hash`,
+**The ops and verification**: `catalog/lifecycle.rs` + the `app/storage.rs` service bodies
+(`backup_photo_as` / `offload_photo_as` / `restore_photo_as`, run on a worker). SHA-256 (`photo_locations.verified_hash`,
 schema v10); each op is plan → pure file IO off-thread → record-under-lock, and the plan
 itself is split like the path resolver (#85): candidate rows are gathered in pure SQL
 under the catalog lock and their existence is statted off it, so a NAS copy never blocks
@@ -394,8 +797,10 @@ take the master **and its frames**. They did not always — trash started cascad
 cluster B while offload and backup still took one row, so the same tile behaved two ways
 and offloading a 7-frame burst freed the keeper alone (#82).
 
-The cascade lives in `plan_offload` / `plan_backup`, so every caller inherits it: the
-inspector button, the reconcile drain, and the age-based `apply_offload_policy` sweep. (The
+The cascade lives in `plan_offload` / `plan_backup` / `plan_restore`, so every caller of the
+service bodies in `crates/core/src/app/storage.rs` inherits it: the inspector buttons, the
+Library's Retrieve from NAS, the reconcile drain, and the age-based `apply_offload_policy`
+sweep. (The
 sweep also has to de-duplicate: a frame is eligible in its own right and its master's
 offload has already freed it, so without that it would count the same frame twice.)
 
@@ -417,15 +822,125 @@ recent work on fast local storage can find yesterday's frame on the NAS, and tha
 behaviour, not a bug (#87).
 
 When reconcile completes only part of a stack, it replaces the completed master's queue
-row with one failed row per skipped frame. Each child row keeps the refusal reason and is
-retried independently, so the completed master is not destructively replayed.
+row with one row per skipped frame, retried independently, so the completed master is not
+destructively replayed. A frame that refused on its own account is `failed` with its reason.
+A frame left only because the drain was superseded (a catalog switch or a newer drain) is
+`pending` again — an interruption is not a failure, and only pending rows are counted by the
+reconcile check and the queue chip, so a failed row would never be retried by itself. For
+the same reason an op the trip stopped before it did anything (an offload before its named
+photo) keeps its pending row untouched.
 
-Async storage commands claim the current catalog through the storage job generation before
-planning. A newer command trips that generation, so stack work stops before its next member.
-The worker also holds the storage ownership gate through plan, filesystem work, and record:
-catalog switches trip the worker and acquire that gate before detaching, while a completed
-indivisible copy/delete is recorded before the old worker releases it. Record steps still
-require the claimed database to be active.
+Ownership is the service layer's (`crates/core/src/app/storage.rs`), not a lock held across
+the work. A verb the user started on ids read from one catalog runs its plan, its file IO and
+its record on a connection of its own to that catalog (`backup_photo_as` and its siblings), so
+a switch mid-copy cannot record it into the catalog switched to. A drain or offload-policy
+sweep also holds the reconcile generation (`storage::ReconcileClaim`): a switch or a newer
+drain trips it, and the claimed work then starts no further stack member — those are
+reported skipped and requeued as above — and no further queued op. Offload, the verb that
+deletes, re-checks the flag before every member's delete, the named photo's included. A copy
+or delete already under way is indivisible and is recorded on that claimed connection.
+
+**One storage operation per photo at a time (#254).** User verbs run on the blocking pool
+beside each other and beside a drain or the offload-policy sweep. Every backup, offload and
+restore the service layer runs therefore claims, in `AppState::storage_claims`
+(`storage::StorageClaims`, keyed by catalog file and photo id), the photo it was named on
+**and the frames it will take** before it plans, and holds the claim until it has recorded.
+Nothing waits on a claim: a verb whose named photo is held fails with "a storage operation
+on this photo is already in progress"; a held frame is left and reported with that reason;
+a drain whose op's photo is held leaves the op `pending` and untouched (`DrainSummary::busy`),
+and a held frame of a stack op is requeued `pending`, not failed — both are retried by the
+next drain. The claim is per photo rather than one global gate because a drain can run for
+hours, and a user's Offload of an unrelated photo must not wait behind it. Its mutex is a
+leaf in the `app::jobs` lock order. The inspector also disables its storage buttons for a
+photo while one of them runs, so a double-click starts one run. The `Catalog::*_photo` sync
+wrappers do not claim; they are for tests and single-threaded callers. The service verbs
+without `_as` (`storage::backup_photo`, `offload_photo`, `restore_photo`, `backup_to`,
+`restore_to`) bind to the catalog open when they are called and run on a connection of their
+own to it too (#231): no step of any verb plans or records through the shared handle, which
+is whichever catalog is open at that step.
+
+Empty Trash and Relocate claim too (#256). Emptying the trash claims each photo just before
+its delete, reads where its copies are under that claim (not when the run listed the
+photos, which can be minutes earlier), and releases it after the delete: a photo a storage
+operation holds is reported failed with the in-progress reason and keeps its row and files,
+so it can be retried; a copy a backup or restore made just before is deleted with the rest
+rather than outliving its photo's row; and a verb that starts after the delete finds
+nothing to copy. Relocate claims the photo in the same catalog lock hold that re-points its
+row, and holds the claim until the moved file's identity is recorded; a held photo is
+refused and left pointing where it was — otherwise an offload's commit could drop the
+re-pointed row by id and leave the moved file with none.
+
+An IPTC sidecar write — a save, the debt panel's Retry, a geocode fill — holds a
+sidecar-write claim on its photo, from before it opens the sidecar until it has settled
+(#256), and only the operations that remove the photo's local files — offload and Empty
+Trash (`storage::ClaimKind::Frees`) — exclude it: an offload deletes the local sidecar once
+it has confirmed it at home, and a write landing after that check would leave a newer
+sidecar beside a freed image, untracked, with the debt settled. Whichever claims first goes
+ahead. A save that meets an offload stores in the catalog and leaves the fields owed,
+reported "sidecar pending (a storage operation on this photo is already in progress)"; the
+next save or the repair pass writes them, to wherever the photo then resolves. An offload
+that meets a write is refused as in progress. A backup, restore or relocate leaves the
+sidecar where it is, so a save beside one goes ahead and is written (review of #256, LOW-5:
+when every claim excluded it, a save during a long drain reported pending and nothing wrote
+it once the drain let go); a copy that reads a sidecar while it is being replaced fails its
+own verification rather than recording a mix, and the next carry takes the new one. The identity-repair pass,
+face-region and GPS writes do not claim. Each replaces the sidecar by a rename, so it
+either lands before the offload moves the sidecar aside — and fails its re-hash — or makes a
+new file at its name, which the offload keeps. In that second case the new file is built
+without the moved sidecar (the writer found none), so it lacks every field ChairPhoto does
+not own — another tool's keywords and history: the offload refuses, puts the image back,
+and keeps the old sidecar beside it under its hidden name, which the refusal names, for the
+user to merge by hand. Nothing is deleted, but the photo's own sidecar name now holds the
+thinner file. A write that lands after the offload's last look is beside a freed image,
+untracked (the photo is recorded archived). Both windows are one small file's hash wide.
+
+**Decided (review of #256, (c)): those three writes stay unclaimed.** A claim never waits, so
+a write that meets an offload must be dropped or remembered. An IPTC write can be refused
+because its fields stay owed and the next save or the repair pass writes them. GPS and
+face-region writes have no such record — they are best-effort and only logged when they
+fail — so a refused one would leave the sidecar without the user's change for good, to close
+a window that loses no byte (every file is kept, and the refusal names the one left under its
+hidden name) and is one small file's hash wide. They also run under the catalog lock in the
+catalog and plugin layers (`map::set_photo_gps`, `faces::write_regions`), which have no
+`AppState` and so no claims to take. The identity write does have a debt the repair pass
+retries, but it writes one element of a photo whose identity is owed, and stays with the
+other two rather than add a third rule. Revisit if GPS or face-region writes gain an owed
+record like IPTC's.
+
+Two guards do not depend on the claim. Offload's commit drops exactly the local location
+rows it planned from, by id, so a row added after the plan (a restore) is never dropped with
+them. And every lifecycle copy (`copy_and_verify`, used for images and companions) writes its
+own temp file (`.<name>.chairphoto-part-<pid>-<n>`, created exclusively) and places it
+**without replacing** whatever is at the destination — `renameat2(RENAME_NOREPLACE)`, else a
+hard link, else an exclusive create, the import's own placement — and then syncs the
+folder (`same_photo::sync_dir_of`), before the copy is recorded: a file's own sync makes its
+bytes durable, not its new name, and a power cut after the row is written must not leave it
+pointing at a name that was lost (#231, import review N-1; the import's placements share the
+helper). On ext4 and XFS a folder's sync commits the journal, which also carries a folder the
+copy just created; elsewhere that folder's own entry is not synced. A filesystem that cannot
+sync a folder is not a failure. Two writers can never write into one file. A destination that already exists is accepted only when it hashes to
+the source (another writer placed the same bytes); otherwise the copy fails and that file is
+left untouched. This also means a Restore no longer overwrites a local file that differs
+from the backup: it fails and names the file instead. On a filesystem with neither a
+no-replace rename nor hard links the destination is claimed by an exclusive create and the
+verified temp copied into it; that second copy is hashed too, and
+one that does not match is removed (the copy created it) and the copy fails (#256). A crash
+during that second copy can leave a short file at the destination, which later copies refuse
+as "already exists with different contents" until it is removed by hand; on every other
+filesystem a crash leaves at most the hidden temp file, which scans skip. The next copy into
+a folder (once per folder per run) removes the temp files there whose process is no longer
+running on this machine and that have gone an hour unwritten — the hour because a backup
+folder can be shared with another machine whose copy is still writing; a temp file only ever
+holds bytes that exist elsewhere.
+
+Which filesystems take the copy fallback is narrower than it sounds (review of #256,
+NIT-3). Current Linux kernels accept `RENAME_NOREPLACE` on vfat and exFAT drives and on
+SMB/CIFS mounts — each driver's rename handler takes that flag — so those place in one step;
+NFS refuses every rename flag but has hard links, so it places by a link. (A reading of the
+kernel sources' rename handlers from memory, the review's and this note's alike; not tested
+on this machine or pinned to a kernel version.) What is left for the exclusive create and
+copy is a filesystem whose driver refuses the flag and has no hard links either: some FUSE
+mounts, depending on the daemon (unverified which).
 
 Restore is the same rule pointing the other way: a stack that leaves as seven frames comes
 back as seven. It brings home only the frames that are *away* — a frame already local is
@@ -452,7 +967,8 @@ where nothing can be recovered afterwards.
 1. **Never delete the last verified copy** of a photo — including the companions that
    carry its edit state.
 2. **Never offload** anything not verified-backed-up.
-3. **Hash-verify** the NAS copy before marking safe or deleting anything local.
+3. **Hash-verify** the NAS copy before marking safe or deleting anything local — and the
+   local copy against it: a local file that no longer matches its backup is never deleted.
 4. On a NAS-less machine, offload of un-backed-up photos is **unavailable**; they
    stay local and flagged at-risk.
 5. If local fills up with **no NAS**, chairphoto may auto-evict only the
@@ -481,11 +997,118 @@ Two modes over the same core location model:
   each supported image from the card into `<dest>/YYYY/MM/DD/` (date from EXIF capture
   time, falling back to file mtime), **keeping camera filenames**, then indexes the
   copies, groups them in one import batch, and auto-enqueues NAS backup. Destination
-  default `~/Pictures/Raw` (must be under the catalog root). Collisions: same byte-size →
-  skipped as already-imported; different size → ` (n)` rename (never overwrites). Owner
-  decisions: Year/Month/Day tree, keep filenames. UI: topbar "Import card" dialog with an
+  default `~/Pictures/Raw` (must be under the catalog root). Collisions (#246, owner
+  decision 2026-10-04): a file of the same name and size already there is the same photo,
+  already imported and skipped, only when its EXIF capture time (`DateTimeOriginal` with
+  `SubSecTimeOriginal`) and camera serial (`SerialNumber`, `InternalSerialNumber`, each
+  compared when both files carry it) agree. A file with no `DateTimeOriginal` (a camera's
+  video) has its QuickTime `CreateDate` as its capture time (read as
+  `-QuickTime:CreateDate`), compared only with the other file's; an all-zero date is no
+  capture time. A still's EXIF or XMP `CreateDate` is not read: a still with no
+  `DateTimeOriginal` has no capture time. When neither file has a
+  capture time (a PNG, a stripped JPEG) their contents are compared by streamed SHA-256
+  instead. Anything else —
+  another size, another sub-second, another body — is a different photo, copied as ` (n)`
+  with its own row and UUID; nothing is ever overwritten (`same_photo::create_new_file`):
+  the copy is written to a hidden temporary file in the same folder
+  (`.<name>.chairphoto-part-…`, never indexed), synced, and then given its name without
+  replacing anything — `renameat2(RENAME_NOREPLACE)` on Linux, else a hard link — so a file
+  that appears there after the name was found free sends the copy on to the next free name,
+  and a crash mid-copy leaves at most the hidden temporary file, never a short original at
+  a library name. The next library scan of that folder removes such a file (#231 N-2) —
+  only the exact name pattern, a regular file (never a symlink), whose process is no longer
+  running here, unwritten for over an hour (`working_files::remove_if_stale_part`). A name
+  within the temporary name's ~30 bytes of the 255-byte limit is carried shortened in the
+  temporary name (a prefix and a hash, N-4); the file still takes its full name. A file
+  whose sidecar could not be written — its name (`<name>.xmp`), or a name the sidecar writer
+  makes on the way (its `.<sidecar>.<pid>-<hex>.chairphoto-tmp` temp file, its
+  `.chairphoto-backup`), over 255 bytes (`xmp::sidecar_fits`, the writer's own budget) — is
+  not imported at all, no row either: its identity could never be written beside it. Only a
+  name the import must make is held to that budget — a new photo's, or a ` (n)` name. A
+  photo the catalog already has keeps the name it has (relB3): a file found already in the
+  library under such a name (#246), and a row's own photo coming back to the row's name
+  after its file was lost (#247; that row's sidecar exists or is owed), are handled as for
+  any other name, and a bundle photo whose identity has a row here still merges onto that
+  row even when its original is refused. A bundle entry with no original, at a path too long
+  for a sidecar, for a photo the catalog does not have, gets no metadata-only row either
+  (relB3 LOW-A): no later import could place its original there with its identity beside
+  it. The result counts a refused photo apart ("name too long for a sidecar"), as it does a
+  file whose name fits but whose ` (n)` names, needed because the name is taken, do not. On
+  a filesystem with neither (some FUSE mounts; current Linux vfat, exFAT and SMB drivers
+  accept the no-replace rename) the name is claimed by an exclusive create and the
+  temporary file copied in: still no overwrite, but without that crash guarantee. A name is
+  free only when nothing is at it and nothing at its sidecar's name (`<name>.xmp`) either:
+  a sidecar with no original beside it (another tool's, or one whose original was removed) belongs to some
+  other photo, and a new file placed beside it would adopt its identity and metadata. Nor is
+  a name free that a catalog row holds (#247) — by its logical path, or by one of its
+  locations (any role) under that location's own volume base, its file there or not
+  (missing storage is normal): indexing matches
+  by path, so a new file there would take that row's identity, rating and tags. A row
+  holds every case variant of its name (#231 F4): on a case-insensitive library (exFAT,
+  FAT, casefold ext4, APFS) `IMG.jpg` is the gone row's `IMG.JPG`, and rather than probe
+  each folder's filesystem the safe rule applies everywhere — on a case-sensitive one it
+  costs at most a ` (n)` name. (Lowercase only; Unicode normalisation is not compared.) A
+  re-link needs the row's own spelling. The catalog
+  is read once per date folder per import (`scanner::free_name::CatalogNames`), on the
+  import's own connection to the catalog it started against, never the one open since.
+  **One exception re-links instead of minting** (L-f of the third #246 review): a name whose
+  file is gone, held by the logical path of exactly one row, goes to the arriving file that
+  *is* that row's photo — for a card's file, its stamp against the capture metadata the row
+  stores must prove it without contents to compare (the row's file is gone): #246's rule
+  says the same capture **and** a sub-second or a serial is present, and equal, on both
+  sides (`same_photo::same_capture_without_contents`). The same second with a serial
+  missing on either side (the catalog's `-fast2` extraction skips MakerNotes serials) and
+  no sub-second on both could be another body's shot, so it re-links nothing, and neither
+  does no capture time; for a bundle's original, the bundle gives
+  it the row's identity — and only when the sidecar at that name, if any, carries the row's
+  identity and no other (one of another identity, of none, or that does not parse keeps the
+  name taken, and is left untouched). The file is placed at that name, even past a free
+  plain name, and indexing re-links the row: missing cleared, its rating, tags and edits
+  kept, no second row. So a photo deleted outside the app and imported again from its card
+  comes back to its row. A photo **offloaded** — the row a file would re-link has no
+  location on a local volume left (an offload drops those once the backup is verified)
+  and a backup location with a verified hash — is already imported: its card's file (or a
+  bundle's original) is skipped, counted apart ("already offloaded, not copied back"), and
+  not copied back to this disk (#231 F5). The record decides, not a look at the backup
+  volume, which may be unmounted. Removing a local volume drops its location rows, so its
+  photos then count as offloaded here too — the same rule as the NAS-only filter
+  (`StorageTier::Nas`). A photo that still has a local location row lost its file
+  some other way, and the card may hold its last copy: it is restored to its row; when
+  unsure, the file is copied. The import dialog's listing flags an offloaded photo the same
+  way. Every other arriving file goes on to the next free ` (n)` with a
+  row of its own: a different capture is never attached to an old row. File mtime is never evidence (a
+  copy changes it). The ` (n)` names an earlier import gave are checked too (every one in
+  the folder, past a gap in the numbers or with the plain name gone), so importing a
+  card again skips every file. Each date folder is listed once per import
+  (`same_photo::FolderListings`), not once per file: card ingest plans every file before
+  copying any, and a bundle's unpack records each name it places, and lists the folder
+  again right before each copy (#231 N-3), so a ` (n)` another program wrote there during
+  the unpack is a candidate too. A name taken between that look and the placement sends
+  the copy on to the next free name, as above. One photo met twice in a run (the same file in two folders
+  of the card) is the same rule against the file already copied: it is copied once. Every
+  earlier match counts, so a third meeting is skipped against the second when the first
+  failed to copy. The metadata comes from one exiftool pass per 150 colliding
+  files (`scanner::same_photo`), over both sides of each pair, so a re-import reads a few KB
+  per file rather than hashing the card. The import dialog's "already imported" flag uses
+  the same rule and the same plan, so a second meeting of one photo on the card is flagged
+  as the copy will skip it. Owner decisions: Year/Month/Day tree, keep filenames. UI: topbar "Import card" dialog with an
   optional **Import name** that labels the batch (defaults to the source folder); the batch
   keeps its stable UUID underneath. (Cross-volume "import once" by UUID is handled by bundle merge.)
+
+**Stopping an import.** Cancel, a newer import and a catalog switch all trip the import's
+abort flag, which is checked between files in every phase. During the copy (or a bundle's
+unpack) the import stops before the next file and indexes nothing; the copies stay in the
+library folder for the next rescan (a bundle: import it again). During indexing
+(`scanner::index_ingested_abortable`, `bundle::importer::index_bundle_abortable`) it stops
+before the next copy, and what it indexed so far is committed whole, as if the import had
+held only those files: rows and identity sidecars, the import batch (and its UUID in their
+sidecars), queued backups, auto-tags and geofence tags; for a bundle, the merge runs over
+the manifest narrowed to those photos, so the originals not yet indexed are not inserted as
+metadata-only rows. Indexing always writes the catalog the import started against (its own
+connection to that file, opened before the copy, which reads the names that catalog's rows
+hold through it), never one opened since. The report says how many were indexed;
+the rest wait for a rescan (card) or a second import of the bundle, which matches what is
+already there by UUID.
 
 ### Import batches ("negative film roll")
 
@@ -548,7 +1171,8 @@ A **merge** is two independent halves:
 
 The laptop only **adds new import batches**; it does not check out existing library
 photos. Therefore merge is **additive** — the desktop gains photos it has never seen,
-and **no edit conflicts are possible**. The one shared structure is the **tag
+and a photo it already has keeps every value it holds (a bundle fills only its blanks and
+adds its edits as new versions, #185), so **no edit conflicts are possible**. The one shared structure is the **tag
 taxonomy**, resolved by matching tags on normalized full path (assignments union);
 albums merge by name. All non-destructive.
 
@@ -578,17 +1202,62 @@ The merge engine (`catalog/merge.rs`) is **pure-DB, no file I/O**:
 | Tag taxonomy | Resolve by tag uuid first, then normalized full_path; create missing ancestors; never overwrite existing uuid / exportable flag |
 | Tag terms | `INSERT … ON CONFLICT DO NOTHING` — adds missing terms, never modifies existing |
 | Photo (new) | Insert with full state (rating, label, pick, IPTC, edit record, versions) |
-| Photo (existing) | **Never touched** — existing rating/label/pick/IPTC/edits/versions are preserved |
+| Photo (existing) | **Its own values win; blanks are filled** (owner decision on #185, 2026-10-04). Rating 0, an empty label and a pick of "none" take the bundle's. The bundle's edit record (as a version named "Imported edit"; a blank one is no edit and adds none) and its versions are added as **new versions** after the photo's own, unless the photo already has those settings (its edit record or a version with an equal JSON value), so a re-merge adds none; the photo's edit record and versions are not changed. Blank IPTC fields are filled by the importer, not the pure-DB merge (below). A row the importer created for this bundle moments before is not filled again. **Once per bundle** (#248, decisions 2026-10-06): every photo a bundle's photo is merged into — inserted, created by the importer, or filled — is recorded with the bundle, its batch uuid and the time it was written (`BundleManifest::created_at`; `bundle_merges`, schema v27, local to the catalog). Merging that same bundle into it again applies nothing — no fill, no version, no tag — so a value the user cleared, a version they deleted or a tag they removed after the first import stays so (counted in `MergeSummary::photos_merged_before`). A later export of the same batch, carrying work done since, is another bundle: it fills the blanks and adds its new versions as before. |
+| Photo (new identity, path taken) | **Kept apart** — no row holds its identity but another photo, under another identity, holds its path (the same capture imported separately on each side, #246): neither inserted (`photos.path` is UNIQUE; before #185 the whole merge failed here) nor merged onto that photo. Counted in `MergeSummary::photos_kept_apart`. The same holds when the importer found the photo's original in the library at another name (a ` (n)` one) under another identity and its own path is free: the importer passes those identities to `merge_bundle_into`, so no metadata-only row is inserted at a path where no file of the photo is. Each one is named in `MergeSummary::kept_apart_names` (the bundle's relative paths), and the import line lists them (#249). |
+| Photo (same capture, another identity, proven) | **Merged onto that row** (#249, decision 2026-10-06): the importer found the original in the library as the same capture under another identity — both machines imported the card, each minting its own UUID — and the stamps prove it by the strict re-link rule (`same_photo::same_capture_without_contents`: the same capture, and a sub-second or a serial present and equal on both sides), and no row holds the bundle's identity. The bundle's data goes onto the library's row as onto any existing photo — blanks filled, versions added, once per bundle (#248), tags unioned — and the row keeps its own identity, in the catalog and in its sidecar. Counted in `MergeSummary::photos_matched_by_capture`. Anything weaker (the same second with no sub-second or serial on both sides, or identical bytes with no capture time) stays kept apart. |
 | Tag assignments | `INSERT OR IGNORE` union — new assignments added, none removed |
 
 The importer (`bundle/importer.rs`) runs in three phases:
 1. **Parse** — open the zip, validate `format_version`.
 2. **Copy** (off the catalog lock) — extract `originals/` into `<root>/YYYY/MM/DD/`;
-   same-size collision → skip; different-size → rename with ` (n)` suffix; never overwrite.
-   Writes a UUID sidecar beside each original so the index phase can match by identity.
+   a collision is decided by card ingest's rule (#246): the same name, size and capture →
+   already imported, skip; anything else → rename with ` (n)` suffix; never overwrite. A
+   name a catalog row holds is not free either, its file gone or not (#247, as for a card),
+   unless that row has the bundle photo's identity and no sidecar there says otherwise: the
+   original then goes back to the row's name and the index phase re-links the row. The
+   bundle's side is read from the original's bytes in memory (the manifest carries no
+   capture time or serial), never written anywhere to be compared: one exiftool process
+   reads the bytes from stdin and the library files from their paths, with one set of
+   arguments, and the stamps decide first, as for a card (`same_photo::find_in_library`).
+   Only where they do not say "the same capture" are the contents compared, streamed and
+   stopping at the first differing byte — byte-identical is always the same photo — so a
+   re-import of RAWs that carry a capture time reads their headers, not every library
+   copy whole. Re-importing a bundle the library already holds writes nothing to the
+   library's disk.
+   A file found already there is not touched by this phase, its sidecar included: the
+   index phase binds an identity to it — the row's, through `ensure_sidecar_identity` —
+   and only when no row of **another** identity holds the file. One that does is the
+   owner's photo (the same capture imported separately on each side): it is neither
+   upserted nor bound, its sidecar never receives the bundle's identity (even when it
+   lacks one, as identity debt), and the bundle's photo is kept apart (below) — or, when
+   the stamps prove the same capture by the strict rule and no row holds the bundle's
+   identity, merged onto that row, which keeps its identity (#249).
+   Writes a UUID sidecar beside each original so the index phase can match by identity:
+   the bundle's own sidecar, or a fresh identity sidecar, each only as a new file — a file
+   already at the sidecar's name (the original's name was chosen with it free, so one there
+   now appeared meanwhile) is left as it is, never replaced.
 3. **Index** (secondary connection, off the main lock) — `upsert_photo_with_identity` for
-   each extracted file; run `merge_bundle`; assign newly-created photos to the batch;
-   write the batch UUID sidecar; apply auto-tags; reconcile missing.
+   each extracted file, giving a row created for the bundle's own photo the bundle's full
+   state; run `merge_bundle_into`, which fills in what an existing photo lacks; assign
+   newly-created photos to the batch; write the batch UUID sidecar; fill an existing
+   photo's blank IPTC; apply auto-tags; reconcile missing.
+
+   **A bundle photo the library already has** (#185) — its file skipped as the same
+   capture (#246), or its identity held by a row whose own file is still in place (its
+   copy then gets a row of its own, as above) — has its data put on the row merge matches
+   by identity, never on a second row, as the table above says. Its IPTC goes through the rules for an existing row's IPTC (AGENTS.md, "XMP
+   safety"): the original's path is resolved first (an unreachable original is not
+   filled), the store is `Catalog::set_iptc` under the sidecar's write turn
+   (`xmp::lock::WriteOrder`), held through the sidecar write and the compare-and-set
+   settle, and a failed write stays owed. A field is filled only when neither the row nor
+   the sidecar beside its original has a value — a value in the sidecar the catalog never
+   imported is the photo's own too — and not at all when that sidecar does not parse. (Not
+   `set_iptc_carried`: that is for values arriving beside a sidecar of their own, and this
+   sidecar is the existing photo's.) Such a photo is **not** queued for backup and **not**
+   put in the bundle's batch: it was not added by this import, and batch membership is
+   immutable ("All photos from that ingest belong to it forever" — it belongs to the batch
+   it arrived with). A version it gains owes the monochrome refresh any version write owes
+   (docs/editing.md): a B&W version sets the flag.
 
 **Batch UUID in XMP sidecar** (`chairphoto:ImportBatch`): every imported photo's
 XMP sidecar carries the batch UUID alongside the photo UUID. This makes the batch
@@ -679,8 +1348,9 @@ root setting rather than silently using whatever the caller passed.
 `switch_catalog` performs a safe handoff in four steps:
 
 1. **Abort every in-flight job** — trips the installed abort generation of every family in
-   `AppState::jobs` (scan, face indexing, face matching, sharpness, pHash, Smart Tagging,
-   identity repair) and clears every queryable status slot, so a running job exits at its
+   `AppState::jobs` (scan, face indexing, face matching, sharpness, pHash, trash, import,
+   reconcile, Smart Tagging, identity repair, develop) and clears every queryable status
+   slot, so a running job exits at its
    next cancellation point and stops being reachable as a slot's owner. The scan and the
    identity repair pass each run on their own `open_secondary` connection, so the mutex is
    not held and the swap is not blocked by either.
@@ -688,22 +1358,26 @@ root setting rather than silently using whatever the caller passed.
    releases the WAL write lock and flushes pending writes before the new catalog is opened.
 3. **Open (or create) the new catalog** — off the async executor, so the UI thread is
    never stalled.
-4. **Emit `catalog:switched`** — the frontend resets all React state (selection, filters,
+4. **Emit `catalog:switched`** — the GPUI app resets all session state (selection, filters,
    albums, scan progress) and re-queries the new catalog.
 
 A *fresh* abort generation is installed for each family after the new catalog is open, so
 subsequent jobs start un-aborted while the old workers keep the flag they were given (and
 stay aborted). Steps 1–2 and the publish in step 3 are the two phases of one ownership
 transition; both, and every job start, live in `commands/jobs.rs`, which also carries the
-backend-wide lock order (storage ownership gate → catalog → abort generations → status
-slots). The pre-gate cancellation step holds no other lock. `set_library_root` runs the same
-transition — it replaces the catalog handle exactly as a switch does.
+backend-wide lock order (catalog → abort generations → status slots). `set_library_root`
+runs the same transition — it replaces the catalog handle exactly as a switch does.
 
 ### Invariants
 
 - **No cross-catalog writes**: an aborted scan stops at the first cancellation point; any
   writes already committed are durable in the *old* catalog only and never appear in the
-  new one (they are separate SQLite files).
+  new one (they are separate SQLite files). A back-up drain (`storage::ReconcileClaim`)
+  runs every op on its own connection to the catalog it claimed, so the op in flight at a
+  switch finishes there and the drain then stops. A write keyed by ids a front end read
+  earlier (Trash today) carries the `CatalogIdentity` it read them with and goes through
+  `with_catalog_as`. That write fails closed once another catalog is open, even before
+  `catalog:switched` reaches the UI.
 - **No dangling state**: between step 2 (close) and step 4 (emit `catalog:switched`) the
   `Option<Catalog>` holds `None`. Any command that calls `with_catalog` during this window
   returns `"No catalog is open"` rather than touching a stale connection.
@@ -731,12 +1405,20 @@ transition — it replaces the catalog handle exactly as a switch does.
 - `albums` — id, name; `album_photos` — album_id, photo_id (manual M:N).
 - `smart_albums` — id, name, rule definition (AND conditions).
 - `pending_operations` — kind (backup/offload/restore), photo_id, target, status.
+- `pending_sidecar_iptc` (v25) — photo_id, `owed` (a bitmask of managed IPTC fields whose
+  bit numbering is persisted), `generation`, attempts, error, timestamps: catalog IPTC the
+  sidecar has not received (see IPTC that fails to reach the disk). No value columns —
+  `photos.iptc_*` is the source of truth.
 - `pending_sidecar_identity` — photo_id, field (`identifier` or `import_batch`), attempts,
   error, timestamps, `dismissed_at`: sidecar identity fields that are in SQLite but not yet
   on disk. No value column — `photos.uuid` and `import_batches.uuid` are the sources of
   truth. A non-zero `dismissed_at` is a human's "stop retrying this copy" (see Resolving a
   conflict): the row stays for the record, and leaves both the repair pass and the debt
   count.
+- `bundle_merges` (v27) — photo_id, batch_uuid, bundle_created_at, merged_at: which bundle
+  (a batch as exported at a time) has been merged into which photo, so importing the same
+  bundle again applies nothing (#248; see Bundle format). Local to the catalog; never
+  exported or merged.
 
 ## Storage model
 

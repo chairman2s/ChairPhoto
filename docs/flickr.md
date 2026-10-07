@@ -70,17 +70,32 @@ publications.
 
 ## Implementation
 
-All network I/O is in Rust. OAuth 1.0a signing lives in `src-tauri/src/oauth1.rs` — RFC 5849
+All network I/O is in Rust. OAuth 1.0a signing lives in `crates/core/src/oauth1.rs` — RFC 5849
 HMAC-SHA1, pure and unit-tested against a reference vector, and shared with the SmugMug
-module.
+module. Every signed request (token steps, REST calls, upload) sends the OAuth params, the
+access token and signature included, in the `Authorization: OAuth` header; only request
+params go in the URL (#190). The one URL with a token is the browser authorize URL, which
+carries the short-lived request token. Header OAuth on Flickr's REST and token endpoints
+still needs a live check with a real account.
 
-`src-tauri/src/flickr/mod.rs` handles the request/access token exchange, the photostream
+`crates/core/src/flickr/mod.rs` handles the request/access token exchange, the photostream
 fetch and matching, and the `up.flickr.com` upload. The multipart body is built by hand to
 avoid an extra dependency.
 
-Commands, all gated on the `flickr` feature: `flickr_begin_auth`,
+The command bodies live in core so both front ends run them: `crates/core/src/app/oauth.rs`
+(the sign-in flow over the service's settings), `app/flickr.rs` (tags, upload, the import, over
+a `FlickrApi` trait whose live impl is `crate::flickr` and which tests fake) and
+`app/uploads.rs` (a publish as an owned job: claimed against the catalog the photo was read
+from, rendered into a private job directory, cancellable until the upload starts). Commands,
+all gated on the `flickr` feature and thin wrappers over those: `flickr_begin_auth`,
 `flickr_complete_auth`, `flickr_connected`, `post_to_flickr`, `flickr_suggest_tags`,
-`flickr_import_published`, `flickr_import_apply`.
+`flickr_import_published`, `flickr_import_apply` (records every entry it can and reports how
+many failed).
+
+The GPUI app's module is `crates/app/src/modules/flickr/`: the shared `OAuthSettings` and the
+import panel on its Preferences tab, the shared `PublishPanel` as its publish target. It
+registers in every build; without the feature the Modules panel says the backend is not
+included.
 
 Frontend: `src/modules/plugins/flickr.tsx` is a thin module definition over shared UI in
 `plugins/publishing.tsx` — the OAuth settings panel and the per-photo publish panel, whose

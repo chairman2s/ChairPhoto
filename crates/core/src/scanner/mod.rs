@@ -1,0 +1,1727 @@
+//! Folder scanning. Walks a directory tree, detects supported image files, and
+//! upserts them into the catalog. This is READ-ONLY on the photo files — it only
+//! reads file size and mtime; it never writes into the user's photo folders.
+//!
+//! Extension lists are ported from the old Python `scanner.py`.
+
+use crate::catalog::Catalog;
+use crate::metadata::extract_batch;
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use walkdir::WalkDir;
+
+pub mod free_name;
+pub mod same_photo;
+pub mod sidecars;
+
+/// Commit a scan's writes every this many files rather than in one giant transaction, so
+/// the WAL write lock is released periodically (concurrent edits get a window) and new rows
+/// become visible in the grid as the scan progresses.
+const COMMIT_EVERY: usize = 500;
+
+/// Error string returned when a scan is cancelled through its abort flag (e.g. a catalog
+/// switch, I4b). The caller (`run_blocking_scan`) treats this as a clean stop, not a failure.
+pub const SCAN_ABORTED: &str = "scan aborted";
+
+/// RAW formats. Their thumbnails come from embedded previews (see `thumbnails`).
+pub const RAW_EXTENSIONS: &[&str] = &[
+    "3fr", "ari", "arw", "bay", "braw", "cr2", "cr3", "crw", "dcr", "dng", "erf", "fff", "iiq",
+    "k25", "kdc", "mef", "mos", "mrw", "nef", "nrw", "orf", "pef", "raf", "raw", "rw2", "rwl",
+    "sr2", "srf", "srw", "x3f",
+];
+
+/// Standard raster formats decodable directly by the `image` crate.
+pub const RASTER_EXTENSIONS: &[&str] = &[
+    "avif", "bmp", "gif", "heic", "heif", "jpeg", "jpg", "jxl", "png", "qoi", "tif", "tiff", "webp",
+];
+
+/// Video formats — catalogued and played via the `video://` protocol (no thumbnail decode;
+/// the grid shows a film placeholder). Includes slideshow output (`.mp4`).
+pub const VIDEO_EXTENSIONS: &[&str] = &["mp4", "m4v", "mov", "avi", "webm", "mkv"];
+
+/// Outcome of a scan, surfaced to the frontend.
+#[derive(Debug, Default, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ScanResult {
+    pub scanned: usize,
+    pub imported: usize,
+    pub created: usize,
+    pub errors: usize,
+    /// Ingest only: source files the library already holds at their destination (the same
+    /// name, size and capture, #246), skipped.
+    pub skipped: usize,
+    /// Ingest only: copies that went back to the row still holding their name, its file
+    /// gone — the row re-linked, not a new one (#247) — and how many of those rows are in
+    /// the trash (so the photo stays hidden there).
+    pub restored: usize,
+    pub restored_trashed: usize,
+    /// Ingest only: card files whose photo was offloaded — its row has no local location
+    /// left and a verified backup (#231 F5): already imported, not copied back.
+    pub offloaded: usize,
+    /// Ingest only: card files whose name is too long for a sidecar beside it (`<name>.xmp`
+    /// over 255 bytes): not imported, since the photo's identity could never be written.
+    pub name_too_long: usize,
+}
+
+/// Live progress of a scan, streamed to the UI via the `scan:progress` event. `total = 0`
+/// means indeterminate (the discovery phase doesn't know the count until it finishes).
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ScanProgress {
+    /// "indexing" | "metadata" | "finalizing" | "done"
+    pub phase: String,
+    pub done: usize,
+    pub total: usize,
+}
+
+impl ScanProgress {
+    fn new(phase: &str, done: usize, total: usize) -> Self {
+        Self { phase: phase.to_string(), done, total }
+    }
+}
+
+/// The hand-off from Phase A (fast walk) to Phase B (background enrichment) of the
+/// two-phase live scan (I6). Phase A returns this; [`phase_b_enrich`] consumes it,
+/// possibly on a **detached** worker thread with its own catalog connection (I6c).
+///
+/// `imported` is the `(path, photo_id, needs_extract)` list built by the walk;
+/// `folder_id` is the scanned folder's catalog id for the local scan (so Phase B can
+/// mark the scan finished), or `None` for a NAS in-place scan (which tracks no folder).
+///
+/// `scope_root` is the folder that was walked. Phase B reconciles the `missing` flag for
+/// the catalog rows under it — including rows whose file was deleted since the last scan,
+/// which the walk by definition never sees. `None` (the enrichment-resume path) means the
+/// scope is just the photos in `imported`, since no folder was walked.
+pub struct PendingEnrich {
+    pub imported: Vec<(PathBuf, i64, bool)>,
+    pub folder_id: Option<i64>,
+    pub scope_root: Option<PathBuf>,
+}
+
+/// A never-aborting flag, for callers (tests, one-shot indexing) that don't drive a
+/// cancellable scan. Passing this to a scan function means it runs to completion.
+pub fn never_abort() -> AtomicBool {
+    AtomicBool::new(false)
+}
+
+/// Rebuild the `PendingEnrich` hand-off from the persisted `pending_enrichment` table
+/// (I6d). Called on startup (or by `drain_enrichment_queue`) when rows remain from a
+/// prior run that crashed or was quit mid-Phase-B. The result feeds directly into
+/// [`phase_b_enrich`] on a detached worker.
+///
+/// `folder_id` is `None` because the resume path doesn't know which folder started the
+/// original scan, so the finalizing pass in Phase B will skip `mark_folder_scan_finished`
+/// — that's acceptable since the scan did complete its walk; we're only catching up on
+/// enrichment.
+pub fn resume_pending_enrichment(catalog: &Catalog) -> Result<Option<PendingEnrich>, String> {
+    let imported = catalog.load_pending_enrichment().map_err(|e| e.to_string())?;
+    if imported.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(PendingEnrich { imported, folder_id: None, scope_root: None }))
+}
+
+pub fn is_raw(path: &Path) -> bool {
+    has_extension(path, RAW_EXTENSIONS)
+}
+
+pub fn is_video(path: &Path) -> bool {
+    has_extension(path, VIDEO_EXTENSIONS)
+}
+
+pub fn is_supported_image(path: &Path) -> bool {
+    has_extension(path, RAW_EXTENSIONS)
+        || has_extension(path, RASTER_EXTENSIONS)
+        || has_extension(path, VIDEO_EXTENSIONS)
+}
+
+fn has_extension(path: &Path, set: &[&str]) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .map(|e| set.contains(&e.to_lowercase().as_str()))
+        .unwrap_or(false)
+}
+
+/// Phase A of the two-phase live scan (I6b): walk `folder`, upsert every supported
+/// image into `catalog` with `metadata_ready = 0` for new/changed files (unchanged
+/// files stay at 1), commit every `COMMIT_EVERY` so rows become visible immediately,
+/// and emit `scan:progress {phase:"indexing"}` after each commit.
+///
+/// The **UUID sidecar write (J5 invariant)** happens here — inside `upsert_fn` — so
+/// every file has an identity before Phase B touches it.
+///
+/// Returns `(result, imported, newly_created)` where `imported` is the
+/// `(path, photo_id, needs_extract)` list for Phase B and `newly_created` is the list
+/// of photo_ids that were inserted for the first time (for import-batch assignment).
+///
+/// `upsert_fn` encapsulates `upsert_one` (local scan) or `upsert_external_one` (NAS
+/// scan) so Phase A logic isn't duplicated across the two callers.
+fn phase_a_walk<F>(
+    catalog: &Catalog,
+    folder: &Path,
+    abort: &AtomicBool,
+    progress: &dyn Fn(ScanProgress),
+    mut upsert_fn: F,
+) -> Result<(ScanResult, Vec<(PathBuf, i64, bool)>, Vec<i64>), String>
+where
+    F: FnMut(&Path) -> Result<(i64, bool, bool), String>,
+{
+    let mut result = ScanResult::default();
+    let mut imported: Vec<(PathBuf, i64, bool)> = Vec::new();
+    let mut newly_created: Vec<i64> = Vec::new();
+
+    let mut tx = catalog.begin().map_err(|e| e.to_string())?;
+    let mut since_commit = 0usize;
+    for entry in WalkDir::new(folder)
+        .into_iter()
+        .filter_entry(|e| {
+            if !is_hidden(e.path()) {
+                return true;
+            }
+            // A crashed import's or copy's hidden temporary file is swept as the walk meets
+            // it (#231 N-2); every other hidden entry is skipped untouched.
+            if e.file_type().is_file() {
+                crate::catalog::working_files::remove_if_stale_part(e.path());
+            }
+            false
+        })
+        .filter_map(|e| e.ok())
+    {
+        // Cancellation point (e.g. a catalog switch): commit what's durable and bail so
+        // nothing further is written into a catalog that's about to be torn down.
+        if abort.load(Ordering::Relaxed) {
+            tx.commit().map_err(|e| e.to_string())?;
+            return Err(SCAN_ABORTED.to_string());
+        }
+        let path = entry.path();
+        if !path.is_file() || !is_supported_image(path) || is_empty_file(path) {
+            continue;
+        }
+        result.scanned += 1;
+        match upsert_fn(path) {
+            Ok((photo_id, created, unchanged)) => {
+                result.imported += 1;
+                let needs_extract = created || !unchanged;
+                if created {
+                    result.created += 1;
+                    newly_created.push(photo_id);
+                }
+                // Mark new/changed files as not-yet-ready: Phase B will set metadata_ready=1
+                // after extracting EXIF/IPTC/XMP. Unchanged files keep their existing flag
+                // value (1 by default, or already set from a previous scan), so the grid
+                // continues to display them immediately without any disruption.
+                if needs_extract {
+                    let _ = catalog.set_metadata_ready(photo_id, false);
+                    // I6d: persist the enrichment intent so Phase B can auto-resume if the
+                    // app is killed or crashes before it finishes.
+                    let _ = catalog.enqueue_pending_enrichment(photo_id);
+                }
+                imported.push((path.to_path_buf(), photo_id, needs_extract));
+            }
+            Err(_) => result.errors += 1,
+        }
+        since_commit += 1;
+        if since_commit >= COMMIT_EVERY {
+            tx.commit().map_err(|e| e.to_string())?;
+            tx = catalog.begin().map_err(|e| e.to_string())?;
+            since_commit = 0;
+            progress(ScanProgress::new("indexing", result.scanned, 0));
+        }
+    }
+    tx.commit().map_err(|e| e.to_string())?;
+
+    Ok((result, imported, newly_created))
+}
+
+/// Phase A of a local library scan: walk `folder` recursively, upsert every supported
+/// image into `catalog` (new/changed rows marked `metadata_ready = 0`), form the import
+/// batch, and write the batch UUID into each new photo's sidecar. Hidden files and
+/// directories (dot-prefixed) are skipped, matching the old app.
+///
+/// Returns `(result, pending)` where `pending` is the hand-off for [`phase_b_enrich`]
+/// (EXIF/IPTC/XMP extraction + finalizing). The caller runs Phase B — inline via
+/// [`scan_folder`], or **detached** on its own connection so the grid stays live while
+/// enrichment continues in the background (I6c).
+pub fn scan_folder_phase_a(
+    catalog: &Catalog,
+    folder: &Path,
+    abort: &AtomicBool,
+    progress: &dyn Fn(ScanProgress),
+) -> Result<(ScanResult, PendingEnrich), String> {
+    if !folder.is_dir() {
+        return Err(format!("Not a directory: {}", folder.display()));
+    }
+    let folder_id = catalog.add_folder(folder).map_err(|e| e.to_string())?;
+    catalog
+        .mark_folder_scan_started(folder_id)
+        .map_err(|e| e.to_string())?;
+
+    // Phase A: fast walk — upsert path/uuid/mtime/size, mark new/changed rows as
+    // metadata_ready=0, emit scan:progress {phase:"indexing"}, return import list.
+    // The UUID sidecar binding (J5) happens inside upsert_one, so identity exists on
+    // disk before Phase B begins — or its repair is queued in pending_sidecar_identity.
+    let (result, imported, newly_created) = phase_a_walk(
+        catalog,
+        folder,
+        abort,
+        progress,
+        |path| upsert_one(catalog, path, folder_id),
+    )?;
+
+    // Each ingest that brought in new photos is an import batch ("negative film roll").
+    // Only newly-created photos join it; existing photos keep their original batch.
+    // K3: also write the batch UUID into each new photo's XMP sidecar so the batch
+    // survives catalog loss / merge across machines.
+    let batch_uuid_for_new: Option<String> = if !newly_created.is_empty() {
+        let mut uuid_opt = None;
+        if let Ok(batch_id) = catalog.create_import_batch(&folder.to_string_lossy()) {
+            let _ = catalog.assign_photos_to_batch(batch_id, &newly_created);
+            uuid_opt = catalog.get_import_batch_uuid(batch_id).ok().flatten();
+        }
+        // Auto-enqueue each new photo for backup (E4); drained when a backup volume is
+        // reachable. No-op effect until the user configures a backup volume.
+        for &photo_id in &newly_created {
+            let _ = catalog.enqueue_operation("backup", photo_id);
+        }
+        uuid_opt
+    } else {
+        None
+    };
+
+    // Write the batch UUID into the sidecar of each newly-created photo (K3).
+    // Done after the phase_a_walk commits so the batch row is durable before we touch
+    // the filesystem. Failures are queued as retryable sidecar debt, not just logged.
+    if let Some(ref batch_uuid) = batch_uuid_for_new {
+        // Build a set of newly-created ids for O(1) lookup.
+        let created_ids: std::collections::HashSet<i64> = newly_created.iter().copied().collect();
+        for (path, photo_id, _) in &imported {
+            if created_ids.contains(photo_id) {
+                if let Err(e) = catalog.ensure_sidecar_import_batch(*photo_id, path, batch_uuid) {
+                    eprintln!(
+                        "scan: couldn't record ImportBatch sidecar debt for {}: {e}",
+                        path.display()
+                    );
+                }
+            }
+        }
+    }
+
+    // Phase A ends here. EXIF/IPTC/XMP extraction, external-editor detection, and the
+    // finalizing pass (auto-tags, RAW/JPEG stacking, missing reconciliation, and marking
+    // the scan finished) all happen in phase_b_enrich — run inline by scan_folder, or
+    // detached on its own connection by the command layer (I6c).
+    let pending = PendingEnrich {
+        imported,
+        folder_id: Some(folder_id),
+        scope_root: Some(folder.to_path_buf()),
+    };
+    Ok((result, pending))
+}
+
+/// Scan `folder` recursively: Phase A (fast walk) followed immediately by Phase B
+/// (metadata enrichment + finalizing), inline on the same connection. Convenience for
+/// tests and callers that want the full result before returning. The command layer runs
+/// the two phases separately so Phase B can be detached (see `run_blocking_scan`).
+pub fn scan_folder(
+    catalog: &Catalog,
+    folder: &Path,
+    abort: &AtomicBool,
+    progress: &dyn Fn(ScanProgress),
+) -> Result<ScanResult, String> {
+    let (result, pending) = scan_folder_phase_a(catalog, folder, abort, progress)?;
+    phase_b_enrich(catalog, pending, abort, progress)?;
+    Ok(result)
+}
+
+/// Phase B of the two-phase live scan (I6c): extract EXIF/IPTC/XMP for the new/changed
+/// files in `pending`, persist it in `COMMIT_EVERY` batches (flipping each row's
+/// `metadata_ready` to 1 and recording external-editor sidecars), then run the finalizing
+/// pass (auto-tags, RAW/JPEG stacking, missing reconciliation over the SCANNED SCOPE,
+/// mark scan finished).
+///
+/// Only new/changed files are extracted — a re-scan of an unchanged library does no
+/// exiftool work at all. exiftool runs per batch (and across cores), not per file. The
+/// persist loop runs in its own transaction (WAL rationale: release the write lock
+/// periodically so grid reads keep flowing).
+///
+/// Honours the `abort` flag (the `Arc<AtomicBool>` shared with the command layer, I4b):
+/// a catalog switch or a second scan flips it, and Phase B commits what's durable and
+/// stops promptly so it never writes into a catalog that's being torn down. Emits
+/// `scan:progress {phase:"metadata", done, total}` per commit and `{phase:"finalizing"}`
+/// before the final pass.
+pub fn phase_b_enrich(
+    catalog: &Catalog,
+    pending: PendingEnrich,
+    abort: &AtomicBool,
+    progress: &dyn Fn(ScanProgress),
+) -> Result<(), String> {
+    let PendingEnrich { imported, folder_id, scope_root } = pending;
+
+    let to_extract: Vec<PathBuf> = imported
+        .iter()
+        .filter(|(_, _, needs)| *needs)
+        .map(|(p, _, _)| p.clone())
+        .collect();
+    let mut meta = extract_batch(&to_extract);
+    let meta_total = to_extract.len();
+    let mut done = 0usize;
+    // Every photo this phase touched, for the scoped `missing` reconciliation below. The
+    // resume path (no walked folder) has nothing else to scope by.
+    let mut enriched_ids: Vec<i64> = Vec::with_capacity(imported.len());
+    // Collect ids of photos whose metadata was just extracted — their GPS columns are now
+    // populated, so the fence-apply step in the finalizing pass has fresh coordinates.
+    // Gated on the `map` feature so there is no overhead when the feature is off.
+    #[cfg(feature = "map")]
+    let mut fenced_ids: Vec<i64> = Vec::new();
+    let mut tx = catalog.begin().map_err(|e| e.to_string())?;
+    let mut since_commit = 0usize;
+    for (path, photo_id, needs) in imported {
+        // Cancellation point (catalog switch / second scan, I4b): commit what's durable
+        // and bail so nothing further is written into a catalog about to be torn down.
+        if abort.load(Ordering::Relaxed) {
+            tx.commit().map_err(|e| e.to_string())?;
+            return Err(SCAN_ABORTED.to_string());
+        }
+        enriched_ids.push(photo_id);
+        if needs {
+            if let Some(m) = meta.remove(&path) {
+                let _ = catalog.set_photo_metadata(photo_id, &m.promoted, &m.entries);
+            }
+            let _ = catalog.set_metadata_ready(photo_id, true);
+            // I6d: clear the queue entry now that this photo is enriched.
+            let _ = catalog.dequeue_pending_enrichment(photo_id);
+            done += 1;
+            // Record for fence-apply (after the commit so GPS columns are durable).
+            #[cfg(feature = "map")]
+            fenced_ids.push(photo_id);
+        }
+        // Detect external-editor sidecars (.xmp/.pp3/.arp) — read-only, never our own.
+        // Run for every file (even unchanged): a user may have edited a RAW in darktable
+        // since the last scan, adding a sidecar without touching the photo's bytes.
+        let editors = sidecars::detect_external_editors_joined(&path);
+        let _ = catalog.set_external_editors(photo_id, &editors);
+        // While we are already looking at what sits beside this file: note how its carried
+        // companions look now, so the safety panel can tell "carried and current" from "the
+        // local one has moved on since" without ever statting home (cluster B, D5). Best
+        // effort — a photo with no carried companions matches nothing, and a failure here
+        // must never fail a scan.
+        let _ = catalog.note_companion_freshness(photo_id, &path);
+        since_commit += 1;
+        if since_commit >= COMMIT_EVERY {
+            tx.commit().map_err(|e| e.to_string())?;
+            tx = catalog.begin().map_err(|e| e.to_string())?;
+            since_commit = 0;
+            progress(ScanProgress::new("metadata", done, meta_total));
+        }
+    }
+    tx.commit().map_err(|e| e.to_string())?;
+
+    // Refresh auto-tags (e.g. monochrome) now that metadata is in place.
+    progress(ScanProgress::new("finalizing", 0, 0));
+    let _ = catalog.apply_auto_tags();
+
+    // Apply geofence place-tags to every photo that had its metadata extracted in this
+    // phase. These are the photos that may carry fresh GPS data. Best-effort — a fence
+    // error never aborts the scan.
+    #[cfg(feature = "map")]
+    {
+        use crate::plugins::map;
+        if let Ok(()) = map::ensure_schema(catalog.conn()) {
+            for photo_id in &fenced_ids {
+                let _ = map::apply_fences_to_photo(catalog, *photo_id);
+            }
+        }
+    }
+
+    // Stack any newly-imported camera JPEGs under their sibling RAW (same folder + stem).
+    let _ = catalog.pair_raw_jpeg_stacks();
+
+    // Self-heal the `missing` flag: hide rows whose original can't be found and have no
+    // backup (e.g. orphan rows left by a re-root), un-hide resolvable ones.
+    //
+    // Scoped to what this scan actually covered — the rows under the walked folder, plus
+    // the photos this phase enriched (the resume path walks no folder at all). Reconciling
+    // the WHOLE catalog here made every scan an O(total photos) stat pass over storage the
+    // scan never looked at, including an offline NAS; the full pass is explicit maintenance
+    // now (`Catalog::reconcile_missing`). The folder-scoped id set is deliberately wider
+    // than `imported`: a file deleted since the last scan is absent from the walk, and
+    // hiding its row is exactly what reconciliation is for.
+    let mut scope: Vec<i64> = match &scope_root {
+        Some(root) => catalog.photo_ids_under(root).unwrap_or_default(),
+        None => Vec::new(),
+    };
+    scope.extend(enriched_ids);
+    let _ = catalog.reconcile_missing_for(&scope);
+
+    // Mark the scan finished for the local scan (NAS in-place scans track no folder).
+    if let Some(folder_id) = folder_id {
+        catalog
+            .mark_folder_scan_finished(folder_id)
+            .map_err(|e| e.to_string())?;
+    }
+
+    // A scan is the one thing that changes row counts by orders of magnitude, so it is
+    // where the planner's statistics go stale. Refresh them here rather than waiting for
+    // the next open, so the grid the user is about to browse is planned against what the
+    // catalog now holds — without statistics SQLite ignores `idx_photos_sort_date` and
+    // sorts the whole library instead. Best-effort; see `Catalog::optimize`.
+    catalog.optimize();
+    Ok(())
+}
+
+/// Scan a folder that lives on a non-root volume (e.g. an existing archive on the NAS)
+/// and index every supported image **in place** — no files are copied. Each photo is
+/// recorded as living on that volume (so it shows as "On NAS"), gets a UUID + merge-safe
+/// sidecar, and has its metadata extracted. This is the "initial scan of old NAS photos"
+/// path; for the local library use [`scan_folder`]. READ-ONLY on the photo files (only a
+/// `.xmp` sidecar is written alongside each, to carry the UUID).
+pub fn scan_external_folder_phase_a(
+    catalog: &Catalog,
+    folder: &Path,
+    abort: &AtomicBool,
+    progress: &dyn Fn(ScanProgress),
+) -> Result<(ScanResult, PendingEnrich), String> {
+    if !folder.is_dir() {
+        return Err(format!("Not a directory: {}", folder.display()));
+    }
+
+    // Phase A: fast walk — upsert path/uuid/mtime/size, mark new/changed rows as
+    // metadata_ready=0, emit scan:progress {phase:"indexing"}, return import list.
+    // The UUID sidecar binding (J5) happens inside upsert_external_one, so identity
+    // exists on disk before Phase B begins — or its repair is queued in
+    // pending_sidecar_identity. A NAS in-place scan tracks no folder row, so
+    // there is no folder_id to mark finished (folder_id = None).
+    let (result, imported, _newly_created) = phase_a_walk(
+        catalog,
+        folder,
+        abort,
+        progress,
+        |path| upsert_external_one(catalog, path),
+    )?;
+
+    let pending = PendingEnrich {
+        imported,
+        folder_id: None,
+        scope_root: Some(folder.to_path_buf()),
+    };
+    Ok((result, pending))
+}
+
+/// Scan a NAS-resident folder in place: Phase A (fast walk) followed immediately by
+/// Phase B (metadata enrichment + finalizing), inline on the same connection. The command
+/// layer runs the two phases separately so Phase B can be detached (see `run_blocking_scan`).
+pub fn scan_external_folder(
+    catalog: &Catalog,
+    folder: &Path,
+    abort: &AtomicBool,
+    progress: &dyn Fn(ScanProgress),
+) -> Result<ScanResult, String> {
+    let (result, pending) = scan_external_folder_phase_a(catalog, folder, abort, progress)?;
+    phase_b_enrich(catalog, pending, abort, progress)?;
+    Ok(result)
+}
+
+/// Index one in-place (NAS-resident) photo, returning (photo_id, created, unchanged).
+pub(crate) fn upsert_external_one(catalog: &Catalog, path: &Path) -> Result<(i64, bool, bool), String> {
+    let meta = std::fs::metadata(path).map_err(|e| e.to_string())?;
+    let mtime_ns = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_nanos() as i64)
+        .unwrap_or(0);
+    let size = meta.len() as i64;
+    let sidecar_uuid = crate::xmp::read_identifier(path);
+    let res = catalog
+        .upsert_scanned_photo_on_volume(path, mtime_ns, size, sidecar_uuid.as_deref())
+        .map_err(|e| e.to_string())?;
+    // Same binding invariant as the local scan (see `upsert_one`): bind the identity to
+    // the file, or queue a repair. A NAS scan is exactly where this matters — an archive
+    // mounted read-only would otherwise index thousands of photos whose identity exists
+    // in one SQLite file and nowhere else.
+    if let Err(e) = catalog.ensure_sidecar_identity(res.id, path, &res.uuid, sidecar_uuid.as_deref())
+    {
+        eprintln!("nas-scan: couldn't queue identity repair for {}: {e}", path.display());
+    }
+    Ok((res.id, res.created, res.unchanged))
+}
+
+/// One file copied off a card, ready to be indexed. Carries the source's metadata
+/// (extracted once, in the copy phase) so the index phase doesn't re-run exiftool.
+pub struct CopiedItem {
+    pub dest: PathBuf,
+    pub meta: Option<crate::metadata::PhotoMetadata>,
+}
+
+/// Import from a card (ingest): copy each supported image from `source` into the local
+/// `dest_base` under a `YYYY/MM/DD` tree (by capture date, falling back to file mtime),
+/// keeping camera filenames, then index the copies, batch them, and auto-enqueue backup.
+/// Unlike scan-in-place, this COPIES files. `dest_base` must be under the catalog root.
+/// See docs/storage-and-import.md (Import). A destination collision that is the same capture
+/// (#246, [`same_photo`]) is already imported and skipped; any other gets a " (n)" name.
+///
+/// This is a convenience wrapper over the two phases [`copy_from_card`] (heavy, no
+/// catalog) and [`index_ingested`] (brief catalog work). `app::scans::ingest_from_card_claimed`
+/// calls the phases separately so the long copy never holds the catalog lock.
+pub fn ingest_from_card(
+    catalog: &Catalog,
+    source: &Path,
+    dest_base: &Path,
+    batch_label: Option<&str>,
+) -> Result<ScanResult, String> {
+    let (result, copied) = copy_from_card(catalog, source, dest_base, None, |_, _| {})?;
+    index_ingested(catalog, dest_base, source, copied, batch_label, result)
+}
+
+/// One importable photo on a card, with whether it's already in the library.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CardPhoto {
+    pub path: String,
+    pub name: String,
+    pub size: i64,
+    pub capture_time: Option<String>,
+    /// The library already holds this photo at its computed destination: a file of the same
+    /// name and size there is the same capture (#246, [`same_photo`]), or it is offloaded.
+    pub is_duplicate: bool,
+    /// Its catalog row's photo was offloaded (#231 F5): the copy skips it as already
+    /// imported, and does not copy it back. Set only when the listing was given the catalog.
+    pub offloaded: bool,
+}
+
+/// List the importable photos on a card/source folder, flagging each as a duplicate when the
+/// library already holds it at its computed date-tree destination under `dest_base`, by the
+/// same rule the copy uses (#246, [`same_photo`]). With `catalog` (the catalog the import
+/// would index into, on its own connection) a file whose row's photo was offloaded is flagged
+/// too, as the copy will skip it (#231 F5). Call off the UI thread.
+pub fn list_card_photos(source: &Path, dest_base: &Path, catalog: Option<&Catalog>) -> Result<Vec<CardPhoto>, String> {
+    if !source.is_dir() {
+        return Err(format!("Not a directory: {}", source.display()));
+    }
+    let sources: Vec<PathBuf> = WalkDir::new(source)
+        .into_iter()
+        .filter_entry(|e| !is_hidden(e.path()))
+        .filter_map(|e| e.ok())
+        .map(|e| e.path().to_path_buf())
+        .filter(|p| p.is_file() && is_supported_image(p))
+        .collect();
+    let meta = extract_batch(&sources);
+    // The copy's own plan, earlier files of the listing included: a file the copy would skip
+    // as the same photo as one it copies first is flagged too (#246 review, N-a).
+    let planned = plan_card(&sources, &meta, dest_base);
+    let duplicates = already_imported(&sources, planned.iter().map(|p| &p.candidates), &AtomicBool::new(false))
+        .unwrap_or_default();
+    let mut names = catalog.map(free_name::CatalogNames::new);
+    let mut out: Vec<CardPhoto> = sources
+        .iter()
+        .zip(planned)
+        .enumerate()
+        .map(|(i, (src, CardPlan { dir, capture, size, .. }))| {
+            let duplicate = duplicates.get(i).is_some_and(|found| !found.is_empty());
+            // The copy's F5 rule, asked only of a file it would not skip as a duplicate.
+            let offloaded = !duplicate
+                && names.as_mut().zip(src.file_name()).is_some_and(|(names, file)| {
+                    let stamp = meta.get(src).map(|m| {
+                        same_photo::stamp_from_metadata(
+                            m.entries.iter().map(|e| (e.key.as_str(), e.group_name.as_str(), e.value.as_str())),
+                        )
+                    });
+                    let arriving = free_name::Arriving::Capture(stamp.unwrap_or_default());
+                    names.kept_elsewhere(&dir.join(file), &arriving).is_some()
+                });
+            CardPhoto {
+                path: src.to_string_lossy().into_owned(),
+                name: src.file_name().map(|f| f.to_string_lossy().into_owned()).unwrap_or_default(),
+                size: size as i64,
+                capture_time: capture,
+                is_duplicate: duplicate || offloaded,
+                offloaded,
+            }
+        })
+        .collect();
+    out.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(out)
+}
+
+/// Phase 1 of import: walk the card, extract metadata, and COPY files into the local
+/// date tree. Writes the filesystem only. It reads `catalog` — the catalog the copies will be
+/// indexed into, on the import's own connection, never the main one under its lock — for the
+/// names its rows hold, once per date folder: a name a row holds is not free even when its
+/// file is gone, unless the card's file is that row's capture coming back, which then takes
+/// the name and re-links the row when indexed (#247, [`free_name`]). So it can run on a
+/// worker thread without holding the catalog lock (the copy is the slow part). Returns
+/// the partial counts (scanned/skipped/errors) and the list of files actually copied.
+///
+/// `progress(done, total)` is called as each source file is processed, so the caller can
+/// stream progress to the UI. Pass `|_, _| {}` if not needed.
+pub fn copy_from_card(
+    catalog: &Catalog,
+    source: &Path,
+    dest_base: &Path,
+    selected: Option<&std::collections::HashSet<String>>,
+    progress: impl Fn(usize, usize),
+) -> Result<(ScanResult, Vec<CopiedItem>), String> {
+    let never = AtomicBool::new(false);
+    let (result, copied, _) = copy_from_card_abortable(catalog, source, dest_base, selected, &never, progress)?;
+    Ok((result, copied))
+}
+
+/// [`copy_from_card`] that stops before the next file once `abort` is set (a Cancel, a newer
+/// import, a catalog switch). The third value says whether it stopped early; the files copied
+/// until then are returned, and are already in the library folder — a caller that does not
+/// index them leaves them for the next rescan, never deletes them.
+pub fn copy_from_card_abortable(
+    catalog: &Catalog,
+    source: &Path,
+    dest_base: &Path,
+    selected: Option<&std::collections::HashSet<String>>,
+    abort: &AtomicBool,
+    progress: impl Fn(usize, usize),
+) -> Result<(ScanResult, Vec<CopiedItem>, bool), String> {
+    if !source.is_dir() {
+        return Err(format!("Not a directory: {}", source.display()));
+    }
+    let mut sources: Vec<PathBuf> = WalkDir::new(source)
+        .into_iter()
+        .filter_entry(|e| !is_hidden(e.path()))
+        .filter_map(|e| e.ok())
+        .map(|e| e.path().to_path_buf())
+        .filter(|p| p.is_file() && is_supported_image(p))
+        .collect();
+    // Restrict to the user's chosen files (by full path), when a selection was given.
+    if let Some(sel) = selected {
+        sources.retain(|p| sel.contains(p.to_string_lossy().as_ref()));
+    }
+    let total = sources.len();
+    // One metadata pass on the source files — reused for the capture date AND indexing.
+    let mut meta = extract_batch(&sources);
+
+    // Which collisions are the same photo is read in one batched pass before anything is
+    // copied.
+    let planned = plan_card(&sources, &meta, dest_base);
+    let Some(imported_before) = already_imported(&sources, planned.iter().map(|p| &p.candidates), abort) else {
+        return Ok((ScanResult::default(), Vec::new(), true));
+    };
+
+    let mut result = ScanResult::default();
+    let mut copied: Vec<CopiedItem> = Vec::new();
+    // The names the catalog's rows hold, read once per date folder (#247).
+    let mut names = free_name::CatalogNames::new(catalog);
+    // The files of this run that are in the library now: copied, or found there already.
+    let mut in_library: HashSet<&PathBuf> = HashSet::new();
+    let this_run: HashSet<&PathBuf> = sources.iter().collect();
+    for ((src, CardPlan { dir, .. }), before) in sources.iter().zip(planned).zip(imported_before) {
+        if abort.load(Ordering::Relaxed) {
+            return Ok((result, copied, true));
+        }
+        result.scanned += 1;
+        progress(result.scanned, total);
+        // Take ownership of this file's metadata so it travels to the index phase.
+        let m = meta.remove(src);
+        // The same photo as a library file, or as an earlier file of this run that made it
+        // into the library (one that failed to copy does not count): any of them, not only
+        // the first found — that one may be a file of the run that failed to copy.
+        let same_photo_imported = before.iter().any(|p| !this_run.contains(p) || in_library.contains(p));
+        if same_photo_imported {
+            result.skipped += 1; // this capture is already in the library
+            in_library.insert(src);
+            continue;
+        }
+        if std::fs::create_dir_all(&dir).is_err() {
+            result.errors += 1;
+            continue;
+        }
+        let Some(filename) = src.file_name() else {
+            result.errors += 1;
+            continue;
+        };
+        // A different photo under a name already used — by a file, or by a catalog row whose
+        // file is gone — is kept beside it as ` (n)`, or an error if no free name is found:
+        // never an overwrite, even of a file placed there after the name was found free. A
+        // row's own capture coming back takes the row's name, and indexing re-links the row
+        // (#247). The copy keeps the source's permissions, as `fs::copy` did.
+        let stamp = m.as_ref().map(|m| {
+            same_photo::stamp_from_metadata(m.entries.iter().map(|e| (e.key.as_str(), e.group_name.as_str(), e.value.as_str())))
+        });
+        let arriving = free_name::Arriving::Capture(stamp.unwrap_or_default());
+        // The row's photo was offloaded (a verified backup holds it): already imported, and
+        // not copied back to this disk (#231 F5).
+        if names.kept_elsewhere(&dir.join(filename), &arriving).is_some() {
+            result.offloaded += 1;
+            in_library.insert(src);
+            continue;
+        }
+        // Only a name made here must fit its sidecar: a row's capture coming back to the row's
+        // own name keeps that name — the card may hold its last copy (relB3 MEDIUM-B).
+        if !same_photo::sidecar_name_fits(&dir.join(filename)) && names.relink_target(&dir.join(filename), &arriving).is_none() {
+            eprintln!("ingest: {} not imported: its name is too long for a sidecar beside it", src.display());
+            result.name_too_long += 1;
+            continue;
+        }
+        let placed = same_photo::create_new_file(&dir.join(filename), &mut names, &arriving, |out| {
+            let mut input = std::fs::File::open(src)?;
+            std::io::copy(&mut input, out)?;
+            out.set_permissions(input.metadata()?.permissions())
+        });
+        let dest = match placed {
+            Ok(dest) => dest,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && !same_photo::numbered_fits(&dir.join(filename)) => {
+                eprintln!("ingest: {} not imported: no name beside it short enough for a sidecar", src.display());
+                result.name_too_long += 1;
+                continue;
+            }
+            Err(_) => {
+                result.errors += 1;
+                continue;
+            }
+        };
+        in_library.insert(src);
+        copied.push(CopiedItem { dest, meta: m });
+    }
+    Ok((result, copied, false))
+}
+
+/// Where a card's file goes, and the files it may already be (#246).
+struct CardPlan {
+    /// The date folder under the destination.
+    dir: PathBuf,
+    capture: Option<String>,
+    size: u64,
+    /// The same-size library files of its name there, then the earlier files of this run
+    /// bound for the same name at that size — one photo met twice on the card (two folders
+    /// holding the same file) is copied once.
+    candidates: Vec<PathBuf>,
+}
+
+/// [`CardPlan`] for each of `sources`, in order: the one plan both the copy
+/// ([`copy_from_card_abortable`]) and the import dialog's listing ([`list_card_photos`])
+/// decide by, so the dialog's "already imported" agrees with what the copy skips. Nothing is
+/// copied while planning, so each folder is listed once for the whole plan.
+fn plan_card(
+    sources: &[PathBuf],
+    meta: &HashMap<PathBuf, crate::metadata::PhotoMetadata>,
+    dest_base: &Path,
+) -> Vec<CardPlan> {
+    let mut listings = same_photo::FolderListings::default();
+    let mut bound_for: HashMap<(PathBuf, u64), Vec<PathBuf>> = HashMap::new();
+    sources
+        .iter()
+        .map(|src| {
+            let capture = meta.get(src).and_then(|m| m.promoted.capture_time.clone());
+            let md = std::fs::metadata(src).ok();
+            let dir = dest_base.join(date_subdir(capture.as_deref(), mtime_secs(md.as_ref())));
+            let size = md.map(|m| m.len()).unwrap_or(0);
+            let Some(dest) = src.file_name().map(|f| dir.join(f)) else {
+                return CardPlan { dir, capture, size, candidates: Vec::new() };
+            };
+            let mut candidates = listings.same_size_candidates(&dest, size);
+            let earlier = bound_for.entry((dest, size)).or_default();
+            candidates.extend(earlier.iter().cloned());
+            earlier.push(src.clone());
+            CardPlan { dir, capture, size, candidates }
+        })
+        .collect()
+}
+
+/// What an abortable indexing pass ([`index_ingested_abortable`],
+/// `bundle::importer::index_bundle_abortable`) did: its result over the photos it indexed,
+/// and how many of the `total` copies those were. `indexed < total` means it was stopped.
+#[derive(Debug, Clone)]
+pub struct Indexed<R> {
+    pub result: R,
+    pub indexed: usize,
+    pub total: usize,
+}
+
+impl<R> Indexed<R> {
+    /// Stopped before the last copy.
+    pub fn aborted(&self) -> bool {
+        self.indexed < self.total
+    }
+}
+
+/// Phase 2 of import: index the already-copied files into the catalog, batch them, and
+/// auto-enqueue backups. This is the only phase that touches the catalog, and it's all
+/// fast DB writes, so the lock is held only briefly. `result` carries the counts from
+/// the copy phase; `source` is the fallback batch label.
+pub fn index_ingested(
+    catalog: &Catalog,
+    dest_base: &Path,
+    source: &Path,
+    copied: Vec<CopiedItem>,
+    batch_label: Option<&str>,
+    result: ScanResult,
+) -> Result<ScanResult, String> {
+    index_ingested_abortable(catalog, dest_base, source, copied, batch_label, result, &AtomicBool::new(false))
+        .map(|i| i.result)
+}
+
+/// [`index_ingested`], stopping before the next copy once `abort` is set (Cancel, a newer
+/// import, a catalog switch). A stop leaves a consistent catalog: every copy indexed so far
+/// is committed whole — its row and identity sidecar, its import batch (and the batch UUID
+/// in its sidecar), its queued backup, auto-tags and geofence tags — exactly as if the
+/// import had been of those copies only. The copies after it stay in the library folder,
+/// unindexed, for the next rescan. [`Indexed`] says how many were indexed.
+pub fn index_ingested_abortable(
+    catalog: &Catalog,
+    dest_base: &Path,
+    source: &Path,
+    copied: Vec<CopiedItem>,
+    batch_label: Option<&str>,
+    result: ScanResult,
+    abort: &AtomicBool,
+) -> Result<Indexed<ScanResult>, String> {
+    index_ingested_with(catalog, dest_base, source, copied, batch_label, result, abort, &|_| {})
+}
+
+/// [`index_ingested_abortable`], calling `after_each(indexed)` after each copy — where a test
+/// trips the abort mid-pass.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn index_ingested_with(
+    catalog: &Catalog,
+    dest_base: &Path,
+    source: &Path,
+    copied: Vec<CopiedItem>,
+    batch_label: Option<&str>,
+    mut result: ScanResult,
+    abort: &AtomicBool,
+    after_each: &dyn Fn(usize),
+) -> Result<Indexed<ScanResult>, String> {
+    let total = copied.len();
+    let mut indexed = 0;
+    let folder_id = catalog.add_folder(dest_base).map_err(|e| e.to_string())?;
+
+    let mut newly_created: Vec<i64> = Vec::new();
+    // K3: track the dest path for each newly-created photo so we can write the batch
+    // UUID to its sidecar after the catalog transaction commits.
+    let mut newly_created_copies: Vec<(i64, PathBuf)> = Vec::new();
+    let tx = catalog.begin().map_err(|e| e.to_string())?;
+    for item in &copied {
+        if abort.load(Ordering::Relaxed) {
+            break; // what is indexed so far is finished below, as a smaller import
+        }
+        indexed += 1;
+        match upsert_one(catalog, &item.dest, folder_id) {
+            Ok((photo_id, created, _)) => {
+                result.imported += 1;
+                if created {
+                    result.created += 1;
+                    newly_created.push(photo_id);
+                    newly_created_copies.push((photo_id, item.dest.clone()));
+                } else {
+                    // A copy placed at a name its row still held, its file gone: the row's
+                    // own capture came back and the row is re-linked (#247). Counted, with
+                    // whether it is in the trash, so it is not invisible in the grid.
+                    result.restored += 1;
+                    if catalog.is_trashed(photo_id).unwrap_or(false) {
+                        result.restored_trashed += 1;
+                    }
+                }
+                // Reuse the source file's metadata for the copy (same bytes).
+                if let Some(m) = &item.meta {
+                    let _ = catalog.set_photo_metadata(photo_id, &m.promoted, &m.entries);
+                }
+            }
+            Err(_) => result.errors += 1,
+        }
+        after_each(indexed);
+    }
+
+    // K3: resolve the batch UUID before committing the transaction so the row exists
+    // when we look it up; the sidecar write happens after commit (filesystem write is
+    // outside the catalog lock, matching the pattern in scan_folder).
+    let batch_uuid_for_new: Option<String> = if !newly_created.is_empty() {
+        // Use the custom import name if given, else the source folder path.
+        let label = batch_label
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| source.to_string_lossy().to_string());
+        let mut uuid_opt = None;
+        if let Ok(batch_id) = catalog.create_import_batch(&label) {
+            let _ = catalog.assign_photos_to_batch(batch_id, &newly_created);
+            uuid_opt = catalog.get_import_batch_uuid(batch_id).ok().flatten();
+        }
+        for &photo_id in &newly_created {
+            let _ = catalog.enqueue_operation("backup", photo_id);
+        }
+        uuid_opt
+    } else {
+        None
+    };
+    tx.commit().map_err(|e| e.to_string())?;
+
+    // Write the batch UUID into the sidecar of each newly-created photo (K3).
+    // Failures are queued as retryable sidecar debt.
+    if let Some(ref batch_uuid) = batch_uuid_for_new {
+        for (photo_id, path) in &newly_created_copies {
+            if let Err(e) = catalog.ensure_sidecar_import_batch(*photo_id, path, batch_uuid) {
+                eprintln!(
+                    "ingest: couldn't record ImportBatch sidecar debt for {}: {e}",
+                    path.display()
+                );
+            }
+        }
+    }
+
+    let _ = catalog.apply_auto_tags();
+
+    // Apply geofence place-tags to each newly-imported photo (the import hook).
+    // Only new photos: existing photos already had their chance at import time, and
+    // re-applying on re-import would be noisy. Best-effort — never aborts the import.
+    #[cfg(feature = "map")]
+    {
+        use crate::plugins::map;
+        if let Ok(()) = map::ensure_schema(catalog.conn()) {
+            for &photo_id in &newly_created {
+                let _ = map::apply_fences_to_photo(catalog, photo_id);
+            }
+        }
+    }
+
+    Ok(Indexed { result, indexed, total })
+}
+
+/// Index a single newly-created file (e.g. a collage saved into the library) into the
+/// catalog: assign a UUID (+ merge-safe sidecar), extract its metadata, refresh auto-tags,
+/// and queue a backup. Unlike a card import it makes no import batch — a generated collage
+/// isn't a "negative film roll". The file must already live under the catalog root. Returns
+/// the photo id.
+pub fn index_generated_file(catalog: &Catalog, path: &Path) -> Result<i64, String> {
+    if !path.is_file() {
+        return Err(format!("Not a file: {}", path.display()));
+    }
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let folder_id = catalog.add_folder(parent).map_err(|e| e.to_string())?;
+    let (photo_id, created, _) = upsert_one(catalog, path, folder_id)?;
+
+    // A generated file has no EXIF capture date, which would sort it to the bottom of the
+    // (date-ordered) library — stamp it with "now" so it appears as a recent photo.
+    let now_iso = {
+        let secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        chrono::DateTime::from_timestamp(secs, 0)
+            .map(|dt| dt.format("%Y-%m-%dT%H:%M:%S").to_string())
+            .unwrap_or_default()
+    };
+    let mut meta = extract_batch(&[path.to_path_buf()]);
+    match meta.remove(path) {
+        Some(mut m) => {
+            if m.promoted.capture_time.as_deref().unwrap_or("").is_empty() {
+                m.promoted.capture_time = Some(now_iso);
+            }
+            let _ = catalog.set_photo_metadata(photo_id, &m.promoted, &m.entries);
+        }
+        None => {
+            let promoted = crate::catalog::PromotedMetadata {
+                capture_time: Some(now_iso),
+                ..Default::default()
+            };
+            let _ = catalog.set_photo_metadata(photo_id, &promoted, &[]);
+        }
+    }
+    if created {
+        let _ = catalog.enqueue_operation("backup", photo_id);
+    }
+    let _ = catalog.apply_auto_tags();
+    Ok(photo_id)
+}
+
+/// `YYYY/MM/DD` from a capture timestamp (`YYYY-MM-DDThh:mm:ss`), else from the file's
+/// mtime (seconds since epoch).
+fn date_subdir(capture: Option<&str>, mtime_secs: i64) -> String {
+    if let Some(c) = capture {
+        if c.len() >= 10 {
+            return c[..10].replace('-', "/");
+        }
+    }
+    chrono::DateTime::from_timestamp(mtime_secs, 0)
+        .map(|dt| dt.format("%Y/%m/%d").to_string())
+        .unwrap_or_else(|| "unknown-date".into())
+}
+
+/// A file's mtime in seconds since the epoch, 0 when unknown.
+fn mtime_secs(md: Option<&std::fs::Metadata>) -> i64 {
+    md.and_then(|m| m.modified().ok())
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// For each of `sources`, every file among its `candidates` that is the same photo (#246,
+/// [`same_photo::find_already_imported`]); only sources with candidates are read. `None`
+/// once `abort` is set.
+fn already_imported<'a>(
+    sources: &[PathBuf],
+    candidates: impl Iterator<Item = &'a Vec<PathBuf>>,
+    abort: &AtomicBool,
+) -> Option<Vec<Vec<PathBuf>>> {
+    let mut out = vec![Vec::new(); sources.len()];
+    let (index, arrivals): (Vec<usize>, Vec<same_photo::Arrival>) = sources
+        .iter()
+        .zip(candidates)
+        .enumerate()
+        .filter(|(_, (_, c))| !c.is_empty())
+        .map(|(i, (src, c))| (i, same_photo::Arrival { file: src.clone(), candidates: c.clone() }))
+        .unzip();
+    if arrivals.is_empty() {
+        return Some(out);
+    }
+    for (i, found) in index.into_iter().zip(same_photo::find_already_imported(&arrivals, abort)?) {
+        out[i] = found;
+    }
+    Some(out)
+}
+
+/// Upsert one photo, returning (photo_id, created, unchanged). `unchanged` is true when
+/// the row already existed and its file stats (mtime + size) were identical — the caller
+/// can then skip re-extracting metadata for it on a re-scan.
+fn upsert_one(catalog: &Catalog, path: &Path, folder_id: i64) -> Result<(i64, bool, bool), String> {
+    let meta = std::fs::metadata(path).map_err(|e| e.to_string())?;
+    let mtime_ns = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_nanos() as i64)
+        .unwrap_or(0);
+    let size = meta.len() as i64;
+
+    // Read the file's own UUID from its sidecar (if any) so a moved/re-rooted file is
+    // matched to its existing row by UUID rather than duplicated.
+    let sidecar_uuid = crate::xmp::read_identifier(path);
+    let res = catalog
+        .upsert_scanned_photo(path, Some(folder_id), mtime_ns, size, sidecar_uuid.as_deref())
+        .map_err(|e| e.to_string())?;
+
+    // Honor the binding invariant: the file's sidecar must carry this photo's UUID so
+    // future moves/re-roots can match by it. Writes only when the sidecar lacks it (don't
+    // rewrite on every scan, never clobber a UUID already on disk); when the write can't
+    // happen, the debt is queued for `repair_pending_identity` rather than logged and
+    // forgotten. A sidecar failure still never aborts the scan — one unwritable file must
+    // not cost the user the other 99,999 rows.
+    if let Err(e) = catalog.ensure_sidecar_identity(res.id, path, &res.uuid, sidecar_uuid.as_deref())
+    {
+        eprintln!("scan: couldn't queue identity repair for {}: {e}", path.display());
+    }
+    Ok((res.id, res.created, res.unchanged))
+}
+
+/// A 0-byte file — an empty/corrupt placeholder (e.g. a long-ago bad sync). Skipped on
+/// scan so it never enters the catalog as an unusable photo.
+fn is_empty_file(path: &Path) -> bool {
+    std::fs::metadata(path).map(|m| m.len() == 0).unwrap_or(false)
+}
+
+fn is_hidden(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|n| n.to_str())
+        .map(|n| n.starts_with('.') && n.len() > 1)
+        .unwrap_or(false)
+}
+
+/// Merge stale `pending_enrichment` rows into a Phase A hand-off (I6d).
+///
+/// Invariant: a stale entry is **never** duplicated into the result when Phase A already
+/// re-enqueued the same photo with `needs_extract = true`. Only entries where Phase B
+/// will actually run extraction are considered "covered" — entries with
+/// `needs_extract = false` (unchanged files that Phase B will skip) are *not* covered,
+/// so a stale row for the same `photo_id` is still merged in to prevent that photo
+/// from being stuck at `metadata_ready = 0` indefinitely.
+///
+/// `phase_a` is the `(path, photo_id, needs_extract)` list produced by [`phase_a_walk`].
+/// `stale` is the result of [`crate::catalog::Catalog::load_pending_enrichment`], which
+/// has already resolved each photo's path and silently dropped entries whose file is
+/// unreachable (e.g. deleted photos). The merged list is returned; the caller appends it
+/// to `PendingEnrich::imported` and passes the whole thing to [`phase_b_enrich`].
+pub fn merge_stale_pending(
+    phase_a: Vec<(PathBuf, i64, bool)>,
+    stale: Vec<(PathBuf, i64, bool)>,
+) -> Vec<(PathBuf, i64, bool)> {
+    let already_covered: std::collections::HashSet<i64> = phase_a
+        .iter()
+        .filter(|(_, _, needs)| *needs)
+        .map(|(_, id, _)| *id)
+        .collect();
+    let mut result = phase_a;
+    for entry in stale {
+        if !already_covered.contains(&entry.1) {
+            result.push(entry);
+        }
+    }
+    result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rrdata_sidecar_is_not_a_supported_image() {
+        // RapidRAW drops a `<filename>.rrdata` JSON sidecar next to the source. The scan walk
+        // filters on `is_supported_image`, so an `.rrdata` file must never be indexed as a
+        // photo (nor its double-extension `.ARW.rrdata` form).
+        assert!(!is_supported_image(Path::new("DSC1.ARW.rrdata")));
+        assert!(!is_supported_image(Path::new("DSC1.rrdata")));
+        // Sanity: the RAW it sits next to *is* supported.
+        assert!(is_supported_image(Path::new("DSC1.ARW")));
+    }
+
+    // --- crashed copies' temporary files (#231 N-2) ----------------------------------------
+
+    /// A library scan removes the hidden temporary file a crashed import left — the exact
+    /// pattern, its process gone, unwritten for over an hour, a regular file — and leaves
+    /// every other hidden entry: a fresh one, a running process's, one off the pattern, a
+    /// symlink. The photos beside them are indexed as before.
+    #[test]
+    fn a_scan_sweeps_a_crashed_imports_temporary_files() {
+        use crate::catalog::working_files::{dead_pid, STALE_PART_AGE};
+        if !cfg!(target_os = "linux") {
+            println!("SKIPPED: a_scan_sweeps_a_crashed_imports_temporary_files — needs /proc");
+            return;
+        }
+        let dir = crate::test_support::TestTmpDir::new("scan-sweeps-parts");
+        let root = dir.join("photos");
+        let day = root.join("2026/06/28");
+        std::fs::create_dir_all(&day).unwrap();
+        let catalog = Catalog::open(&dir.join("test.chairphoto"), &root).unwrap();
+        std::fs::write(day.join("DSC1.jpg"), b"a photo").unwrap();
+        let dead = dead_pid();
+        let tag = same_photo::PART_TAG;
+        let part = |name: &str, pid: u32| day.join(format!(".{name}.{tag}-{pid}-3"));
+        let old = std::time::SystemTime::now() - STALE_PART_AGE - std::time::Duration::from_secs(60);
+        let write_old = |path: &Path| {
+            std::fs::write(path, b"partial").unwrap();
+            std::fs::File::options().write(true).open(path).unwrap().set_modified(old).unwrap();
+        };
+        write_old(&part("A.jpg", dead));
+        std::fs::write(part("B.jpg", dead), b"being written").unwrap();
+        write_old(&part("C.jpg", std::process::id()));
+        write_old(&day.join(".D.jpg.notes"));
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(day.join("DSC1.jpg"), part("E.jpg", dead)).unwrap();
+
+        let result = scan_folder(&catalog, &root, &AtomicBool::new(false), &|_| {}).unwrap();
+
+        assert_eq!(result.created, 1, "{result:?}");
+        assert!(!part("A.jpg", dead).exists(), "stale, its process gone: swept");
+        assert!(part("B.jpg", dead).exists(), "recently written: kept");
+        assert!(part("C.jpg", std::process::id()).exists(), "a running process's: kept");
+        assert!(day.join(".D.jpg.notes").exists(), "off the pattern: kept");
+        #[cfg(unix)]
+        assert!(std::fs::symlink_metadata(part("E.jpg", dead)).is_ok(), "a symlink: kept");
+    }
+
+    // --- card ingest: same name, same size (#246) ------------------------------------------
+
+    use same_photo::test_files::{exiftool_available, stamped_jpeg};
+
+    fn ingest_rig(tag: &str) -> (Catalog, crate::test_support::TestTmpDir, PathBuf, PathBuf) {
+        let dir = crate::test_support::TestTmpDir::new(&format!("ingest-246-{tag}"));
+        let root = dir.join("photos");
+        std::fs::create_dir_all(&root).unwrap();
+        let catalog = Catalog::open(&dir.join("test.chairphoto"), &root).unwrap();
+        let card = dir.join("card");
+        (catalog, dir, root, card)
+    }
+
+    fn photos(catalog: &Catalog) -> Vec<(String, String)> {
+        let mut stmt = catalog.conn().prepare("SELECT path, uuid FROM photos ORDER BY path").unwrap();
+        stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?))).unwrap().collect::<Result<_, _>>().unwrap()
+    }
+
+    /// Two bodies wrote `DSC1.jpg` in the same second, at the same byte size: one card holds
+    /// the first (already imported), a second card the other two — one differing in the
+    /// sub-second, one in the serial. Both are different photos: each is kept under a ` (n)`
+    /// name with its own row and UUID, and nothing is overwritten. Importing the cards again
+    /// skips every file, the ` (n)` ones included.
+    #[test]
+    fn a_different_capture_under_a_used_name_is_kept_and_a_second_import_skips_all() {
+        if !exiftool_available("a_different_capture_under_a_used_name_is_kept_and_a_second_import_skips_all") {
+            return;
+        }
+        let (catalog, _dir, root, card) = ingest_rig("kept");
+        let first = card.join("A/DSC1.jpg");
+        let subsec = card.join("B/DSC1.jpg");
+        let serial = card.join("C/DSC1.jpg");
+        stamped_jpeg(&first, "2026:06:28 12:00:00", "123", "4711");
+        stamped_jpeg(&subsec, "2026:06:28 12:00:00", "456", "4711");
+        stamped_jpeg(&serial, "2026:06:28 12:00:00", "123", "4712");
+        let size = |p: &Path| std::fs::metadata(p).unwrap().len();
+        assert!(size(&first) == size(&subsec) && size(&first) == size(&serial), "same size");
+
+        // The first body's photo is in the library already.
+        let only_first: std::collections::HashSet<String> =
+            [first.to_string_lossy().into_owned()].into_iter().collect();
+        let (r, copied) = copy_from_card(&catalog, &card, &root, Some(&only_first), |_, _| {}).unwrap();
+        index_ingested(&catalog, &root, &card, copied, None, r).unwrap();
+        let library = root.join("2026/06/28/DSC1.jpg");
+        let before = std::fs::read(&library).unwrap();
+
+        let result = ingest_from_card(&catalog, &card, &root, None).unwrap();
+        assert_eq!((result.scanned, result.skipped, result.created), (3, 1, 2), "{result:?}");
+        assert_eq!(std::fs::read(&library).unwrap(), before, "never overwritten");
+        let rows = photos(&catalog);
+        let paths: Vec<&str> = rows.iter().map(|(p, _)| p.as_str()).collect();
+        assert_eq!(paths, ["2026/06/28/DSC1 (2).jpg", "2026/06/28/DSC1 (3).jpg", "2026/06/28/DSC1.jpg"]);
+        let uuids: std::collections::HashSet<&str> = rows.iter().map(|(_, u)| u.as_str()).collect();
+        assert_eq!(uuids.len(), 3, "each photo its own UUID: {rows:?}");
+
+        let again = ingest_from_card(&catalog, &card, &root, None).unwrap();
+        assert_eq!((again.skipped, again.created), (3, 0), "a second import skips all: {again:?}");
+        assert_eq!(photos(&catalog), rows);
+        assert!(!root.join("2026/06/28/DSC1 (4).jpg").exists());
+
+        // The card listing says the same.
+        let listed = list_card_photos(&card, &root, None).unwrap();
+        assert!(listed.iter().all(|p| p.is_duplicate), "all listed as imported");
+    }
+
+    /// A file with no capture time (here: bytes exiftool cannot read) is decided by its
+    /// contents: the same bytes are skipped, other bytes of the same size kept as ` (2)`.
+    #[test]
+    fn without_a_capture_time_the_contents_decide_a_collision() {
+        let (catalog, _dir, root, card) = ingest_rig("hash");
+        std::fs::create_dir_all(&card).unwrap();
+        std::fs::write(card.join("IMG.jpg"), b"\xff\xd8one").unwrap();
+        let first = ingest_from_card(&catalog, &card, &root, None).unwrap();
+        assert_eq!(first.created, 1);
+        let again = ingest_from_card(&catalog, &card, &root, None).unwrap();
+        assert_eq!((again.skipped, again.created), (1, 0), "identical bytes: skipped");
+
+        std::fs::write(card.join("IMG.jpg"), b"\xff\xd8two").unwrap();
+        let other = ingest_from_card(&catalog, &card, &root, None).unwrap();
+        assert_eq!((other.skipped, other.created), (0, 1), "other bytes: kept");
+        let copies: Vec<PathBuf> = WalkDir::new(&root)
+            .into_iter()
+            .filter_map(|e| e.ok())
+            .map(|e| e.into_path())
+            .filter(|p| p.extension().is_some_and(|e| e == "jpg"))
+            .collect();
+        assert_eq!(copies.len(), 2, "{copies:?}");
+        assert!(copies.iter().any(|p| p.ends_with("IMG (2).jpg")));
+    }
+
+    /// L-1 of the #246 review: one photo met twice in a run — the same file in two folders of
+    /// the card — is copied once and the second skipped, as before #246; a different photo
+    /// of that name and size in the same run is still kept as ` (2)`.
+    #[test]
+    fn the_same_photo_twice_on_one_card_is_copied_once() {
+        let (catalog, _dir, root, card) = ingest_rig("twice");
+        for (folder, bytes) in [("A", b"\xff\xd8one"), ("B", b"\xff\xd8one"), ("C", b"\xff\xd8two")] {
+            std::fs::create_dir_all(card.join(folder)).unwrap();
+            std::fs::write(card.join(folder).join("IMG.jpg"), bytes).unwrap();
+        }
+        let result = ingest_from_card(&catalog, &card, &root, None).unwrap();
+        assert_eq!((result.scanned, result.skipped, result.created), (3, 1, 2), "{result:?}");
+        // The walk's order decides which of the two photos keeps the plain name.
+        let (mut names, mut contents): (Vec<String>, Vec<Vec<u8>>) = WalkDir::new(&root)
+            .into_iter()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().extension().is_some_and(|x| x == "jpg"))
+            .map(|e| (e.file_name().to_string_lossy().into_owned(), std::fs::read(e.path()).unwrap()))
+            .unzip();
+        names.sort();
+        contents.sort();
+        assert_eq!(names, ["IMG (2).jpg", "IMG.jpg"]);
+        assert_eq!(contents, [b"\xff\xd8one".to_vec(), b"\xff\xd8two".to_vec()]);
+        let again = ingest_from_card(&catalog, &card, &root, None).unwrap();
+        assert_eq!((again.skipped, again.created), (3, 0), "{again:?}");
+    }
+
+    /// M-a of the second #246 review: an orphan sidecar (another tool's, with an identifier;
+    /// its original gone) at the name a card's file would take is not adopted: the file goes
+    /// to the next name whose sidecar's name is free too, gets a fresh identity of its own,
+    /// and the orphan is untouched.
+    #[test]
+    fn a_card_file_never_lands_beside_an_orphan_sidecar() {
+        const ORPHAN_ID: &str = "11111111-1111-4111-8111-111111111111";
+        let (catalog, _dir, root, card) = ingest_rig("orphan");
+        std::fs::create_dir_all(&card).unwrap();
+        let src = card.join("IMG.jpg");
+        std::fs::write(&src, b"\xff\xd8one").unwrap();
+        // A fixed mtime, so the date folder is known.
+        let mtime = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_782_648_000);
+        std::fs::File::options().write(true).open(&src).unwrap().set_modified(mtime).unwrap();
+        let dir = root.join(date_subdir(None, mtime_secs(std::fs::metadata(&src).ok().as_ref())));
+        std::fs::create_dir_all(&dir).unwrap();
+        let orphan = dir.join("IMG.jpg.xmp");
+        let orphan_xml = format!(
+            r#"<x:xmpmeta xmlns:x="adobe:ns:meta/"><rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"><rdf:Description rdf:about="" xmlns:xmp="http://ns.adobe.com/xap/1.0/" xmp:Rating="5" xmp:Identifier="{ORPHAN_ID}"/></rdf:RDF></x:xmpmeta>"#
+        );
+        std::fs::write(&orphan, &orphan_xml).unwrap();
+
+        let result = ingest_from_card(&catalog, &card, &root, None).unwrap();
+        assert_eq!(result.created, 1, "{result:?}");
+        assert!(!dir.join("IMG.jpg").exists(), "nothing placed beside the orphan");
+        let rows = photos(&catalog);
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].0.ends_with("/IMG (2).jpg"), "{rows:?}");
+        assert_ne!(rows[0].1, ORPHAN_ID, "the orphan's identity is not adopted");
+        assert_eq!(std::fs::read_to_string(&orphan).unwrap(), orphan_xml);
+    }
+
+    // --- card ingest: a name a catalog row holds (#247) -------------------------------------
+
+    fn row_at(catalog: &Catalog, rel: &str) -> Option<(i64, String, i64, i64)> {
+        catalog
+            .conn()
+            .query_row("SELECT id, uuid, rating, missing FROM photos WHERE path = ?1", [rel], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+            })
+            .ok()
+    }
+
+    fn rate(catalog: &Catalog, id: i64, rating: i64) {
+        catalog.conn().execute("UPDATE photos SET rating = ?1 WHERE id = ?2", rusqlite::params![rating, id]).unwrap();
+    }
+
+    /// The date folder a card file with no capture time goes to: from a fixed mtime.
+    fn fixed_day(src: &Path, root: &Path) -> PathBuf {
+        let mtime = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_782_648_000);
+        std::fs::File::options().write(true).open(src).unwrap().set_modified(mtime).unwrap();
+        root.join(date_subdir(None, mtime_secs(std::fs::metadata(src).ok().as_ref())))
+    }
+
+    /// #247: `IMG (2).jpg`, rated, is deleted outside the app with its sidecar; its row stays
+    /// (missing storage is normal). A different `IMG.jpg` arriving from a card does not take
+    /// the name the row holds — it would be indexed onto that row, the old photo's identity
+    /// and rating on another capture — but the next one no row holds, with a row of its own.
+    #[test]
+    fn a_different_capture_never_takes_the_name_of_a_row_whose_file_is_gone() {
+        let (catalog, _dir, root, card) = ingest_rig("247");
+        for (folder, bytes) in [("A", b"\xff\xd8one"), ("B", b"\xff\xd8two")] {
+            std::fs::create_dir_all(card.join(folder)).unwrap();
+            std::fs::write(card.join(folder).join("IMG.jpg"), bytes).unwrap();
+        }
+        let day = fixed_day(&card.join("A/IMG.jpg"), &root);
+        fixed_day(&card.join("B/IMG.jpg"), &root);
+        ingest_from_card(&catalog, &card, &root, None).unwrap();
+        let rel = |name: &str| format!("{}/{name}", day.strip_prefix(&root).unwrap().to_string_lossy());
+        let (old_id, old_uuid, _, _) = row_at(&catalog, &rel("IMG (2).jpg")).unwrap();
+        rate(&catalog, old_id, 5);
+        let gone = day.join("IMG (2).jpg");
+        let old_bytes = std::fs::read(&gone).unwrap();
+        std::fs::remove_file(&gone).unwrap();
+        std::fs::remove_file(crate::xmp::sidecar_path(&gone)).unwrap();
+        catalog.reconcile_missing_for(&[old_id]).unwrap();
+
+        let second = dir_of_one(&card, "second", b"\xff\xd8six");
+        fixed_day(&second.join("IMG.jpg"), &root);
+        let result = ingest_from_card(&catalog, &second, &root, None).unwrap();
+        assert_eq!((result.created, result.errors), (1, 0), "{result:?}");
+        assert!(!gone.exists(), "the name the row holds stays empty");
+        assert_eq!(std::fs::read(day.join("IMG (3).jpg")).unwrap(), b"\xff\xd8six");
+        let (new_id, new_uuid, new_rating, _) = row_at(&catalog, &rel("IMG (3).jpg")).unwrap();
+        assert_ne!(new_id, old_id);
+        assert_ne!(new_uuid, old_uuid);
+        assert_eq!(new_rating, 0);
+        assert_eq!(row_at(&catalog, &rel("IMG (2).jpg")), Some((old_id, old_uuid, 5, 1)), "the old row is as it was");
+        assert_ne!(old_bytes, b"\xff\xd8six");
+    }
+
+    /// A card folder `card/<name>` holding one `IMG.jpg` of `bytes`.
+    fn dir_of_one(card: &Path, name: &str, bytes: &[u8]) -> PathBuf {
+        let dir = card.with_file_name(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("IMG.jpg"), bytes).unwrap();
+        dir
+    }
+
+    /// L-f of the third #246 review: a photo deleted outside the app (its row kept, missing)
+    /// and imported again from the same card goes back to its name and its row — rating
+    /// kept, no second row — whether its own sidecar was left behind or went with it.
+    #[test]
+    fn a_photo_deleted_outside_the_app_comes_back_to_its_row() {
+        if !exiftool_available("a_photo_deleted_outside_the_app_comes_back_to_its_row") {
+            return;
+        }
+        for sidecar_left in [true, false] {
+            let (catalog, _dir, root, card) = ingest_rig(&format!("lf-{sidecar_left}"));
+            stamped_jpeg(&card.join("IMG.jpg"), "2026:06:28 12:00:00", "123", "4711");
+            ingest_from_card(&catalog, &card, &root, None).unwrap();
+            let name = root.join("2026/06/28/IMG.jpg");
+            let (id, uuid, _, _) = row_at(&catalog, "2026/06/28/IMG.jpg").unwrap();
+            rate(&catalog, id, 5);
+            std::fs::remove_file(&name).unwrap();
+            if !sidecar_left {
+                std::fs::remove_file(crate::xmp::sidecar_path(&name)).unwrap();
+            }
+            catalog.reconcile_missing_for(&[id]).unwrap();
+            assert_eq!(row_at(&catalog, "2026/06/28/IMG.jpg").unwrap().3, 1, "missing before");
+            // One of the two is in the trash too: it is restored there, and the result says so.
+            let trashed = !sidecar_left;
+            if trashed {
+                catalog.conn().execute("UPDATE photos SET trashed_at = 1 WHERE id = ?1", [id]).unwrap();
+            }
+
+            let again = ingest_from_card(&catalog, &card, &root, None).unwrap();
+            assert_eq!((again.created, again.skipped, again.imported), (0, 0, 1), "{sidecar_left}: {again:?}");
+            assert_eq!((again.restored, again.restored_trashed), (1, usize::from(trashed)), "{again:?}");
+            assert!(name.exists(), "{sidecar_left}: back at its name");
+            assert!(!root.join("2026/06/28/IMG (2).jpg").exists(), "{sidecar_left}");
+            assert_eq!(row_at(&catalog, "2026/06/28/IMG.jpg"), Some((id, uuid.clone(), 5, 0)), "{sidecar_left}");
+            assert_eq!(photos(&catalog).len(), 1, "{sidecar_left}: no second row");
+            assert_eq!(crate::xmp::read_identifier(&name).as_deref(), Some(uuid.as_str()), "{sidecar_left}");
+        }
+    }
+
+    /// #231 F5 (narrowed after the release review, MEDIUM-1 / probe P4): only a photo that was
+    /// really **offloaded** — no local location row left, and a backup with a verified hash —
+    /// is already imported: its card's file is skipped, counted as offloaded, not copied back,
+    /// and the import dialog's listing flags it the same way. A photo whose local file was
+    /// lost while its local location row stays (P4: deleted outside the app, the backup
+    /// record verified) may have its last copy on the card: it is restored to its row. So is
+    /// one offloaded to a backup never verified. Whether the backup volume is mounted plays
+    /// no part.
+    #[test]
+    fn only_an_offloaded_photo_on_a_card_again_is_skipped() {
+        if !exiftool_available("only_an_offloaded_photo_on_a_card_again_is_skipped") {
+            return;
+        }
+        for case in ["offloaded", "lost-locally", "unverified"] {
+            let (catalog, dir, root, card) = ingest_rig(&format!("f5-{case}"));
+            stamped_jpeg(&card.join("IMG.jpg"), "2026:06:28 12:00:00", "123", "4711");
+            ingest_from_card(&catalog, &card, &root, None).unwrap();
+            let name = root.join("2026/06/28/IMG.jpg");
+            let (id, uuid, _, _) = row_at(&catalog, "2026/06/28/IMG.jpg").unwrap();
+            let local_rows = || -> i64 {
+                catalog
+                    .conn()
+                    .query_row(
+                        "SELECT COUNT(*) FROM photo_locations l JOIN volumes v ON v.id = l.volume_id
+                          WHERE l.photo_id = ?1 AND v.kind = 'local'",
+                        [id],
+                        |r| r.get(0),
+                    )
+                    .unwrap()
+            };
+            assert_eq!(local_rows(), 1, "{case}: the ingest recorded its local location");
+            // A backup copy on a NAS that is not mounted.
+            let nas = catalog.add_volume("NAS", &dir.join("nas-unmounted"), crate::catalog::VolumeKind::Backup).unwrap();
+            catalog.add_location(id, nas, "2026/06/28/IMG.jpg", crate::catalog::LocationRole::Backup).unwrap();
+            if case != "unverified" {
+                catalog
+                    .conn()
+                    .execute("UPDATE photo_locations SET verified_hash = 'abc' WHERE photo_id = ?1 AND volume_id = ?2", [id, nas])
+                    .unwrap();
+            }
+            if case != "lost-locally" {
+                // What an offload commits: the local location rows go.
+                catalog
+                    .conn()
+                    .execute(
+                        "DELETE FROM photo_locations WHERE photo_id = ?1
+                            AND volume_id IN (SELECT id FROM volumes WHERE kind = 'local')",
+                        [id],
+                    )
+                    .unwrap();
+            }
+            std::fs::remove_file(&name).unwrap();
+            std::fs::remove_file(crate::xmp::sidecar_path(&name)).unwrap();
+
+            let listed = list_card_photos(&card, &root, Some(&catalog)).unwrap();
+            let again = ingest_from_card(&catalog, &card, &root, None).unwrap();
+            if case == "offloaded" {
+                assert_eq!((again.offloaded, again.skipped, again.created, again.restored), (1, 0, 0, 0), "{again:?}");
+                assert!(!name.exists(), "not copied back to this disk");
+                assert!(listed[0].offloaded && listed[0].is_duplicate, "the dialog agrees: {}", listed[0].offloaded);
+            } else {
+                assert_eq!((again.offloaded, again.restored), (0, 1), "{case}: {again:?}");
+                assert!(name.exists(), "{case}: the card's copy is back");
+                assert!(!listed[0].offloaded && !listed[0].is_duplicate, "{case}: the dialog offers it");
+            }
+            assert_eq!(photos(&catalog), [("2026/06/28/IMG.jpg".to_string(), uuid)], "{case}: one row");
+        }
+    }
+
+    /// relB2 LOW-3: a card file whose own name just fits, arriving at a name a different file
+    /// holds, would need a ` (n)` name too long for a sidecar: it is refused as
+    /// `name_too_long` (not an error), the search stops at the first name that does not fit,
+    /// and nothing is copied.
+    #[test]
+    fn a_numbered_name_too_long_for_a_sidecar_is_refused_not_an_error() {
+        let (catalog, _dir, root, card) = ingest_rig("numbered-too-long");
+        let name = (1..=255usize)
+            .rev()
+            .map(|n| format!("{}.jpg", "D".repeat(n - 4)))
+            .find(|n| same_photo::sidecar_name_fits(Path::new(n)))
+            .unwrap();
+        assert!(!same_photo::numbered_fits(Path::new(&name)));
+        std::fs::create_dir_all(&card).unwrap();
+        std::fs::write(card.join(&name), b"\xff\xd8the card's").unwrap();
+        let day = fixed_day(&card.join(&name), &root);
+        std::fs::create_dir_all(&day).unwrap();
+        std::fs::write(day.join(&name), b"\xff\xd8another photo, longer").unwrap();
+
+        let result = ingest_from_card(&catalog, &card, &root, None).unwrap();
+        assert_eq!((result.name_too_long, result.errors, result.created), (1, 0, 0), "{result:?}");
+        assert_eq!(std::fs::read_dir(&day).unwrap().count(), 1, "nothing copied beside it");
+    }
+
+    /// relB2 LOW-1 at the boundary: the longest card file name `sidecar_name_fits` allows is
+    /// imported with its identity in its sidecar (no identity debt); one byte longer is
+    /// refused as `name_too_long`.
+    #[test]
+    fn the_longest_name_imported_carries_its_identity_and_one_more_byte_is_refused() {
+        let (catalog, _dir, root, card) = ingest_rig("name-boundary");
+        let limit = (1..=255usize).rev().find(|n| same_photo::sidecar_name_fits(Path::new(&"D".repeat(*n)))).unwrap();
+        assert!(limit < 251, "the writer's temp name is budgeted: {limit}");
+        std::fs::create_dir_all(&card).unwrap();
+        let fits = format!("{}.jpg", "A".repeat(limit - 4));
+        let over = format!("{}.jpg", "B".repeat(limit - 3));
+        std::fs::write(card.join(&fits), b"\xff\xd8one").unwrap();
+        std::fs::write(card.join(&over), b"\xff\xd8two").unwrap();
+        let day = fixed_day(&card.join(&fits), &root);
+        fixed_day(&card.join(&over), &root);
+
+        let result = ingest_from_card(&catalog, &card, &root, None).unwrap();
+        assert_eq!((result.created, result.name_too_long, result.errors), (1, 1, 0), "{result:?}");
+        let (id, uuid, _, _) = row_at(&catalog, &format!("{}/{fits}", day.strip_prefix(&root).unwrap().to_string_lossy())).unwrap();
+        assert_eq!(crate::xmp::read_identifier(&day.join(&fits)).as_deref(), Some(uuid.as_str()));
+        let debt: i64 = catalog
+            .conn()
+            .query_row("SELECT COUNT(*) FROM pending_sidecar_identity WHERE photo_id = ?1", [id], |r| r.get(0))
+            .unwrap();
+        assert_eq!(debt, 0, "no identity debt");
+        assert!(!day.join(&over).exists());
+    }
+
+    // --- card ingest: a long name the catalog already has (relB3 MEDIUM-B) -----------------
+
+    /// relB3 P2: a row holds a 220-byte name — too long for a new photo's sidecar, but the
+    /// row has it (a folder scan has no limit; an import under the old rule) — and its file
+    /// is lost while its local location row stays. The same capture on a card may be its last
+    /// copy: it goes back to the row's name and re-links the row, as for any lost file; no
+    /// new name is made, so none is refused.
+    #[test]
+    fn a_lost_file_under_a_long_name_is_restored_from_the_card() {
+        if !exiftool_available("a_lost_file_under_a_long_name_is_restored_from_the_card") {
+            return;
+        }
+        let (catalog, _dir, root, card) = ingest_rig("relb3-p2");
+        let long = format!("{}.jpg", "L".repeat(216));
+        assert!(!same_photo::sidecar_name_fits(Path::new(&long)));
+        stamped_jpeg(&card.join(&long), "2026:06:28 12:00:00", "123", "4711");
+        let name = root.join("2026/06/28").join(&long);
+        std::fs::create_dir_all(name.parent().unwrap()).unwrap();
+        std::fs::copy(card.join(&long), &name).unwrap();
+        scan_folder(&catalog, &root, &AtomicBool::new(false), &|_| {}).unwrap();
+        let rel = format!("2026/06/28/{long}");
+        let (id, uuid, _, _) = row_at(&catalog, &rel).unwrap();
+        rate(&catalog, id, 5);
+        std::fs::remove_file(&name).unwrap();
+        let _ = std::fs::remove_file(crate::xmp::sidecar_path(&name));
+        catalog.reconcile_missing_for(&[id]).unwrap();
+        assert_eq!(row_at(&catalog, &rel).unwrap().3, 1, "missing before");
+
+        let again = ingest_from_card(&catalog, &card, &root, None).unwrap();
+        assert_eq!((again.restored, again.name_too_long, again.created, again.errors), (1, 0, 0, 0), "{again:?}");
+        assert!(name.exists(), "the card's copy is back at the row's name");
+        assert_eq!(row_at(&catalog, &rel), Some((id, uuid.clone(), 5, 0)));
+        assert_eq!(photos(&catalog), [(rel, uuid)], "no second row");
+    }
+
+    /// The same capture comes back, but the sidecar at its name now carries another identity
+    /// (or none): the name stays taken — the sidecar is not adopted, not rewritten — and the
+    /// file lands at ` (2)` with a row of its own.
+    #[test]
+    fn a_sidecar_of_another_identity_keeps_the_name_taken() {
+        if !exiftool_available("a_sidecar_of_another_identity_keeps_the_name_taken") {
+            return;
+        }
+        const OTHER: &str = "22222222-2222-4222-8222-222222222222";
+        let (catalog, _dir, root, card) = ingest_rig("lf-other");
+        stamped_jpeg(&card.join("IMG.jpg"), "2026:06:28 12:00:00", "123", "4711");
+        ingest_from_card(&catalog, &card, &root, None).unwrap();
+        let name = root.join("2026/06/28/IMG.jpg");
+        let (id, uuid, _, _) = row_at(&catalog, "2026/06/28/IMG.jpg").unwrap();
+        std::fs::remove_file(&name).unwrap();
+        let sidecar = crate::xmp::sidecar_path(&name);
+        std::fs::remove_file(&sidecar).unwrap();
+        same_photo::test_files::orphan_sidecar(&name, OTHER);
+        let foreign = std::fs::read(&sidecar).unwrap();
+
+        let again = ingest_from_card(&catalog, &card, &root, None).unwrap();
+        assert_eq!(again.created, 1, "{again:?}");
+        assert!(!name.exists());
+        assert_eq!(std::fs::read(&sidecar).unwrap(), foreign, "the sidecar is untouched");
+        let (new_id, new_uuid, _, _) = row_at(&catalog, "2026/06/28/IMG (2).jpg").unwrap();
+        assert_ne!(new_id, id);
+        assert!(new_uuid != uuid && new_uuid != OTHER, "{new_uuid}");
+        assert_eq!(row_at(&catalog, "2026/06/28/IMG.jpg").unwrap().0, id);
+    }
+
+    /// L-e of the second #246 review: one photo met three times in a run, the first copy
+    /// failing. The second is copied (the first is not in the library), and the third is
+    /// skipped against the second — not copied again because the first match it meets is the
+    /// failed one.
+    #[cfg(unix)]
+    #[test]
+    fn a_photo_met_again_after_a_failed_copy_is_skipped_against_the_copy_that_landed() {
+        use std::os::unix::fs::PermissionsExt;
+        let (catalog, _dir, root, card) = ingest_rig("failed-first");
+        let mtime = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_782_648_000);
+        let files: Vec<PathBuf> = ["A", "B", "D"].iter().map(|f| card.join(f).join("IMG.jpg")).collect();
+        for f in &files {
+            std::fs::create_dir_all(f.parent().unwrap()).unwrap();
+            std::fs::write(f, b"\xff\xd8one").unwrap();
+            std::fs::File::options().write(true).open(f).unwrap().set_modified(mtime).unwrap();
+        }
+        let set_mode = |mode: u32| {
+            for f in &files {
+                std::fs::set_permissions(f, std::fs::Permissions::from_mode(mode)).unwrap();
+            }
+        };
+        // Whichever file the walk meets first cannot be read when it is copied (after the
+        // plan read them all); the others can.
+        let (result, copied, _) = copy_from_card_abortable(&catalog, &card, &root, None, &AtomicBool::new(false), |done, _| {
+            match done {
+                1 => set_mode(0o000),
+                2 => set_mode(0o644),
+                _ => {}
+            }
+        })
+        .unwrap();
+        set_mode(0o644);
+        assert_eq!((result.scanned, result.errors, result.skipped, copied.len()), (3, 1, 1, 1), "{result:?}");
+        let copies: Vec<PathBuf> = WalkDir::new(&root)
+            .into_iter()
+            .filter_map(|e| e.ok())
+            .map(|e| e.into_path())
+            .filter(|p| p.is_file())
+            .collect();
+        assert_eq!(copies.len(), 1, "{copies:?}");
+        assert!(copies[0].ends_with("IMG.jpg"));
+    }
+
+    /// N-a of the second #246 review: the import dialog's listing flags the second meeting of
+    /// one photo in a card as already imported, as the copy skips it (both decide by one plan,
+    /// `plan_card`).
+    #[test]
+    fn the_listing_flags_what_the_copy_skips() {
+        let (catalog, _dir, root, card) = ingest_rig("listing");
+        for folder in ["A", "B"] {
+            std::fs::create_dir_all(card.join(folder)).unwrap();
+            std::fs::write(card.join(folder).join("IMG.jpg"), b"\xff\xd8one").unwrap();
+        }
+        let flagged: Vec<String> =
+            list_card_photos(&card, &root, None).unwrap().into_iter().filter(|p| p.is_duplicate).map(|p| p.path).collect();
+        assert_eq!(flagged.len(), 1, "{flagged:?}");
+        let (result, copied) = copy_from_card(&catalog, &card, &root, None, |_, _| {}).unwrap();
+        assert_eq!((result.skipped, copied.len()), (1, 1));
+    }
+
+    /// An abort while the collisions are being read copies nothing.
+    #[test]
+    fn an_abort_before_the_copy_copies_nothing() {
+        let (catalog, _dir, root, card) = ingest_rig("abort");
+        std::fs::create_dir_all(&card).unwrap();
+        std::fs::write(card.join("IMG.jpg"), b"\xff\xd8one").unwrap();
+        let (_, copied, aborted) =
+            copy_from_card_abortable(&catalog, &card, &root, None, &AtomicBool::new(true), |_, _| {}).unwrap();
+        assert!(aborted && copied.is_empty());
+    }
+}

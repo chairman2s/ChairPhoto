@@ -1,0 +1,3 @@
+[submodule "crates/core/vendor/LibRaw"]
+	path = crates/core/vendor/LibRaw
+	url = https://github.com/LibRaw/LibRaw.git

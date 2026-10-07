@@ -1,0 +1,8 @@
+#!/bin/sh
+# A fake ffmpeg that never finishes: it writes a partial output (the last argument, a file:
+# URL), says it has started with one progress line, then sleeps until the test kills it.
+# Checked in, never written by a test (see ffmpeg-ok).
+for last; do :; done
+printf partial > "${last#file:}"
+echo frame=1
+exec sleep 30

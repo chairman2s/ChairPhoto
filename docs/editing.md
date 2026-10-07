@@ -15,20 +15,23 @@ aliases:
 A non-destructive editor for crop, tone and film looks. Your original RAW or JPEG is never
 modified — that is a binding architecture invariant, not a policy this module chose.
 
-Editing arrives as a full-window **Develop** tab rather than a modal, following the darkroom
-metaphor: a version bar, crop with social aspect presets and Free (drag to move, resize from the
-corners, live pixel-size readout), composition overlays (none, thirds, phi grid, golden spiral —
-remembered in `editor.crop_overlay`), tone sliders for EV, contrast, highlights, shadows and
-white balance (double-click any slider to reset), a live proxy preview, and auto-save to the
-active version.
+Editing arrives as a full-window **Develop** tab rather than a modal: the **Darkroom**
+(docs/plans/darkroom — since its slice 8 the only Develop surface; the classic editor view
+is retired). A version bar, the tone strip (the histogram as a control), the proof sheet and
+duels, the preset browser, crop with social aspect presets and Free (drag to move, resize
+from the corners, live pixel-size readout), composition overlays (none, thirds, phi grid,
+golden spiral — remembered in `editor.crop_overlay`), tone sliders for EV, contrast,
+highlights, shadows and white balance in Kelvin or relative (double-click any slider to
+reset), a filmstrip, the pop-out loupe print, and autosave with history.
 
 A photo can carry **multiple versions** — several crops, or the same frame at different
 exposures — each independently editable and exportable.
 
 **Packaging.** The render engine is gated behind the `edit` Cargo feature, while the loupe's
 render hook belongs to the bundled Basic Editor module. Disable the module and the loupe falls
-back to the original image with the Develop and Edit entry points hidden. Full-resolution RAW
-decode for export sits behind the `raw` feature via LibRaw.
+back to the original image with the Develop and Edit entry points hidden. The RAW decode —
+Develop's working image and every engine-2 render and export — sits behind the `raw`
+feature via the vendored LibRaw; without it Develop works on the camera preview.
 
 ## Goal & requirements
 
@@ -67,7 +70,8 @@ CREATE TABLE photo_versions (
     edit_json  TEXT NOT NULL,            -- crop + tone for THIS version (shape below)
     position   INTEGER NOT NULL,         -- display order
     created_at INTEGER NOT NULL,
-    updated_at INTEGER NOT NULL
+    updated_at INTEGER NOT NULL,
+    changed_seq INTEGER NOT NULL DEFAULT 0  -- settings-write order: the automatic face (#252)
 );
 ```
 
@@ -82,6 +86,109 @@ CREATE TABLE photo_versions (
   duplicate, delete, pick the active version to edit/preview.
 - The **grid** shows the master thumbnail with a small **"N versions" badge** — no extra
   tiles, no stacks. Versions are chosen at export time.
+
+### History and autosave (the Darkroom)
+
+The Darkroom saves every change to the **active version** as it goes — settings only, never
+pixels, never the original or its sidecar (user decision 2026-09-24, replacing the slice-7
+sandbox). A photo with no version gets "Version N" on its first change; "Original" on the
+shelf shows the unedited file, and changing anything there starts a new version. "+ New
+version" copies the current settings into a new version and continues there.
+
+Each settled change (0.6 s of quiet) is a **history step** on that version, named after what
+changed ("Exposure +0.50", "Crop 4:5", "Proof: Portra", "Reset"). The same control still
+moving within four seconds amends its step rather than adding one, so a keyboard nudge or a
+second drag is one step. Step 0, "Before", holds what the version had when its history
+began, so the first change is always undoable.
+
+The History panel (top of the rail) lists the steps newest first; clicking one — or Ctrl+Z /
+Ctrl+Shift+Z / Ctrl+Y — makes it current and saves its settings back into the version. The
+steps after it stay until the next change, which **replaces** them (a list, not a tree). At
+most 200 steps per version are kept. Pending changes are saved before a step, a version
+switch, or leaving the photo.
+
+**Filmstrip.** The Darkroom's bottom strip shows the Library's photos in their current
+order and filter, the one being developed centred. Click a frame, or ← / →, to move on
+(the arrows are left alone while a slider, field or the proof sheet/duel has them). Moving
+on saves first. With the RAW engine on, the next and previous photos are already decoded
+in memory (docs/plans/raw-foundation, slice 4), so a step shows the RAW at once.
+
+**Cover (the Library face).** A photo's face in the Library grid, the Bench and the
+filmstrip is the look of its **most recently changed version** — the one whose settings were
+written last: a settled edit, a proof adopted, a history step (undo/redo included), a new or
+duplicated version, the versions a bundle brings with a photo new to the catalog (the last in
+bundle order). Opening or renaming a version
+is not a change, and neither is a version merged into an existing photo from a bundle or
+another catalog: it is set aside (`catalog::edits::set_aside`), like a What-if below
+(#252 decision 2). With no versions it is the original (owner decision, #252). A Duel's "What-if"
+variant is a side branch, not a change: it is banked beside the version being edited and the
+face stays where it was — on another version or on the original — until the variant itself is
+edited ("+ New version" does move it, as editing continues there; #252 decision 2026-10-06,
+`catalog::NewVersion::Aside`). "☆ Use as cover" on the
+Darkroom bar **pins** what is shown as the face — the version being edited, or, with
+"Original" chosen on the shelf, the untouched original — and it stays the face whatever is
+edited later; "★ Cover" unpins it, and the face follows the latest change again. The bar says
+"Face: latest edit" while nothing is pinned, and the shelf stars the pinned chip. Deleting
+the face's version falls back to the next most recently changed version, else the original;
+a pin on a deleted version is lifted.
+
+The original is untouched: the grid thumbnail is rendered from the version's settings at
+512 px on a worker (`plugins/edit/cover.rs`, with the RAW engine when the version uses it) and
+cached under `<cache>/chairphoto/cover512v2/`, keyed by file and settings. If that render
+fails the plain thumbnail is shown; the original's own thumbnail is still kept as the
+offline fallback. The photo row carries a face token, `"<version>:<rev>"` (none for the
+original), which the views ask for the thumbnail under; `rev` rises on every change of the
+face — it moving to another version, the face version's settings changing, a pin or unpin, a
+deletion — so no view shows a cached stale face. Only settled writes count, so a slider drag
+renders no faces; the Library's rows (and so the faces) are re-read when Develop is left
+and after a pin or a version operation. When the filmstrip steps on from a photo whose
+changes were saved, only that photo's face is read again (`ShellState::refresh_face`), not
+the whole library. The original's offline fallback thumbnail is refreshed on the face path
+as on the plain one, so a rotation change does not leave it stale.
+
+Stored in the core table `photo_cover` (one row per photo): `version_id` is the face itself,
+kept current in the transaction of every write that can move it (`catalog::edits`,
+`settings_written` / `refresh_face`), `pin` says how it is chosen (0 automatic, 1 the
+version, 2 the original), and `rev` counts. Versions order by `photo_versions.changed_seq`,
+which each settings write sets one past the photo's highest; only a version above 0 is a
+candidate, and a version banked aside goes below every other and below 0, so it never is
+until it is written. Covers set before #252 migrate
+as pinned. Local to this catalog like the history: catalog merge and bundle export do not
+carry it.
+
+**An older build on the same catalog** (review of #252, L1; schema v28). A trigger in the
+catalog file keeps `changed_seq` true whichever build changes a version's settings
+(`Catalog::ensure_face_trigger`): the version becomes the photo's latest change, and the
+face's `rev` rises when its own settings change. A version a build that does not know the
+column creates is left at `changed_seq` 0, no candidate (this build never leaves one at 0:
+a version that must not be a change — a What-if, a version merged into an existing photo —
+is stored below 0, `catalog::edits::set_aside`); when an open finds the catalog
+stamped below v28 since this build last opened it (every build stamps its own schema on
+open), those versions become their photos' latest changes, in `updated_at` order — after
+everything else that build did, whatever the order it did it in. Every open then moves each
+face left behind (`Catalog::heal_faces`: an automatic face that is not the latest change, a
+version pin whose version is gone). What older builds do with a v28 catalog:
+
+- The packaged **2026.8.0** (schema 19, the Tauri shell) opens it without complaint — it has
+  no newer-schema check — and stamps it back to 19. It knows nothing of faces: it never reads
+  or writes `photo_cover`, so it shows the original everywhere. Its edits are ordered by the
+  trigger, its new, duplicated and merged versions by the next open; its deletion of a face's
+  version leaves a NULL face (`ON DELETE SET NULL`). The next open by this build heals the faces. Because of
+  the stamp, that open also re-runs the backfills gated on v23, v24 and v26, each of which
+  touches only rows not yet migrated.
+- A **pre-#252 GPUI build** (schema 26) does the same, and its "Use as cover" writes
+  `photo_cover.version_id` without `pin`: on a photo that had no row, or an automatic one,
+  that cover reads as automatic and the next open moves it to the latest change. A cover it
+  sets on a photo already pinned stays pinned.
+- From this build on, a catalog stamped with a **newer** schema than the build knows is
+  refused on open (`CatalogError::NewerSchema`), nothing written; a later build that changes
+  what an older one would misread bumps `SCHEMA_VERSION`.
+
+Storage: core tables `photo_version_history` and `photo_version_history_head`
+(`catalog/schema.rs`), both cascading with their version. They are local to the catalog:
+catalog merge and bundle export carry versions but not their history. Every write that
+changes a version's settings — a save, a commit, a step — refreshes the photo's monochrome
+flag and auto-tag the same way (`commands::editing::write_version_then_refresh_monochrome`).
 
 ## Edit record shape (resolution-independent)
 
@@ -174,9 +281,11 @@ parser + mtime cache in `plugins/edit/cube.rs`; LUT files managed via
 **Develop presets** (`src/modules/presets.ts`): built-in library of parameter recipes
 (monochrome filter styles, sepia/selenium, film stocks like Tri-X/Kodak Gold/Portra/
 Ektachrome/Kodachrome/Velvia) + user presets saved under the settings key
-`basic-editor.presets`. Presets are look-only — never crop/straighten. The preset browser
-(`src/components/PresetBrowser.tsx`) shows the current photo rendered per preset via one
-`render_edit_batch` call (proxy decoded once).
+`basic-editor.presets`. Presets are look-only — never crop/straighten. The Darkroom's preset
+browser (`src/components/PresetBrowser.tsx`) shows the current photo rendered per preset, each
+card an `edit://` render from the Darkroom's own source and engine; "☆ Save as preset" on
+the bar saves the current look (`lookOnly`), and the browser renames and deletes user
+presets.
 
 ## Aspect-ratio presets (social), as data
 
@@ -208,15 +317,151 @@ implemented — the crop fixes shape, resize would fix pixels.
 
 ## Rendering & export
 
-- **Live preview:** render the cached **preview proxy** (embedded JPEG, ~fast) as sliders/crop
-  change (debounced). Proxy quality is fine for judging an edit.
-- **Loupe:** shows the active version's render when the module is enabled; otherwise the
-  unedited preview (the core edit contract already falls back).
-- **Edited export — decided: render from a full RAW decode.** "Show off" (JPEG) renders each
-  chosen version from the **full-resolution source**: a decoded RAW for RAW originals, or the
-  original JPEG for JPEG-only photos. This gates *edited RAW export* on a RAW decoder that
-  doesn't exist yet (see Phase 3) — JPEG-only originals can export edited immediately.
-  Per-version filenames (`<stem> - <version>.jpg`), collision-safe.
+- **What Develop renders from.** A RAW the bundled decoder supports is developed from the
+  RAW itself (engine 2, below) — the default since the swap (docs/plans/raw-foundation,
+  slice 8; the `develop.rawEngine` setting is gone). The camera's embedded **preview proxy**
+  is what the stage shows for the moment the RAW is being prepared, and what engine 1
+  renders from: JPEG-only photos, RAWs the decoder does not support yet (the bar says so and
+  names the camera), and versions saved on engine 1.
+- **Two caches make the drag cheap.** The proxy JPEG is decoded once (a one-slot cache
+  keyed by the bytes' fingerprint), and `render_proxy` keeps the **framed base** — the
+  proxy after perspective → straighten → crop → downscale, before the look — keyed by
+  (proxy fingerprint, geometry, edge), four entries, least recently used out. A look-only
+  slider frame therefore pays the look and the encode and nothing else; a geometry change
+  is a miss and re-frames. Both caches are byte-identical to the uncached path (locked by
+  tests in `plugins/edit`).
+- **Transport — in-process, no encode, no protocol.** Every render — the Darkroom stage, the
+  loupe's active version, the Duel's two variants, the Proof sheet and the preset browser —
+  is an `EditJob { photo_id, edit_json, max_edge, hi_res, base_only, source, clip,
+  catalog }` (`crates/core/src/image_pool.rs`) submitted to the same bounded LIFO image
+  pool as thumbnails/previews/zoom, under `JobKey::Edit`: the newest job renders first and
+  identical jobs coalesce into one render, which is what makes slider spam safe.
+  `media::render_edit_image` runs it and hands GPUI the result directly as a BGRA
+  `RenderImage` texture — no JPEG/PNG encode, no URL, no IPC, so there is nothing to cache or
+  bust: a regenerated proxy or re-imported LUT is simply a new job. `source` names the working
+  image to render from (the camera preview, or a resident RAW by token), `clip: true` asks for
+  the sensor-clipping overlay instead of the render, and `base_only: true` renders the
+  geometry only (perspective → straighten, no crop, no look). `hi_res: true` renders from the
+  native-size zoom tier instead of the 2048 px proxy. Every job carries the `CatalogIdentity`
+  its photo id was read from (#251) — the Darkroom's open (`OpenPhoto::from`) for the stage,
+  the Duel, the Proof sheet and the loupe print; the shell's rows (`rows_from`) for the
+  loupe's active version — so a request from before a catalog switch can never merge into,
+  or be handed to, one made after. The worker renders a job only while that catalog is still
+  open, checked under the catalog lock together with the photo's read (`with_catalog_as`'s
+  check): a switch publishes the new catalog before `catalog:switched` reaches the UI, and a
+  job reaching a worker in that window answers `CATALOG_CHANGED` and renders nothing, never
+  the new catalog's photo of that id. The front end drops that answer — the stage like a
+  cancellation, `EditRenders` as `RenderState::Stale` (nothing drawn, no failure, not asked
+  again). An engine-2 render reuses a resident or offline decode only if it is the job's
+  catalog's photo (the decodes are keyed by catalog identity and photo id, #259), and checks
+  the catalog again after the load: a switch during it answers `CATALOG_CHANGED`. One render path (`media::render_edit_image`) serves every
+  caller, engine-1 and engine-2 alike: it branches internally on the record's engine and on
+  whether a resident RAW working image exists for the job's source token.
+- **Loupe:** shows the active version's render when the module is enabled (`renderForLoupe`):
+  an engine-2 version is the RAW through its pipeline at 2560 px, full size to zoom — from
+  the Darkroom's own working image while it prints there, else from an offline load — and
+  an engine-1 version renders as it always has; otherwise the unedited preview.
+- **Edited export.** "Show off" (JPEG) renders each chosen version at full resolution: an
+  engine-2 version from its working image (below — it *is* the view); an engine-1 version
+  from a LibRaw decode tone-matched to the camera preview it was judged on, or from the
+  original for JPEG-only photos. Per-version filenames (`<stem> - <version>.jpg`),
+  collision-safe.
 - **Hand-off export (RAW + XMP) stays unedited** — you're giving the RAW to another editor;
   crop/exposure are not written into the sidecar (merge-safe invariant).
+
+### Two engines, one record shape (docs/plans/raw-foundation)
+
+Every record carries an **engine id** — absent or `1`: the pipeline above, on the camera's
+embedded preview, rendered exactly as it always was; `2`: the scene-linear pipeline on the
+RAW **working image**. A version means one thing forever: the Darkroom never reinterprets
+an engine-1 record as engine 2 (an EV of +1 on gamma pixels is not the same picture as +1
+in linear light). New edits of a supported RAW are engine 2. A saved engine-1 version keeps
+rendering on engine 1 even with the RAW open, and the bar offers **Develop with the new
+engine**, which forks "<name> (RAW)" with the framing copied and tone and look reset.
+
+- **Working image.** Opening a photo in the Darkroom claims the `develop` job family and
+  decodes the RAW on its own thread (`raw::decode_linear`: 16-bit, gamma 1.0, sRGB/Rec.709
+  primaries, as-shot white balance, no auto-brightening, highlights clipped at sensor white,
+  the camera's visible rectangle) into an f32 image held by `develop::ResidentSet`. A photo
+  switch, leaving Develop, or a catalog switch trips the claim and releases it (the switch releases in its detach phase, with the slot); a
+  decode that finishes after a newer claim removes only its own image. Each transition trips
+  the old claim before it releases, and a worker checks its claim under the resident set's
+  lock before inserting, so a tripped worker's decode is never resident, even for an instant
+  (#259). Each resident image also records the catalog its photo id came from: a claim, a
+  render outside Develop or an export takes only its own catalog's decode of an id, and a
+  claim is taken only while the catalog its photo was read from is still open. The resident set's
+  lock is a leaf in the `commands::jobs` lock order. Each of those transitions is forced in
+  `develop::session::tests` and `commands::jobs::tests`. The event
+  `develop:source` carries the state — `preview` (preparing), `raw` with the **token**
+  `w:<photo>:<generation>`, `unsupported` with the camera, `jpeg`, `nodecoder`.
+- **Decoder.** LibRaw, vendored as a pinned submodule and compiled in (`raw` feature; LGPL-2.1,
+  see `MODULE_LICENSING.md`). Every call runs under the crash marker: a file that took the
+  process down twice is skipped and Develop stays on its preview, saying so. A camera
+  newer than the decoder is *RAW not supported yet* on the bar, never a silent fallback.
+- **Caches, each bounded.** The `.rawf` **decode cache** keeps each decoded RAW on disk
+  (uncompressed, keyed by file size, mtime and decoder version; Preferences › Darkroom sets
+  its size, default 20 GB, oldest first out), so a second open is a read. The **resident
+  set** holds the open photo and its preloaded neighbours in memory (4 GB budget; the open
+  photo is never evicted for a neighbour). One **offline** image (`develop::offline`) serves
+  engine-2 renders outside Develop — the Library loupe, cover thumbnails, exports — loaded
+  one at a time and kept 60 s. The **framed-base cache** keeps four geometry-applied bases,
+  linear ones only up to 2560 px. **Cover** thumbnails cache on disk per file and look.
+- **Camera match.** When a working image is prepared it is measured against its own camera
+  JPEG (`linear::camera_match_ev`), and a new engine-2 record stores that offset as
+  `cameraEv`: the extended-low-ISO pull, a body's metering bias, and a global share of DRO
+  that one fixed curve cannot carry.
+- **Sensor clipping.** *◩ Clipping* on the bar overlays, in magenta, where the RAW itself
+  is clipped (`edit://…&k=1`) — the only white no slider can bring back.
+- **Source on every render.** `edit://…&s=<token>`, `render_edit_batch` and
+  `edit_zone_masses` name the pixels they render from. A token that is no longer resident is
+  a 404, never a fallback to the preview; engine 2 refuses a preview source and engine 1
+  refuses the working image (`plugins/edit/source.rs`, `RenderSource`).
+- **Engine 2's pipeline** (`plugins/edit/linear.rs`): exposure and white balance as
+  multiplications of linear light (values above white survive), then one display
+  transform (`display`: absent/`"srgb"`, `"soft"` with a highlight shoulder, or
+  `"camera"`, the per-channel curve fitted to the camera's own JPEGs, or `"camera.2"`,
+  that curve after a fitted camera colour matrix, which new engine-2 records get by
+  default; a record keeps the transform it was saved with) with a
+  `BASELINE_EV` lift plus the record's `cameraEv` — the offset that matched this photo's
+  camera JPEG, measured when the RAW was prepared and stamped on a new engine-2 record —
+  so as-shot lands at the camera JPEG's brightness, then the *same*
+  display-domain look as engine 1 — zones, region sliders, contrast, saturation, and the
+  finish (B&W, LUT, split, fade, vignette, grain) — so presets mean the same on both.
+  Geometry (perspective → straighten → crop → downscale) runs on the f32 image; the
+  framed-base cache keys on the token instead of the JPEG fingerprint.
+- **White balance on engine 2** is a tagged meaning on `tone.wb`: `mode` absent or
+  `"relative"` (warmer/cooler than as-shot, the same gentle gains as engine 1) or
+  `"kelvin"` — the scene's light, `kelvin` plus `tint` (+100 = one stop less green),
+  rendered as a change of balance in the camera's own space
+  (`rgb_cam · diag(b / as-shot) · rgb_cam⁻¹`, green held). The balance for a stated light
+  comes from the **camera's own white-balance table** where the file has one (LibRaw's
+  `WBCT_Coeffs`, interpolated in mireds), else from the decoder's daylight multipliers and
+  matrix. The as-shot light is solved the same way, so rendering it is exactly the picture
+  as shot, and a blank white balance and "as shot" are the same record. The Darkroom's
+  rail shows Kelvin (slider 2000–12000 K, log; double-click = as shot) or the relative
+  pair, switched by *K/±*; which one a fresh RAW edit shows is Preferences › Darkroom
+  (`develop.wbSlider`, Kelvin by default). The proof sheet's warm/cool cells and the
+  duel's warmth round step stated light in mireds on the RAW. A camera with neither table
+  nor daylight white refuses Kelvin with a clear error, never a silent relative.
+- **Export of an engine-2 version** renders the same working image the view does — the
+  Develop session's, or one bounded load from the `.rawf` cache or the decoder
+  (`develop::offline`) — through the same pipeline at full size; the tone-matching step
+  belongs to engine 1 only. At 100 % the export equals the view byte for byte
+  (`export_at_full_size_is_the_view_at_full_size`). Every engine-2 export is also checked
+  against the view at Fit (`plugins::edit::parity`: the view's 512 px render against the
+  export scaled to it, mean |Δ| ≤ 6 levels — above what resampling order alone produces on
+  a detailed frame, below any other-source or other-pipeline mismatch) and tallied per
+  catalog in `metrics.exportParity`; Preferences › Darkroom shows the count — the product's
+  success metric, "0 exports that differ from the view".
+
+### Measuring the render path
+
+Every stage of a render can be timed without a profiler: `CHAIRPHOTO_EDIT_TIMING=1` makes
+the backend print one `[edit-timing]` line per render (stages, total, and the build profile —
+a debug `cargo run` without `--release` runs the engine unoptimized, so its numbers are not
+release numbers), and the Darkroom's Preferences toggle "Log render timings to the console"
+adds the GPUI half: submit-to-paint and drag cadence per frame, summarized every 2 s and
+persisted under `editor.renderTiming.lastSummary`. The ignored bench
+`plugins::edit::bench::render_stage_timings` gives the same stages in isolation; see
+`docs/performance-harness.md` § Edit render bench.
 

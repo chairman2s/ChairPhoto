@@ -105,6 +105,14 @@ and again at the next phase boundary, and a catalog switch stops it the same way
 stop, not a rollback: the pass is idempotent, so suggestions already written stay and a re-run
 recomputes the rest.
 
+Auto-seeding confirms faces, so the run ends by writing the face regions of the photos it seeded
+(#210; phase "writing face regions"), through the face verbs' own write — merge-safe, backed up
+before ChairPhoto's first write to a sidecar, refused where the sidecar's frame cannot hold the
+boxes. It runs on the job's own connection and reads each photo's set under the sidecar's file
+lock, so a face verb writing the same sidecar meanwhile is ordered with it. A cancel or a switch
+stops it at the next photo; a photo it did not reach, or that was offline, keeps its seed out of
+the sidecar until the next face write for that photo, as do seeds of runs before #210.
+
 ## Indexing
 
 A background worker with its own catalog connection, bounded parallelism,
@@ -129,26 +137,229 @@ Working Group schema that digiKam, Lightroom and Picasa all understand. The code
 `crate::xmp` (`write_face_regions` / `read_face_regions`); the catalog-side wiring is in
 `plugins/faces/regions.rs`.
 
-**Structure.** `mwg-rs:AppliedToDimensions` records the photo's **oriented** pixel size — EXIF
-dimensions with the non-destructive `user_rotation` applied, so a 90°/270° rotation swaps the
-axes. That is the reference frame for the normalized areas. Each region in the `RegionList`
+**The frame.** Face boxes are stored normalized in one canonical frame, the **display frame**:
+the photo as its own metadata orients it (the oriented preview the indexer detects on),
+**without** the non-destructive `user_rotation`. The loupe draws the picture with the user
+rotation applied, so the overlay turns each box by it for display and turns a box drawn on the
+rotated picture back before storing it. The user rotation lives only in the catalog — the
+original is never rewritten and the sidecar carries no orientation of ours — so the export
+ignores it too: other tools see the file unturned, and so must its regions.
+
+MWG regions use a different frame, the **stored frame**: region coordinates are measured on
+the stored image, before its EXIF Orientation is applied, and `AppliedToDimensions` is the
+stored image's size. This is the rule of the MWG *Guidelines for Handling Image Metadata* 2.0
+for image regions as we understand it. **Citation unverified:** earlier text here quoted it
+as § 5.9 ("relative to the stored image, prior to the application of the Exif Orientation
+tag"), but no copy of the guidelines was available offline to check the section number or
+the wording (#154; exiftool's `MWG.pm` only links the PDF). A scan records each photo's EXIF
+Orientation (`photos.exif_orientation`, 1–8, from exiftool's `EXIF:Orientation`; schema v26
+fills it for photos scanned earlier from the metadata they already stored). The export turns
+each box from the display frame into the stored frame by that orientation — all eight,
+mirrors included — and the import (`read_face_regions_in`) turns a region back before matching
+it to the detections. **An unknown orientation is never guessed:** the boxes are written and
+read as they are.
+
+**HEIF/HEIC** (#154) is turned by its container, not by EXIF: the `irot` (rotation) and `imir`
+(mirror) properties of the primary item, applied in the order the item lists them. The
+preview goes through ImageMagick's libheif delegate, which applies them once and leaves the
+EXIF Orientation unapplied (observed with ImageMagick 7.1.2-31 and libheif 1.23.4 on files in
+`crates/core/tests/fixtures/heif/`; a test pins it where `magick` decodes HEIC). So for a
+`.heic`/`.heif` the region writer reads the container (`metadata::heif`, the `meta` box only)
+and uses its turn as the orientation (`RegionFrame::with_container`): an EXIF Orientation that
+agrees, or none, is fine; one that **disagrees**, or a container that cannot be read, makes
+the turn **doubted**, and no region is written or imported for that photo — the preview
+follows one turn, a tool going by EXIF perhaps the other, and which frame is stored cannot
+be told. On 942 iPhone/iPad HEICs on the development machine the primary item's turn agreed
+with EXIF in 935 and 7 had no EXIF Orientation; none disagreed. (exiftool's
+`QuickTime:Rotation` is not always the primary's turn: on 27 recent iPhone files it reports
+another item's `irot`, 0, while the primary's is 270° anticlockwise.)
+
+**The preview cross-check** (#154, review L2). The stored size comes from metadata, and a
+writer that records it in the display frame defeats the swapped-dimensions rule below: the
+boxes would land in the wrong frame with no error. So the writer and the importer also take
+the size of the cached 2048 px preview the faces were found on
+(`thumbnails::cached_preview_size`, its header only; nothing is generated). When both sizes
+are known, the preview must have the stored aspect turned by the orientation — swapped for
+5–8, as is for 1–4 and for an unknown orientation — within 2%; otherwise the photo's region
+write is refused and its import reads nothing. With no cached preview the check is skipped
+and the rules below apply as before. Only the preview's aspect counts, never its pixel size,
+and the face boxes are stored normalized, so a preview regenerated at another size (#245:
+a small original's preview, once upscaled to 2048 px, is now its own size) changes nothing
+written. Until a photo's preview is regenerated, the size of the one it replaces stands in —
+from the old `p2048v5` cache directory, or from the `p2048v5.sizes` list the cleanup keeps
+of it before removing that directory — so the version bump does not turn the check off. On the development machine it refuses 6 of the 7 iPhone HEICs without EXIF
+Orientation: their pixels were re-rendered (cropped or turned upright, apparently by an edit
+on the phone) while their EXIF still records the original 4032×3024 size.
+
+**Structure.** `mwg-rs:AppliedToDimensions` records the stored pixel size — the photo's recorded
+`width` / `height` (EXIF `ExifImageWidth` / `ExifImageHeight`) — never swapped for the EXIF
+Orientation or a user rotation. A photo with no recorded size gets no `AppliedToDimensions`
+(there is no `1×1` stand-in).
+
+**An `AppliedToDimensions` already in the sidecar is never rewritten** (#145): the regions
+other tools wrote are normalized against it, so changing it would move them. ChairPhoto writes
+`AppliedToDimensions` only into a `Regions` that has none, and otherwise puts its boxes into the
+frame the sidecar declares (`region_target`; the import reads by the same rule):
+
+| Declared size | Known orientation | ChairPhoto's boxes go in |
+|---|---|---|
+| none, or ChairPhoto's old `1×1` | any | the stored frame |
+| the stored image's aspect (resized or not) | any | the stored frame |
+| the aspect swapped | 5–8 (turned a quarter) | the display frame the size describes |
+| anything else, or a size without a usable `w`/`h` | any | **refused** |
+| any, with the photo's size unknown | 5–8 | **refused** — which frame is meant cannot be told |
+| any | unknown | as they are |
+| any | doubted (HEIF), or not the preview's frame | **refused** — the boxes' own frame is not known |
+
+A refused write fails with an error naming the sidecar and leaves it byte for byte as it was;
+a refused frame imports nothing.
+
+Each region in the `RegionList`
 carries `mwg-rs:Name` (the person tag's leaf name), `mwg-rs:Type="Face"`, and an `mwg-rs:Area`
 whose `x`/`y` are the rectangle's normalized **center** — MWG stores centers, not corners — with
 `w`/`h` as the size. Stored bboxes are top-left-normalized, so the writer converts corner→center
 and the reader converts back.
 
 **Merge safety is binding.** The RegionList may already contain regions written by other tools.
-The writer rebuilds it from the foreign regions it did not write plus ChairPhoto's current
-confirmed set. A region counts as ours — and is therefore replaced — only when its `Name` matches
-one we are writing *and* its center area is within `AREA_EPSILON = 0.02`. **When in doubt, the
-region is preserved.** Re-writing updates only ChairPhoto's own regions and can never duplicate
-or clobber a foreign face.
+The writer edits the existing `Regions` in place, never rebuilds it. **Every region ChairPhoto
+writes carries its marker** (#135), and a catalog replaces or removes only regions carrying
+*its own* marker.
+
+**The marker format is stable** — it is on disk in users' sidecars, and changing it needs a
+legacy rule of its own. It is a `chairphoto:FaceId` struct field
+(`https://chairphoto.local/ns/1.0/`) of the region, whose value is
+
+```
+<catalog UUID>/<face id>
+```
+
+— the writing catalog's identity, exactly as `settings.catalog_uuid` holds it (a UUID v4,
+lowercase and hyphenated, minted once on the catalog's first open; `catalog::CATALOG_UUID_KEY`),
+a `/`, and the face's `faces__faces.id` in canonical decimal (no sign, no leading zero:
+`/007` is not `/7`). Face ids are `AUTOINCREMENT`, so a catalog never reuses one. A region whose marker names another catalog — a second catalog over the same
+folders, or this catalog's predecessor before a rebuild — or whose value is anything but exactly
+this form is **foreign**: never removed, never re-marked.
+
+A copy of a catalog file — a sync between two machines, a restored backup — shares the
+original's identity *and* its face-id counter, so the two copies write the same markers for
+different faces. A marker is therefore this catalog's only for a **face it knows on that
+photo**: one in the set being written, or one of the photo's faces that has left it (rejected,
+ignored, unnamed). A marker with this catalog's identity but a face id it does not know on that
+photo came from a copy and is foreign like any other (review N1). A region of a face that is
+still in the set but no longer recognisably that face (step 1) is kept as it is — it may be the
+copy's face of the same id — until another region carries the same marker and is claimed
+(step 3). Deleting a drawn box writes the photo's regions first, while its id is still known.
+
+**A limit of copies** (review F4, #209): when both copies later create a face with the *same*
+id on the *same* photo — a re-index of a changed file, or a drawn box, after the copy — the
+two faces carry the same marker, and nothing in the sidecar tells them apart. A write by one
+copy then treats the other's region as its own: it removes it once its own face of that id
+leaves the set (rejected, ignored, unnamed), or once its own region with that marker is
+claimed beside it. A per-copy marker would need a new marker format, which is stable on disk,
+so this is documented rather than fixed. Ids colliding on *different* photos, and every region
+from before the copy, are unaffected.
+
+Each write sends the photo's whole confirmed set, and for each existing region, in this order:
+
+1. **This catalog's marker, with the id of a face in the set** (and still that face's name or
+   place): moved to the face's box and renamed to its person. A renamed person or a
+   re-detected box no longer leaves a stale copy behind.
+2. **This catalog's marker, same Name and center within `AREA_EPSILON = 0.02` of a face in the
+   set** (a face id that changed): taken over the same way.
+3. **This catalog's marker, matched by nothing, for a face of this photo that has left the
+   set:** removed. This is how a **rejected or ignored** face, or one whose person was removed,
+   leaves the sidecar. **Or for a face still in the set, when another region claimed in
+   step 1 or 2 carries the same marker after the write** (#209): that one is the face, and
+   this one a stale copy — left by a write that renamed *and* moved the face in one go (a new
+   person, and the orientation found by a rescan), which step 1 cannot follow and so appends
+   beside it. The photo's next write claims the new region and removes the stale one.
+4. **Anything else — unmarked, or another catalog's:** foreign, and **always kept**. When its
+   Name and center (within `AREA_EPSILON`) match a face in the set it is that face already in
+   the file — a Lightroom region ingested earlier, say: only its `Area` coordinates
+   (`stArea:x/y/w/h/unit`) are updated, in the form they are written in, and no marked copy is
+   appended. Its marker (if any), `mwg-rs:Rotation`, `Type`, extensions and foreign attributes
+   such as `digiKam:Confidence` stay, and it is never marked as ours, so rejecting the face
+   later never removes it.
+
+Each existing region is claimed by at most one face and each face claims at most one region;
+where several regions match a face by Name + Area, the **closest** center wins, not the first in
+the file (#147). The faces that claimed none are appended, marked. **When in doubt, the
+region is preserved.** Foreign attributes and children of `Regions`, `AppliedToDimensions`
+and the list survive. A write that changes nothing in the
+regions (an empty set and nothing of ours, or the set as the file already has it) leaves the
+sidecar untouched and creates none.
+
+**Regions written before the marker existed** are recognised against the catalog's record of
+what the old writer exported: `faces__legacy_regions`, taken once — when a catalog that already
+has faces first opens the faces tables after the upgrade; the one call whose `faces__once` claim
+row is new takes it, in the same savepoint, so two connections opening at once never take it
+twice or bring back rows already spent — with the name and display-frame box
+each face had then (the old writer did not convert frames). The old writer exported a photo's
+whole confirmed set after every face verb on it and never otherwise, so the record holds the
+confirmed, named faces it can tell were exported:
+
+- a face a verb confirmed (accepted, assigned, named — every source but `seed` and `xmp`);
+- an auto-seeded face (`seed`; the matching pass exported nothing) only on a photo a verb
+  touched — a verb-confirmed face, an ignored face or a remembered rejection there;
+- never a face confirmed from another tool's region (`xmp`).
+
+Whether a write succeeded was never recorded (an offline photo's was skipped), and a seed made
+after the verb is still counted, so the record can over-count. That is why only an unmarked
+region in **exactly the old writer's shape** can be taken for its: `rdf:li
+rdf:parseType="Resource"` holding exactly `mwg-rs:Name`, `mwg-rs:Type` = `Face` and an
+`mwg-rs:Area rdf:parseType="Resource"` of exactly `stArea:x/y/w/h` and `stArea:unit` =
+`normalized`, all as plain elements, with no other attribute, field or child. A region another
+tool wrote at the same place under the same name — digiKam's nested `rdf:Description` with
+`digiKam:Confidence`, a Lightroom region with `mwg-rs:Rotation` — has another shape and stays
+foreign. Such an old-shaped region matching a recorded face by Name + Area is adopted (moved and
+marked) while the face is in the set, and removed once it is not. A photo's record is spent by
+its first write that reaches the sidecar, so a region another tool writes later under the same
+name and place is never taken for ours. Pre-marker regions of a face rejected *before* the
+upgrade are not on the record and stay — the catalog no longer knows they were ours.
+
+The old writer wrote display-frame boxes, so until a photo's pre-marker regions are converted
+another tool — or a later import, by a rebuilt or second catalog — reads them in the wrong place
+on a turned photo. **Every face index run converts them first** (`convert_legacy_regions`,
+before it indexes anything): it writes each photo still on the record through the normal region
+write, which adopts and marks (or removes) the old regions in the stored frame and spends the
+record. It shares the index job's abort flag, ownership and catalog connection, and the record
+is its queue: an abort, an offline original or a failed write leaves that photo's rows for the
+next run, and rows of photos no longer in the catalog are dropped. A photo whose sidecar
+*refuses* the write for its own layout or frame — a `Regions` this writer cannot read, or an
+`AppliedToDimensions` of another frame — is tried once and then set aside (`faces__legacy_refused`,
+counted as `refused`): the same write would be refused on every run until the file changes. It
+keeps its record, so a face verb that later writes the photo still adopts or removes its old
+regions, and that write clears the refusal. The unprefixed `parseType`, `about` and MWG
+struct fields that a pre-#138 build's xmltree left behind are no longer refused. Every sidecar
+write restores them first, when it can do so unambiguously, and backs the file up (#143; see
+`docs/storage-and-import.md`, "Sidecars damaged by releases before #138"). A photo set aside
+for that damage by an earlier build is retried: the first open of the faces tables after the
+upgrade clears `faces__legacy_refused` once (a `faces__once` claim), and a photo still refused
+is set aside again. Reads repair in memory too, so face import sees those regions before any
+write. Its progress goes out through
+the index job's own status and `faces:progress` — photos converted of photos to convert, `0/n`
+to `n/n` — before the index's own count starts again from `0`; there is no phase label, which
+would need a new field in both front ends. It logs a summary of what it did. It is part of the index
+job rather than a job of its own to keep this branch small: the record is a one-time backlog,
+indexing is the faces job a user runs, and it already owns the faces worker. A catalog that is
+never indexed again keeps its record until a face verb touches each photo.
+
+A sidecar may be rooted at `x:xmpmeta` or, as the XMP spec allows, at a bare `rdf:RDF`, which
+is read and written in place (#147); a file rooted at anything else is not written. The writer
+and reader accept `Regions` in any top-level `rdf:Description`, struct values written
+with `rdf:parseType="Resource"`, as a nested `rdf:Description` or as attributes, and a list in an
+`rdf:Bag` or `rdf:Seq`. A `Regions` in any other layout (two of them, another container, a
+reference) is **not written**: the write fails with an error and the sidecar is left as it was,
+because a write that cannot see a foreign region would delete it.
 
 **Writes** fire from the same hooks as keyword export — `faces_accept`, `faces_accept_person`,
 `faces_assign`, `faces_reject`, `faces_ignore`, `faces_name_cluster` — each writing the photo's
-full current confirmed set, so the sidecar stays in sync. The batch confirm writes only the
-photos it actually changed, after its transaction commits: a sidecar that cannot be written
-(offline volume) must not roll back a confirmation the catalog already recorded.
+full current confirmed set right after the verb, so the sidecar stays in sync. The batch confirm
+writes only the photos it actually changed, after its transaction commits: a sidecar that cannot
+be written (offline volume) must not roll back a confirmation the catalog already recorded. An
+offline photo's write is skipped, not queued: its sidecar catches up at the next face write for
+that photo. The matching job writes the photos its auto-seed confirmed when it ends (see
+"Seeding and matching").
 
 **Reads** happen during indexing: existing `mwg-rs:Regions` are parsed and IoU-matched
 (≥ 0.5, greedy best-first, one-to-one) against the photo's still-unassigned detections. A named
@@ -159,7 +370,13 @@ previous ChairPhoto run are therefore ingested for free.
 ## Interface
 
 - **Loupe overlay** — face rectangles on the photo, each with a chip showing the assigned or
-  suggested name and confirm / reject / reassign / ignore actions.
+  suggested name and confirm / reject / reassign / ignore actions. Confirm and reject here and
+  in the inspector carry **the person the chip showed** (#208), by the review queue's rule
+  below: confirm applies only while the face is still suggested as that person, and reject
+  only while it is, or while it has no person at all — a matching run resets every pending
+  suggestion when it starts, and a reject made then is remembered against the person shown,
+  so the run does not suggest them again. Anything else (the face now suggested as someone
+  else, or decided in another view) is stale: nothing changes, and the app says so.
 - **Inspector panel** — the active photo's face list with the same per-face actions. With more
   than one photo selected, a suggested face also offers *confirm on N*: `faces_accept_person`
   confirms that person across the whole selection in one transaction. It **accepts suggestions,
@@ -169,7 +386,20 @@ previous ChairPhoto run are therefore ingested for free.
   already confirmed / had no suggestion), so a count never claims more than happened.
 - **People view** — a wall of named people with face crops as avatars and photo counts, plus
   unnamed clusters waiting to be named. Clicking a person filters to their photos, and a review
-  queue supports bulk confirmation.
+  queue supports bulk confirmation. A review verdict applies only while the face is still
+  suggested as the person the queue showed, so a list read before a re-run of matching never
+  confirms someone the user did not see (a rejection also applies to a face the run has reset
+  to no person: the shown pair is remembered). Clusters can be named together as one person (a merge),
+  and a cluster's faces can be named apart or ignored (a split); only faces still pending a
+  decision change, and a cluster that a matching run has since regrouped names nothing (cluster
+  ids are never reused). Clusters are rebuilt from scratch by every matching run, so merging or
+  splitting is done by *naming* — the only durable form. In the GPUI app these writes wait while
+  a matching run is going, as UX only: a run regroups the clusters the view shows. The guarantee
+  is in the core — every seed, suggestion and cluster write of the matcher re-checks in its own
+  `UPDATE` that the face is still undecided, so a confirm, naming, assignment or ignore made
+  during a run (from any view) is never overwritten; and every seed and
+  suggestion write re-checks that the pair is not rejected, so a rejection made during a run
+  stands too.
 - **Settings** — people root, model download status, similarity threshold, and index actions
   with progress.
 
@@ -182,8 +412,19 @@ enables `ort/cuda`. Off by default so the standard build stays CPU-only and port
 explicitly per session (`engine::try_register_cuda`) rather than through
 `with_execution_providers`, precisely so a registration failure is observable. If the runtime,
 driver, GPU or **cuDNN 9** is missing, registration returns an error, the reason is logged, and
-inference continues on CPU. `engine::active_ep()` reports where inference actually ran, so the UI
-can be honest about it.
+inference continues on CPU. A provider that registers but whose session then fails to build is
+dropped and the session built again on CPU (`onnx::with_cpu_fallback`, #210), so indexing does
+not fail on it. `engine::active_ep()` reports where inference actually ran, so the UI can be
+honest about it.
+
+A session build on CUDA runs under a **crash marker** (`crash_marker`, kind `onnx-cuda-session`):
+native CUDA init can take the process down rather than return an error. After two such crashes
+with the same ONNX Runtime and NVIDIA driver versions (the subject, read from
+`/proc/driver/nvidia/version`), CUDA is skipped and sessions build on CPU until either version
+changes; a clean build clears the strikes. Inference itself is not under the marker — a marker
+write per face would put file I/O on the hot path, and the documented failure is CUDA's init.
+A cuDNN repair alone does not change the subject: clearing the app data's `crash-markers/`
+retries CUDA.
 
 Setting `faces.force_cpu = "true"` skips CUDA registration even in a `faces-cuda` build — useful
 when the GPU is needed elsewhere or to compare the two directly.

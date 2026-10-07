@@ -1,0 +1,65 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Mockup — Headroom: the sky comes back</title>
+<style>
+  :root { --bg:#0d1117; --panel:#161b22; --border:#2d333b; --txt:#e6edf3; --dim:#9da7b3; --accent:#4c8dff; --warn:#ff5d5d; }
+  * { box-sizing: border-box; margin: 0; }
+  body { background: var(--bg); color: var(--txt); font: 13px/1.4 system-ui, sans-serif; padding: 24px; }
+  h1 { font-size: 15px; margin-bottom: 4px; }
+  .sub { color: var(--dim); margin-bottom: 20px; }
+  .row { display: grid; grid-template-columns: repeat(3, 1fr); gap: 18px; }
+  .cell { border: 1px solid var(--border); border-radius: 10px; background: var(--panel); padding: 12px; }
+  .cell h2 { font-size: 12px; margin-bottom: 8px; display: flex; justify-content: space-between; }
+  .cell h2 span { color: var(--dim); font-weight: 400; }
+  .print { width: 100%; aspect-ratio: 3/2; border-radius: 8px; position: relative; overflow: hidden; }
+  /* sky band on top, sea below */
+  .sky { position: absolute; inset: 0 0 45% 0; }
+  .sea { position: absolute; inset: 55% 0 0 0; background: linear-gradient(#2e4a6b, #16283f); }
+  .blown { background: #ffffff; }
+  .blownish { background: linear-gradient(#f4f4f4, #e6e6e6); }
+  .clouds { background:
+      radial-gradient(60% 40% at 20% 40%, #fff 0 35%, transparent 60%),
+      radial-gradient(50% 45% at 55% 30%, #f1f3f6 0 30%, transparent 62%),
+      radial-gradient(70% 50% at 85% 55%, #e4e9f0 0 28%, transparent 60%),
+      linear-gradient(#9dbfe4, #6f9bcc); }
+  .clip { position: absolute; inset: 0 0 45% 0; background: repeating-linear-gradient(45deg, rgba(255,93,93,.55) 0 6px, transparent 6px 12px); mix-blend-mode: multiply; }
+  .strip { display: flex; height: 28px; border: 1px solid var(--border); border-radius: 6px; overflow: hidden; margin-top: 10px; }
+  .strip div { flex: 1; position: relative; }
+  .strip i { position: absolute; bottom: 0; left: 0; right: 0; background: #9aa3b5; }
+  .strip div:last-child i { background: #fff; }
+  .cap { color: var(--dim); font-size: 12px; margin-top: 8px; }
+  .cap b { color: var(--txt); }
+  .legend { margin-top: 22px; border: 1px dashed var(--border); border-radius: 10px; padding: 12px 14px; color: var(--dim); display: flex; gap: 14px; align-items: center; }
+  .legend .sw { width: 34px; height: 18px; border-radius: 4px; background: repeating-linear-gradient(45deg, rgba(255,93,93,.7) 0 6px, transparent 6px 12px); border: 1px solid var(--border); }
+</style>
+
+<h1>The reason: headroom</h1>
+<div class="sub">A bright sky, three ways. The camera's JPEG has already decided the sky is white; the RAW still knows better.</div>
+
+<div class="row">
+  <div class="cell">
+    <h2>As shot <span>camera preview</span></h2>
+    <div class="print"><div class="sky blown"></div><div class="sea"></div></div>
+    <div class="strip"><div><i style="height:10%"></i></div><div><i style="height:20%"></i></div><div><i style="height:30%"></i></div><div><i style="height:38%"></i></div><div><i style="height:30%"></i></div><div><i style="height:18%"></i></div><div><i style="height:12%"></i></div><div><i style="height:92%"></i></div></div>
+    <div class="cap">The whites zone is full: the sky is one flat value.</div>
+  </div>
+  <div class="cell">
+    <h2>Exposure −1 <span>on the camera preview (today)</span></h2>
+    <div class="print"><div class="sky blownish"></div><div class="sea" style="filter:brightness(.6)"></div></div>
+    <div class="strip"><div><i style="height:16%"></i></div><div><i style="height:26%"></i></div><div><i style="height:34%"></i></div><div><i style="height:32%"></i></div><div><i style="height:22%"></i></div><div><i style="height:14%"></i></div><div><i style="height:80%"></i></div><div><i style="height:10%"></i></div></div>
+    <div class="cap">Everything gets darker, the sky becomes <b>grey</b> — the detail was gone before the file reached ChairPhoto.</div>
+  </div>
+  <div class="cell">
+    <h2>Exposure −1 <span>on the RAW (this feature)</span></h2>
+    <div class="print"><div class="sky clouds"></div><div class="sea" style="filter:brightness(.6)"></div></div>
+    <div class="strip"><div><i style="height:16%"></i></div><div><i style="height:26%"></i></div><div><i style="height:34%"></i></div><div><i style="height:32%"></i></div><div><i style="height:28%"></i></div><div><i style="height:30%"></i></div><div><i style="height:24%"></i></div><div><i style="height:6%"></i></div></div>
+    <div class="cap">The clouds come back and the whites mass spreads into lights and highlights — the tone strip finally shows the photo, not the preview.</div>
+  </div>
+</div>
+
+<div class="legend">
+  <div class="sw"></div>
+  <div><b style="color:var(--txt)">Sensor clipping overlay</b> — an optional overlay marking where the RAW itself
+  is clipped. That is the only white that is gone for good; everything else is headroom. It answers a
+  different question from the output-clipping warning and stays separate from it.</div>
+</div>

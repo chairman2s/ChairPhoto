@@ -43,45 +43,41 @@ publications(
   Tracking *repeats of the identical version over time* is a non-goal.
 
 Catalog API: `record_publication`, `list_publications`, `delete_publication`,
-`published_platforms` (`src-tauri/src/catalog/publications.rs`). `record_publication`
+`published_platforms` (`crates/core/src/catalog/publications.rs`). `record_publication`
 rejects an empty `platform`.
 
 ## Markers are declared by the publishing module
 
 The backend never invents a platform string. A publishing module declares
-`publicationMarker` on its `ChairPhotoModule` (in `src/modules/registry.ts`); if it omits
-one, the host falls back to the module `id`.
+`publication_marker` on its `ModuleMeta` (`crates/app/src/modules/mod.rs`); if it omits one,
+`ModuleMeta::marker()` falls back to the module's own id.
 
-A module records a publication through its injected `ChairPhotoAPI` — and **never passes
-the platform string itself**:
+A publish target reads its own module's marker — `host.meta().marker()`, from the
+`ModuleHost` its `load()` was given — and passes it to core's
+`app::publications::record_publications_as`, bound to the catalog its photo ids were read
+from (`with_catalog_as`), so a record never lands in a catalog opened since, and run in one
+transaction (`Catalog::record_publications`), so a failing row records none.
 
-```ts
-// inside a module, `api` is the injected ChairPhotoAPI
-await api.recordPublication(photoId, versionId /* null = Original */, postUrl);
-const pubs = await api.listPublications(photoId);
-await api.deletePublication(pubs[0].id);
-```
+Modules are first-party Rust now, not sandboxed third-party code, so there is no host
+boundary forcing the marker the way an injected, host-mediated `recordPublication` call
+once did: the guarantee is "every publish target reads and passes its own `marker()`," held
+by convention and code review rather than by construction. The **Flickr and SmugMug
+modules** are the reference implementation of this contract — see [flickr.md](flickr.md)
+and [smugmug.md](smugmug.md).
 
-The host wires `recordPublication` to stamp the calling module's marker
-(`getPublicationMarker(mod.id)` in `src/modules/host.ts`), so the "module declares it,
-host enforces the fallback" rule holds for every module by construction — a module can't
-record under the wrong platform. The **Flickr and SmugMug modules** are the reference
-implementation of this contract — see [flickr.md](flickr.md) and [smugmug.md](smugmug.md).
-
-Instagram, Flickr, and SmugMug are all modules now and record this way (on a confirmed
-post), each via its publish target in the unified Publish dialog. One lower-level escape
-hatch remains for core UI: the raw `recordPublication(photoId, versionId, platform, url)`
-wrapper in `src/modules/api.ts`, which takes an explicit platform.
+Instagram, Flickr, SmugMug, LocalSend and Snapchat all record this way (on a confirmed
+post), each via its publish target in the unified Publish dialog.
 
 ## How it's surfaced
 
 - **Auto-record:** a confirmed Instagram post records a publication with the version it
-  actually rendered (`post_to_instagram`, `src-tauri/src/commands/instagram.rs`).
-- **Manual:** the inspector's **Published to** panel (`src/components/PublishedPanel.tsx`)
+  actually rendered, from within the post's own job (`crates/app/src/modules/instagram/`); a
+  supervised post only on "Yes, I posted it".
+- **Manual:** the inspector's **Published to** panel (`crates/app/src/modules/publishing/panel.rs`)
   lists publications and lets the user mark a Flickr/SmugMug/other post by picking a
   platform and which version (defaults to the inspector's active version).
 - **Filtering:** dynamic facets keyed `published:<platform>` are appended by
-  `available_facets()` and reuse the existing FilterBar chips — no dedicated filter UI.
+  `available_facets()` and reuse the existing command pill chips — no dedicated filter UI.
 
 ## Progress and cancellation
 
@@ -89,17 +85,19 @@ What each publish path reports while it runs, as of this writing:
 
 | path | progress | cancellation |
 |---|---|---|
-| Flickr, SmugMug | none — one render, one upload request, and the command returns when it finishes | none |
-| Instagram | none — the supervised flow ends by handing you the composer, which *is* the progress report | none |
-| LocalSend | `localsend:progress` `{ done, total }` after each file, rendered by `SendToDevicePanel.tsx` | none — the protocol's `POST /cancel?sessionId=` exists but ChairPhoto never calls it |
+| Flickr, SmugMug | the GPUI panel shows the job's step (Preparing…, Rendering…, Uploading to X…) | every publish is its own job (`app::uploads`), so publishes run side by side and a newer one never stops an older one; the GPUI panel's Cancel (that publish only) or a catalog switch (all of them) stops it before its render or its upload; **an upload already in flight is not interrupted**. A publish whose dialog was closed reports how it ended — published, failed, cancelled or the catalog changed — on the status line |
+| Instagram | the GPUI panel shows Preparing…, Rendering…, then Composing the post in Chrome…; the supervised flow ends by handing you the composer | as Flickr's until Chrome has the render; from then on closing the browser window is the cancel |
+| LocalSend | `localsend:progress` `{ done, total, job }` after each file; a panel shows only its own job's | the GPUI panel's Cancel, a newer send or a catalog switch trips the send job (`app::localsend`): it stops before its next render or file, or mid-upload, and calls `POST /cancel?sessionId=` |
 
-**Nothing in the publish UI stops a publish once it has started.** That is a real gap for a
-multi-photo LocalSend send, where a wrong selection means waiting out every file; it is much
-less of one for the single-photo services, where by the time a user reaches for Cancel the
-request is usually already in flight and aborting it would leave the service holding a
-partial upload it may or may not commit. Instagram cannot be cancelled by us at all in the
-supervised case — the post is finished by the user, in a browser ChairPhoto deliberately
-does not own; closing that window is the cancel.
+**Only a LocalSend send can be stopped mid-transfer** (a multi-photo send was where a wrong
+selection meant waiting out every file). A single-photo publish stops only *before* its upload:
+the render (a full-resolution RAW decode) is the slow part, and aborting an upload in flight
+would leave the service holding bytes it may or may not commit — the user could not know
+whether the photo is online. A catalog switch during an upload lets it finish; recording the
+publication then fails closed (it is bound to the catalog the photo came from) and the panel
+says the photo is published but not recorded, so it is not uploaded twice. Instagram cannot be
+cancelled by us once Chrome has the render — the post is finished by the user, in a browser
+ChairPhoto deliberately does not own; closing that window is the cancel.
 
 ## Rendering and upload strategy: render-first by design
 
@@ -107,10 +105,10 @@ Every upload path renders to a JPEG first and reads the whole render into memory
 
 | Path | How it reads the render | Approx. peak |
 |---|---|---|
-| Flickr (`flickr/mod.rs:739`) | `fs::read()` into memory | ~5–25 MB |
-| SmugMug (`smugmug/mod.rs:208`) | `fs::read()` into memory | ~5–25 MB |
+| Flickr (`flickr/mod.rs`, `upload`) | `fs::read()` into memory | ~5–25 MB |
+| SmugMug (`smugmug/mod.rs`, `upload`) | `fs::read()` into memory | ~5–25 MB |
 | LocalSend (`localsend/mod.rs:863`) | `tokio::fs::read()` into memory, one file per loop iteration | ~5–25 MB |
-| Instagram (`commands/instagram.rs`) | rendered to disk, path passed to Chrome (not uploaded by ChairPhoto) | ~200 KB (1080px cap) |
+| Instagram (`app/instagram.rs`) | rendered to disk, path passed to Chrome (not uploaded by ChairPhoto) | ~200 KB (1080px cap) |
 
 This design is deliberate. **Peak exposure is roughly one full-resolution JPEG** (~5–25 MB for Flickr,
 SmugMug, and LocalSend; ~200 KB for Instagram). LocalSend's batch loop reads one file at a time
@@ -131,10 +129,12 @@ Today every path renders to JPEG specifically because RAW decode is slow, so the
 yet active. It is recorded here against the condition that would trigger it, so that whoever changes
 an upload path to send originals meets the requirement before writing the code rather than after.
 
-Temp renders do not depend on any of this. Each job renders into a directory of its own that
-is removed when the job ends, whichever way it ends — see `publishing::JobTempDir` in
-`src-tauri/src/commands/publishing.rs`, and [instagram.md](instagram.md) for the one flow
-whose render outlives the command on purpose.
+Temp renders do not depend on any of this. Each job renders into a directory of its own (mode
+0700, a random name) that is removed when the job ends, whichever way it ends — see
+`publishing::JobTempDir` in `crates/core/src/publishing.rs`, and [instagram.md](instagram.md)
+for the one flow whose render outlives the command on purpose. A render is an export, so its
+"export equals view" checks are collected per job (`app::exports::collect_parity`) and added to
+the catalog the photo was read from — dropped if another catalog opened meanwhile.
 
 ## Migration
 

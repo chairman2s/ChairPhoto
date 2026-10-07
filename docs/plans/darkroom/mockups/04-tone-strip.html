@@ -1,0 +1,64 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Mockup — Tone strip (the adjustable histogram)</title>
+<style>
+  :root { --bg:#0d1117; --panel:#161b22; --border:#2d333b; --txt:#e6edf3; --dim:#9da7b3; --accent:#4c8dff; }
+  * { box-sizing: border-box; margin: 0; }
+  body { background: var(--bg); color: var(--txt); font: 13px/1.5 system-ui, sans-serif; min-height: 100vh;
+         display: flex; flex-direction: column; align-items: center; gap: 26px; padding: 30px 20px; }
+  .photo { background:
+      radial-gradient(120% 90% at 70% 20%, #f7b267 0%, #e8804d 30%, #a1476d 55%, #452a63 80%, #1b1b3a 100%); }
+  h1 { font-size: 16px; } h1 small { color: var(--dim); font-weight: 400; }
+
+  .print { width: min(70vw, 780px); aspect-ratio: 3/2; border-radius: 8px; box-shadow: 0 20px 60px rgba(0,0,0,.55); }
+
+  /* ── The tone strip ─────────────────────────────────────────────
+     One control, three readings:
+       · zone WIDTH is fixed (one EV each), zone FILL height = pixel mass there (the histogram)
+       · zone BRIGHTNESS previews where that range sits after the sculpt
+       · drag a zone ↑/↓ = lift/crush that range (a smooth bump, not a step)          */
+  .strip-wrap { width: min(70vw, 780px); }
+  .strip { display: flex; height: 84px; border: 1px solid var(--border); border-radius: 8px; overflow: hidden; background: var(--panel); }
+  .zone { flex: 1; position: relative; border-right: 1px solid rgba(255,255,255,.05); cursor: ns-resize; }
+  .zone:last-child { border-right: 0; }
+  .zone .mass { position: absolute; bottom: 0; left: 0; right: 0; }
+  .zone:hover { outline: 1px solid var(--accent); outline-offset: -1px; }
+  .zone .delta { position: absolute; top: 4px; left: 0; right: 0; text-align: center; font-size: 11px;
+                 color: var(--accent); font-variant-numeric: tabular-nums; }
+  .zone.dragging { outline: 2px solid var(--accent); outline-offset: -2px; }
+  .zone.dragging::after { content: "↕"; position: absolute; top: 50%; left: 50%; transform: translate(-50%,-50%);
+                          font-size: 18px; color: #fff; text-shadow: 0 1px 4px #000; }
+  .labels { display: flex; margin-top: 5px; color: var(--dim); font-size: 11px; }
+  .labels span { flex: 1; text-align: center; }
+  .evs { display: flex; color: var(--mute, #6b7280); font-size: 10px; font-variant-numeric: tabular-nums; }
+  .evs span { flex: 1; text-align: center; }
+
+  .notes { width: min(70vw, 780px); color: var(--dim); display: grid; grid-template-columns: 1fr 1fr; gap: 8px 26px; }
+  .notes b { color: var(--txt); }
+</style>
+
+<h1>The tone strip <small>— the histogram, reshaped into a control</small></h1>
+
+<div class="print photo"></div>
+
+<div class="strip-wrap">
+  <div class="strip">
+    <div class="zone"><div class="mass" style="height:6%;  background:#1a1d24"></div></div>
+    <div class="zone"><div class="mass" style="height:18%; background:#2a2f3a"></div></div>
+    <div class="zone dragging"><div class="delta">+0.4</div><div class="mass" style="height:58%; background:#4a5265"></div></div>
+    <div class="zone"><div class="mass" style="height:74%; background:#707a90"></div></div>
+    <div class="zone"><div class="mass" style="height:66%; background:#9aa3b5"></div></div>
+    <div class="zone"><div class="mass" style="height:38%; background:#c3cad8"></div></div>
+    <div class="zone"><div class="mass" style="height:14%; background:#e4e8ef"></div></div>
+    <div class="zone"><div class="mass" style="height:4%;  background:#ffffff"></div></div>
+  </div>
+  <div class="labels"><span>blacks</span><span>deep&nbsp;shadows</span><span>shadows</span><span>low&nbsp;mids</span><span>high&nbsp;mids</span><span>lights</span><span>highlights</span><span>whites</span></div>
+  <div class="evs"><span>−4</span><span>−3</span><span>−2</span><span>−1</span><span>+1</span><span>+2</span><span>+3</span><span>+4</span></div>
+</div>
+
+<div class="notes">
+  <div><b>Fill height = pixel mass.</b> You always see where the photo's tones live — the histogram never left, it just grew handles.</div>
+  <div><b>Drag ↑/↓ to lift or crush</b> that range — a smooth bump into the tone curve, feathered into the neighbours. Live on the print (and the loupe screen).</div>
+  <div><b>Drag the whole strip</b> sideways = exposure; <b>pinch it</b> (Alt-drag ends) = contrast around the middle.</div>
+  <div><b>Double-click a zone</b> resets it; the strip glows on zones a duel round is currently exploring.</div>
+</div>

@@ -1,0 +1,60 @@
+//! ChairPhoto's core: the catalog, import, XMP, decode, background jobs and the module
+//! backends — everything the app does, with no UI toolkit.
+//!
+//! The front end is the GPUI app (`crates/app`), which links this crate directly. (Until #165
+//! a Tauri shell wrapped it too.) Anything the front end needs from here is `pub`; it reaches it through [`app::AppState`]
+//! and the domain modules, and hears from it through [`app::events`].
+
+pub mod app;
+pub mod appearance;
+pub mod bundle;
+pub mod burst;
+pub mod burst_analysis;
+pub mod catalog;
+#[cfg(feature = "collage")]
+pub mod collage;
+pub mod companions;
+pub mod crash_marker;
+#[cfg(all(feature = "raw", feature = "edit"))]
+pub mod develop;
+pub mod develop_source;
+pub mod export;
+pub mod external_edit;
+#[cfg(feature = "flickr")]
+pub mod flickr;
+pub mod image_pool;
+#[cfg(feature = "instagram")]
+pub mod instagram;
+#[cfg(feature = "raw")]
+pub mod lens;
+#[cfg(feature = "localsend")]
+pub mod localsend;
+pub mod media;
+pub mod metadata;
+#[cfg(any(feature = "flickr", feature = "smugmug"))]
+pub mod oauth1;
+pub mod phash;
+pub mod phash_indexer;
+pub mod photo_signals;
+pub mod plugins;
+pub mod publishing;
+pub mod rapidraw;
+#[cfg(feature = "raw")]
+pub mod raw;
+pub mod scanner;
+pub mod sharpness;
+pub mod sharpness_indexer;
+pub mod sharpness_regions;
+#[cfg(feature = "slideshow")]
+pub mod slideshow;
+#[cfg(feature = "smugmug")]
+pub mod smugmug;
+pub mod stack_proposals;
+#[cfg(any(test, feature = "test-hooks"))]
+pub mod test_home;
+#[cfg(test)]
+mod test_support;
+pub mod thumbnails;
+pub mod upload_sweep;
+pub mod volume_health;
+pub mod xmp;

@@ -1,0 +1,2358 @@
+//! Seed / match / cluster engine (H13c) — the recognition brain of the faces plugin.
+//!
+//! Turns indexed faces (raw detections, `state='unassigned'`, `source='detect'`) into
+//! person-tag assignments, bootstrapping from the catalog's existing **photo-level person
+//! tags** (who is in the photo, from years of manual tagging). See docs/face-tagging.md
+//! "Seeding & matching".
+//!
+//! The pipeline [`run_matching`] executes, in order:
+//!
+//! 1. **Auto-seed** — a photo with **exactly 1** detected face AND **exactly 1** assigned
+//!    person tag ⇒ that face is `confirmed`, `source='seed'`. A seed is data, not a
+//!    suggestion (auditable + revocable), but flagged as machine-derived.
+//! 2. **Per-person centroids** — the L2-normalized mean of each person's confirmed,
+//!    non-ignored face embeddings.
+//! 3. **Constrained match** — a photo with N unassigned faces and M assigned person tags
+//!    (with centroids) ⇒ optimal one-to-one assignment via Hungarian
+//!    ([`hungarian_min_cost`], cost `1 − cosine`) ⇒ `suggested` rows + `match_confidence`.
+//!    The photo's own tags constrain the space, which is what makes this far more accurate
+//!    than open-set matching.
+//! 4. **Open matching** — remaining unassigned faces ⇒ nearest person centroid above the
+//!    similarity threshold ([`MatchSettings::threshold`]) ⇒ `suggested`.
+//! 5. **Clustering** — everything left ⇒ incremental greedy clustering: join the nearest
+//!    existing cluster centroid within threshold, else start a new cluster (Immich-style;
+//!    deliberately *not* batch DBSCAN so it evolves as photos arrive).
+//!
+//! ## Idempotence & safety
+//!
+//! Re-running is safe and proposes nothing new when nothing changed:
+//! - **Confirmed** / **ignored** / **manual** faces are never touched (never downgraded).
+//! - A **rejected** `(face, person)` pair (recorded by [`reject`]) is never re-proposed.
+//! - A decision made **while a run is going** stands: the run reads its candidates once, but
+//!   every seed, suggestion and cluster write re-checks in its own `UPDATE` that the face is
+//!   still undecided, so a confirm/name/assign/ignore made mid-run is never overwritten
+//!   (#137). This is the guarantee; a UI gate on writes during a run is only UX. Seeds and
+//!   suggestions also re-check that the pair is not rejected, and a front end rejects the
+//!   person it showed ([`reject_shown`]), so a reject made after the run's reset stands (#208).
+//! - Existing `suggested` rows are re-evaluated from scratch each run: the matcher first
+//!   resets every still-`suggested`/`unassigned` face back to a clean slate, then recomputes.
+//!   So a run that finds the same best match writes back the same row — no churn — and a run
+//!   where a centroid moved updates the suggestion rather than piling up duplicates.
+//!
+//! ## Testability
+//!
+//! Nothing here depends on ONNX or the models — it is pure math over `f32` embeddings plus
+//! SQLite. The whole engine (seed edge cases, Hungarian correctness on a known cost matrix,
+//! threshold boundary, rejection memory, ignore exclusion, idempotent re-run) is unit-tested
+//! on synthetic embeddings. No `#[cfg(feature = "faces")]` gates the logic; only the wiring
+//! command in `commands.rs` is feature-gated.
+
+use rusqlite::{Connection, OptionalExtension};
+
+use super::engine::cosine;
+use super::store::{blob_to_embedding, embedding_to_blob};
+
+// ── Settings keys & defaults ────────────────────────────────────────────────────
+
+/// Setting key for the people-root tag branch. Person tags are strict descendants of this
+/// branch's `full_path` (e.g. root `People` ⇒ `People/Alice`, `People/Family/Bob`). The root
+/// itself is not a person.
+pub const PEOPLE_ROOT_SETTING: &str = "faces.people_root";
+/// Default people-root branch when the setting is unset.
+pub const PEOPLE_ROOT_DEFAULT: &str = "People";
+
+/// Setting key for the cosine-similarity match threshold (open matching + clustering).
+pub const THRESHOLD_SETTING: &str = "faces.match_threshold";
+/// Default match threshold. A candidate must exceed this cosine similarity to a centroid to
+/// be suggested (open matching) or to join a cluster.
+pub const THRESHOLD_DEFAULT: f32 = 0.45;
+
+// ── Face states & sources (string constants matching the store schema) ──────────
+
+const STATE_UNASSIGNED: &str = "unassigned";
+const STATE_SUGGESTED: &str = "suggested";
+const STATE_CONFIRMED: &str = "confirmed";
+const STATE_IGNORED: &str = "ignored";
+
+const SOURCE_SEED: &str = "seed";
+const SOURCE_MATCH: &str = "match";
+const SOURCE_MANUAL: &str = "manual";
+
+// ── Public settings bundle ──────────────────────────────────────────────────────
+
+/// Resolved matcher settings, loaded from the `settings` table (with defaults).
+#[derive(Debug, Clone)]
+pub struct MatchSettings {
+    /// `full_path` of the people-root tag branch (person tags are its strict descendants).
+    pub people_root: String,
+    /// Cosine-similarity threshold for open matching + clustering.
+    pub threshold: f32,
+}
+
+impl Default for MatchSettings {
+    fn default() -> Self {
+        Self {
+            people_root: PEOPLE_ROOT_DEFAULT.to_string(),
+            threshold: THRESHOLD_DEFAULT,
+        }
+    }
+}
+
+impl MatchSettings {
+    /// Load the settings from the `settings` key-value table, falling back to defaults for
+    /// any missing/blank/unparseable key.
+    pub fn load(conn: &Connection) -> rusqlite::Result<Self> {
+        // Trimmed, as the person picker and the People view use it: a root saved as " People "
+        // must not make the matcher look under " People /".
+        let people_root = get_setting(conn, PEOPLE_ROOT_SETTING)?
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| PEOPLE_ROOT_DEFAULT.to_string());
+        let threshold = get_setting(conn, THRESHOLD_SETTING)?
+            .and_then(|s| s.trim().parse::<f32>().ok())
+            .filter(|t| t.is_finite())
+            .unwrap_or(THRESHOLD_DEFAULT);
+        Ok(Self {
+            people_root,
+            threshold,
+        })
+    }
+}
+
+fn get_setting(conn: &Connection, key: &str) -> rusqlite::Result<Option<String>> {
+    conn.query_row("SELECT value FROM settings WHERE key = ?1", [key], |r| {
+        r.get::<_, String>(0)
+    })
+    .optional()
+}
+
+// ── Run summary ─────────────────────────────────────────────────────────────────
+
+/// Counters returned by [`run_matching`], reported to the UI so a run can say what it did.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+pub struct MatchOutcome {
+    /// Faces auto-seeded to `confirmed` this run (step 1).
+    pub seeded: usize,
+    /// Faces given a `suggested` row by constrained (Hungarian) matching (step 3).
+    pub constrained: usize,
+    /// Faces given a `suggested` row by open nearest-centroid matching (step 4).
+    pub open: usize,
+    /// Faces assigned to a cluster (step 5), whether an existing or newly created one.
+    pub clustered: usize,
+    /// Number of distinct people that had a usable centroid this run.
+    pub people: usize,
+}
+
+// ── Progress reporting ──────────────────────────────────────────────────────────
+
+/// Pipeline steps reported through the [`run_matching_with_progress`] callback, in
+/// execution order. `label()` is what the settings panel shows verbatim.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MatchPhase {
+    Seed,
+    Constrained,
+    Open,
+    Cluster,
+    /// After the pipeline: the match job writes the face regions of the photos this run
+    /// seeded (#210, `app::faces::matching`). The matcher itself never reports it.
+    Regions,
+}
+
+impl MatchPhase {
+    pub fn label(self) -> &'static str {
+        match self {
+            MatchPhase::Seed => "seeding from tags",
+            MatchPhase::Constrained => "matching tagged photos",
+            MatchPhase::Open => "matching known people",
+            MatchPhase::Cluster => "clustering unknowns",
+            MatchPhase::Regions => "writing face regions",
+        }
+    }
+}
+
+/// Progress callback: `(phase, done, total)`. Called once with `done = 0` when a phase
+/// starts (so empty phases still announce themselves) and then per processed item —
+/// callers who forward this to the UI should throttle.
+///
+/// **Returns whether to keep going.** `false` stops the pipeline at the next item, which
+/// is how a cancelled or superseded job gets out of a long phase without waiting for it
+/// to finish. Callers that never cancel return `true` unconditionally.
+///
+/// Stopping early is safe because the whole pipeline is idempotent: a partial run leaves
+/// confirmed, ignored and manual faces untouched, and re-running resets and recomputes the
+/// pending ones. It is a stop, not a rollback — suggestions already written stay written.
+pub type MatchProgress<'a> = &'a mut dyn FnMut(MatchPhase, usize, usize) -> bool;
+
+// ── Internal working types ──────────────────────────────────────────────────────
+
+/// A face row loaded for matching.
+struct FaceRow {
+    id: i64,
+    photo_id: i64,
+    embedding: Vec<f32>,
+}
+
+/// One person's centroid, keyed by tag id.
+struct Centroid {
+    tag_id: i64,
+    vec: Vec<f32>,
+}
+
+// ── The pipeline ────────────────────────────────────────────────────────────────
+
+/// Run the full seed / match / cluster pipeline over the indexed faces.
+///
+/// Idempotent and re-runnable: confirmed/ignored/manual faces are never modified, rejected
+/// pairs are never re-proposed, and stale `suggested`/cluster assignments are cleared and
+/// recomputed each run so nothing accumulates. Returns per-step counters.
+///
+/// `now` is the timestamp stamped on new rows (unix seconds), injected for deterministic tests.
+pub fn run_matching(conn: &Connection, settings: &MatchSettings, now: i64) -> rusqlite::Result<MatchOutcome> {
+    run_matching_with_progress(conn, settings, now, &mut |_, _, _| true)
+}
+
+/// [`run_matching`] with a progress callback — see [`MatchProgress`] for the contract.
+pub fn run_matching_with_progress(
+    conn: &Connection,
+    settings: &MatchSettings,
+    now: i64,
+    progress: MatchProgress,
+) -> rusqlite::Result<MatchOutcome> {
+    run_matching_seeded(conn, settings, now, progress).map(|(outcome, _)| outcome)
+}
+
+/// [`run_matching_with_progress`], also returning the photos whose face this run's auto-seed
+/// confirmed (one face each), in candidate order: the match job writes their face regions
+/// once the pipeline is done (#210). Every other step only suggests or clusters, which no
+/// sidecar records.
+pub fn run_matching_seeded(
+    conn: &Connection,
+    settings: &MatchSettings,
+    now: i64,
+    progress: MatchProgress,
+) -> rusqlite::Result<(MatchOutcome, Vec<i64>)> {
+    super::store::ensure_schema(conn)?;
+
+    let mut outcome = MatchOutcome::default();
+
+    // A phase that is told to stop returns early, but returning from one phase does not by
+    // itself end the pipeline — the next would start, do its own setup queries, and call
+    // progress again before stopping. Remember the refusal so the steps below can bail at
+    // the next boundary. `Cell` because the wrapper closure below borrows `progress`
+    // mutably for its whole life, and these checks read the flag while it is alive.
+    let cancelled = std::cell::Cell::new(false);
+    let mut stop_aware = |phase: MatchPhase, done: usize, total: usize| -> bool {
+        let go = progress(phase, done, total);
+        if !go {
+            cancelled.set(true);
+        }
+        go
+    };
+    let progress: MatchProgress = &mut stop_aware;
+
+    // Resolve the set of person tag ids (strict descendants of the people root branch).
+    let person_tags = person_tag_ids(conn, &settings.people_root)?;
+
+    // Step 1 — auto-seed.
+    let seeded = auto_seed(conn, &person_tags, now, progress)?;
+    outcome.seeded = seeded.len();
+    if cancelled.get() {
+        return Ok((outcome, seeded));
+    }
+
+    // Clear stale suggestions/cluster assignments so the run is idempotent and never stacks
+    // duplicate rows. Only faces that are still unassigned/suggested are reset — confirmed,
+    // ignored and manual faces are left untouched.
+    reset_pending(conn)?;
+
+    // Step 2 — per-person centroids from confirmed, non-ignored faces.
+    let centroids = compute_centroids(conn, &person_tags)?;
+    outcome.people = centroids.len();
+
+    // Load all faces still pending a decision (unassigned, with an embedding).
+    let pending = load_pending_faces(conn)?;
+
+    // Track which faces got resolved by constrained/open matching so clustering ignores them.
+    let mut resolved: std::collections::HashSet<i64> = std::collections::HashSet::new();
+
+    if !centroids.is_empty() {
+        // Step 3 — constrained match: per photo, N faces × M person-tags on that photo.
+        outcome.constrained = constrained_match(
+            conn,
+            &pending,
+            &centroids,
+            &person_tags,
+            &mut resolved,
+            now,
+            progress,
+        )?;
+        if cancelled.get() {
+            return Ok((outcome, seeded));
+        }
+
+        // Step 4 — open matching: nearest centroid above threshold for the remainder.
+        outcome.open = open_match(
+            conn,
+            &pending,
+            &centroids,
+            settings.threshold,
+            &mut resolved,
+            now,
+            progress,
+        )?;
+        if cancelled.get() {
+            return Ok((outcome, seeded));
+        }
+    }
+
+    // Step 5 — incremental greedy clustering for everything left.
+    outcome.clustered =
+        cluster_leftovers(conn, &pending, settings.threshold, &resolved, now, progress)?;
+
+    Ok((outcome, seeded))
+}
+
+// ── Person-tag resolution ───────────────────────────────────────────────────────
+
+/// All tag ids that are **strict descendants** of the people-root branch — i.e. whose
+/// `full_path` starts with `<root>/`. The root itself is excluded (it's a container, not a
+/// person). Returns an empty set if the root branch does not exist.
+fn person_tag_ids(conn: &Connection, people_root: &str) -> rusqlite::Result<std::collections::HashSet<i64>> {
+    let prefix = format!("{people_root}/");
+    // Match strict descendants by character-length prefix. SQLite `substr`/`length` count
+    // CHARACTERS, so we let SQLite compute `length(?1)` from the bound prefix rather than
+    // passing a Rust byte length — otherwise a non-ASCII people-root would silently mismatch
+    // (mirrors catalog/mod.rs's `substr(full_path, 1, length(...)) = ...` idiom).
+    let mut stmt = conn.prepare(
+        "SELECT id FROM tags WHERE substr(full_path, 1, length(?1)) = ?1",
+    )?;
+    let rows = stmt.query_map(
+        rusqlite::params![prefix],
+        |r| r.get::<_, i64>(0),
+    )?;
+    rows.collect()
+}
+
+/// The set of person tag ids assigned to a given photo (intersection of its `photo_tags`
+/// with the person-tag set).
+fn photo_person_tags(
+    conn: &Connection,
+    photo_id: i64,
+    person_tags: &std::collections::HashSet<i64>,
+) -> rusqlite::Result<Vec<i64>> {
+    let mut stmt =
+        conn.prepare("SELECT tag_id FROM photo_tags WHERE photo_id = ?1")?;
+    let rows = stmt.query_map([photo_id], |r| r.get::<_, i64>(0))?;
+    let mut out = Vec::new();
+    for tid in rows {
+        let tid = tid?;
+        if person_tags.contains(&tid) {
+            out.push(tid);
+        }
+    }
+    out.sort_unstable();
+    out.dedup();
+    Ok(out)
+}
+
+// ── Step 1: auto-seed ───────────────────────────────────────────────────────────
+
+/// Auto-seed: a photo with **exactly one** detected face and **exactly one** assigned person
+/// tag becomes a confirmed seed for that person. Skips photos already carrying a confirmed/
+/// ignored/manual face (idempotent), and honours rejection memory. Returns the photos it
+/// seeded (one face each).
+fn auto_seed(
+    conn: &Connection,
+    person_tags: &std::collections::HashSet<i64>,
+    now: i64,
+    progress: MatchProgress,
+) -> rusqlite::Result<Vec<i64>> {
+    if person_tags.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // Candidate photos: exactly one face row, and that face is still unassigned (not already
+    // confirmed/ignored/manual/suggested — seeding only fires on a clean detection).
+    let mut stmt = conn.prepare(
+        "SELECT photo_id, MIN(id) AS face_id, COUNT(*) AS n
+           FROM faces__faces
+          GROUP BY photo_id
+         HAVING n = 1",
+    )?;
+    let candidates: Vec<(i64, i64)> = stmt
+        .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+
+    if !progress(MatchPhase::Seed, 0, candidates.len()) {
+        return Ok(Vec::new());
+    }
+    let mut seeded = Vec::new();
+    for (done, &(photo_id, face_id)) in candidates.iter().enumerate() {
+        if !progress(MatchPhase::Seed, done + 1, candidates.len()) {
+            break;
+        }
+        // The photo must have exactly one *person* tag.
+        let tags = photo_person_tags(conn, photo_id, person_tags)?;
+        if tags.len() != 1 {
+            continue; // 2 faces + 1 tag handled by the COUNT above; here: 1 face + ≠1 person tag.
+        }
+        let tag_id = tags[0];
+
+        // Respect rejection memory — never seed a pair the user rejected.
+        if is_rejected(conn, face_id, tag_id)? {
+            continue;
+        }
+
+        let _ = now; // seeds carry no created_at rewrite; timestamp reserved for future audit.
+        if write_seed(conn, face_id, tag_id)? {
+            seeded.push(photo_id);
+        }
+    }
+    Ok(seeded)
+}
+
+// ── Reset pending state (idempotence) ───────────────────────────────────────────
+
+/// Clear machine-made, non-confirmed decisions so the run recomputes from a clean slate:
+/// every face that is still `suggested` (from a prior run) or `unassigned` is returned to
+/// `unassigned` with no person/cluster/confidence. Confirmed, ignored and manual faces are
+/// left exactly as they are — the matcher never downgrades a human (or seed) decision.
+fn reset_pending(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute(
+        "UPDATE faces__faces
+            SET state = ?1, person_tag_id = NULL, match_confidence = NULL,
+                cluster_id = NULL, source = ?2
+          WHERE state IN (?1, ?3)",
+        rusqlite::params![STATE_UNASSIGNED, super::indexer::SOURCE_DETECT, STATE_SUGGESTED],
+    )?;
+    Ok(())
+}
+
+// ── Step 2: per-person centroids ────────────────────────────────────────────────
+
+/// Compute one L2-normalized centroid per person from that person's **confirmed** (and not
+/// ignored) faces that carry an embedding. People with no usable confirmed face get no
+/// centroid (and so are skipped in steps 3–4). Ignored faces are excluded by the `state`
+/// filter — they never influence a centroid.
+fn compute_centroids(
+    conn: &Connection,
+    person_tags: &std::collections::HashSet<i64>,
+) -> rusqlite::Result<Vec<Centroid>> {
+    let mut stmt = conn.prepare(
+        "SELECT person_tag_id, embedding
+           FROM faces__faces
+          WHERE state = ?1 AND person_tag_id IS NOT NULL AND embedding IS NOT NULL",
+    )?;
+    let rows = stmt.query_map([STATE_CONFIRMED], |r| {
+        Ok((r.get::<_, i64>(0)?, r.get::<_, Vec<u8>>(1)?))
+    })?;
+
+    let mut sums: std::collections::HashMap<i64, (Vec<f32>, usize)> =
+        std::collections::HashMap::new();
+    for row in rows {
+        let (tag_id, blob) = row?;
+        if !person_tags.contains(&tag_id) {
+            continue; // person tag was moved out of the people branch — ignore.
+        }
+        let emb = match blob_to_embedding(&blob) {
+            Ok(e) if !e.is_empty() => e,
+            _ => continue,
+        };
+        let entry = sums.entry(tag_id).or_insert_with(|| (vec![0.0; emb.len()], 0));
+        if entry.0.len() != emb.len() {
+            continue; // dimension mismatch — skip defensively.
+        }
+        for (acc, v) in entry.0.iter_mut().zip(emb.iter()) {
+            *acc += v;
+        }
+        entry.1 += 1;
+    }
+
+    let mut out: Vec<Centroid> = sums
+        .into_iter()
+        .filter_map(|(tag_id, (sum, n))| {
+            if n == 0 {
+                return None;
+            }
+            let mean: Vec<f32> = sum.iter().map(|s| s / n as f32).collect();
+            let normed = l2_normalize(&mean);
+            Some(Centroid {
+                tag_id,
+                vec: normed,
+            })
+        })
+        .collect();
+    // Deterministic order for stable tests.
+    out.sort_by_key(|c| c.tag_id);
+    Ok(out)
+}
+
+// ── Load pending faces ──────────────────────────────────────────────────────────
+
+/// Load all faces that are still `unassigned` and carry an embedding — the candidates for
+/// steps 3–5. Ordered by id for determinism.
+fn load_pending_faces(conn: &Connection) -> rusqlite::Result<Vec<FaceRow>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, photo_id, embedding
+           FROM faces__faces
+          WHERE state = ?1 AND embedding IS NOT NULL
+          ORDER BY id",
+    )?;
+    let rows = stmt.query_map([STATE_UNASSIGNED], |r| {
+        Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, Vec<u8>>(2)?))
+    })?;
+    let mut out = Vec::new();
+    for row in rows {
+        let (id, photo_id, blob) = row?;
+        if let Ok(emb) = blob_to_embedding(&blob) {
+            if !emb.is_empty() {
+                out.push(FaceRow {
+                    id,
+                    photo_id,
+                    embedding: emb,
+                });
+            }
+        }
+    }
+    Ok(out)
+}
+
+// ── Step 3: constrained (Hungarian) match ───────────────────────────────────────
+
+/// Constrained match: for each photo with ≥1 pending face AND ≥1 assigned person tag that has
+/// a centroid, solve the optimal one-to-one assignment (Hungarian, cost = `1 − cosine`) of the
+/// photo's faces to its people. Only assignments involving a real (non-padding) face and
+/// person are written as `suggested`. Rejected pairs are made infinitely costly so they are
+/// never chosen. Returns the number of faces suggested.
+fn constrained_match(
+    conn: &Connection,
+    pending: &[FaceRow],
+    centroids: &[Centroid],
+    person_tags: &std::collections::HashSet<i64>,
+    resolved: &mut std::collections::HashSet<i64>,
+    now: i64,
+    progress: MatchProgress,
+) -> rusqlite::Result<usize> {
+    // Group pending faces by photo, preserving id order.
+    let mut by_photo: std::collections::BTreeMap<i64, Vec<usize>> =
+        std::collections::BTreeMap::new();
+    for (i, f) in pending.iter().enumerate() {
+        by_photo.entry(f.photo_id).or_default().push(i);
+    }
+
+    let centroid_by_tag: std::collections::HashMap<i64, &Vec<f32>> =
+        centroids.iter().map(|c| (c.tag_id, &c.vec)).collect();
+
+    let total_photos = by_photo.len();
+    if !progress(MatchPhase::Constrained, 0, total_photos) {
+        return Ok(0);
+    }
+    let mut suggested = 0usize;
+    for (done, (photo_id, face_idxs)) in by_photo.into_iter().enumerate() {
+        if !progress(MatchPhase::Constrained, done + 1, total_photos) {
+            break;
+        }
+        let ptags = photo_person_tags(conn, photo_id, person_tags)?;
+        // Only people that actually have a centroid can be matched.
+        let people: Vec<i64> = ptags
+            .into_iter()
+            .filter(|t| centroid_by_tag.contains_key(t))
+            .collect();
+        if people.is_empty() {
+            continue; // no constraining people → leave to open matching.
+        }
+
+        let rows = face_idxs.len();
+        let cols = people.len();
+        // Build the cost matrix, padded to square. Cost = 1 - cosine to that person's centroid.
+        // Padding entries (nonexistent face/person) cost PAD so they never beat a real pair.
+        let dim = rows.max(cols);
+        const PAD: f32 = 10.0;
+        const REJECTED: f32 = 1e6;
+        let mut cost = vec![vec![PAD; dim]; dim];
+        for (ri, &fi) in face_idxs.iter().enumerate() {
+            let emb = &pending[fi].embedding;
+            for (ci, &tag_id) in people.iter().enumerate() {
+                if is_rejected(conn, pending[fi].id, tag_id)? {
+                    cost[ri][ci] = REJECTED;
+                    continue;
+                }
+                let sim = cosine(emb, centroid_by_tag[&tag_id]);
+                cost[ri][ci] = 1.0 - sim;
+            }
+        }
+
+        let assignment = hungarian_min_cost(&cost);
+        for (ri, &fi) in face_idxs.iter().enumerate() {
+            let ci = assignment[ri];
+            if ci >= cols {
+                continue; // matched to padding — no real person for this face.
+            }
+            let c = cost[ri][ci];
+            if c >= REJECTED || c >= PAD {
+                continue; // rejected pair or padding cost — skip.
+            }
+            let tag_id = people[ci];
+            let confidence = 1.0 - c; // cosine similarity.
+            // A face decided meanwhile is resolved either way: it must not be clustered.
+            resolved.insert(pending[fi].id);
+            if write_suggestion(conn, pending[fi].id, tag_id, confidence, now)? {
+                suggested += 1;
+            }
+        }
+    }
+    Ok(suggested)
+}
+
+// ── Step 4: open matching ───────────────────────────────────────────────────────
+
+/// Open matching: for each still-unresolved pending face, find the nearest person centroid;
+/// if its cosine similarity exceeds the threshold and the pair isn't rejected, write a
+/// `suggested` row. Returns the number suggested.
+fn open_match(
+    conn: &Connection,
+    pending: &[FaceRow],
+    centroids: &[Centroid],
+    threshold: f32,
+    resolved: &mut std::collections::HashSet<i64>,
+    now: i64,
+    progress: MatchProgress,
+) -> rusqlite::Result<usize> {
+    if !progress(MatchPhase::Open, 0, pending.len()) {
+        return Ok(0);
+    }
+    let mut suggested = 0usize;
+    for (done, f) in pending.iter().enumerate() {
+        if !progress(MatchPhase::Open, done + 1, pending.len()) {
+            break;
+        }
+        // Skip faces already resolved by constrained matching (step 3).
+        if resolved.contains(&f.id) {
+            continue;
+        }
+        // Find the best centroid strictly above the threshold, honouring rejection memory.
+        let mut best: Option<(i64, f32)> = None;
+        for c in centroids {
+            if is_rejected(conn, f.id, c.tag_id)? {
+                continue;
+            }
+            let sim = cosine(&f.embedding, &c.vec);
+            if sim > threshold && best.map(|(_, s)| sim > s).unwrap_or(true) {
+                best = Some((c.tag_id, sim));
+            }
+        }
+        if let Some((tag_id, sim)) = best {
+            resolved.insert(f.id);
+            // A test can land a reject here — after this face's `is_rejected` read already
+            // found nothing, before `write_suggestion` — to prove the write's own fresh
+            // `NOT_REJECTED` check is what stops it (#217's test gap: the #137/#208 tests
+            // force their reject before this read, so that check alone already catches it).
+            #[cfg(test)]
+            tests::before_suggestion_write(conn, f.id);
+            if write_suggestion(conn, f.id, tag_id, sim, now)? {
+                suggested += 1;
+            }
+        }
+    }
+    Ok(suggested)
+}
+
+// ── Step 5: incremental greedy clustering ───────────────────────────────────────
+
+/// Incremental greedy clustering for faces that matched no known person: join the nearest
+/// existing cluster centroid within threshold, else start a new cluster. The cluster centroid
+/// is updated (running L2-normalized mean) as members join. Returns the number of faces
+/// clustered.
+fn cluster_leftovers(
+    conn: &Connection,
+    pending: &[FaceRow],
+    threshold: f32,
+    resolved: &std::collections::HashSet<i64>,
+    now: i64,
+    progress: MatchProgress,
+) -> rusqlite::Result<usize> {
+    // Rebuild clusters from scratch every run so the pipeline is idempotent. The only cluster
+    // rows that survive between runs hold *leftover* (still-pending) faces — `reset_pending`
+    // has already cleared their `cluster_id`, and `name_cluster` deletes a cluster the moment
+    // it's named + its members confirmed. So the persisted rows carry no state we must keep;
+    // re-growing them incrementally would re-add each leftover face on every run, inflating
+    // `size` and drifting the running-mean centroid. Instead we clear the table and rebuild it
+    // fresh from the current leftovers — exactly how `suggested` rows are recomputed each run.
+    conn.execute("DELETE FROM faces__clusters", [])?;
+    let mut clusters: Vec<(i64, Vec<f32>, usize)> = Vec::new();
+
+    if !progress(MatchPhase::Cluster, 0, pending.len()) {
+        return Ok(0);
+    }
+    let mut clustered = 0usize;
+    for (done, f) in pending.iter().enumerate() {
+        if !progress(MatchPhase::Cluster, done + 1, pending.len()) {
+            break;
+        }
+        if resolved.contains(&f.id) {
+            continue;
+        }
+        // Nearest existing cluster within threshold.
+        let mut best: Option<(usize, f32)> = None; // (index into `clusters`, sim)
+        for (i, (_, cen, _)) in clusters.iter().enumerate() {
+            let sim = cosine(&f.embedding, cen);
+            if sim > threshold && best.map(|(_, s)| sim > s).unwrap_or(true) {
+                best = Some((i, sim));
+            }
+        }
+
+        // The face joins a cluster only while it is still unassigned: `pending` was read
+        // before this step, and a naming or ignore may have landed since (#137). A face that
+        // is no longer pending neither joins nor moves a centroid.
+        match best {
+            Some((idx, _)) => {
+                if !assign_cluster(conn, f.id, clusters[idx].0)? {
+                    continue;
+                }
+                // Join: update the running mean centroid.
+                let (cid, cen, size) = &mut clusters[idx];
+                let n = *size as f32;
+                let updated: Vec<f32> = cen
+                    .iter()
+                    .zip(f.embedding.iter())
+                    .map(|(c, v)| (c * n + v) / (n + 1.0))
+                    .collect();
+                *cen = l2_normalize(&updated);
+                *size += 1;
+                let cid = *cid;
+                conn.execute(
+                    "UPDATE faces__clusters SET centroid = ?2, size = ?3 WHERE id = ?1",
+                    rusqlite::params![cid, embedding_to_blob(cen), *size as i64],
+                )?;
+            }
+            None => {
+                // New cluster seeded from this face's (normalized) embedding.
+                let cen = l2_normalize(&f.embedding);
+                conn.execute(
+                    "INSERT INTO faces__clusters (centroid, size, created_at) VALUES (?1, 1, ?2)",
+                    rusqlite::params![embedding_to_blob(&cen), now],
+                )?;
+                let cid = conn.last_insert_rowid();
+                if !assign_cluster(conn, f.id, cid)? {
+                    conn.execute("DELETE FROM faces__clusters WHERE id = ?1", [cid])?;
+                    continue;
+                }
+                clusters.push((cid, cen, 1));
+            }
+        }
+        clustered += 1;
+    }
+    Ok(clustered)
+}
+
+// ── Write helpers ───────────────────────────────────────────────────────────────
+
+// The matcher reads its candidates once, then writes them one by one on its own connection,
+// outside any transaction, so the user can confirm, name, assign or ignore a face in between
+// (the inspector, the loupe overlay, the People view). Every write below
+// therefore re-checks, in the UPDATE itself, that the face is still undecided: a decision
+// made during a run always stands, in the catalog and so in the sidecar it was exported to
+// (#137).
+
+/// The pair `(?1 face, ?2 person)` of a seed or suggestion write is not remembered as
+/// rejected. The matcher checks [`is_rejected`] before it writes, but a reject on the main
+/// connection can land in between (#208), so the write checks again in its own `UPDATE`.
+const NOT_REJECTED: &str =
+    "NOT EXISTS (SELECT 1 FROM faces__rejections r WHERE r.face_id = ?1 AND r.person_tag_id = ?2)";
+
+/// Confirm a face as a seed of `tag_id` (`source='seed'`). The single face must still be a raw
+/// unassigned detection — checked in the UPDATE itself, so a confirm/name/ignore that landed
+/// since the candidates were read is never overwritten (#137) — and the pair unrejected
+/// ([`NOT_REJECTED`]). Returns whether it wrote.
+fn write_seed(conn: &Connection, face_id: i64, tag_id: i64) -> rusqlite::Result<bool> {
+    let changed = conn.execute(
+        &format!(
+            "UPDATE faces__faces
+                SET person_tag_id = ?2, state = ?3, source = ?4,
+                    match_confidence = 1.0, cluster_id = NULL
+              WHERE id = ?1 AND state = ?5 AND {NOT_REJECTED}"
+        ),
+        rusqlite::params![face_id, tag_id, STATE_CONFIRMED, SOURCE_SEED, STATE_UNASSIGNED],
+    )?;
+    Ok(changed == 1)
+}
+
+/// Write a `suggested` row for a face: set the person, confidence and `source='match'` —
+/// only while the face is still pending a decision ([`PENDING_STATES`]) and the pair is not
+/// rejected ([`NOT_REJECTED`]). Returns whether it wrote.
+fn write_suggestion(
+    conn: &Connection,
+    face_id: i64,
+    tag_id: i64,
+    confidence: f32,
+    _now: i64,
+) -> rusqlite::Result<bool> {
+    let changed = conn.execute(
+        &format!(
+            "UPDATE faces__faces
+                SET person_tag_id = ?2, state = ?3, source = ?4,
+                    match_confidence = ?5, cluster_id = NULL
+              WHERE id = ?1 AND state IN {PENDING_STATES} AND {NOT_REJECTED}"
+        ),
+        rusqlite::params![face_id, tag_id, STATE_SUGGESTED, SOURCE_MATCH, confidence as f64],
+    )?;
+    Ok(changed == 1)
+}
+
+/// Put a face in cluster `cluster_id` — only while it is still `unassigned` (no suggestion,
+/// no decision). Returns whether it did.
+fn assign_cluster(conn: &Connection, face_id: i64, cluster_id: i64) -> rusqlite::Result<bool> {
+    let changed = conn.execute(
+        "UPDATE faces__faces SET cluster_id = ?2 WHERE id = ?1 AND state = ?3",
+        rusqlite::params![face_id, cluster_id, STATE_UNASSIGNED],
+    )?;
+    Ok(changed == 1)
+}
+
+// ── Rejection memory ────────────────────────────────────────────────────────────
+
+/// True if the `(face, person)` pair has been rejected by the user.
+fn is_rejected(conn: &Connection, face_id: i64, person_tag_id: i64) -> rusqlite::Result<bool> {
+    conn.query_row(
+        "SELECT 1 FROM faces__rejections WHERE face_id = ?1 AND person_tag_id = ?2",
+        rusqlite::params![face_id, person_tag_id],
+        |_| Ok(()),
+    )
+    .optional()
+    .map(|r| r.is_some())
+}
+
+// ── Mutations (accept / reject / ignore / assign) ───────────────────────────────
+//
+// These are the low-level DB mutations behind accept/reject/ignore/assign. `accept` also
+// needs to assign the person tag to the *photo* through the catalog's `assign_tag` path (XMP
+// export + merge-safe). That side effect lives in `app/faces.rs`, which owns the `Catalog`;
+// here we only return the `(photo_id, person_tag_id)` the caller must assign.
+
+/// What [`accept`] answers for a face with no person to confirm. (It used to say "face has
+/// no assigned person to accept" — misleading for a face the user saw suggested, #208.)
+pub const NO_SUGGESTION_TO_ACCEPT: &str =
+    "the face has no suggestion to confirm any more (matching or a reject changed it since it was shown)";
+
+/// Confirm a suggested/unassigned face: mark it `confirmed`. Returns `(photo_id, person_tag_id)`
+/// so the caller can `assign_tag` the photo through the catalog (XMP + merge). Errors with
+/// [`NO_SUGGESTION_TO_ACCEPT`] if the face has no person (nothing to confirm) — typically a
+/// suggestion that a matching run has reset, or a reject has removed, since it was shown. A
+/// front end that shows the person uses [`accept_suggestion`] instead, which confirms only
+/// the person shown (#208).
+pub fn accept(conn: &Connection, face_id: i64) -> rusqlite::Result<(i64, i64)> {
+    let row: Option<(i64, Option<i64>)> = conn
+        .query_row(
+            "SELECT photo_id, person_tag_id FROM faces__faces WHERE id = ?1",
+            [face_id],
+            |r| Ok((r.get::<_, i64>(0)?, r.get::<_, Option<i64>>(1)?)),
+        )
+        .optional()?;
+    let (photo_id, person) = row.ok_or_else(|| {
+        rusqlite::Error::QueryReturnedNoRows
+    })?;
+    let person_tag_id = person.ok_or_else(|| {
+        // No person to confirm — surface as a constraint failure.
+        rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CONSTRAINT),
+            Some(NO_SUGGESTION_TO_ACCEPT.into()),
+        )
+    })?;
+    conn.execute(
+        "UPDATE faces__faces
+            SET state = ?2, match_confidence = 1.0, cluster_id = NULL
+          WHERE id = ?1",
+        rusqlite::params![face_id, STATE_CONFIRMED],
+    )?;
+    Ok((photo_id, person_tag_id))
+}
+
+/// Reject the face's currently-suggested/assigned person: remember the `(face, person)` pair
+/// so it is never re-proposed, and return the face to `unassigned`. No-op detail: if the face
+/// has no person assigned there is nothing to remember and the face is simply left unassigned.
+pub fn reject(conn: &Connection, face_id: i64, now: i64) -> rusqlite::Result<()> {
+    // Before the face loses its person: a catalog's first face write after the pre-marker
+    // record arrived must still find this face on it (#135, `store::ensure_schema`).
+    super::store::ensure_schema(conn)?;
+    let person: Option<i64> = conn
+        .query_row(
+            "SELECT person_tag_id FROM faces__faces WHERE id = ?1",
+            [face_id],
+            |r| r.get::<_, Option<i64>>(0),
+        )
+        .optional()?
+        .flatten();
+    if let Some(person_tag_id) = person {
+        conn.execute(
+            "INSERT OR IGNORE INTO faces__rejections (face_id, person_tag_id, rejected_at)
+             VALUES (?1, ?2, ?3)",
+            rusqlite::params![face_id, person_tag_id, now],
+        )?;
+    }
+    conn.execute(
+        "UPDATE faces__faces
+            SET state = ?2, person_tag_id = NULL, match_confidence = NULL, cluster_id = NULL
+          WHERE id = ?1",
+        rusqlite::params![face_id, STATE_UNASSIGNED],
+    )?;
+    Ok(())
+}
+
+/// Mark a face `ignored`: excluded from centroids and suggestions but kept so re-indexing
+/// doesn't resurrect it. Clears any person/cluster association.
+pub fn ignore(conn: &Connection, face_id: i64) -> rusqlite::Result<()> {
+    super::store::ensure_schema(conn)?; // as in `reject`
+    conn.execute(
+        "UPDATE faces__faces
+            SET state = ?2, person_tag_id = NULL, match_confidence = NULL, cluster_id = NULL
+          WHERE id = ?1",
+        rusqlite::params![face_id, STATE_IGNORED],
+    )?;
+    Ok(())
+}
+
+/// Manually assign a face to a specific person tag and confirm it (`source='manual'`).
+/// Returns `(photo_id, tag_id)` so the caller can `assign_tag` the photo. A manual assignment
+/// clears any stale rejection of that exact pair (the user changed their mind).
+pub fn assign(conn: &Connection, face_id: i64, tag_id: i64) -> rusqlite::Result<(i64, i64)> {
+    let photo_id: i64 = conn.query_row(
+        "SELECT photo_id FROM faces__faces WHERE id = ?1",
+        [face_id],
+        |r| r.get(0),
+    )?;
+    conn.execute(
+        "DELETE FROM faces__rejections WHERE face_id = ?1 AND person_tag_id = ?2",
+        rusqlite::params![face_id, tag_id],
+    )?;
+    conn.execute(
+        "UPDATE faces__faces
+            SET person_tag_id = ?2, state = ?3, source = ?4,
+                match_confidence = 1.0, cluster_id = NULL
+          WHERE id = ?1",
+        rusqlite::params![face_id, tag_id, STATE_CONFIRMED, SOURCE_MANUAL],
+    )?;
+    Ok((photo_id, tag_id))
+}
+
+/// Confirm all faces in a cluster against a (freshly created/bound) person tag: assign the tag,
+/// mark them `confirmed` with `source='manual'`, and clear their cluster membership. Returns the
+/// distinct `(photo_id)` list the caller must `assign_tag` for. The tag itself is created by the
+/// caller (which owns the `Catalog`) — here we only bind the member faces.
+pub fn name_cluster(conn: &Connection, cluster_id: i64, tag_id: i64) -> rusqlite::Result<Vec<i64>> {
+    // Collect the photos the members belong to (for photo-level tag assignment).
+    let photos: Vec<i64> = {
+        let mut stmt = conn.prepare(
+            "SELECT DISTINCT photo_id FROM faces__faces WHERE cluster_id = ?1",
+        )?;
+        let rows = stmt.query_map([cluster_id], |r| r.get::<_, i64>(0))?;
+        rows.collect::<rusqlite::Result<_>>()?
+    };
+    conn.execute(
+        "UPDATE faces__faces
+            SET person_tag_id = ?2, state = ?3, source = ?4,
+                match_confidence = 1.0, cluster_id = NULL
+          WHERE cluster_id = ?1",
+        rusqlite::params![cluster_id, tag_id, STATE_CONFIRMED, SOURCE_MANUAL],
+    )?;
+    // The cluster is now empty; drop its bookkeeping row.
+    conn.execute("DELETE FROM faces__clusters WHERE id = ?1", [cluster_id])?;
+    Ok(photos)
+}
+
+/// What [`name_faces`] / [`ignore_faces`] changed: how many faces, the distinct photos they
+/// are on (the caller assigns the person tag to these and re-exports their regions), and the
+/// clusters they left (for [`tidy_clusters`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FacesChanged {
+    pub faces: usize,
+    pub photos: Vec<i64>,
+    pub clusters: Vec<i64>,
+}
+
+/// The states a People-view verb may move a face out of: still pending a decision. A face the
+/// user (or a seed, or an import) already confirmed, or ignored, is never overwritten by a
+/// list read before that happened.
+const PENDING_STATES: &str = "('unassigned', 'suggested')";
+
+/// Confirm `face_ids` as the person `tag_id` (`source='manual'`) — the People view's naming
+/// of a cluster, of several clusters at once (a merge), or of some of a cluster's faces (a
+/// split). Only faces still pending a decision change; the rest are skipped and not counted.
+/// A naming is the user's explicit word, so it clears a remembered rejection of that pair,
+/// as [`assign`] does.
+pub fn name_faces(conn: &Connection, face_ids: &[i64], tag_id: i64) -> rusqlite::Result<FacesChanged> {
+    let mut read = conn.prepare(&format!(
+        "SELECT photo_id, cluster_id FROM faces__faces WHERE id = ?1 AND state IN {PENDING_STATES}"
+    ))?;
+    let mut confirm = conn.prepare(&format!(
+        "UPDATE faces__faces
+            SET person_tag_id = ?2, state = ?3, source = ?4, match_confidence = 1.0, cluster_id = NULL
+          WHERE id = ?1 AND state IN {PENDING_STATES}"
+    ))?;
+    let mut forget = conn.prepare("DELETE FROM faces__rejections WHERE face_id = ?1 AND person_tag_id = ?2")?;
+    let mut out = FacesChanged::default();
+    let mut seen = std::collections::HashSet::new();
+    for &face in face_ids {
+        if !seen.insert(face) {
+            continue;
+        }
+        let Some((photo, cluster)) =
+            read.query_row([face], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, Option<i64>>(1)?))).optional()?
+        else {
+            continue;
+        };
+        confirm.execute(rusqlite::params![face, tag_id, STATE_CONFIRMED, SOURCE_MANUAL])?;
+        forget.execute(rusqlite::params![face, tag_id])?;
+        out.faces += 1;
+        if !out.photos.contains(&photo) {
+            out.photos.push(photo);
+        }
+        if let Some(c) = cluster.filter(|c| !out.clusters.contains(c)) {
+            out.clusters.push(c);
+        }
+    }
+    Ok(out)
+}
+
+/// Mark `face_ids` `ignored` (a stranger, a crowd) — only those still pending a decision.
+/// `photos` is left empty: a pending face is in no exported region, so no sidecar changes.
+pub fn ignore_faces(conn: &Connection, face_ids: &[i64]) -> rusqlite::Result<FacesChanged> {
+    let mut read =
+        conn.prepare(&format!("SELECT cluster_id FROM faces__faces WHERE id = ?1 AND state IN {PENDING_STATES}"))?;
+    let mut set = conn.prepare(&format!(
+        "UPDATE faces__faces
+            SET state = ?2, person_tag_id = NULL, match_confidence = NULL, cluster_id = NULL
+          WHERE id = ?1 AND state IN {PENDING_STATES}"
+    ))?;
+    let mut out = FacesChanged::default();
+    for &face in face_ids {
+        let Some(cluster) = read.query_row([face], |r| r.get::<_, Option<i64>>(0)).optional()? else { continue };
+        if set.execute(rusqlite::params![face, STATE_IGNORED])? == 0 {
+            continue;
+        }
+        out.faces += 1;
+        if let Some(c) = cluster.filter(|c| !out.clusters.contains(c)) {
+            out.clusters.push(c);
+        }
+    }
+    Ok(out)
+}
+
+/// Bring the bookkeeping of `clusters` up to date after faces left them: a cluster with no
+/// member left is dropped, the others get their member count. (Their centroids stay as they
+/// were until the next matching run rebuilds every cluster.)
+pub fn tidy_clusters(conn: &Connection, clusters: &[i64]) -> rusqlite::Result<()> {
+    for &c in clusters {
+        let left: i64 = conn.query_row("SELECT COUNT(*) FROM faces__faces WHERE cluster_id = ?1", [c], |r| r.get(0))?;
+        if left == 0 {
+            conn.execute("DELETE FROM faces__clusters WHERE id = ?1", [c])?;
+        } else {
+            conn.execute("UPDATE faces__clusters SET size = ?2 WHERE id = ?1", rusqlite::params![c, left])?;
+        }
+    }
+    Ok(())
+}
+
+/// Whether face `face_id` is still `suggested` as `tag_id` — the suggestion as it was shown.
+/// Read-only: a caller sorts a stale verdict from the rest before acting on it.
+pub fn still_suggested(conn: &Connection, face_id: i64, tag_id: i64) -> rusqlite::Result<bool> {
+    Ok(conn
+        .query_row(
+            "SELECT 1 FROM faces__faces WHERE id = ?1 AND state = ?2 AND person_tag_id = ?3",
+            rusqlite::params![face_id, STATE_SUGGESTED, tag_id],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some())
+}
+
+/// Confirm a suggestion **as it was shown**: only while face `face_id` is still `suggested` as
+/// `tag_id`. A review list read before a re-run of matching (which may now suggest someone
+/// else) can therefore never confirm a person the user did not see. Returns the photo when it
+/// confirmed, `None` when the suggestion had changed.
+///
+/// The `UPDATE` re-checks the same `state`/`person_tag_id` the read just confirmed and looks at
+/// its own affected-row count (#217), rather than writing unconditionally by id: a match worker
+/// on another connection that reassigns, resets or rejects the face between this function's read
+/// and its write (WAL — see the module doc) is then a `None` (stale), the same answer as a read
+/// that already saw the change, never a lost update that resurrects a decision the race made.
+pub fn accept_suggestion(conn: &Connection, face_id: i64, tag_id: i64) -> rusqlite::Result<Option<i64>> {
+    let photo: Option<i64> = conn
+        .query_row(
+            "SELECT photo_id FROM faces__faces WHERE id = ?1 AND state = ?2 AND person_tag_id = ?3",
+            rusqlite::params![face_id, STATE_SUGGESTED, tag_id],
+            |r| r.get(0),
+        )
+        .optional()?;
+    let Some(photo) = photo else {
+        return Ok(None);
+    };
+    #[cfg(test)]
+    tests::before_accept_update(conn);
+    let changed = conn.execute(
+        "UPDATE faces__faces SET state = ?2, match_confidence = 1.0, cluster_id = NULL
+          WHERE id = ?1 AND state = ?3 AND person_tag_id = ?4",
+        rusqlite::params![face_id, STATE_CONFIRMED, STATE_SUGGESTED, tag_id],
+    )?;
+    if changed == 0 {
+        return Ok(None);
+    }
+    Ok(Some(photo))
+}
+
+/// Reject a suggestion as it was shown (see [`accept_suggestion`]), by [`reject_shown`].
+/// Returns whether it rejected.
+pub fn reject_suggestion(conn: &Connection, face_id: i64, tag_id: i64, now: i64) -> rusqlite::Result<bool> {
+    reject_shown(conn, face_id, Some(tag_id), now)
+}
+
+/// Reject a face **as it was shown**: `shown` is the person the user saw suggested, `None`
+/// for a face shown with no person. It applies only while the face holds no other verdict or
+/// proposal:
+///
+/// - still `suggested` as `shown`: the pair is remembered and the face is unassigned, as
+///   [`reject`] does;
+/// - `unassigned` with no person — for a shown person, a matching run's reset has cleared the
+///   suggestion the user saw (#208): the face stays unassigned and the shown pair is
+///   remembered, so the run, which re-checks rejections before and in each write, never
+///   proposes it again;
+/// - anything else — confirmed, ignored, or now suggested as someone the user did not see —
+///   is **stale**: nothing changes, and no other person is rejected.
+///
+/// The conditional `UPDATE` comes first, inside a savepoint, so this connection holds the
+/// write lock until the pair is remembered: a matching run on another connection cannot slip
+/// a suggestion in between. Returns whether it applied.
+pub fn reject_shown(conn: &Connection, face_id: i64, shown: Option<i64>, now: i64) -> rusqlite::Result<bool> {
+    // As in `reject`: before the face loses its person.
+    super::store::ensure_schema(conn)?;
+    conn.execute_batch("SAVEPOINT faces_reject_shown")?;
+    let applied = (|| -> rusqlite::Result<bool> {
+        let changed = conn.execute(
+            "UPDATE faces__faces
+                SET state = ?2, person_tag_id = NULL, match_confidence = NULL, cluster_id = NULL
+              WHERE id = ?1
+                AND ((state = ?3 AND person_tag_id = ?4) OR (state = ?2 AND person_tag_id IS NULL))",
+            rusqlite::params![face_id, STATE_UNASSIGNED, STATE_SUGGESTED, shown],
+        )?;
+        if changed == 0 {
+            return Ok(false);
+        }
+        if let Some(tag_id) = shown {
+            conn.execute(
+                "INSERT OR IGNORE INTO faces__rejections (face_id, person_tag_id, rejected_at)
+                 VALUES (?1, ?2, ?3)",
+                rusqlite::params![face_id, tag_id, now],
+            )?;
+        }
+        Ok(true)
+    })();
+    match applied {
+        Ok(applied) => {
+            conn.execute_batch("RELEASE faces_reject_shown")?;
+            Ok(applied)
+        }
+        Err(e) => {
+            let _ = conn.execute_batch("ROLLBACK TO faces_reject_shown; RELEASE faces_reject_shown");
+            Err(e)
+        }
+    }
+}
+
+/// Counters from [`accept_person_on_photos`], so a batch confirm can report what it actually
+/// did instead of implying every selected photo changed.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AcceptPersonOutcome {
+    /// Photos where at least one suggested face became `confirmed`.
+    pub photos_confirmed: usize,
+    /// Faces moved `suggested` → `confirmed`, summed over every photo.
+    pub faces_confirmed: usize,
+    /// Photos that already had this person confirmed — nothing to do, and not a failure.
+    pub photos_already_confirmed: usize,
+    /// Photos with neither a suggestion nor a confirmation for this person.
+    pub photos_without_suggestion: usize,
+}
+
+/// Confirm, across `photo_ids`, the faces the matcher **already suggested** as `tag_id`
+/// (issue #68: confirming a person on a multi-selection, not just the active photo).
+///
+/// The criterion is exactly `state = 'suggested' AND person_tag_id = tag_id`, which is the
+/// same set the per-face confirm button acts on, one photo at a time. A photo where this
+/// person was never suggested is *reported*, never force-assigned: inventing a face region
+/// for a person the detector never proposed there would fabricate data, and assigning only
+/// the photo-level tag would leave the tag and the face rows disagreeing. Rejections need no
+/// special case — a rejected `(face, person)` pair is never re-suggested, so it cannot be in
+/// the selected set.
+///
+/// Returns the counters plus the distinct photos that actually changed, so the caller can
+/// `assign_tag` and re-export MWG regions for exactly those (this function owns no `Catalog`).
+pub fn accept_person_on_photos(
+    conn: &Connection,
+    photo_ids: &[i64],
+    tag_id: i64,
+) -> rusqlite::Result<(AcceptPersonOutcome, Vec<i64>)> {
+    let mut count_suggested = conn.prepare(
+        "SELECT COUNT(*) FROM faces__faces
+          WHERE photo_id = ?1 AND person_tag_id = ?2 AND state = ?3",
+    )?;
+    let mut has_confirmed = conn.prepare(
+        "SELECT 1 FROM faces__faces
+          WHERE photo_id = ?1 AND person_tag_id = ?2 AND state = ?3 LIMIT 1",
+    )?;
+    let mut confirm = conn.prepare(
+        "UPDATE faces__faces
+            SET state = ?4, match_confidence = 1.0, cluster_id = NULL
+          WHERE photo_id = ?1 AND person_tag_id = ?2 AND state = ?3",
+    )?;
+
+    let mut outcome = AcceptPersonOutcome::default();
+    let mut changed: Vec<i64> = Vec::new();
+    let mut seen: std::collections::HashSet<i64> = std::collections::HashSet::new();
+
+    for &photo_id in photo_ids {
+        // A selection can name the same photo twice (or the caller may union in the active
+        // photo); counting it twice would inflate the report.
+        if !seen.insert(photo_id) {
+            continue;
+        }
+        let suggested: i64 = count_suggested.query_row(
+            rusqlite::params![photo_id, tag_id, STATE_SUGGESTED],
+            |r| r.get(0),
+        )?;
+        if suggested > 0 {
+            confirm.execute(rusqlite::params![
+                photo_id,
+                tag_id,
+                STATE_SUGGESTED,
+                STATE_CONFIRMED
+            ])?;
+            outcome.photos_confirmed += 1;
+            outcome.faces_confirmed += suggested as usize;
+            changed.push(photo_id);
+        } else if has_confirmed
+            .query_row(rusqlite::params![photo_id, tag_id, STATE_CONFIRMED], |_| Ok(()))
+            .optional()?
+            .is_some()
+        {
+            outcome.photos_already_confirmed += 1;
+        } else {
+            outcome.photos_without_suggestion += 1;
+        }
+    }
+
+    Ok((outcome, changed))
+}
+
+// ── Math helpers ────────────────────────────────────────────────────────────────
+
+/// L2-normalize a vector into a unit vector (safe on a zero vector → returns it unchanged).
+fn l2_normalize(v: &[f32]) -> Vec<f32> {
+    let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+    if norm > 0.0 {
+        v.iter().map(|x| x / norm).collect()
+    } else {
+        v.to_vec()
+    }
+}
+
+// ── Hungarian algorithm (Kuhn–Munkres, O(n³)) ───────────────────────────────────
+
+/// Solve the rectangular-padded-to-square **minimum-cost assignment** problem with the
+/// Jonker-style O(n³) Kuhn–Munkres algorithm (the standard potentials/augmenting-path form).
+///
+/// Input `cost` must be a square `n × n` matrix (callers pad rectangular problems with a
+/// large constant). Returns a `Vec<usize>` of length `n` where `out[r]` is the column assigned
+/// to row `r`; the assignment is a permutation minimizing the total cost.
+///
+/// Uses `f64` internally for numerical headroom. This is hand-rolled (not the `pathfinding`
+/// crate) so the plugin carries no extra dependency and the algorithm is unit-tested directly.
+pub fn hungarian_min_cost(cost: &[Vec<f32>]) -> Vec<usize> {
+    let n = cost.len();
+    if n == 0 {
+        return Vec::new();
+    }
+    debug_assert!(cost.iter().all(|row| row.len() == n), "cost must be square");
+
+    const INF: f64 = f64::INFINITY;
+    // 1-indexed potentials/arrays following the classic e-maxx implementation.
+    let mut u = vec![0.0f64; n + 1];
+    let mut v = vec![0.0f64; n + 1];
+    let mut p = vec![0usize; n + 1]; // p[j] = row matched to column j (0 = none)
+    let mut way = vec![0usize; n + 1];
+
+    for i in 1..=n {
+        p[0] = i;
+        let mut j0 = 0usize;
+        let mut minv = vec![INF; n + 1];
+        let mut used = vec![false; n + 1];
+        loop {
+            used[j0] = true;
+            let i0 = p[j0];
+            let mut delta = INF;
+            let mut j1 = 0usize;
+            for j in 1..=n {
+                if !used[j] {
+                    let cur = cost[i0 - 1][j - 1] as f64 - u[i0] - v[j];
+                    if cur < minv[j] {
+                        minv[j] = cur;
+                        way[j] = j0;
+                    }
+                    if minv[j] < delta {
+                        delta = minv[j];
+                        j1 = j;
+                    }
+                }
+            }
+            for j in 0..=n {
+                if used[j] {
+                    u[p[j]] += delta;
+                    v[j] -= delta;
+                } else {
+                    minv[j] -= delta;
+                }
+            }
+            j0 = j1;
+            if p[j0] == 0 {
+                break;
+            }
+        }
+        // Augment along the found path.
+        loop {
+            let j1 = way[j0];
+            p[j0] = p[j1];
+            j0 = j1;
+            if j0 == 0 {
+                break;
+            }
+        }
+    }
+
+    // p[j] = row assigned to column j → invert to row → column.
+    let mut result = vec![0usize; n];
+    for j in 1..=n {
+        if p[j] >= 1 {
+            result[p[j] - 1] = j - 1;
+        }
+    }
+    result
+}
+
+// ── Tests ───────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+pub(crate) mod tests {
+    use super::*;
+    use crate::plugins::faces::store;
+
+    // ── Test scaffolding ────────────────────────────────────────────────────────
+
+    thread_local! {
+        /// A hook [`accept_suggestion`] runs once, right after its read confirms the face is
+        /// still suggested as the person shown and before its conditional `UPDATE` — the
+        /// window #217 names. The hook gets the connection (really: the open transaction)
+        /// `accept_suggestion` is using, so a test can land a conflicting write there —
+        /// standing in for another connection's reject, reassignment or reset, which
+        /// `IMMEDIATE` (see `accept_shown`'s doc comment) keeps out of this window in
+        /// production — and prove the `UPDATE`'s own re-check reports it stale rather than
+        /// losing the race silently.
+        ///
+        /// Thread-local (#226), not a process-global `Mutex`: every caller in this module and
+        /// in `app::faces::tests` reaches `accept_suggestion` by a plain call on the thread
+        /// that set the hook (never across a `spawn_blocking`/`thread::spawn` hop), so scoping
+        /// by thread is exact — a parallel test's `accept_suggestion` never sees, and can
+        /// never consume, this thread's hook (the #217 merge-verify flake: face ids restart at
+        /// 1 in every fresh in-memory catalog, so a global slot let one test's `open_match`
+        /// steal another's hook).
+        pub(crate) static BEFORE_ACCEPT_UPDATE: std::cell::RefCell<Option<Box<dyn FnOnce(&Connection)>>> =
+            std::cell::RefCell::new(None);
+    }
+
+    pub(super) fn before_accept_update(conn: &Connection) {
+        let hook = BEFORE_ACCEPT_UPDATE.with(|cell| cell.borrow_mut().take());
+        if let Some(hook) = hook {
+            hook(conn);
+        }
+    }
+
+    thread_local! {
+        /// A hook [`open_match`] runs once for a given face, right after its `is_rejected`
+        /// read has already found the pair not rejected and before it calls
+        /// `write_suggestion` — the window #217's test gap names (the run's own rejection
+        /// read, then its write). The hook gets the connection `open_match` is using, so it
+        /// can land a reject there and a test can prove `write_suggestion`'s own fresh
+        /// `NOT_REJECTED` check — not just this read — is what stops a stale write.
+        ///
+        /// Thread-local (#226): see [`BEFORE_ACCEPT_UPDATE`]. The face-id key alone was not
+        /// enough — every fresh in-memory test catalog numbers faces from 1, so two tests'
+        /// faces can share an id — scoping by thread closes that the rest of the way.
+        pub(crate) static BEFORE_SUGGESTION_WRITE: std::cell::RefCell<Option<(i64, Box<dyn FnOnce(&Connection)>)>> =
+            std::cell::RefCell::new(None);
+    }
+
+    pub(super) fn before_suggestion_write(conn: &Connection, face_id: i64) {
+        let hook = BEFORE_SUGGESTION_WRITE.with(|cell| {
+            let mut slot = cell.borrow_mut();
+            if slot.as_ref().is_some_and(|(id, _)| *id == face_id) { slot.take() } else { None }
+        });
+        if let Some((_, hook)) = hook {
+            hook(conn);
+        }
+    }
+
+    fn mem_conn() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "PRAGMA foreign_keys = ON;
+             CREATE TABLE photos (id INTEGER PRIMARY KEY, uuid TEXT DEFAULT '', path TEXT DEFAULT '');
+             CREATE TABLE tags (id INTEGER PRIMARY KEY, full_path TEXT NOT NULL);
+             CREATE TABLE photo_tags (photo_id INTEGER, tag_id INTEGER, created_at INTEGER,
+                                      PRIMARY KEY (photo_id, tag_id));
+             CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT);",
+        )
+        .unwrap();
+        store::ensure_schema(&conn).unwrap();
+        conn
+    }
+
+    fn add_photo(conn: &Connection, id: i64) {
+        conn.execute("INSERT INTO photos (id) VALUES (?1)", [id]).unwrap();
+    }
+
+    /// Insert a person tag under the default `People` root, returning its id.
+    fn add_person(conn: &Connection, id: i64, name: &str) -> i64 {
+        conn.execute(
+            "INSERT INTO tags (id, full_path) VALUES (?1, ?2)",
+            rusqlite::params![id, format!("People/{name}")],
+        )
+        .unwrap();
+        id
+    }
+
+    fn tag_photo(conn: &Connection, photo_id: i64, tag_id: i64) {
+        conn.execute(
+            "INSERT OR IGNORE INTO photo_tags (photo_id, tag_id, created_at) VALUES (?1, ?2, 0)",
+            rusqlite::params![photo_id, tag_id],
+        )
+        .unwrap();
+    }
+
+    /// A deterministic synthetic unit embedding built around a "prototype axis" `axis`, with a
+    /// little `jitter` so two faces of the same person are close but not identical.
+    fn embed(axis: usize, jitter: f32) -> Vec<f32> {
+        let mut v = vec![0.0f32; 512];
+        v[axis] = 1.0;
+        // Spread a small amount of energy into a neighbouring axis to simulate variation.
+        v[(axis + 1) % 512] = jitter;
+        let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+        v.iter().map(|x| x / norm).collect()
+    }
+
+    /// Insert a detected (unassigned) face on a photo, returning its id.
+    fn add_face(conn: &Connection, photo_id: i64, emb: &[f32]) -> i64 {
+        let blob = embedding_to_blob(emb);
+        store::insert_face(
+            conn,
+            photo_id,
+            "[0,0,0.1,0.1]",
+            "[]",
+            0.99,
+            Some(&blob),
+            super::super::indexer::SOURCE_DETECT,
+            0,
+        )
+        .unwrap()
+    }
+
+    fn face_state(conn: &Connection, face_id: i64) -> (String, Option<i64>, String) {
+        conn.query_row(
+            "SELECT state, person_tag_id, source FROM faces__faces WHERE id = ?1",
+            [face_id],
+            |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, Option<i64>>(1)?,
+                    r.get::<_, String>(2)?,
+                ))
+            },
+        )
+        .unwrap()
+    }
+
+    fn count_state(conn: &Connection, state: &str) -> i64 {
+        conn.query_row(
+            "SELECT COUNT(*) FROM faces__faces WHERE state = ?1",
+            [state],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
+    // ── Hungarian correctness ─────────────────────────────────────────────────────
+
+    /// Known 3×3 cost matrix with a unique optimal assignment.
+    #[test]
+    fn hungarian_known_matrix() {
+        // Optimal: r0->c1 (2), r1->c0 (3), r2->c2 (4) = 9. (Classic textbook example.)
+        let cost = vec![
+            vec![4.0, 2.0, 8.0],
+            vec![3.0, 6.0, 7.0],
+            vec![9.0, 5.0, 4.0],
+        ];
+        let a = hungarian_min_cost(&cost);
+        assert_eq!(a, vec![1, 0, 2]);
+        let total: f32 = a.iter().enumerate().map(|(r, &c)| cost[r][c]).sum();
+        assert!((total - 9.0).abs() < 1e-4, "total cost = {total}");
+    }
+
+    /// Identity is optimal when the diagonal is cheapest.
+    #[test]
+    fn hungarian_diagonal_optimal() {
+        let cost = vec![
+            vec![1.0, 9.0, 9.0],
+            vec![9.0, 1.0, 9.0],
+            vec![9.0, 9.0, 1.0],
+        ];
+        assert_eq!(hungarian_min_cost(&cost), vec![0, 1, 2]);
+    }
+
+    /// A cross assignment is optimal when off-diagonal is cheapest (2×2).
+    #[test]
+    fn hungarian_cross_optimal() {
+        let cost = vec![vec![5.0, 1.0], vec![1.0, 5.0]];
+        assert_eq!(hungarian_min_cost(&cost), vec![1, 0]);
+    }
+
+    /// 1×1 and empty edge cases.
+    #[test]
+    fn hungarian_trivial_sizes() {
+        assert_eq!(hungarian_min_cost(&[vec![3.0]]), vec![0]);
+        let empty: Vec<Vec<f32>> = Vec::new();
+        assert!(hungarian_min_cost(&empty).is_empty());
+    }
+
+    // ── Auto-seed rules ───────────────────────────────────────────────────────────
+
+    /// 1 face + 1 person tag → seeded (confirmed, source=seed).
+    /// A progress callback that returns `false` stops the pipeline instead of running it
+    /// to completion — the mechanism `faces_run_matching` uses to honour Cancel and to get
+    /// out of a superseded run without waiting for clustering to finish.
+    ///
+    /// Seeding is the first phase, so stopping at its first item means nothing downstream
+    /// runs: no suggestions, no clusters. The comparison run is the same fixture with a
+    /// callback that always returns `true`, which is what makes this a cancellation test
+    /// rather than a test that the fixture happens to produce nothing.
+    #[test]
+    fn a_progress_callback_returning_false_stops_the_pipeline() {
+        let build = || {
+            let conn = mem_conn();
+            let alice = add_person(&conn, 100, "Alice");
+            for photo in 1..=6i64 {
+                add_photo(&conn, photo);
+                tag_photo(&conn, photo, alice);
+                add_face(&conn, photo, &embed(0, 0.01 * photo as f32));
+            }
+            conn
+        };
+        let settings = MatchSettings::default();
+
+        // Baseline: run to completion.
+        let full = build();
+        let mut calls = 0usize;
+        let done = run_matching_with_progress(&full, &settings, 0, &mut |_, _, _| {
+            calls += 1;
+            true
+        })
+        .unwrap();
+        assert!(done.seeded > 0, "fixture seeds nothing, so stopping it would prove nothing");
+        let full_calls = calls;
+
+        // Cancelled: refuse to continue at the very first callback.
+        let stopped_conn = build();
+        let mut seen = 0usize;
+        let stopped = run_matching_with_progress(&stopped_conn, &settings, 0, &mut |_, _, _| {
+            seen += 1;
+            false
+        })
+        .unwrap();
+
+        assert_eq!(seen, 1, "the pipeline kept calling progress after being told to stop");
+        assert!(seen < full_calls);
+        assert_eq!(stopped.seeded, 0);
+        assert_eq!(stopped.constrained, 0);
+        assert_eq!(stopped.open, 0);
+        assert_eq!(stopped.clustered, 0);
+    }
+
+    #[test]
+    fn seed_one_face_one_tag() {
+        let conn = mem_conn();
+        add_photo(&conn, 1);
+        let alice = add_person(&conn, 100, "Alice");
+        tag_photo(&conn, 1, alice);
+        let f = add_face(&conn, 1, &embed(0, 0.0));
+
+        let out = run_matching(&conn, &MatchSettings::default(), 1000).unwrap();
+        assert_eq!(out.seeded, 1);
+        let (state, person, source) = face_state(&conn, f);
+        assert_eq!(state, "confirmed");
+        assert_eq!(person, Some(alice));
+        assert_eq!(source, "seed");
+    }
+
+    /// 2 faces + 1 person tag → NO seed (ambiguous which face is the person).
+    #[test]
+    fn seed_two_faces_one_tag_no_seed() {
+        let conn = mem_conn();
+        add_photo(&conn, 1);
+        let alice = add_person(&conn, 100, "Alice");
+        tag_photo(&conn, 1, alice);
+        add_face(&conn, 1, &embed(0, 0.0));
+        add_face(&conn, 1, &embed(1, 0.0));
+
+        let out = run_matching(&conn, &MatchSettings::default(), 1000).unwrap();
+        assert_eq!(out.seeded, 0, "2 faces + 1 tag must not seed");
+        assert_eq!(count_state(&conn, "confirmed"), 0);
+    }
+
+    /// 1 face + 2 person tags → NO seed (ambiguous which person the face is).
+    #[test]
+    fn seed_one_face_two_tags_no_seed() {
+        let conn = mem_conn();
+        add_photo(&conn, 1);
+        let alice = add_person(&conn, 100, "Alice");
+        let bob = add_person(&conn, 101, "Bob");
+        tag_photo(&conn, 1, alice);
+        tag_photo(&conn, 1, bob);
+        add_face(&conn, 1, &embed(0, 0.0));
+
+        let out = run_matching(&conn, &MatchSettings::default(), 1000).unwrap();
+        assert_eq!(out.seeded, 0, "1 face + 2 person tags must not seed");
+        assert_eq!(count_state(&conn, "confirmed"), 0);
+    }
+
+    /// A non-person tag (outside the People branch) does not count toward the seed rule.
+    #[test]
+    fn seed_ignores_non_person_tags() {
+        let conn = mem_conn();
+        add_photo(&conn, 1);
+        let alice = add_person(&conn, 100, "Alice");
+        // A landscape tag not under People — must be ignored by the person-tag filter.
+        conn.execute(
+            "INSERT INTO tags (id, full_path) VALUES (200, 'Places/Beach')",
+            [],
+        )
+        .unwrap();
+        tag_photo(&conn, 1, alice);
+        tag_photo(&conn, 1, 200);
+        let f = add_face(&conn, 1, &embed(0, 0.0));
+
+        let out = run_matching(&conn, &MatchSettings::default(), 1000).unwrap();
+        assert_eq!(out.seeded, 1, "non-person tag must not block the 1+1 seed");
+        assert_eq!(face_state(&conn, f).1, Some(alice));
+    }
+
+    // ── Constrained (Hungarian) match ─────────────────────────────────────────────
+
+    /// A photo with 2 faces and 2 person tags (both with centroids) gets each face suggested
+    /// to the correct person via Hungarian assignment.
+    #[test]
+    fn constrained_match_assigns_correctly() {
+        let conn = mem_conn();
+        let alice = add_person(&conn, 100, "Alice");
+        let bob = add_person(&conn, 101, "Bob");
+
+        // Seed centroids: single-face+single-tag photos for each.
+        add_photo(&conn, 1);
+        tag_photo(&conn, 1, alice);
+        add_face(&conn, 1, &embed(0, 0.0)); // Alice axis 0
+
+        add_photo(&conn, 2);
+        tag_photo(&conn, 2, bob);
+        add_face(&conn, 2, &embed(10, 0.0)); // Bob axis 10
+
+        // The target photo: two faces (one near Alice, one near Bob), both tags present.
+        add_photo(&conn, 3);
+        tag_photo(&conn, 3, alice);
+        tag_photo(&conn, 3, bob);
+        let fa = add_face(&conn, 3, &embed(0, 0.05)); // close to Alice
+        let fb = add_face(&conn, 3, &embed(10, 0.05)); // close to Bob
+
+        let out = run_matching(&conn, &MatchSettings::default(), 1000).unwrap();
+        assert_eq!(out.seeded, 2, "both single-face photos seed");
+        assert_eq!(out.constrained, 2, "both target faces constrained-matched");
+
+        assert_eq!(face_state(&conn, fa), ("suggested".into(), Some(alice), "match".into()));
+        assert_eq!(face_state(&conn, fb), ("suggested".into(), Some(bob), "match".into()));
+    }
+
+    // ── Open matching + threshold boundary ────────────────────────────────────────
+
+    /// A face in an untagged photo matches the nearest centroid above threshold.
+    #[test]
+    fn open_match_above_threshold() {
+        let conn = mem_conn();
+        let alice = add_person(&conn, 100, "Alice");
+        add_photo(&conn, 1);
+        tag_photo(&conn, 1, alice);
+        add_face(&conn, 1, &embed(0, 0.0)); // seeds Alice's centroid (axis 0)
+
+        // Untagged photo, face very close to Alice.
+        add_photo(&conn, 2);
+        let f = add_face(&conn, 2, &embed(0, 0.05));
+
+        let out = run_matching(&conn, &MatchSettings::default(), 1000).unwrap();
+        assert_eq!(out.open, 1);
+        assert_eq!(face_state(&conn, f).1, Some(alice));
+    }
+
+    /// A far-away face (cosine below threshold) is NOT open-matched; it clusters instead.
+    #[test]
+    fn open_match_below_threshold_clusters() {
+        let conn = mem_conn();
+        let alice = add_person(&conn, 100, "Alice");
+        add_photo(&conn, 1);
+        tag_photo(&conn, 1, alice);
+        add_face(&conn, 1, &embed(0, 0.0)); // Alice on axis 0
+
+        // Untagged photo, face on an orthogonal axis (cosine ~0 << 0.45).
+        add_photo(&conn, 2);
+        let f = add_face(&conn, 2, &embed(50, 0.0));
+
+        let out = run_matching(&conn, &MatchSettings::default(), 1000).unwrap();
+        assert_eq!(out.open, 0, "orthogonal face must not open-match");
+        assert_eq!(out.clustered, 1, "it must fall through to clustering");
+        // Face stays unassigned (no person) but gets a cluster_id.
+        let (state, person, _) = face_state(&conn, f);
+        assert_eq!(state, "unassigned");
+        assert_eq!(person, None);
+        let cid: Option<i64> = conn
+            .query_row("SELECT cluster_id FROM faces__faces WHERE id = ?1", [f], |r| r.get(0))
+            .unwrap();
+        assert!(cid.is_some(), "leftover face must be clustered");
+    }
+
+    /// Threshold boundary: a similarity exactly equal to the threshold does NOT match
+    /// (strictly-greater rule), just above does.
+    #[test]
+    fn threshold_boundary_is_strict() {
+        let conn = mem_conn();
+        let alice = add_person(&conn, 100, "Alice");
+        add_photo(&conn, 1);
+        tag_photo(&conn, 1, alice);
+        // Alice centroid = unit vector on axis 0.
+        add_face(&conn, 1, &embed(0, 0.0));
+
+        // Craft a face whose cosine to axis-0 is exactly 0.45.
+        let mut v = vec![0.0f32; 512];
+        v[0] = 0.45;
+        // remaining magnitude on an orthogonal axis so the vector is unit and cosine = 0.45.
+        v[300] = (1.0 - 0.45f32 * 0.45).sqrt();
+        add_photo(&conn, 2);
+        let f_eq = add_face(&conn, 2, &v);
+
+        let mut settings = MatchSettings::default();
+        settings.threshold = 0.45;
+        let out = run_matching(&conn, &settings, 1000).unwrap();
+        // Exactly at threshold → not open-matched (strict >).
+        assert_eq!(face_state(&conn, f_eq).1, None, "cosine == threshold must not match");
+        assert!(out.open == 0);
+    }
+
+    // ── Rejection memory ──────────────────────────────────────────────────────────
+
+    /// Once a (face, person) pair is rejected it is never re-proposed on re-run.
+    #[test]
+    fn rejection_is_remembered() {
+        let conn = mem_conn();
+        let alice = add_person(&conn, 100, "Alice");
+        add_photo(&conn, 1);
+        tag_photo(&conn, 1, alice);
+        add_face(&conn, 1, &embed(0, 0.0)); // seeds Alice
+
+        add_photo(&conn, 2);
+        let f = add_face(&conn, 2, &embed(0, 0.05)); // would open-match Alice
+
+        // First run suggests Alice.
+        let out1 = run_matching(&conn, &MatchSettings::default(), 1000).unwrap();
+        assert_eq!(out1.open, 1);
+        assert_eq!(face_state(&conn, f).1, Some(alice));
+
+        // User rejects.
+        reject(&conn, f, 1001).unwrap();
+        assert_eq!(face_state(&conn, f).1, None);
+
+        // Re-run must NOT re-propose Alice for this face → it clusters instead.
+        let out2 = run_matching(&conn, &MatchSettings::default(), 1002).unwrap();
+        assert_eq!(out2.open, 0, "rejected pair must not be re-proposed");
+        assert_eq!(face_state(&conn, f).1, None);
+        assert_eq!(out2.clustered, 1);
+    }
+
+    /// A rejection that lands between the run's `is_rejected` check and its write (another
+    /// connection, #208) still stops the write: seed and suggestion re-check it in the UPDATE.
+    #[test]
+    fn a_rejection_landing_before_the_write_stops_it() {
+        let conn = mem_conn();
+        let alice = add_person(&conn, 100, "Alice");
+        add_photo(&conn, 1);
+        let f = add_face(&conn, 1, &embed(0, 0.0));
+        conn.execute("INSERT INTO faces__rejections (face_id, person_tag_id, rejected_at) VALUES (?1, ?2, 0)", [f, alice])
+            .unwrap();
+        assert!(!write_suggestion(&conn, f, alice, 0.9, 0).unwrap(), "a rejected pair is not suggested");
+        assert_eq!(face_state(&conn, f).0, STATE_UNASSIGNED);
+        assert!(!write_seed(&conn, f, alice).unwrap(), "nor seeded");
+        assert_eq!(face_state(&conn, f).0, STATE_UNASSIGNED);
+    }
+
+    /// #217: `accept_suggestion`'s own defense, independent of any caller's transaction. Its
+    /// read finds the face still suggested as Alice; before its `UPDATE` runs, something else
+    /// (here, directly on the same connection — standing in for another connection that has
+    /// already committed) rejects the face. The `UPDATE`'s own re-check — not the earlier read
+    /// — is what decides: the race lands first, so `accept_suggestion` reports `None` rather
+    /// than overwriting the reject with a confirmation the user never actually saw land.
+    #[test]
+    fn accept_suggestion_does_not_overwrite_a_change_landing_before_its_update() {
+        let conn = mem_conn();
+        let alice = add_person(&conn, 100, "Alice");
+        add_photo(&conn, 1);
+        let f = add_face(&conn, 1, &embed(0, 0.0));
+        set_suggested(&conn, f, alice);
+
+        BEFORE_ACCEPT_UPDATE.with(|cell| {
+            *cell.borrow_mut() = Some(Box::new(move |conn: &Connection| {
+                assert!(reject_shown(conn, f, Some(alice), 0).unwrap(), "the reject applies");
+            }));
+        });
+
+        assert_eq!(accept_suggestion(&conn, f, alice).unwrap(), None, "the race landed first; not overwritten");
+        assert!(BEFORE_ACCEPT_UPDATE.with(|cell| cell.borrow().is_none()), "the hook ran");
+        assert_eq!(face_state(&conn, f).0, STATE_UNASSIGNED, "the reject stands");
+    }
+
+    /// #217 test gap: `a_rejection_landing_before_the_write_stops_it` (and the #137/#208
+    /// integration tests) force their reject before the run even reads its rejections, so
+    /// `write_suggestion`'s own `NOT_REJECTED` guard is never the thing that actually stops
+    /// the write — the run's own `is_rejected` pre-check already does. Here the reject lands
+    /// in `open_match` itself, after its `is_rejected` read for this face already found
+    /// nothing, but before its `write_suggestion` call: the pair must still not be suggested.
+    #[test]
+    fn a_reject_landing_between_open_matchs_read_and_write_still_stops_it() {
+        let conn = mem_conn();
+        let alice = add_person(&conn, 100, "Alice");
+        add_photo(&conn, 1);
+        tag_photo(&conn, 1, alice);
+        add_face(&conn, 1, &embed(0, 0.0)); // Alice's confirmed seed/centroid
+
+        add_photo(&conn, 2);
+        let f = add_face(&conn, 2, &embed(0, 0.05)); // would open-match Alice
+
+        BEFORE_SUGGESTION_WRITE.with(|cell| {
+            *cell.borrow_mut() = Some((
+                f,
+                Box::new(move |conn: &Connection| {
+                    conn.execute(
+                        "INSERT INTO faces__rejections (face_id, person_tag_id, rejected_at) VALUES (?1, ?2, 0)",
+                        rusqlite::params![f, alice],
+                    )
+                    .unwrap();
+                }),
+            ));
+        });
+
+        let out = run_matching(&conn, &MatchSettings::default(), 1000).unwrap();
+
+        assert!(BEFORE_SUGGESTION_WRITE.with(|cell| cell.borrow().is_none()), "the hook ran");
+        assert_eq!(out.open, 0, "the pair rejected mid-run is not suggested");
+        // open_match already marks a face `resolved` (so clustering skips it) once it has a
+        // best candidate, before the write is attempted — a face the race stops from being
+        // suggested is therefore left unassigned this run, not clustered, rather than
+        // retried; it is picked up again (seeded, matched or clustered) on the next run.
+        assert_eq!(face_state(&conn, f).0, "unassigned", "not suggested as Alice, and not lost to it");
+        assert_eq!(face_state(&conn, f).1, None, "no person assigned");
+        assert_eq!(out.clustered, 0, "resolved before the write was attempted, so not offered to clustering either");
+    }
+
+    // ── Thread-local hook scoping (#226) ────────────────────────────────────────
+
+    /// #226: `BEFORE_SUGGESTION_WRITE` is thread-local, not a process-global slot, so one
+    /// thread's hook can never fire on another thread's connection, even though every fresh
+    /// in-memory catalog gives its second added face the same id (2) — the actual collision
+    /// that let `accept_and_assign_mutations`, which arms no hook of its own, pick up another
+    /// parallel test's leftover `BEFORE_SUGGESTION_WRITE` under the old global `Mutex`.
+    ///
+    /// Forced, not timed: this thread arms a hook keyed to face id 2 and a barrier holds the
+    /// second thread's real `run_matching` call — whose own face also lands on id 2, and which
+    /// arms no hook of its own — until after the hook is armed. A shared slot would then hand
+    /// this thread's hook to the second thread's connection, exactly as `accept_and_assign_mutations`
+    /// suffered; thread-local storage must not.
+    #[test]
+    fn suggestion_write_hook_never_fires_on_another_threads_connection() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::{Arc, Barrier};
+
+        fn pending_face_on_alice(conn: &Connection) -> (i64, i64) {
+            let alice = add_person(conn, 100, "Alice");
+            add_photo(conn, 1);
+            tag_photo(conn, 1, alice);
+            add_face(conn, 1, &embed(0, 0.0)); // Alice's seed/centroid — id 1
+            add_photo(conn, 2);
+            (alice, add_face(conn, 2, &embed(0, 0.05))) // id 2, every time
+        }
+
+        let armed = Arc::new(Barrier::new(2));
+        let fired_while_armed = Arc::new(AtomicBool::new(false));
+
+        let conn_a = mem_conn();
+        let (alice, f_a) = pending_face_on_alice(&conn_a);
+        assert_eq!(f_a, 2, "the collision this test forces depends on both threads' pending face being id 2");
+
+        BEFORE_SUGGESTION_WRITE.with(|cell| {
+            *cell.borrow_mut() = Some((f_a, {
+                let fired_while_armed = fired_while_armed.clone();
+                Box::new(move |_conn: &Connection| {
+                    fired_while_armed.store(true, Ordering::SeqCst);
+                })
+            }));
+        });
+
+        let other = {
+            let armed = armed.clone();
+            std::thread::spawn(move || {
+                let conn_b = mem_conn();
+                let (_, f_b) = pending_face_on_alice(&conn_b); // sets no hook of its own
+                assert_eq!(f_b, 2, "thread B's pending face must collide with thread A's for this to prove anything");
+                armed.wait(); // thread A's hook is armed before this call starts
+                let out = run_matching(&conn_b, &MatchSettings::default(), 1000).unwrap();
+                (out.open, face_state(&conn_b, f_b).1)
+            })
+        };
+
+        armed.wait();
+        let (b_open, b_person) = other.join().unwrap();
+
+        assert!(!fired_while_armed.load(Ordering::SeqCst), "thread A's hook must not fire on thread B's call");
+        assert_eq!(b_open, 1, "thread B's own write must land undisturbed; it owes thread A's hook nothing");
+        assert_eq!(b_person, Some(alice), "thread B suggested Alice, untouched by thread A's armed hook");
+
+        // Thread A's own hook is still armed on this thread (never taken by thread B) and
+        // fires for real once this thread makes its own call.
+        let out_a = run_matching(&conn_a, &MatchSettings::default(), 1000).unwrap();
+        assert!(fired_while_armed.load(Ordering::SeqCst), "thread A's hook fires on thread A's own connection");
+        assert_eq!(out_a.open, 1, "thread A's hook here only records that it ran; it does not reject the pair");
+    }
+
+    /// `reject_shown` remembers the person shown on a face a run has reset (#208), and leaves
+    /// a face suggested as someone else alone.
+    #[test]
+    fn reject_shown_names_the_person_shown() {
+        let conn = mem_conn();
+        let alice = add_person(&conn, 100, "Alice");
+        let bob = add_person(&conn, 101, "Bob");
+        add_photo(&conn, 1);
+        let reset = add_face(&conn, 1, &embed(0, 0.0)); // unassigned, no person: a reset suggestion
+        assert!(reject_shown(&conn, reset, Some(alice), 5).unwrap());
+        assert!(is_rejected(&conn, reset, alice).unwrap());
+        let other = add_face(&conn, 1, &embed(1, 0.0));
+        set_suggested(&conn, other, bob);
+        assert!(!reject_shown(&conn, other, Some(alice), 5).unwrap(), "stale: Bob is suggested now");
+        assert_eq!(face_state(&conn, other).1, Some(bob));
+        assert!(!is_rejected(&conn, other, alice).unwrap() && !is_rejected(&conn, other, bob).unwrap());
+    }
+
+    // ── Ignore exclusion ──────────────────────────────────────────────────────────
+
+    /// An ignored face is excluded from centroids and never suggested; a re-run leaves it
+    /// ignored.
+    #[test]
+    fn ignore_excludes_from_everything() {
+        let conn = mem_conn();
+        let alice = add_person(&conn, 100, "Alice");
+        add_photo(&conn, 1);
+        tag_photo(&conn, 1, alice);
+        add_face(&conn, 1, &embed(0, 0.0)); // Alice centroid
+
+        // A photobomber face we ignore.
+        add_photo(&conn, 2);
+        let bomber = add_face(&conn, 2, &embed(0, 0.05));
+        ignore(&conn, bomber).unwrap();
+
+        let out = run_matching(&conn, &MatchSettings::default(), 1000).unwrap();
+        assert_eq!(out.open, 0);
+        assert_eq!(out.clustered, 0, "ignored face must not cluster");
+        let (state, person, _) = face_state(&conn, bomber);
+        assert_eq!(state, "ignored");
+        assert_eq!(person, None);
+    }
+
+    /// A confirmed face that is later marked ignored no longer contributes to a centroid.
+    #[test]
+    fn ignored_confirmed_face_drops_from_centroid() {
+        let conn = mem_conn();
+        let alice = add_person(&conn, 100, "Alice");
+        // Two confirmed Alice faces via seeds.
+        add_photo(&conn, 1);
+        tag_photo(&conn, 1, alice);
+        let f1 = add_face(&conn, 1, &embed(0, 0.0));
+        run_matching(&conn, &MatchSettings::default(), 1000).unwrap();
+        assert_eq!(face_state(&conn, f1).0, "confirmed");
+
+        // Ignore the only confirmed face → Alice has no centroid now.
+        ignore(&conn, f1).unwrap();
+
+        add_photo(&conn, 2);
+        let f = add_face(&conn, 2, &embed(0, 0.05));
+        let out = run_matching(&conn, &MatchSettings::default(), 1001).unwrap();
+        assert_eq!(out.people, 0, "ignored confirmed face leaves person centroid-less");
+        assert_eq!(out.open, 0);
+        assert_eq!(face_state(&conn, f).1, None);
+    }
+
+    // ── Idempotent re-run ─────────────────────────────────────────────────────────
+
+    /// Re-running with no changes proposes nothing new and never downgrades confirmed rows.
+    #[test]
+    fn rerun_is_idempotent() {
+        let conn = mem_conn();
+        let alice = add_person(&conn, 100, "Alice");
+        add_photo(&conn, 1);
+        tag_photo(&conn, 1, alice);
+        let seed = add_face(&conn, 1, &embed(0, 0.0));
+
+        add_photo(&conn, 2);
+        let f = add_face(&conn, 2, &embed(0, 0.05));
+
+        let out1 = run_matching(&conn, &MatchSettings::default(), 1000).unwrap();
+        assert_eq!(out1.seeded, 1);
+        assert_eq!(out1.open, 1);
+        let suggested_after_1 = count_state(&conn, "suggested");
+        let confirmed_after_1 = count_state(&conn, "confirmed");
+
+        // Re-run: same inputs.
+        let out2 = run_matching(&conn, &MatchSettings::default(), 1001).unwrap();
+        // Seed already confirmed → not re-seeded.
+        assert_eq!(out2.seeded, 0, "confirmed seed must not be re-seeded");
+        // Same single open match again (recomputed, not stacked).
+        assert_eq!(out2.open, 1);
+        assert_eq!(count_state(&conn, "suggested"), suggested_after_1, "no duplicate suggestions");
+        assert_eq!(count_state(&conn, "confirmed"), confirmed_after_1, "confirmed count stable");
+        // The confirmed seed is untouched.
+        assert_eq!(face_state(&conn, seed), ("confirmed".into(), Some(alice), "seed".into()));
+        // The suggestion still points at Alice.
+        assert_eq!(face_state(&conn, f).1, Some(alice));
+
+        // No duplicate face rows were created.
+        let total: i64 = conn.query_row("SELECT COUNT(*) FROM faces__faces", [], |r| r.get(0)).unwrap();
+        assert_eq!(total, 2);
+    }
+
+    /// Re-running clustering with no changes must NOT grow existing clusters: cluster count,
+    /// per-cluster `size`, and each face's `cluster_id` all stay stable, and `out.clustered`
+    /// reports the same number each run. (Regression: a prior version grew the persisted
+    /// `faces__clusters` rows on every re-run — size 2 → 4 → 6 …, corrupting the People count.)
+    #[test]
+    fn clustering_is_idempotent_on_rerun() {
+        let conn = mem_conn();
+        // Two untagged photos with similar faces (no known people) → one 2-member cluster.
+        add_photo(&conn, 1);
+        let f1 = add_face(&conn, 1, &embed(7, 0.0));
+        add_photo(&conn, 2);
+        let f2 = add_face(&conn, 2, &embed(7, 0.03));
+
+        let out1 = run_matching(&conn, &MatchSettings::default(), 1000).unwrap();
+        assert_eq!(out1.clustered, 2);
+
+        let clusters_after_1 = |conn: &Connection| -> Vec<(i64, i64)> {
+            let mut stmt = conn
+                .prepare("SELECT id, size FROM faces__clusters ORDER BY id")
+                .unwrap();
+            stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap()
+        };
+        let before = clusters_after_1(&conn);
+        assert_eq!(before.len(), 1, "one cluster");
+        assert_eq!(before[0].1, 2, "cluster holds both faces");
+        let cid1: i64 = conn
+            .query_row("SELECT cluster_id FROM faces__faces WHERE id = ?1", [f1], |r| r.get(0))
+            .unwrap();
+
+        // Re-run with identical inputs.
+        let out2 = run_matching(&conn, &MatchSettings::default(), 1001).unwrap();
+        assert_eq!(out2.clustered, 2, "same faces re-cluster, count unchanged");
+
+        // Exactly one cluster, size still 2 (not 4) — no membership double-count.
+        let after = clusters_after_1(&conn);
+        assert_eq!(after.len(), 1, "still one cluster after re-run");
+        assert_eq!(after[0].1, 2, "cluster size must NOT inflate on re-run");
+        // Both faces still clustered together.
+        let cid1b: i64 = conn
+            .query_row("SELECT cluster_id FROM faces__faces WHERE id = ?1", [f1], |r| r.get(0))
+            .unwrap();
+        let cid2b: i64 = conn
+            .query_row("SELECT cluster_id FROM faces__faces WHERE id = ?1", [f2], |r| r.get(0))
+            .unwrap();
+        assert_eq!(cid1b, cid2b, "faces still share a cluster");
+        let _ = cid1; // (cluster id may be renumbered when rebuilt; membership is what matters)
+    }
+
+    // ── accept / assign side-effect returns ──────────────────────────────────────
+
+    /// accept returns (photo, person) and confirms; assign confirms manually + clears rejection.
+    #[test]
+    fn accept_and_assign_mutations() {
+        let conn = mem_conn();
+        let alice = add_person(&conn, 100, "Alice");
+        let bob = add_person(&conn, 101, "Bob");
+        add_photo(&conn, 1);
+        tag_photo(&conn, 1, alice);
+        add_face(&conn, 1, &embed(0, 0.0)); // seed Alice
+
+        add_photo(&conn, 2);
+        let f = add_face(&conn, 2, &embed(0, 0.05));
+        run_matching(&conn, &MatchSettings::default(), 1000).unwrap();
+        assert_eq!(face_state(&conn, f).1, Some(alice));
+
+        // Accept it.
+        let (photo, person) = accept(&conn, f).unwrap();
+        assert_eq!((photo, person), (2, alice));
+        assert_eq!(face_state(&conn, f).0, "confirmed");
+
+        // Manually reassign to Bob.
+        let (photo2, tag2) = assign(&conn, f, bob).unwrap();
+        assert_eq!((photo2, tag2), (2, bob));
+        assert_eq!(face_state(&conn, f), ("confirmed".into(), Some(bob), "manual".into()));
+    }
+
+    /// accept on a face with no assigned person is an error.
+    #[test]
+    fn accept_without_person_errors() {
+        let conn = mem_conn();
+        add_photo(&conn, 1);
+        let f = add_face(&conn, 1, &embed(0, 0.0));
+        assert!(accept(&conn, f).is_err());
+    }
+
+    // ── name_cluster ──────────────────────────────────────────────────────────────
+
+    /// Naming a cluster binds a person tag to all its members and confirms them.
+    #[test]
+    fn name_cluster_confirms_members() {
+        let conn = mem_conn();
+        // Two untagged photos with similar faces (no known people) → one cluster.
+        add_photo(&conn, 1);
+        let f1 = add_face(&conn, 1, &embed(7, 0.0));
+        add_photo(&conn, 2);
+        let f2 = add_face(&conn, 2, &embed(7, 0.03));
+
+        let out = run_matching(&conn, &MatchSettings::default(), 1000).unwrap();
+        assert_eq!(out.clustered, 2, "both similar faces land in one cluster");
+        let cid: i64 = conn
+            .query_row("SELECT cluster_id FROM faces__faces WHERE id = ?1", [f1], |r| r.get(0))
+            .unwrap();
+        let cid2: i64 = conn
+            .query_row("SELECT cluster_id FROM faces__faces WHERE id = ?1", [f2], |r| r.get(0))
+            .unwrap();
+        assert_eq!(cid, cid2, "similar faces share a cluster");
+
+        // Name it "Carol".
+        let carol = add_person(&conn, 102, "Carol");
+        let photos = name_cluster(&conn, cid, carol).unwrap();
+        assert_eq!(photos.len(), 2);
+        assert!(photos.contains(&1) && photos.contains(&2));
+        assert_eq!(face_state(&conn, f1), ("confirmed".into(), Some(carol), "manual".into()));
+        assert_eq!(face_state(&conn, f2), ("confirmed".into(), Some(carol), "manual".into()));
+        // Cluster row is gone.
+        let n: i64 = conn.query_row("SELECT COUNT(*) FROM faces__clusters WHERE id = ?1", [cid], |r| r.get(0)).unwrap();
+        assert_eq!(n, 0);
+    }
+
+    // ── accept_person_on_photos (batch confirm, issue #68) ───────────────────────
+
+    /// Mark a face as the matcher would after suggesting `tag_id` for it.
+    fn set_suggested(conn: &Connection, face_id: i64, tag_id: i64) {
+        conn.execute(
+            "UPDATE faces__faces SET person_tag_id = ?2, state = ?3, match_confidence = 0.9
+              WHERE id = ?1",
+            rusqlite::params![face_id, tag_id, STATE_SUGGESTED],
+        )
+        .unwrap();
+    }
+
+    fn face_count(conn: &Connection, photo_id: i64) -> i64 {
+        conn.query_row(
+            "SELECT COUNT(*) FROM faces__faces WHERE photo_id = ?1",
+            [photo_id],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
+    /// Against real matcher output: the seeded photo is reported as already confirmed, and
+    /// both suggested photos are confirmed in one call — the multi-select case from issue #68,
+    /// which previously only ever touched the active photo.
+    #[test]
+    fn accept_person_confirms_every_suggested_photo() {
+        let conn = mem_conn();
+        let alice = add_person(&conn, 100, "Alice");
+        // Photo 1: one face + one person tag ⇒ seeded (confirmed) and gives Alice a centroid.
+        add_photo(&conn, 1);
+        tag_photo(&conn, 1, alice);
+        add_face(&conn, 1, &embed(0, 0.0));
+        // Photos 2 and 3: untagged, faces close to Alice's centroid ⇒ suggested.
+        add_photo(&conn, 2);
+        let f2 = add_face(&conn, 2, &embed(0, 0.02));
+        add_photo(&conn, 3);
+        let f3 = add_face(&conn, 3, &embed(0, 0.03));
+
+        run_matching(&conn, &MatchSettings::default(), 1000).unwrap();
+        assert_eq!(face_state(&conn, f2).0, "suggested");
+        assert_eq!(face_state(&conn, f3).0, "suggested");
+
+        let (out, changed) = accept_person_on_photos(&conn, &[1, 2, 3], alice).unwrap();
+        assert_eq!(out.photos_confirmed, 2);
+        assert_eq!(out.faces_confirmed, 2);
+        assert_eq!(out.photos_already_confirmed, 1, "the seeded photo needed nothing");
+        assert_eq!(out.photos_without_suggestion, 0);
+        assert_eq!(changed, vec![2, 3], "only the photos that changed need a tag + sidecar");
+        assert_eq!(face_state(&conn, f2).0, "confirmed");
+        assert_eq!(face_state(&conn, f3).0, "confirmed");
+    }
+
+    /// The four buckets, on one call: two suggestions in one photo, another person's
+    /// suggestion, an already-confirmed photo, and a photo with nothing for this person.
+    /// A photo the person was never suggested on is reported, never force-assigned — no face
+    /// row is invented there.
+    #[test]
+    fn accept_person_reports_each_photo_honestly() {
+        let conn = mem_conn();
+        let alice = add_person(&conn, 100, "Alice");
+        let bob = add_person(&conn, 101, "Bob");
+
+        // Photo 1: Alice suggested on two faces. Open matching assigns each face its nearest
+        // centroid independently, so one person can be suggested twice in a photo (a mirror,
+        // a photo-of-a-photo). Both must be confirmed, but the photo counts once.
+        add_photo(&conn, 1);
+        let a1 = add_face(&conn, 1, &embed(0, 0.0));
+        let a2 = add_face(&conn, 1, &embed(0, 0.01));
+        set_suggested(&conn, a1, alice);
+        set_suggested(&conn, a2, alice);
+        // Photo 2: only Bob is suggested — Alice was never proposed here.
+        add_photo(&conn, 2);
+        let b1 = add_face(&conn, 2, &embed(3, 0.0));
+        set_suggested(&conn, b1, bob);
+        // Photo 3: Alice already confirmed.
+        add_photo(&conn, 3);
+        let c1 = add_face(&conn, 3, &embed(0, 0.02));
+        set_suggested(&conn, c1, alice);
+        accept(&conn, c1).unwrap();
+        // Photo 4: indexed, no faces detected at all.
+        add_photo(&conn, 4);
+
+        // Photo 1 appears twice: a duplicate id must not be counted twice.
+        let (out, changed) = accept_person_on_photos(&conn, &[1, 2, 3, 4, 1], alice).unwrap();
+
+        assert_eq!(out.photos_confirmed, 1);
+        assert_eq!(out.faces_confirmed, 2, "both of the photo's Alice faces");
+        assert_eq!(out.photos_already_confirmed, 1);
+        assert_eq!(out.photos_without_suggestion, 2, "Bob-only and face-less photos");
+        assert_eq!(changed, vec![1]);
+
+        assert_eq!(face_state(&conn, a1).0, "confirmed");
+        assert_eq!(face_state(&conn, a2).0, "confirmed");
+        // Bob's suggestion is untouched, and Alice is not forced onto his photo.
+        assert_eq!(face_state(&conn, b1), ("suggested".into(), Some(bob), "detect".into()));
+        assert_eq!(face_count(&conn, 2), 1, "no Alice face invented on Bob's photo");
+        assert_eq!(face_count(&conn, 4), 0, "no face invented on the face-less photo");
+    }
+
+    /// A `(face, person)` pair the user rejected is never resurrected by a batch confirm:
+    /// rejection clears `person_tag_id`, so the face cannot be in the suggested set.
+    #[test]
+    fn accept_person_does_not_resurrect_a_rejected_face() {
+        let conn = mem_conn();
+        let alice = add_person(&conn, 100, "Alice");
+        add_photo(&conn, 1);
+        let f = add_face(&conn, 1, &embed(0, 0.0));
+        set_suggested(&conn, f, alice);
+        reject(&conn, f, 1000).unwrap();
+
+        let (out, changed) = accept_person_on_photos(&conn, &[1], alice).unwrap();
+        assert_eq!(out.photos_without_suggestion, 1);
+        assert_eq!(out.photos_confirmed, 0);
+        assert_eq!(out.faces_confirmed, 0);
+        assert!(changed.is_empty());
+        assert_eq!(face_state(&conn, f).0, "unassigned");
+        assert!(is_rejected(&conn, f, alice).unwrap(), "the rejection still stands");
+    }
+
+    /// Person tags resolve correctly under a NON-ASCII people-root. `substr`/`length` count
+    /// characters, so binding a Rust byte-length would over-count for multibyte roots and
+    /// silently match nothing. (Regression: matcher no-op'd for a non-ASCII root.)
+    #[test]
+    fn person_tags_resolve_under_non_ascii_root() {
+        let conn = mem_conn();
+        // Non-ASCII root "Persøner" (ø is 2 UTF-8 bytes → byte len ≠ char len).
+        conn.execute(
+            "INSERT INTO tags (id, full_path) VALUES (100, 'Persøner/Ålev')",
+            [],
+        )
+        .unwrap();
+        // A sibling outside the branch must not match.
+        conn.execute(
+            "INSERT INTO tags (id, full_path) VALUES (200, 'Places/Beach')",
+            [],
+        )
+        .unwrap();
+
+        let ids = person_tag_ids(&conn, "Persøner").unwrap();
+        assert!(ids.contains(&100), "descendant of non-ASCII root must resolve");
+        assert!(!ids.contains(&200), "outside-branch tag must not resolve");
+
+        // End-to-end: a 1-face + 1-person-tag photo under the non-ASCII root seeds.
+        add_photo(&conn, 1);
+        tag_photo(&conn, 1, 100);
+        let f = add_face(&conn, 1, &embed(0, 0.0));
+        let mut settings = MatchSettings::default();
+        settings.people_root = "Persøner".to_string();
+        let out = run_matching(&conn, &settings, 1000).unwrap();
+        assert_eq!(out.seeded, 1, "seed must fire under a non-ASCII root");
+        assert_eq!(face_state(&conn, f).1, Some(100));
+    }
+
+    // ── Settings loading ──────────────────────────────────────────────────────────
+
+    /// Settings load from the table with defaults for missing/blank keys.
+    #[test]
+    fn settings_load_with_overrides() {
+        let conn = mem_conn();
+        // Defaults when unset.
+        let s = MatchSettings::load(&conn).unwrap();
+        assert_eq!(s.people_root, "People");
+        assert!((s.threshold - 0.45).abs() < 1e-6);
+
+        // Overrides.
+        conn.execute(
+            "INSERT INTO settings (key, value) VALUES (?1, 'Faces/Person'), (?2, '0.6')",
+            [PEOPLE_ROOT_SETTING, THRESHOLD_SETTING],
+        )
+        .unwrap();
+        let s2 = MatchSettings::load(&conn).unwrap();
+        assert_eq!(s2.people_root, "Faces/Person");
+        assert!((s2.threshold - 0.6).abs() < 1e-6);
+
+        // Blank / garbage falls back to defaults.
+        conn.execute(
+            "UPDATE settings SET value = '  ' WHERE key = ?1",
+            [PEOPLE_ROOT_SETTING],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE settings SET value = 'notanumber' WHERE key = ?1",
+            [THRESHOLD_SETTING],
+        )
+        .unwrap();
+        let s3 = MatchSettings::load(&conn).unwrap();
+        assert_eq!(s3.people_root, "People");
+        assert!((s3.threshold - 0.45).abs() < 1e-6);
+    }
+}

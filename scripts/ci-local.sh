@@ -4,31 +4,29 @@ set -euo pipefail
 
 repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 
-run_frontend_checks() {
+run_backend_checks() {
+  # The Cargo workspace is the repository root: crates/core, crates/model and crates/app.
   cd "$repo_root"
 
-  npm ci
-  npx tsc --noEmit
-  npm test
-  npm run build
-}
+  cargo test --workspace
+  cargo check --workspace --all-targets
+  cargo check --workspace --no-default-features
 
-run_backend_checks() {
-  cd "$repo_root/src-tauri"
-
-  cargo test
-  cargo check --all-targets
-  cargo check --no-default-features
-
-  local feature
+  local feature pkg
   for feature in ai edit raw instagram collage slideshow localsend map faces smarttags flickr smugmug; do
-    RUSTFLAGS="-D warnings" \
-      cargo check --no-default-features --features "$feature" --all-targets
+    for pkg in chairphoto-core chairphoto-app; do
+      RUSTFLAGS="-D warnings" \
+        cargo check -p "$pkg" --no-default-features --features "$feature" --all-targets
+    done
   done
 
-  RUSTFLAGS="-D warnings" cargo check --all-targets
-  cargo check --all-features --all-targets
+  # tag-graph is app-only (crates/app/Cargo.toml has no matching chairphoto-core feature),
+  # so it checks against chairphoto-app alone rather than joining the loop above.
+  RUSTFLAGS="-D warnings" \
+    cargo check -p chairphoto-app --no-default-features --features tag-graph --all-targets
+
+  RUSTFLAGS="-D warnings" cargo check --workspace --all-targets
+  cargo check --workspace --all-features --all-targets
 }
 
-run_frontend_checks
 run_backend_checks

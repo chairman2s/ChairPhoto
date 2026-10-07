@@ -26,11 +26,16 @@ phone* — and ChairPhoto records it as published to Snapchat.
 A **publish target**, "Device (LocalSend)", in the unified **Publish** dialog. It sends the
 current selection of one or more photos.
 
-Rendering is `render_localsend_jpegs` (`commands/localsend.rs`) — **not**
-`commands::publishing::render_export_jpeg`, the SmugMug/Flickr helper. The two are siblings
-built from the same `export` primitives (`resolve_originals`, `upload_file_name`,
-`JobTempDir`, `write_item_jpeg`), not one calling the other, so they share behaviour by
-construction rather than by delegation:
+A send is a core job, `crates/core/src/app/localsend.rs` (`claim_send`, then
+`LocalSendJob::run`), called directly by the GPUI panel. The claim
+checks the catalog the ids were read from, resolves the originals and takes the LocalSend job
+generation under one catalog lock; a newer send, Cancel or a catalog switch trips it, and the
+send stops before its next render or file — mid-upload too — and cancels the receiver's session
+(`POST /cancel`). A send that stops part-way (Cancel, or the receiver rejecting a file) answers
+`SendStopped`: the photos already on the device and why the rest did not go. Its rendering is **not** `publishing::render_upload_jpeg`, the SmugMug/Flickr
+helper. The two are siblings built from the same `export` primitives (`resolve_originals`,
+`upload_file_name`, `JobTempDir`, `write_item_jpeg`), not one calling the other, so they share
+behaviour by construction rather than by delegation:
 
 - **Shared.** Version-picking (the selected version where it matches), and EXIF/GPS carried
   into the render — `write_item_jpeg` re-encodes, which strips metadata, then copies EXIF+GPS
@@ -102,15 +107,16 @@ on success — mirroring how `publishing.tsx` is shared by Flickr and SmugMug.
 
 ## Implementation
 
-All I/O is in Rust. `src-tauri/src/localsend/mod.rs`, behind a `localsend` Cargo feature,
+All I/O is in Rust. `crates/core/src/localsend/mod.rs`, behind a `localsend` Cargo feature,
 reuses `reqwest` and does UDP through tokio:
 
 - `discover(timeout_ms) -> Vec<Device>` — multicast listen and announce, plus a concurrent
   subnet sweep, yielding `Device { alias, deviceModel, deviceType, ip, port, protocol,
   fingerprint }`. The three sources (UDP announcement, register POST, sweep) feed one channel
   and one dedupe map, so each peer yields one `Device` however many ways it was heard.
-- `send_files(device, [paths], pin?)` — prepare-upload then per-file upload, emitting a
-  `localsend:progress` event stream like card import.
+- `send_files_abortable(device, [paths], pin?, abort)` — prepare-upload then per-file upload,
+  calling back after each file (the job turns that into `localsend:progress` with its job id),
+  and stopping on `abort` (`send_files` is the same without one).
 
 Two feature-gated commands:
 
@@ -119,17 +125,25 @@ localsend_discover() -> [{ alias, deviceModel, deviceType, ip, port, protocol, f
 localsend_send(photoIds, versionId?, device, pin?) -> { sent, failed }
 ```
 
-`SendToDevicePanel.tsx` owns the module's backend surface: the `localsend_discover` and
-`localsend_send` wrappers go through `ChairPhotoAPI.invoke`, and the `localsend:progress`
-stream through `ChairPhotoAPI.onEvent` — not through core `api.ts`, and never through
-Tauri directly. `onEvent` is an optional host-API member, so the panel guards for hosts
-that predate it, in which case progress simply does not display.
+In the GPUI app (`crates/app/src/modules/localsend/`) the LocalSend and Snapchat modules each
+contribute a publish target rendering `send::SendToDevicePanel`; Snapchat records through
+core's `app::publications::record_publications_as` with its marker, only for the photos that reached the
+device — including those delivered before a send stopped part-way (the status then reads
+"Sent 3 of 5 to Phone, then stopped: …"). The Publish dialog builds a target's form when its chip is chosen, so the opening scan
+runs only for a form the user is looking at. Tests fake the network at `LocalSendBackend`;
+core's `app::localsend` tests drive the real send against a loopback stub receiver
+(`localsend/test_receiver.rs`, an ephemeral `127.0.0.1` port).
+
+`send::SendToDevicePanel` (`crates/app/src/modules/localsend/send.rs`) calls
+`app::localsend`'s discovery and send functions directly — no command indirection — and
+subscribes to the app model's events to catch `CoreEvent::LocalSendProgress`, filtering to
+its own job id so a stale or another panel's job never moves its counter.
 
 Unit tests cover the discovery-JSON parse, the prepare-upload body and response shapes, the
-device-info builder, the host's `satisfies` semver helper, and the Snapchat aspect helper.
+device-info builder, and the Snapchat aspect helper.
 The discovery-socket tests (issue #39) are the exception: they bind the real well-known UDP
 port, join the real multicast group, and send/receive real datagrams over loopback — see the
-`#[cfg(test)] mod tests` doc comments in `src-tauri/src/localsend/mod.rs` for what that costs
+`#[cfg(test)] mod tests` doc comments in `crates/core/src/localsend/mod.rs` for what that costs
 (serialized against each other and against a co-resident LocalSend desktop app) and how it's
 kept hermetic (loopback only, never the LAN).
 
@@ -186,31 +200,27 @@ modules.
 
 ## Module dependencies (`requires`)
 
-`ChairPhotoModule` (`src/modules/registry.ts`) carries a version-aware `requires`:
+`ModuleMeta` (`crates/app/src/modules/mod.rs`) carries plain module-id dependencies, with no
+version to match against — a compiled-in module ships with the app, so there is nothing to
+version-range:
 
-```ts
-requires?: { id: string; version?: string }[];   // version = semver range; omit = any
-// e.g. snapchat: requires: [{ id: "localsend", version: "^0.1.0" }]
+```rust
+ModuleMeta::new(SNAPCHAT_ID, "Snapchat")
+    .requires(LOCALSEND_ID)
+    // ...
 ```
 
-Modules already carry a `version` such as "0.1.0", and a dependency's range is matched
-against it. Enforcement is in `src/modules/host.ts`:
+Enforcement is in `ModuleRegistry` (`crates/app/src/modules/registry.rs`):
 
-- `enableModule(id)` first recursively enables each required module, dependencies before
-  dependents so `onLoad` order is correct. It **refuses**, and reports why, if a required
-  module is missing, its `backendFeature` is not compiled, or its version does not satisfy
-  the requested range.
-- `disableModule(id)` cascade-disables any enabled module that requires it, with a toast,
-  so there is never an orphaned dependent.
-- `persistEnabled`/`initHost` enable in dependency order on load.
-- `components/ModulesPanel.tsx` shows "Requires: `<name>` `<range>`" and disables the
-  toggle when a dependency is unavailable or version-incompatible.
+- **Enable** first validates the module's own requirement (the required module must exist
+  and its backend feature, if any, must be compiled in), then enables each required module
+  first — dependencies before dependents, so `load` order is correct. It refuses, with the
+  reason on the status line, if a requirement can't be met.
+- **Disable** cascade-disables any enabled module that requires it, so there is never an
+  orphaned dependent.
+- The enabled set is persisted and restored in dependency order.
 
-Version matching uses a small in-repo `satisfies(version, range)` — no new dependency —
-covering what simple `MAJOR.MINOR.PATCH` module versions need: omitted or `*` for any,
-exact `X.Y.Z`, `>=X.Y.Z`, and npm-style caret `^X.Y.Z`. For `X > 0` the caret means same
-major and greater-or-equal; `^0.Y.Z` means same major **and minor** and greater-or-equal,
-since a 0.x bump is treated as breaking. See [plugin-system.md](plugin-system.md).
+See [plugin-system.md](plugin-system.md).
 
 ## Limits
 

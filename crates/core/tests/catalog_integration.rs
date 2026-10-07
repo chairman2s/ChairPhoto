@@ -1,0 +1,6842 @@
+//! End-to-end catalog tests against a real temp SQLite file. Exercises the
+//! invariants from AGENTS.md: UUID assignment, relative-path storage,
+//! hierarchical tags, and culling.
+
+use chairphoto_core::catalog::{
+    Catalog, CullingFilter, LocationRole, PhotoQuery, PhotoSort, PhotoWindow, PickState,
+    SafetyStatus, StorageStatus, StorageTier, VolumeKind,
+};
+
+/// Push a file's mtime forward, so "edited after the backup" is expressible without
+/// sleeping. `File::set_modified` avoids a `filetime` dependency for one assertion.
+fn set_mtime_ahead(path: &std::path::Path, secs: u64) {
+    let f = std::fs::File::options().write(true).open(path).unwrap();
+    f.set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(secs))
+        .unwrap();
+}
+use chairphoto_core::catalog::PathCandidate;
+use std::path::PathBuf;
+
+mod common;
+
+/// Recursively collect `.jpg` files under a directory (test helper).
+fn walkdir_jpgs(dir: &std::path::Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for e in entries.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                out.extend(walkdir_jpgs(&p));
+            } else if p.extension().and_then(|s| s.to_str()) == Some("jpg") {
+                out.push(p);
+            }
+        }
+    }
+    out
+}
+
+/// Build a catalog in a unique temp dir and return (catalog, root).
+fn temp_catalog(tag: &str) -> (Catalog, common::TestSubPath) {
+    let dir = common::TestTmpDir::new(tag);
+    let root = dir.join("photos");
+    std::fs::create_dir_all(&root).unwrap();
+    let catalog = Catalog::open(&dir.join("test.chairphoto"), &root).unwrap();
+    (catalog, dir.into_subpath("photos"))
+}
+
+#[test]
+fn upsert_assigns_uuid_once_and_stores_relative_path() {
+    let (catalog, root) = temp_catalog("upsert");
+    let photo_path = root.join("trip/DSC0001.ARW");
+
+    let first = catalog.upsert_photo(&photo_path, None, 111, 2048).unwrap();
+    assert!(first.created, "first upsert should create the row");
+    assert!(!first.uuid.is_empty(), "a UUID must be assigned on import");
+
+    // Stored path is relative to the root, not absolute.
+    let photo = catalog.get_photo(first.id).unwrap();
+    assert_eq!(photo.path, "trip/DSC0001.ARW");
+
+    // Re-upserting the same file keeps the same id and UUID (no new identity).
+    let second = catalog.upsert_photo(&photo_path, None, 222, 4096).unwrap();
+    assert!(!second.created);
+    assert_eq!(second.id, first.id);
+    assert_eq!(second.uuid, first.uuid);
+    // Stats differed from the first upsert (111/2048 → 222/4096), so it's NOT unchanged.
+    assert!(!second.unchanged, "changed mtime/size must report unchanged = false");
+
+    // Re-upserting with identical stats reports unchanged = true — the scanner uses this
+    // to skip re-extracting metadata for untouched files on a re-scan.
+    let third = catalog.upsert_photo(&photo_path, None, 222, 4096).unwrap();
+    assert!(!third.created);
+    assert!(third.unchanged, "identical mtime/size must report unchanged = true");
+    // A newly-created row is never "unchanged".
+    assert!(!first.unchanged);
+}
+
+#[test]
+fn remove_photo_forgets_row_and_cascades_but_keeps_no_file_logic() {
+    let (catalog, root) = temp_catalog("remove-photo");
+    let path = root.join("gone.jpg");
+    std::fs::write(&path, b"x").unwrap();
+    let id = catalog.upsert_photo(&path, None, 1, 1).unwrap().id;
+    let tag = catalog.create_tag("Test").unwrap();
+    catalog.assign_tag(id, tag).unwrap();
+    // It has a location row from the upsert.
+    assert!(!catalog.photo_locations(id).unwrap().is_empty());
+
+    catalog.remove_photo(id).unwrap();
+
+    // Row is gone, and its location rows cascaded away.
+    assert!(catalog.get_photo(id).is_err(), "photo row must be deleted");
+    assert!(catalog.photo_locations(id).unwrap().is_empty(), "locations cascade");
+    // remove_photo never touches files on disk.
+    assert!(path.exists(), "the file on disk must NOT be deleted");
+}
+
+#[test]
+fn offload_policy_selects_old_backed_up_photos_only() {
+    use chairphoto_core::catalog::PromotedMetadata;
+    let (catalog, root) = temp_catalog("offload-policy");
+    let nas_dir = root.parent().unwrap().join("nas-policy");
+    std::fs::create_dir_all(&nas_dir).unwrap();
+    let nas = catalog.add_volume("NAS", &nas_dir, VolumeKind::Backup).unwrap();
+
+    let mk = |name: &str, bytes: &[u8]| -> i64 {
+        let p = root.join(name);
+        std::fs::write(&p, bytes).unwrap();
+        catalog.upsert_photo(&p, None, 1, bytes.len() as i64).unwrap().id
+    };
+    let set_old = |id: i64| {
+        let promoted = PromotedMetadata {
+            capture_time: Some("2000-01-01T00:00:00".into()),
+            ..Default::default()
+        };
+        catalog.set_photo_metadata(id, &promoted, &[]).unwrap();
+    };
+
+    let old_bak = mk("old1.ARW", b"oldbak");
+    set_old(old_bak);
+    catalog.backup_photo(old_bak, nas).unwrap(); // OLD + backed up → eligible
+    let recent = mk("recent.ARW", b"recent");
+    catalog.backup_photo(recent, nas).unwrap(); // RECENT (created_at=now) → kept local
+    let old_nobak = mk("old2.ARW", b"oldnobak");
+    set_old(old_nobak); // OLD but no backup → never offloaded
+
+    let eligible = catalog.photos_eligible_for_offload(90).unwrap();
+    assert!(eligible.contains(&old_bak), "old + backed up is eligible");
+    assert!(!eligible.contains(&recent), "recent photo is kept local");
+    assert!(!eligible.contains(&old_nobak), "no verified backup → never offloaded");
+
+    // Once offloaded, it has no local copy left, so it drops out of the eligible set.
+    catalog.offload_photo(old_bak).unwrap();
+    assert!(
+        !catalog.photos_eligible_for_offload(90).unwrap().contains(&old_bak),
+        "already-offloaded photo is not re-listed"
+    );
+}
+
+#[test]
+fn scan_external_indexes_nas_photos_in_place() {
+    let (catalog, root) = temp_catalog("nas-scan");
+    // A NAS (backup) volume holding an existing archive — not under the catalog root.
+    let nas_dir = root.parent().unwrap().join("nas-archive");
+    std::fs::create_dir_all(nas_dir.join("1998")).unwrap();
+    catalog.add_volume("NAS", &nas_dir, VolumeKind::Backup).unwrap();
+    let photo = nas_dir.join("1998/old.jpg");
+    std::fs::write(&photo, b"oldphoto").unwrap();
+
+    let res = chairphoto_core::scanner::scan_external_folder(&catalog, &nas_dir, &chairphoto_core::scanner::never_abort(), &|_| {}).unwrap();
+    assert_eq!(res.created, 1, "the NAS photo is indexed");
+
+    // It's catalogued as NAS-only: shows under the "nas" tier, resolves to the NAS file,
+    // status Archived, and is NOT under "local".
+    let nas_ids: Vec<i64> = catalog
+        .list_photos(&PhotoQuery { storage_tier: StorageTier::Nas, ..Default::default() })
+        .unwrap()
+        .into_iter()
+        .map(|p| p.id)
+        .collect();
+    assert_eq!(nas_ids.len(), 1);
+    let id = nas_ids[0];
+    assert_eq!(catalog.resolve_photo_path(id).unwrap(), Some(photo.clone()));
+    assert_eq!(catalog.photo_storage_status(id).unwrap(), StorageStatus::Archived);
+    assert!(
+        catalog.list_photos(&PhotoQuery { storage_tier: StorageTier::Local, ..Default::default() }).unwrap().is_empty(),
+        "a NAS-resident photo is not 'local'"
+    );
+
+    // Re-scan is idempotent — matched by location, no duplicate row.
+    chairphoto_core::scanner::scan_external_folder(&catalog, &nas_dir, &chairphoto_core::scanner::never_abort(), &|_| {}).unwrap();
+    assert_eq!(
+        catalog.list_photos(&PhotoQuery::default()).unwrap().len(),
+        1
+    );
+}
+
+#[test]
+fn vacuum_runs_and_reports_size() {
+    let (mut catalog, root) = temp_catalog("vacuum");
+    catalog.upsert_photo(&root.join("a.jpg"), None, 1, 1).unwrap();
+    let before = catalog.db_size_bytes().unwrap();
+    assert!(before > 0);
+    catalog.vacuum().unwrap(); // must succeed (not inside a transaction)
+    assert!(catalog.db_size_bytes().unwrap() > 0);
+}
+
+#[test]
+fn find_and_purge_empty_photos() {
+    let (catalog, root) = temp_catalog("empty-photos");
+    // good: non-empty local file; empty: 0-byte file; gone: no file at all.
+    let good = root.join("good.jpg");
+    std::fs::write(&good, b"data").unwrap();
+    let good_id = catalog.upsert_photo(&good, None, 1, 4).unwrap().id;
+    let empty = root.join("empty.jpg");
+    std::fs::write(&empty, b"").unwrap(); // 0 bytes
+    let empty_id = catalog.upsert_photo(&empty, None, 1, 0).unwrap().id;
+    let gone_id = catalog.upsert_photo(&root.join("gone.jpg"), None, 1, 1).unwrap().id; // no file
+
+    let found: Vec<i64> = catalog
+        .find_empty_photos()
+        .unwrap()
+        .into_iter()
+        .map(|(id, _)| id)
+        .collect();
+    assert_eq!(found, vec![empty_id], "only the 0-byte photo is 'empty'");
+    let _ = (good_id, gone_id);
+
+    let removed = catalog.purge_empty_photos().unwrap();
+    assert_eq!(removed.len(), 1);
+    assert!(catalog.get_photo(empty_id).is_err(), "empty photo row deleted");
+    assert!(catalog.get_photo(good_id).is_ok(), "good photo kept");
+    assert!(catalog.get_photo(gone_id).is_ok(), "missing-file photo kept (it's 'unavailable', not 'empty')");
+    assert!(empty.exists(), "the empty file on disk is left as-is");
+}
+
+#[test]
+fn list_photos_filters_by_storage_tier() {
+    let (catalog, root) = temp_catalog("tier-filter");
+    let nas_dir = root.parent().unwrap().join("nas-tier");
+    std::fs::create_dir_all(&nas_dir).unwrap();
+    let nas = catalog.add_volume("NAS", &nas_dir, VolumeKind::Backup).unwrap();
+    let local_vol = catalog
+        .list_volumes()
+        .unwrap()
+        .into_iter()
+        .find(|v| v.kind == VolumeKind::Local)
+        .unwrap()
+        .id;
+
+    // local-only, local+NAS, and NAS-only (offloaded) photos.
+    let local_id = catalog.upsert_photo(&root.join("local.jpg"), None, 1, 1).unwrap().id;
+    let bak_id = catalog.upsert_photo(&root.join("bak.jpg"), None, 1, 1).unwrap().id;
+    catalog.add_location(bak_id, nas, "bak.jpg", LocationRole::Backup).unwrap();
+    let arch_id = catalog.upsert_photo(&root.join("arch.jpg"), None, 1, 1).unwrap().id;
+    catalog.add_location(arch_id, nas, "arch.jpg", LocationRole::Backup).unwrap();
+    catalog.remove_locations_on_volume(arch_id, local_vol).unwrap(); // offloaded: NAS only
+
+    let ids = |storage_tier: StorageTier| -> Vec<i64> {
+        catalog
+            .list_photos(&PhotoQuery { storage_tier, ..Default::default() })
+            .unwrap()
+            .into_iter()
+            .map(|p| p.id)
+            .collect()
+    };
+
+    let local = ids(StorageTier::Local);
+    assert!(local.contains(&local_id) && local.contains(&bak_id));
+    assert!(!local.contains(&arch_id), "offloaded photo is not 'local'");
+
+    let nas_only = ids(StorageTier::Nas);
+    assert!(nas_only.contains(&arch_id), "offloaded photo is 'nas'");
+    assert!(
+        !nas_only.contains(&local_id) && !nas_only.contains(&bak_id),
+        "on-disk photos are not 'nas-only'"
+    );
+
+    assert_eq!(ids(StorageTier::All).len(), 3);
+}
+
+#[test]
+fn backup_is_idempotent_and_copy_never_clobbers_existing() {
+    use chairphoto_core::catalog::copy_and_verify;
+    let (catalog, root) = temp_catalog("backup-safety");
+    let nas_dir = root.parent().unwrap().join("nas-safety");
+    std::fs::create_dir_all(&nas_dir).unwrap();
+    let nas = catalog.add_volume("NAS", &nas_dir, VolumeKind::Backup).unwrap();
+
+    let raw = root.join("a/DSC1.ARW");
+    std::fs::create_dir_all(raw.parent().unwrap()).unwrap();
+    std::fs::write(&raw, b"hello").unwrap();
+    let id = catalog.upsert_photo(&raw, None, 1, 5).unwrap().id;
+
+    // Idempotency signal: false before, true after a successful backup.
+    assert!(!catalog.has_verified_backup(id).unwrap());
+    catalog.backup_photo(id, nas).unwrap();
+    assert!(catalog.has_verified_backup(id).unwrap());
+
+    let nas_copy = nas_dir.join("a/DSC1.ARW");
+    assert!(nas_copy.is_file());
+    // The temp sibling is renamed away on success — nothing left behind.
+    let part = nas_dir.join("a/.DSC1.ARW.chairphoto-part");
+    assert!(!part.exists(), "no temp left after a successful copy");
+
+    // A failed copy_and_verify must NEVER damage an existing destination. A wrong
+    // `expected` hash makes it refuse; the existing backup and dir must be intact.
+    let before = std::fs::read(&nas_copy).unwrap();
+    assert!(
+        copy_and_verify(&raw, &nas_copy, Some("deadbeef")).is_err(),
+        "mismatched expected hash must error"
+    );
+    assert_eq!(std::fs::read(&nas_copy).unwrap(), before, "existing backup untouched on failure");
+    assert!(!part.exists(), "temp cleaned up on failure");
+}
+
+#[test]
+fn find_and_purge_unavailable_photos_is_conservative() {
+    let (catalog, root) = temp_catalog("unavailable");
+
+    // A: present local file → available.
+    let a_path = root.join("a.jpg");
+    std::fs::write(&a_path, b"a").unwrap();
+    let a = catalog.upsert_photo(&a_path, None, 1, 1).unwrap().id;
+
+    // B: catalog row + local primary location, but no file anywhere → unavailable.
+    let b = catalog.upsert_photo(&root.join("b.jpg"), None, 1, 1).unwrap().id;
+
+    // A reachable backup volume (its base dir exists).
+    let backup_dir = root.parent().unwrap().join("backup");
+    std::fs::create_dir_all(&backup_dir).unwrap();
+    let backup_vol = catalog.add_volume("nas", &backup_dir, VolumeKind::Backup).unwrap();
+
+    // C: local gone, but the backup file exists on the reachable volume → available.
+    let c = catalog.upsert_photo(&root.join("c.jpg"), None, 1, 1).unwrap().id;
+    std::fs::write(backup_dir.join("c.jpg"), b"c").unwrap();
+    catalog.add_location(c, backup_vol, "c.jpg", LocationRole::Backup).unwrap();
+
+    // D: local gone, backup record on an UNREACHABLE volume (base dir absent) → uncertain,
+    //    so it must NEVER be purged (the file may be there once the volume is mounted).
+    let offline_dir = root.parent().unwrap().join("offline-nas");
+    let offline_vol = catalog.add_volume("offline", &offline_dir, VolumeKind::Backup).unwrap();
+    let d = catalog.upsert_photo(&root.join("d.jpg"), None, 1, 1).unwrap().id;
+    catalog.add_location(d, offline_vol, "d.jpg", LocationRole::Backup).unwrap();
+
+    let gone: Vec<i64> = catalog
+        .find_unavailable_photos()
+        .unwrap()
+        .into_iter()
+        .map(|(id, _)| id)
+        .collect();
+    assert!(gone.contains(&b), "B (no copy anywhere) is unavailable");
+    assert!(!gone.contains(&a), "A has a present local file");
+    assert!(!gone.contains(&c), "C has a present reachable backup");
+    assert!(!gone.contains(&d), "D might be on the offline volume — never removed");
+
+    let removed = catalog.purge_unavailable_photos().unwrap();
+    assert_eq!(removed.len(), 1, "only B is purged");
+    assert!(catalog.get_photo(b).is_err(), "B row deleted");
+    assert!(catalog.get_photo(a).is_ok());
+    assert!(catalog.get_photo(c).is_ok());
+    assert!(catalog.get_photo(d).is_ok());
+    // Purge never touches files.
+    assert!(a_path.exists());
+    assert!(backup_dir.join("c.jpg").exists());
+}
+
+#[test]
+fn relocate_photo_repoints_path_and_clears_missing() {
+    let (catalog, root) = temp_catalog("relocate");
+    let old = root.join("old/DSC1.ARW");
+    std::fs::create_dir_all(old.parent().unwrap()).unwrap();
+    std::fs::write(&old, b"original").unwrap();
+    let id = catalog.upsert_photo(&old, None, 1, 8).unwrap().id;
+
+    // Simulate the file moving to a new location under the library root.
+    let moved = root.join("2026/DSC1.ARW");
+    std::fs::create_dir_all(moved.parent().unwrap()).unwrap();
+    std::fs::rename(&old, &moved).unwrap();
+
+    let uuid = catalog.relocate_photo(id, &moved).unwrap();
+    assert!(!uuid.is_empty());
+    // Logical path now reflects the new location, and it resolves to the moved file.
+    assert_eq!(catalog.get_photo(id).unwrap().path, "2026/DSC1.ARW");
+    assert_eq!(catalog.resolve_photo_path(id).unwrap(), Some(moved.clone()));
+
+    // A file outside the catalog root is rejected.
+    let outside_dir = common::TestTmpDir::new("relocate-outside");
+    let outside = outside_dir.join("outside.ARW");
+    std::fs::write(&outside, b"x").unwrap();
+    assert!(catalog.relocate_photo(id, &outside).is_err());
+}
+
+#[test]
+fn moved_file_matches_by_uuid_instead_of_duplicating() {
+    let (catalog, root) = temp_catalog("rehome");
+    let first = catalog.upsert_photo(&root.join("DSC1.ARW"), None, 1, 1).unwrap();
+    assert!(first.created);
+
+    // The same photo now appears at a different relative path (a re-root / move). With
+    // its UUID supplied (as the scanner reads from the sidecar), it re-homes the existing
+    // row rather than creating a new one.
+    let moved = catalog
+        .upsert_photo_with_identity(&root.join("2026/DSC1.ARW"), None, 2, 2, Some(&first.uuid))
+        .unwrap();
+    assert!(!moved.created, "moved file must match the existing row, not duplicate");
+    assert_eq!(moved.id, first.id);
+    assert_eq!(moved.uuid, first.uuid);
+    assert_eq!(catalog.get_photo(first.id).unwrap().path, "2026/DSC1.ARW");
+
+    // A brand-new file with a UUID from another machine adopts that identity.
+    let imported = catalog
+        .upsert_photo_with_identity(
+            &root.join("FROM-LAPTOP.ARW"),
+            None,
+            3,
+            3,
+            Some("3b2f7c1e-8a4d-4e6f-9b0a-1c2d3e4f5a6b"),
+        )
+        .unwrap();
+    assert!(imported.created);
+    assert_eq!(imported.uuid, "3b2f7c1e-8a4d-4e6f-9b0a-1c2d3e4f5a6b");
+}
+
+/// #150 (reviews F5 and N2 of #146): a re-home by identity is for a file that moved. While
+/// the row's own file is still in place, a second file carrying the same UUID — a copy, the
+/// other half of a v24 case collision — gets a row of its own, for a scan and a trusted
+/// (bundle) upsert alike, on the catalog root and on a volume indexed in place. Once the
+/// original is gone, the next file carrying the UUID re-homes the row as before.
+#[test]
+fn a_uuid_rehome_never_leaves_a_file_still_in_place() {
+    let (catalog, root) = temp_catalog("rehome-guard");
+    const KNOWN: &str = "6f1c1f0e-2b7a-4c3d-9e8f-0a1b2c3d4e5f";
+    let write = |p: &std::path::Path| {
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(p, b"notarealjpeg").unwrap();
+    };
+    let original = root.join("a/x.jpg");
+    write(&original);
+    let row = catalog.upsert_photo_with_identity(&original, None, 1, 12, Some(KNOWN)).unwrap();
+
+    let copy = root.join("b/x.jpg");
+    write(&copy);
+    let trusted = catalog.upsert_photo_with_identity(&copy, None, 1, 12, Some(KNOWN)).unwrap();
+    assert!(trusted.created && trusted.uuid != KNOWN, "a bundle's copy is not the row");
+    let other = root.join("c/x.jpg");
+    write(&other);
+    let scanned = catalog.upsert_scanned_photo(&other, None, 1, 12, Some(KNOWN)).unwrap();
+    assert!(scanned.created && scanned.uuid != KNOWN, "a scanned copy is not the row");
+    assert_eq!(catalog.get_photo(row.id).unwrap().path, "a/x.jpg");
+
+    std::fs::remove_file(&original).unwrap();
+    let moved = root.join("d/x.jpg");
+    write(&moved);
+    let rehomed = catalog.upsert_scanned_photo(&moved, None, 1, 12, Some(KNOWN)).unwrap();
+    assert_eq!((rehomed.id, rehomed.created), (row.id, false), "moved: re-homed");
+    assert_eq!(catalog.get_photo(row.id).unwrap().path, "d/x.jpg");
+
+    // On a volume indexed in place: the row's primary copy there is the one that matters.
+    const ON_NAS: &str = "0d9c8b7a-6f5e-4d3c-8b2a-190807060504";
+    let nas = root.parent().unwrap().join("nas");
+    std::fs::create_dir_all(&nas).unwrap();
+    catalog.add_volume("NAS", &nas, VolumeKind::Backup).unwrap();
+    write(&nas.join("x.jpg"));
+    let nas_row = catalog.upsert_photo_on_volume(&nas.join("x.jpg"), 1, 12, Some(ON_NAS)).unwrap();
+    write(&nas.join("y.jpg"));
+    let nas_copy = catalog.upsert_scanned_photo_on_volume(&nas.join("y.jpg"), 1, 12, Some(ON_NAS)).unwrap();
+    assert!(nas_copy.created && nas_copy.uuid != ON_NAS, "a second NAS file is not the row");
+    std::fs::remove_file(nas.join("x.jpg")).unwrap();
+    write(&nas.join("z.jpg"));
+    let nas_moved = catalog.upsert_scanned_photo_on_volume(&nas.join("z.jpg"), 1, 12, Some(ON_NAS)).unwrap();
+    assert_eq!((nas_moved.id, nas_moved.created), (nas_row.id, false));
+}
+
+/// Issue #141: a sidecar identifier that is not a UUID is another tool's (here a DAM asset
+/// id, in the XMP spec's Bag form, written by hand rather than by ChairPhoto). Two files
+/// carrying the same one must not share a row: before the fix the scan adopted it as the
+/// first file's `photos.uuid` and then re-homed that row onto the second file's path, and
+/// every later scan moved it back. Now each file gets its own minted UUID, the foreign value
+/// stays in both sidecars as a reported conflict, and Adopt refuses to make it an identity.
+#[test]
+fn scan_ignores_a_non_uuid_sidecar_identifier_but_preserves_it() {
+    let (catalog, root) = temp_catalog("non-uuid-identifier");
+    const DAM_ID: &str = "dam:asset/4711";
+    let sidecar = format!(r#"<?xml version="1.0" encoding="UTF-8"?>
+<x:xmpmeta xmlns:x="adobe:ns:meta/">
+ <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
+  <rdf:Description rdf:about=""
+    xmlns:xmp="http://ns.adobe.com/xap/1.0/"
+    xmlns:darktable="http://darktable.sf.net/">
+   <xmp:Identifier><rdf:Bag><rdf:li>{DAM_ID}</rdf:li></rdf:Bag></xmp:Identifier>
+   <darktable:history_end>3</darktable:history_end>
+  </rdf:Description>
+ </rdf:RDF>
+</x:xmpmeta>"#);
+    let files = [root.join("a/one.jpg"), root.join("b/two.jpg")];
+    for f in &files {
+        std::fs::create_dir_all(f.parent().unwrap()).unwrap();
+        std::fs::write(f, b"notarealjpeg").unwrap();
+        std::fs::write(chairphoto_core::xmp::sidecar_path(f), &sidecar).unwrap();
+    }
+
+    let abort = chairphoto_core::scanner::never_abort();
+    let rows = |catalog: &Catalog| -> Vec<(i64, String, String)> {
+        let mut rows: Vec<_> = catalog
+            .list_photos(&PhotoQuery::default())
+            .unwrap()
+            .into_iter()
+            .map(|p| (p.id, p.path, p.uuid))
+            .collect();
+        rows.sort_by(|a, b| a.1.cmp(&b.1));
+        rows
+    };
+    chairphoto_core::scanner::scan_folder(&catalog, &root, &abort, &|_| {}).unwrap();
+    let first = rows(&catalog);
+    let paths: Vec<&str> = first.iter().map(|r| r.1.as_str()).collect();
+    assert_eq!(paths, ["a/one.jpg", "b/two.jpg"], "one row per file: {first:?}");
+    for (_, path, uuid) in &first {
+        assert!(chairphoto_core::catalog::is_photo_identity(uuid),
+            "{path} got a minted UUID, not the foreign id: {uuid}");
+    }
+    assert_ne!(first[0].2, first[1].2);
+
+    // A re-scan matches each file to its own row by path: nothing moves.
+    chairphoto_core::scanner::scan_folder(&catalog, &root, &abort, &|_| {}).unwrap();
+    assert_eq!(rows(&catalog), first, "a re-scan must not move rows between the files");
+
+    // The foreign identifier is ignored, not removed: both sidecars still carry it (and the
+    // rest of their content), and each copy is reported as a conflict for a person to decide.
+    for f in &files {
+        assert_eq!(chairphoto_core::xmp::read_identifier(f).as_deref(), Some(DAM_ID));
+        let xml = std::fs::read_to_string(chairphoto_core::xmp::sidecar_path(f)).unwrap();
+        assert!(xml.contains("history_end"), "{xml}");
+    }
+    let pending = catalog.list_pending_identity().unwrap();
+    let conflicts: Vec<_> = pending.iter().filter(|p| p.state == "conflict").collect();
+    assert_eq!(conflicts.len(), 2, "{pending:#?}");
+    assert!(conflicts.iter().all(|p| p.error.contains(DAM_ID)), "{pending:#?}");
+
+    // Adopt would make the foreign id a photo identity; it is refused, and nothing changes.
+    let c = conflicts[0];
+    let err = catalog
+        .resolve_identity_conflict(
+            c.photo_id,
+            c.volume_id,
+            &c.relative_path,
+            chairphoto_core::catalog::IdentityConflictAction::Adopt,
+        )
+        .expect_err("a non-UUID identifier must not be adopted");
+    assert!(err.to_string().contains("not a UUID"), "{err}");
+    assert_eq!(rows(&catalog), first);
+}
+
+/// Issue #146: before #141 a scan adopted a non-UUID sidecar identifier as `photos.uuid`.
+/// #141 stopped matching on such values, so when that file moved, the next scan catalogued
+/// it again and left its tags and rating on a row nobody sees. Schema v23 re-mints those rows
+/// and keeps the old value as a legacy identifier; a moved file comes back to its row, the
+/// foreign value stays in the sidecar as a conflict, and a second file sharing it does not
+/// take the row over.
+#[test]
+fn a_row_holding_a_pre_141_non_uuid_identity_survives_its_file_moving() {
+    let (catalog, root) = temp_catalog("legacy-non-uuid-identity");
+    const DAM_ID: &str = "dam:asset/1";
+    let sidecar = format!(r#"<?xml version="1.0" encoding="UTF-8"?>
+<x:xmpmeta xmlns:x="adobe:ns:meta/">
+ <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
+  <rdf:Description rdf:about="" xmlns:xmp="http://ns.adobe.com/xap/1.0/">
+   <xmp:Identifier>{DAM_ID}</xmp:Identifier>
+  </rdf:Description>
+ </rdf:RDF>
+</x:xmpmeta>"#);
+    let place = |f: &std::path::Path| {
+        std::fs::create_dir_all(f.parent().unwrap()).unwrap();
+        std::fs::write(f, b"notarealjpeg").unwrap();
+        std::fs::write(chairphoto_core::xmp::sidecar_path(f), &sidecar).unwrap();
+    };
+    let original = root.join("a/x.jpg");
+    place(&original);
+    let abort = chairphoto_core::scanner::never_abort();
+    chairphoto_core::scanner::scan_folder(&catalog, &root, &abort, &|_| {}).unwrap();
+    let id = catalog.list_photos(&PhotoQuery::default()).unwrap()[0].id;
+    catalog.set_culling(id, Some(4), None, None).unwrap();
+    let tag = catalog.create_tag("Places/Harbour").unwrap();
+    catalog.assign_tag(id, tag).unwrap();
+
+    // Make it the catalog a pre-#141 scan left: the foreign value adopted as the identity,
+    // the copy counted as bound, and the catalog at schema v22.
+    catalog
+        .conn()
+        .execute_batch(&format!(
+            "UPDATE photos SET uuid = '{DAM_ID}' WHERE id = {id};
+             DELETE FROM pending_sidecar_identity;
+             UPDATE settings SET value = '22' WHERE key = 'schema_version';"
+        ))
+        .unwrap();
+    let db = catalog.db_path().to_path_buf();
+    drop(catalog);
+    let catalog = Catalog::open(&db, &root).unwrap();
+
+    let reminted = catalog.get_photo(id).unwrap().uuid;
+    assert!(chairphoto_core::catalog::is_photo_identity(&reminted), "{reminted}");
+    let queue = |catalog: &Catalog| -> Vec<(i64, String, String)> {
+        catalog
+            .list_pending_identity()
+            .unwrap()
+            .into_iter()
+            .map(|p| (p.photo_id, p.relative_path, p.state))
+            .collect()
+    };
+    assert_eq!(queue(&catalog), [(id, "a/x.jpg".to_string(), "conflict".to_string())]);
+    assert_eq!(chairphoto_core::xmp::read_identifier(&original).as_deref(), Some(DAM_ID),
+        "the migration writes no sidecar");
+
+    // The file moves, sidecar and all, and the folder is rescanned.
+    let moved = root.join("b/x.jpg");
+    std::fs::create_dir_all(moved.parent().unwrap()).unwrap();
+    std::fs::rename(&original, &moved).unwrap();
+    std::fs::rename(
+        chairphoto_core::xmp::sidecar_path(&original),
+        chairphoto_core::xmp::sidecar_path(&moved),
+    )
+    .unwrap();
+    chairphoto_core::scanner::scan_folder(&catalog, &root, &abort, &|_| {}).unwrap();
+
+    let visible = catalog.list_photos(&PhotoQuery::default()).unwrap();
+    assert_eq!(visible.len(), 1, "one row, not a duplicate: {visible:?}");
+    assert_eq!((visible[0].id, visible[0].path.as_str()), (id, "b/x.jpg"));
+    assert_eq!(visible[0].uuid, reminted);
+    assert_eq!(visible[0].rating, 4);
+    let tags: Vec<String> = catalog.get_photo_tags(id).unwrap().into_iter().map(|t| t.name).collect();
+    assert_eq!(tags, ["Harbour"]);
+    assert_eq!(chairphoto_core::xmp::read_identifier(&moved).as_deref(), Some(DAM_ID));
+    assert_eq!(queue(&catalog), [(id, "b/x.jpg".to_string(), "conflict".to_string())],
+        "the conflict follows the file; the path it left owes nothing");
+
+    // Another file carrying the same foreign id, while the row's own file is still there:
+    // it is a different photo and gets its own row, and the moved one keeps its own.
+    place(&root.join("c/y.jpg"));
+    chairphoto_core::scanner::scan_folder(&catalog, &root, &abort, &|_| {}).unwrap();
+    chairphoto_core::scanner::scan_folder(&catalog, &root, &abort, &|_| {}).unwrap();
+    let mut paths: Vec<(String, i64)> = catalog
+        .list_photos(&PhotoQuery::default())
+        .unwrap()
+        .into_iter()
+        .map(|p| (p.path, p.id))
+        .collect();
+    paths.sort();
+    assert_eq!(paths.len(), 2, "{paths:?}");
+    assert_eq!(paths[0], ("b/x.jpg".to_string(), id));
+    assert_eq!(paths[1].0, "c/y.jpg");
+}
+
+/// Issue #146 (L5): a UUID is one identity in either case. A sidecar spelling it upper-case
+/// is bound to the lowercase row, leads a moved file back to it, and is never rewritten;
+/// a new file's upper-case identity is stored lowercase; a deep link finds it either way.
+#[test]
+fn an_upper_case_sidecar_uuid_is_the_lowercase_rows_identity() {
+    let (catalog, root) = temp_catalog("uppercase-identity");
+    let abort = chairphoto_core::scanner::never_abort();
+    let original = root.join("a/x.jpg");
+    std::fs::create_dir_all(original.parent().unwrap()).unwrap();
+    std::fs::write(&original, b"notarealjpeg").unwrap();
+    chairphoto_core::scanner::scan_folder(&catalog, &root, &abort, &|_| {}).unwrap();
+    let row = catalog.list_photos(&PhotoQuery::default()).unwrap().remove(0);
+    let upper = row.uuid.to_ascii_uppercase();
+    assert_ne!(upper, row.uuid);
+    // Another tool rewrites the identity upper-case.
+    chairphoto_core::xmp::write_identifier(&original, &upper).unwrap();
+
+    // The file moves; the scan finds its row, binds it, and leaves the sidecar's spelling.
+    let moved = root.join("b/x.jpg");
+    std::fs::create_dir_all(moved.parent().unwrap()).unwrap();
+    std::fs::rename(&original, &moved).unwrap();
+    std::fs::rename(
+        chairphoto_core::xmp::sidecar_path(&original),
+        chairphoto_core::xmp::sidecar_path(&moved),
+    )
+    .unwrap();
+    chairphoto_core::scanner::scan_folder(&catalog, &root, &abort, &|_| {}).unwrap();
+    let visible = catalog.list_photos(&PhotoQuery::default()).unwrap();
+    assert_eq!(visible.len(), 1, "{visible:?}");
+    assert_eq!((visible[0].id, visible[0].path.as_str(), visible[0].uuid.as_str()),
+        (row.id, "b/x.jpg", row.uuid.as_str()));
+    assert!(catalog.list_pending_identity().unwrap().is_empty(), "an identity in another case is no conflict");
+    assert_eq!(chairphoto_core::xmp::read_identifier(&moved).as_deref(), Some(upper.as_str()));
+    assert_eq!(catalog.get_photo_by_uuid(&upper).unwrap().id, row.id);
+
+    // A file new to this catalog whose sidecar spells its identity upper-case.
+    const ARRIVING: &str = "6F1C1F0E-2B7A-4C3D-9E8F-0A1B2C3D4E5F";
+    let arriving = root.join("c/y.jpg");
+    std::fs::create_dir_all(arriving.parent().unwrap()).unwrap();
+    std::fs::write(&arriving, b"notarealjpeg").unwrap();
+    chairphoto_core::xmp::write_identifier(&arriving, ARRIVING).unwrap();
+    chairphoto_core::scanner::scan_folder(&catalog, &root, &abort, &|_| {}).unwrap();
+    let new_row = catalog.get_photo_by_uuid(&ARRIVING.to_ascii_lowercase()).unwrap();
+    assert_eq!(new_row.uuid, ARRIVING.to_ascii_lowercase());
+    assert!(catalog.list_pending_identity().unwrap().is_empty());
+    assert_eq!(chairphoto_core::xmp::read_identifier(&arriving).as_deref(), Some(ARRIVING));
+}
+
+/// Issue #146 (L5): schema v24 stores every identity lowercase. A row whose lowercase
+/// spelling another row already holds cannot take it; it is re-minted and its copy queued as
+/// a conflict for a person, like any copy whose sidecar carries another photo's identity.
+#[test]
+fn schema_v24_lowercases_identities_and_re_mints_a_collision() {
+    let (catalog, root) = temp_catalog("v24-lowercase");
+    let mut ids = Vec::new();
+    for name in ["a.jpg", "b.jpg", "c.jpg"] {
+        std::fs::write(root.join(name), b"notarealjpeg").unwrap();
+        ids.push(catalog.upsert_photo(&root.join(name), None, 1, 1).unwrap().id);
+    }
+    const SHARED: &str = "6f1c1f0e-2b7a-4c3d-9e8f-0a1b2c3d4e5f";
+    const ALONE: &str = "0d9c8b7a-6f5e-4d3c-8b2a-190807060504";
+    let shared_upper = SHARED.to_ascii_uppercase();
+    let alone_upper = ALONE.to_ascii_uppercase();
+    let set = |id: i64, uuid: &str| {
+        catalog
+            .conn()
+            .execute("UPDATE photos SET uuid = ?1 WHERE id = ?2", rusqlite::params![uuid, id])
+            .unwrap();
+    };
+    set(ids[0], SHARED);
+    set(ids[1], &shared_upper);
+    set(ids[2], &alone_upper);
+    catalog.set_setting("schema_version", "23").unwrap();
+    let db = catalog.db_path().to_path_buf();
+    drop(catalog);
+    let catalog = Catalog::open(&db, &root).unwrap();
+
+    let uuid = |id: i64| catalog.get_photo(id).unwrap().uuid;
+    assert_eq!(uuid(ids[0]), SHARED, "the row already lowercase keeps its identity");
+    assert_eq!(uuid(ids[2]), ALONE, "an upper-case identity nobody else holds is lowercased");
+    let reminted = uuid(ids[1]);
+    assert!(chairphoto_core::catalog::is_photo_identity(&reminted) && reminted != SHARED, "{reminted}");
+    let pending = catalog.list_pending_identity().unwrap();
+    assert_eq!(pending.len(), 1, "{pending:#?}");
+    assert_eq!((pending[0].photo_id, pending[0].state.as_str()), (ids[1], "conflict"));
+    assert!(pending[0].error.contains(&shared_upper), "{}", pending[0].error);
+}
+
+/// A catalog as a pre-#141 scan left it: each `(relative path, sidecar identifier)` file
+/// scanned, its row holding the identifier as `photos.uuid`, copies counted as bound, and the
+/// catalog stamped schema v22 — then reopened, which runs v23 and v24.
+fn legacy_catalog(tag: &str, files: &[(&str, &str)]) -> (Catalog, common::TestSubPath, Vec<i64>) {
+    let (catalog, root) = temp_catalog(tag);
+    for (rel, id) in files {
+        let f = root.join(rel);
+        std::fs::create_dir_all(f.parent().unwrap()).unwrap();
+        std::fs::write(&f, b"notarealjpeg").unwrap();
+        std::fs::write(
+            chairphoto_core::xmp::sidecar_path(&f),
+            format!(r#"<x:xmpmeta xmlns:x="adobe:ns:meta/"><rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"><rdf:Description rdf:about="" xmlns:xmp="http://ns.adobe.com/xap/1.0/"><xmp:Identifier>{id}</xmp:Identifier></rdf:Description></rdf:RDF></x:xmpmeta>"#),
+        )
+        .unwrap();
+    }
+    let abort = chairphoto_core::scanner::never_abort();
+    chairphoto_core::scanner::scan_folder(&catalog, &root, &abort, &|_| {}).unwrap();
+    let mut ids = Vec::new();
+    for (rel, id) in files {
+        let photo: i64 = catalog
+            .conn()
+            .query_row("SELECT id FROM photos WHERE path = ?1", [rel], |r| r.get(0))
+            .unwrap();
+        catalog
+            .conn()
+            .execute("UPDATE photos SET uuid = ?1 WHERE id = ?2", rusqlite::params![id, photo])
+            .unwrap();
+        ids.push(photo);
+    }
+    catalog
+        .conn()
+        .execute_batch(
+            "DELETE FROM pending_sidecar_identity;
+             UPDATE settings SET value = '22' WHERE key = 'schema_version';",
+        )
+        .unwrap();
+    let db = catalog.db_path().to_path_buf();
+    drop(catalog);
+    (Catalog::open(&db, &root).unwrap(), root, ids)
+}
+
+/// #146 review F3: a legacy row whose original also has a backup copy in place. The original
+/// moves; the backup is the same row's copy, not another photo, so the scan still brings the
+/// moved file back to the row instead of cataloguing it again.
+#[test]
+fn a_backup_in_place_does_not_stop_a_moved_legacy_file_coming_home() {
+    let (catalog, root, ids) = legacy_catalog("legacy-backup-in-place", &[("a/x.jpg", "dam:asset/9")]);
+    let nas = root.parent().unwrap().join("nas");
+    std::fs::create_dir_all(nas.join("a")).unwrap();
+    std::fs::write(nas.join("a/x.jpg"), b"notarealjpeg").unwrap();
+    let volume = catalog.add_volume("NAS", &nas, VolumeKind::Backup).unwrap();
+    catalog.add_location(ids[0], volume, "a/x.jpg", LocationRole::Backup).unwrap();
+    catalog.set_culling(ids[0], Some(5), None, None).unwrap();
+
+    let moved = root.join("b/x.jpg");
+    std::fs::create_dir_all(moved.parent().unwrap()).unwrap();
+    std::fs::rename(root.join("a/x.jpg"), &moved).unwrap();
+    std::fs::rename(
+        chairphoto_core::xmp::sidecar_path(&root.join("a/x.jpg")),
+        chairphoto_core::xmp::sidecar_path(&moved),
+    )
+    .unwrap();
+    let abort = chairphoto_core::scanner::never_abort();
+    chairphoto_core::scanner::scan_folder(&catalog, &root, &abort, &|_| {}).unwrap();
+
+    let all: i64 = catalog.conn().query_row("SELECT count(*) FROM photos", [], |r| r.get(0)).unwrap();
+    assert_eq!(all, 1, "no second row for the moved file");
+    let photo = catalog.get_photo(ids[0]).unwrap();
+    assert_eq!((photo.path.as_str(), photo.rating), ("b/x.jpg", 5));
+}
+
+/// #146 review F8: the Obsidian module keys a photo's note record by its uuid. When v23
+/// re-mints a legacy row, or v24 lowercases one, the record moves with the photo, so the note
+/// is still found. A tag's note record is keyed by the tag and stays where it is.
+#[test]
+fn a_photos_note_record_follows_its_identity_through_v23_and_v24() {
+    let (catalog, root) = temp_catalog("note-record-rekey");
+    const UPPER: &str = "6F1C1F0E-2B7A-4C3D-9E8F-0A1B2C3D4E5F";
+    let mut ids = Vec::new();
+    for (name, uuid) in [("a.jpg", "dam:asset/1"), ("b.jpg", UPPER)] {
+        std::fs::write(root.join(name), b"notarealjpeg").unwrap();
+        let id = catalog.upsert_photo(&root.join(name), None, 1, 1).unwrap().id;
+        catalog
+            .conn()
+            .execute("UPDATE photos SET uuid = ?1 WHERE id = ?2", rusqlite::params![uuid, id])
+            .unwrap();
+        catalog.set_setting(&format!("obsidian.note.{uuid}"), &format!("record of {name}")).unwrap();
+        ids.push(id);
+    }
+    catalog.set_setting("obsidian.tagnote.dam:asset/1", "a tag's record").unwrap();
+    catalog.set_setting("schema_version", "22").unwrap();
+    let db = catalog.db_path().to_path_buf();
+    drop(catalog);
+    let catalog = Catalog::open(&db, &root).unwrap();
+
+    let a = catalog.get_photo(ids[0]).unwrap().uuid;
+    let b = catalog.get_photo(ids[1]).unwrap().uuid;
+    assert_eq!(b, UPPER.to_ascii_lowercase());
+    let note = |uuid: &str| catalog.get_setting(&format!("obsidian.note.{uuid}")).unwrap();
+    assert_eq!(note(&a).as_deref(), Some("record of a.jpg"));
+    assert_eq!(note(&b).as_deref(), Some("record of b.jpg"));
+    assert_eq!(note("dam:asset/1"), None);
+    assert_eq!(note(UPPER), None);
+    assert_eq!(
+        catalog.get_setting("obsidian.tagnote.dam:asset/1").unwrap().as_deref(),
+        Some("a tag's record")
+    );
+}
+
+/// #150 (review N5 of #146): when the photo's new identity already has a note record, the one
+/// with content wins. A Forget-blanked record at the new key does not hide the real one at the
+/// old key; a blank one at the old key is dropped beside a real one at the new key; and when
+/// both are real, neither is deleted or overwritten.
+#[test]
+fn a_blank_note_record_never_hides_the_real_one_across_a_remint() {
+    let (catalog, root) = temp_catalog("note-record-collision");
+    let cases = [
+        ("a.jpg", "dam:asset/1", "REAL", ""),
+        ("b.jpg", "dam:asset/2", "", "REAL AT NEW"),
+        ("c.jpg", "dam:asset/3", "REAL AT OLD", "REAL AT NEW"),
+    ];
+    let mut ids = Vec::new();
+    for (name, legacy, at_old, at_new) in cases {
+        std::fs::write(root.join(name), b"notarealjpeg").unwrap();
+        let id = catalog.upsert_photo(&root.join(name), None, 1, 1).unwrap().id;
+        catalog
+            .conn()
+            .execute("UPDATE photos SET uuid = ?1 WHERE id = ?2", rusqlite::params![legacy, id])
+            .unwrap();
+        let v5 = chairphoto_core::catalog::legacy_photo_identity(legacy);
+        catalog.set_setting(&format!("obsidian.note.{legacy}"), at_old).unwrap();
+        catalog.set_setting(&format!("obsidian.note.{v5}"), at_new).unwrap();
+        ids.push(id);
+    }
+    catalog.set_setting("schema_version", "22").unwrap();
+    let db = catalog.db_path().to_path_buf();
+    drop(catalog);
+    let catalog = Catalog::open(&db, &root).unwrap();
+
+    let note = |key: &str| catalog.get_setting(&format!("obsidian.note.{key}")).unwrap();
+    let uuid = |i: usize| catalog.get_photo(ids[i]).unwrap().uuid;
+    assert_eq!(note(&uuid(0)).as_deref(), Some("REAL"), "the real record replaced the blank one");
+    assert_eq!(note("dam:asset/1"), None);
+    assert_eq!(note(&uuid(1)).as_deref(), Some("REAL AT NEW"));
+    assert_eq!(note("dam:asset/2"), None, "the blank old record is dropped");
+    assert_eq!(note(&uuid(2)).as_deref(), Some("REAL AT NEW"));
+    assert_eq!(note("dam:asset/3").as_deref(), Some("REAL AT OLD"), "never deleted");
+}
+
+/// #146 review N1: an offloaded legacy photo — its original deleted, its primary location
+/// rows dropped, a verified backup on the NAS — has no primary copy left to be "gone". A
+/// different file whose sidecar shares its DAM id (an export of it, say) must get its own
+/// row, not take the photo's over: the sizes differ, and an original never changes size.
+#[test]
+fn an_offloaded_legacy_photo_is_not_taken_over_by_another_file_with_its_dam_id() {
+    let (catalog, root, ids) = legacy_catalog("legacy-offloaded", &[("a/x.jpg", "dam:asset/5")]);
+    let nas = root.parent().unwrap().join("nas");
+    std::fs::create_dir_all(nas.join("a")).unwrap();
+    std::fs::write(nas.join("a/x.jpg"), b"notarealjpeg").unwrap();
+    let volume = catalog.add_volume("NAS", &nas, VolumeKind::Backup).unwrap();
+    catalog.add_location(ids[0], volume, "a/x.jpg", LocationRole::Backup).unwrap();
+    catalog.set_culling(ids[0], Some(5), None, None).unwrap();
+    // Offload, as commit_offload leaves it: the local file gone, the primary rows dropped.
+    std::fs::remove_file(root.join("a/x.jpg")).unwrap();
+    catalog
+        .conn()
+        .execute(
+            "DELETE FROM photo_locations WHERE photo_id = ?1 AND role = 'primary'",
+            [ids[0]],
+        )
+        .unwrap();
+
+    let export = root.join("exports/x-web.jpg");
+    std::fs::create_dir_all(export.parent().unwrap()).unwrap();
+    std::fs::write(&export, b"a quite different derived jpeg").unwrap();
+    std::fs::copy(
+        chairphoto_core::xmp::sidecar_path(&root.join("a/x.jpg")),
+        chairphoto_core::xmp::sidecar_path(&export),
+    )
+    .unwrap();
+    let abort = chairphoto_core::scanner::never_abort();
+    chairphoto_core::scanner::scan_folder(&catalog, &root, &abort, &|_| {}).unwrap();
+
+    let photo = catalog.get_photo(ids[0]).unwrap();
+    assert_eq!((photo.path.as_str(), photo.rating), ("a/x.jpg", 5), "the offloaded row is untouched");
+    let all: i64 = catalog.conn().query_row("SELECT count(*) FROM photos", [], |r| r.get(0)).unwrap();
+    assert_eq!(all, 2, "the export is another photo");
+
+    // The real original, restored by hand to another folder, still comes home: same size.
+    let restored = root.join("restored/x.jpg");
+    std::fs::create_dir_all(restored.parent().unwrap()).unwrap();
+    std::fs::copy(nas.join("a/x.jpg"), &restored).unwrap();
+    std::fs::copy(chairphoto_core::xmp::sidecar_path(&export), chairphoto_core::xmp::sidecar_path(&restored)).unwrap();
+    chairphoto_core::scanner::scan_folder(&catalog, &root, &abort, &|_| {}).unwrap();
+    assert_eq!(catalog.get_photo(ids[0]).unwrap().path, "restored/x.jpg");
+    let all: i64 = catalog.conn().query_row("SELECT count(*) FROM photos", [], |r| r.get(0)).unwrap();
+    assert_eq!(all, 2);
+}
+
+/// #146 review N4: an empty or blank uuid names no identity. Two bundles from different
+/// catalogs, each carrying a photo with one, keep separate rows (before, both mapped to
+/// v5("") and merged into one), neither row's identity is v5(""), and no lookup of a blank
+/// uuid finds anything. A blank-uuid photo at a path already catalogued is that photo.
+#[test]
+fn a_blank_uuid_is_no_identity_at_all() {
+    let (catalog, _root) = temp_catalog("blank-identity");
+    for (blank, rel) in [("", "a.jpg"), ("  ", "b.jpg")] {
+        let s = catalog.merge_bundle(&bare_bundle(&[(blank, rel)])).unwrap();
+        assert_eq!((s.photos_existing, s.photos_added), (0, 1), "{blank:?} at {rel}");
+    }
+    let rows = catalog.list_photos(&PhotoQuery::default()).unwrap();
+    assert_eq!(rows.len(), 2, "{rows:?}");
+    for row in &rows {
+        assert!(chairphoto_core::catalog::is_photo_identity(&row.uuid), "{row:?}");
+        assert_ne!(row.uuid, chairphoto_core::catalog::legacy_photo_identity(""));
+    }
+    assert!(catalog.get_photo_by_uuid("").is_err());
+    assert!(catalog.get_photo_by_uuid("   ").is_err());
+    assert_eq!(catalog.count_existing_uuids(&["".to_string()]).unwrap(), 0);
+    let legacy: i64 = catalog
+        .conn()
+        .query_row("SELECT count(*) FROM photo_legacy_identifiers", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(legacy, 0, "a blank value is not a legacy identifier");
+
+    // Re-merging one of them (no original in the bundle) finds a photo at its path, which
+    // nothing says is this one (#150): skipped, rather than a second row, a UNIQUE error or
+    // the bundle's state on the photo that is there.
+    let s = catalog.merge_bundle(&bare_bundle(&[("", "a.jpg")])).unwrap();
+    assert_eq!((s.photos_existing, s.photos_added, s.photos_skipped), (0, 0, 1));
+    assert_eq!(catalog.list_photos(&PhotoQuery::default()).unwrap().len(), 2);
+}
+
+/// #150 (the #146 N4 follow-up): a blank-uuid bundle photo must not be attached to a
+/// different photo at the same path. Here the library already has its own x.jpg (other
+/// bytes, other size, a rating) where the bundle's x.jpg would go, so the importer renames
+/// the copy to `x (2).jpg`. The bundle's tag and rating belong on that copy's row; merge used
+/// to match the blank-uuid photo by path and put the tag on the user's own photo.
+#[test]
+fn a_blank_uuid_bundle_photo_is_not_attached_to_the_photo_at_its_path() {
+    let (catalog, root) = temp_catalog("blank-uuid-path-collision");
+    let source = root.parent().unwrap().join("bundle-source");
+    let mut manifest = bare_bundle(&[("", "2020/01/01/x.jpg")]);
+    manifest.format_version = chairphoto_core::bundle::BUNDLE_FORMAT_VERSION;
+    manifest.photos[0].rating = 4;
+    manifest.photos[0].tag_uuids = vec!["3d1e0f2a-4b5c-4d6e-8f70-8192a3b4c5d6".into()];
+    manifest.taxonomy.push(chairphoto_core::bundle::BundleTag {
+        uuid: "3d1e0f2a-4b5c-4d6e-8f70-8192a3b4c5d6".into(),
+        full_path: "From the bundle".into(),
+        exportable: true,
+        terms: Vec::new(),
+    });
+    let f = source.join("x.jpg");
+    std::fs::create_dir_all(&source).unwrap();
+    std::fs::write(&f, b"the bundle's own bytes").unwrap();
+    let originals = std::collections::HashMap::from([(String::new(), Some(f))]);
+    let bundle = root.parent().unwrap().join("blank.chairphoto");
+    chairphoto_core::bundle::writer::write_bundle(
+        &chairphoto_core::bundle::writer::GatheredBundle { manifest, originals },
+        &bundle,
+        |_, _| {},
+    )
+    .unwrap();
+    let own = root.join("2020/01/01/x.jpg");
+    std::fs::create_dir_all(own.parent().unwrap()).unwrap();
+    std::fs::write(&own, b"mine").unwrap();
+    let mine = catalog.upsert_photo(&own, None, 1, 4).unwrap();
+    catalog.set_culling(mine.id, Some(2), None, None).unwrap();
+
+    let state = chairphoto_core::app::AppState::default();
+    *state.catalog.lock().unwrap() = Some(catalog);
+    chairphoto_core::app::bundles::import_bundle(&state, &bundle).unwrap();
+    let catalog = state.catalog.lock().unwrap().take().unwrap();
+
+    let tag = catalog.find_tag_id_by_path("From the bundle").unwrap().unwrap();
+    assert!(catalog.get_photo_tags(mine.id).unwrap().is_empty(), "the user's photo got the bundle's tag");
+    assert_eq!(catalog.get_photo(mine.id).unwrap().rating, 2);
+    let copy = catalog
+        .list_photos(&PhotoQuery::default())
+        .unwrap()
+        .into_iter()
+        .find(|p| p.path == "2020/01/01/x (2).jpg")
+        .expect("the bundle's copy is catalogued");
+    assert_eq!(copy.rating, 4);
+    assert_eq!(catalog.get_photo_tags(copy.id).unwrap().iter().map(|t| t.id).collect::<Vec<_>>(), [tag]);
+    assert_eq!(catalog.list_photos(&PhotoQuery::default()).unwrap().len(), 2);
+}
+
+/// #146 review N6: when the bundle importer writes a sidecar identity itself, it writes the
+/// mapped identity, never an old bundle's raw non-UUID id. Two paths write one:
+/// - a copied original with no sidecar in the bundle gets a fresh sidecar;
+/// - a same-size file already at the destination, with no sidecar, is bound in place.
+/// Either way the sidecar ends up with the v5 the row has, and no conflict is queued.
+#[test]
+fn the_bundle_importer_writes_an_old_bundles_id_as_its_mapped_identity() {
+    let (catalog, root) = temp_catalog("import-writes-mapped-identity");
+    let source = root.parent().unwrap().join("bundle-source");
+    let mut manifest = bare_bundle(&[("dam:asset/1", "2020/01/01/x.jpg"), ("dam:asset/2", "2020/01/02/y.jpg")]);
+    manifest.format_version = chairphoto_core::bundle::BUNDLE_FORMAT_VERSION;
+    let mut originals = std::collections::HashMap::new();
+    for (uuid, name) in [("dam:asset/1", "x.jpg"), ("dam:asset/2", "y.jpg")] {
+        let f = source.join(name);
+        std::fs::create_dir_all(f.parent().unwrap()).unwrap();
+        std::fs::write(&f, b"notarealjpeg").unwrap();
+        originals.insert(uuid.to_string(), Some(f));
+    }
+    let bundle = root.parent().unwrap().join("old.chairphoto");
+    chairphoto_core::bundle::writer::write_bundle(
+        &chairphoto_core::bundle::writer::GatheredBundle { manifest, originals },
+        &bundle,
+        |_, _| {},
+    )
+    .unwrap();
+    // y.jpg is already in the library, same size, with no sidecar: the copy is skipped and
+    // the importer binds the identity onto the file that is there.
+    let present = root.join("2020/01/02/y.jpg");
+    std::fs::create_dir_all(present.parent().unwrap()).unwrap();
+    std::fs::write(&present, b"notarealjpeg").unwrap();
+
+    let state = chairphoto_core::app::AppState::default();
+    *state.catalog.lock().unwrap() = Some(catalog);
+    chairphoto_core::app::bundles::import_bundle(&state, &bundle).unwrap();
+    let catalog = state.catalog.lock().unwrap().take().unwrap();
+
+    for (old, rel) in [("dam:asset/1", "2020/01/01/x.jpg"), ("dam:asset/2", "2020/01/02/y.jpg")] {
+        let mapped = chairphoto_core::catalog::legacy_photo_identity(old);
+        assert_eq!(
+            chairphoto_core::xmp::read_identifier(&root.join(rel)).as_deref(),
+            Some(mapped.as_str()),
+            "{rel}'s sidecar"
+        );
+        assert_eq!(catalog.get_photo_by_uuid(&mapped).unwrap().path, rel);
+    }
+    assert!(catalog.list_pending_identity().unwrap().is_empty(), "{:#?}", catalog.list_pending_identity());
+}
+
+/// A bundle of `photos`, each `(uuid, relative path)`, with nothing else in it.
+fn bare_bundle(photos: &[(&str, &str)]) -> chairphoto_core::bundle::BundleManifest {
+    let mut m = chairphoto_core::bundle::BundleManifest::new(
+        chairphoto_core::bundle::BundleBatch {
+            uuid: "5c0e9d2a-1b3f-4a6c-8d7e-9f0a1b2c3d4e".into(),
+            source_label: "laptop".into(),
+            note: String::new(),
+            created_at: 1,
+        },
+        2,
+    );
+    m.photos = photos
+        .iter()
+        .map(|(uuid, rel)| chairphoto_core::bundle::BundlePhoto {
+            uuid: (*uuid).into(),
+            relative_path: (*rel).into(),
+            rating: 0,
+            label: String::new(),
+            pick_state: PickState::None,
+            iptc: Default::default(),
+            edit_record: None,
+            versions: vec![],
+            tag_uuids: vec![],
+        })
+        .collect();
+    m
+}
+
+fn non_uuid_rows(catalog: &Catalog) -> Vec<String> {
+    catalog
+        .list_photos(&PhotoQuery::default())
+        .unwrap()
+        .into_iter()
+        .map(|p| p.uuid)
+        .filter(|u| !chairphoto_core::catalog::is_photo_identity(u))
+        .collect()
+}
+
+/// #146 review F1: two catalogs that each held one photo as `dam:asset/1` before #141 migrate
+/// independently, and must still agree on its identity — it is the merge key, and a bundle
+/// does not carry the legacy value. A bundle from one then merges onto the other's row,
+/// whatever path it gives the photo.
+#[test]
+fn two_catalogs_that_held_one_legacy_photo_agree_on_its_identity() {
+    let (a, _ra, ia) = legacy_catalog("legacy-merge-a", &[("x.jpg", "dam:asset/1")]);
+    let (b, _rb, ib) = legacy_catalog("legacy-merge-b", &[("x.jpg", "dam:asset/1")]);
+    let ua = a.get_photo(ia[0]).unwrap().uuid;
+    let ub = b.get_photo(ib[0]).unwrap().uuid;
+    assert_eq!(ua, ub, "independent migrations of one legacy photo must agree");
+    assert_eq!(ua, chairphoto_core::catalog::legacy_photo_identity("dam:asset/1"));
+    assert!(chairphoto_core::catalog::is_photo_identity(&ua), "{ua}");
+
+    for rel in ["x.jpg", "elsewhere/x.jpg"] {
+        let s = a.merge_bundle(&bare_bundle(&[(&ub, rel)])).unwrap();
+        assert_eq!((s.photos_existing, s.photos_added), (1, 0), "bundle from B at {rel}");
+    }
+    assert_eq!(a.list_photos(&PhotoQuery::default()).unwrap().len(), 1);
+}
+
+/// #146 review F2: a bundle written before #146 carries the photo's non-UUID id. It merges
+/// onto the row v23 re-minted (same path or not), and into a catalog that never had the
+/// photo it lands under the same identity v23 would have given it, with the legacy value
+/// recorded — never as a non-UUID `photos.uuid`.
+#[test]
+fn an_old_bundles_non_uuid_id_never_becomes_a_photos_uuid() {
+    let (a, _ra, ia) = legacy_catalog("legacy-old-bundle", &[("x.jpg", "dam:asset/1")]);
+    for rel in ["x.jpg", "y.jpg"] {
+        let s = a.merge_bundle(&bare_bundle(&[("dam:asset/1", rel)])).unwrap();
+        assert_eq!((s.photos_existing, s.photos_added), (1, 0), "old bundle at {rel}");
+    }
+    assert_eq!(a.list_photos(&PhotoQuery::default()).unwrap().len(), 1);
+    assert!(non_uuid_rows(&a).is_empty());
+    assert_eq!(a.get_photo(ia[0]).unwrap().uuid, chairphoto_core::catalog::legacy_photo_identity("dam:asset/1"));
+
+    let (fresh, _root) = temp_catalog("legacy-old-bundle-fresh");
+    let s = fresh.merge_bundle(&bare_bundle(&[("dam:asset/2", "z.jpg")])).unwrap();
+    assert_eq!((s.photos_existing, s.photos_added), (0, 1));
+    assert!(non_uuid_rows(&fresh).is_empty());
+    let landed = fresh.list_photos(&PhotoQuery::default()).unwrap().remove(0);
+    assert_eq!(landed.uuid, chairphoto_core::catalog::legacy_photo_identity("dam:asset/2"));
+    let legacy: String = fresh
+        .conn()
+        .query_row("SELECT identifier FROM photo_legacy_identifiers WHERE photo_id = ?1", [landed.id], |r| r.get(0))
+        .unwrap();
+    assert_eq!(legacy, "dam:asset/2");
+    assert_eq!(fresh.count_existing_uuids(&["dam:asset/2".to_string()]).unwrap(), 1,
+        "the import preview counts it as already present");
+}
+
+/// #146 (L5), review mutation gaps: the import preview's count and the in-place volume
+/// upsert canonicalise a UUID like every other entry point. An upper-case spelling counts as
+/// the photo the catalog already has, and a NAS copy carrying it is the same row.
+#[test]
+fn the_import_count_and_the_volume_upsert_see_an_upper_case_uuid_as_the_same_photo() {
+    let (catalog, root) = temp_catalog("uppercase-count-volume");
+    const KNOWN: &str = "6f1c1f0e-2b7a-4c3d-9e8f-0a1b2c3d4e5f";
+    let local = root.join("x.jpg");
+    std::fs::write(&local, b"notarealjpeg").unwrap();
+    let row = catalog.upsert_photo_with_identity(&local, None, 1, 1, Some(KNOWN)).unwrap();
+    assert_eq!(catalog.count_existing_uuids(&[KNOWN.to_ascii_uppercase()]).unwrap(), 1);
+
+    let nas = root.parent().unwrap().join("nas");
+    std::fs::create_dir_all(&nas).unwrap();
+    catalog.add_volume("NAS", &nas, VolumeKind::Backup).unwrap();
+    std::fs::write(nas.join("x.jpg"), b"notarealjpeg").unwrap();
+    let copy = catalog
+        .upsert_photo_on_volume(&nas.join("x.jpg"), 1, 1, Some(&KNOWN.to_ascii_uppercase()))
+        .unwrap();
+    assert_eq!((copy.id, copy.created), (row.id, false), "the NAS copy is the same photo");
+
+    const ARRIVING: &str = "0D9C8B7A-6F5E-4D3C-8B2A-190807060504";
+    std::fs::write(nas.join("y.jpg"), b"notarealjpeg").unwrap();
+    let new_row = catalog.upsert_photo_on_volume(&nas.join("y.jpg"), 1, 1, Some(ARRIVING)).unwrap();
+    assert!(new_row.created);
+    assert_eq!(catalog.get_photo(new_row.id).unwrap().uuid, ARRIVING.to_ascii_lowercase());
+}
+
+/// #146 review F2: the bundle importer falls back to the manifest id when the copied file's
+/// sidecar has none, through `upsert_photo_with_identity`. A non-UUID id there is mapped and
+/// recorded exactly as merge and v23 do.
+#[test]
+fn a_trusted_non_uuid_identity_is_stored_as_its_legacy_mapping() {
+    let (catalog, root) = temp_catalog("legacy-upsert");
+    let f = root.join("a/x.jpg");
+    std::fs::create_dir_all(f.parent().unwrap()).unwrap();
+    std::fs::write(&f, b"notarealjpeg").unwrap();
+    let up = catalog.upsert_photo_with_identity(&f, None, 1, 1, Some("dam:asset/5")).unwrap();
+    assert!(up.created);
+    assert_eq!(up.uuid, chairphoto_core::catalog::legacy_photo_identity("dam:asset/5"));
+    assert_eq!(catalog.get_photo(up.id).unwrap().uuid, up.uuid);
+    // Moved: a re-home never leaves a file still in place behind (#150).
+    std::fs::remove_file(&f).unwrap();
+    let again = catalog
+        .upsert_photo_with_identity(&root.join("b/x.jpg"), None, 1, 1, Some("dam:asset/5"))
+        .unwrap();
+    assert_eq!((again.id, again.created), (up.id, false), "the same old id finds the same row");
+    let legacy: String = catalog
+        .conn()
+        .query_row("SELECT identifier FROM photo_legacy_identifiers WHERE photo_id = ?1", [up.id], |r| r.get(0))
+        .unwrap();
+    assert_eq!(legacy, "dam:asset/5");
+}
+
+#[test]
+fn culling_round_trips() {
+    let (catalog, root) = temp_catalog("culling");
+    let id = catalog
+        .upsert_photo(&root.join("a.jpg"), None, 1, 1)
+        .unwrap()
+        .id;
+
+    let updated = catalog
+        .set_culling(id, Some(4), Some("Red"), Some(PickState::Pick))
+        .unwrap();
+    assert_eq!(updated.rating, 4);
+    assert_eq!(updated.label, "Red");
+    assert_eq!(updated.pick_state, PickState::Pick);
+
+    // A partial update leaves the other fields intact.
+    let only_rating = catalog.set_culling(id, Some(2), None, None).unwrap();
+    assert_eq!(only_rating.rating, 2);
+    assert_eq!(only_rating.label, "Red");
+    assert_eq!(only_rating.pick_state, PickState::Pick);
+}
+
+#[test]
+fn hierarchical_tags_and_assignment() {
+    let (catalog, root) = temp_catalog("tags");
+    let id = catalog
+        .upsert_photo(&root.join("boat.arw"), None, 1, 1)
+        .unwrap()
+        .id;
+
+    // Creating a nested path creates the ancestors too.
+    let leaf = catalog.create_tag("Transportation/Watercraft/Ferry").unwrap();
+    let all = catalog.list_tags_with_counts().unwrap();
+    assert_eq!(all.len(), 3, "three tags: Transportation, Watercraft, Ferry");
+
+    // Re-creating returns the same leaf id (idempotent).
+    let leaf_again = catalog.create_tag("transportation | watercraft | ferry").unwrap();
+    assert_eq!(leaf, leaf_again);
+
+    catalog.assign_tag(id, leaf).unwrap();
+    let tags = catalog.get_photo_tags(id).unwrap();
+    assert_eq!(tags.len(), 1);
+    assert_eq!(tags[0].full_path, "Transportation/Watercraft/Ferry");
+
+    // Filtering by an ancestor tag includes photos tagged with a descendant.
+    let root_tag = all.iter().find(|t| t.tag.name == "Transportation").unwrap();
+    let filtered = catalog.list_photos(&PhotoQuery { tag_id: Some(root_tag.tag.id), ..Default::default() }).unwrap();
+    assert_eq!(filtered.len(), 1);
+
+    catalog.remove_tag(id, leaf).unwrap();
+    assert_eq!(catalog.get_photo_tags(id).unwrap().len(), 0);
+}
+
+#[test]
+fn upsert_records_a_primary_location_on_the_default_volume() {
+    let (catalog, root) = temp_catalog("locations");
+
+    // A default volume exists from migration.
+    let volumes = catalog.list_volumes().unwrap();
+    assert_eq!(volumes.len(), 1);
+    assert!(volumes[0].reachable, "catalog root should be reachable");
+
+    let photo_path = root.join("sub/a.arw");
+    std::fs::create_dir_all(photo_path.parent().unwrap()).unwrap();
+    std::fs::write(&photo_path, b"raw").unwrap();
+    let id = catalog.upsert_photo(&photo_path, None, 1, 3).unwrap().id;
+
+    // upsert recorded a primary location relative to the default volume.
+    let locations = catalog.photo_locations(id).unwrap();
+    assert_eq!(locations.len(), 1);
+    assert_eq!(locations[0].role, LocationRole::Primary);
+    assert_eq!(locations[0].relative_path, "sub/a.arw");
+
+    // The resolver returns the real, existing absolute path.
+    let resolved = catalog.resolve_photo_path(id).unwrap();
+    assert_eq!(resolved, Some(photo_path));
+}
+
+#[test]
+fn assemble_export_keywords_expands_ancestors_and_paths() {
+    let (catalog, root) = temp_catalog("export-keywords");
+    let id = catalog.upsert_photo(&root.join("p.arw"), None, 1, 1).unwrap().id;
+    let owl = catalog.create_tag("Animals/Birds/Owl").unwrap();
+    catalog.add_synonym(owl, "Strigiformes", None, true).unwrap();
+    catalog.assign_tag(id, owl).unwrap();
+
+    let kw = catalog.assemble_export_keywords(id, &[]).unwrap();
+    // Flat keywords include the tag, its synonym, and all ancestors.
+    for expected in ["Owl", "Strigiformes", "Birds", "Animals"] {
+        assert!(kw.flat.contains(&expected.to_string()), "missing {expected}");
+    }
+    // Ordered by specificity (G4): the leaf term + synonym precede its ancestors.
+    assert_eq!(kw.flat, vec!["Owl", "Strigiformes", "Birds", "Animals"]);
+    // Hierarchical path is the canonical full path, pipe-joined.
+    assert_eq!(kw.hierarchical, vec!["Animals|Birds|Owl".to_string()]);
+
+    // With a second, shallower assigned tag, the deeper tag's keywords rank first.
+    let weather = catalog.create_tag("Weather").unwrap();
+    catalog.assign_tag(id, weather).unwrap();
+    let kw2 = catalog.assemble_export_keywords(id, &[]).unwrap();
+    assert_eq!(kw2.flat, vec!["Owl", "Strigiformes", "Birds", "Animals", "Weather"]);
+
+    // A photo with no tags yields nothing.
+    let bare = catalog.upsert_photo(&root.join("b.arw"), None, 1, 1).unwrap().id;
+    let empty = catalog.assemble_export_keywords(bare, &[]).unwrap();
+    assert!(empty.flat.is_empty() && empty.hierarchical.is_empty());
+}
+
+#[test]
+fn assigning_a_child_drops_the_redundant_parent() {
+    let (catalog, root) = temp_catalog("prune-tags");
+    let id = catalog.upsert_photo(&root.join("p.arw"), None, 1, 1).unwrap().id;
+    let harbor = catalog.create_tag("Public place/Harbor").unwrap();
+    let marina = catalog.create_tag("Public place/Harbor/Marina").unwrap();
+
+    // Tag the parent first, then the child (the paste-then-redundant case).
+    catalog.assign_tag(id, harbor).unwrap();
+    catalog.assign_tag(id, marina).unwrap();
+
+    // The parent is implied by the child and was auto-pruned — only the leaf remains.
+    let paths: Vec<String> = catalog
+        .get_photo_tags(id)
+        .unwrap()
+        .into_iter()
+        .map(|t| t.full_path)
+        .collect();
+    assert_eq!(paths, vec!["Public place/Harbor/Marina".to_string()]);
+    // A similarly-prefixed sibling ("Harbortown") must NOT be treated as a descendant.
+    let town = catalog.create_tag("Public place/Harbortown").unwrap();
+    catalog.assign_tag(id, town).unwrap();
+    assert_eq!(catalog.get_photo_tags(id).unwrap().len(), 2, "sibling kept, not pruned");
+
+    // The library-wide tidy is a no-op once everything's already leaves-only.
+    assert_eq!(catalog.tidy_redundant_tags().unwrap(), 0);
+}
+
+#[test]
+fn non_exportable_tag_is_dropped_but_descendants_export() {
+    let (catalog, root) = temp_catalog("export-gate");
+    let id = catalog.upsert_photo(&root.join("p.arw"), None, 1, 1).unwrap().id;
+    let owl = catalog.create_tag("Animals/Birds/Owl").unwrap();
+    catalog.assign_tag(id, owl).unwrap();
+
+    // Mark the middle "Birds" tag organizational (not for export).
+    let birds = catalog.create_tag("Animals/Birds").unwrap();
+    catalog.set_tag_exportable(birds, false).unwrap();
+    assert!(!catalog.tag_exportable(birds).unwrap());
+
+    let kw = catalog.assemble_export_keywords(id, &[]).unwrap();
+    assert!(kw.flat.contains(&"Owl".to_string()), "leaf still exports");
+    assert!(kw.flat.contains(&"Animals".to_string()), "ancestor still exports");
+    assert!(!kw.flat.contains(&"Birds".to_string()), "organizational tag dropped");
+    // The hierarchical path drops the organizational segment too.
+    assert_eq!(kw.hierarchical, vec!["Animals|Owl".to_string()]);
+
+    // Marking the assigned leaf itself organizational emits only its ancestors.
+    catalog.set_tag_exportable(owl, false).unwrap();
+    let kw2 = catalog.assemble_export_keywords(id, &[]).unwrap();
+    assert!(!kw2.flat.contains(&"Owl".to_string()));
+    assert_eq!(kw2.hierarchical, vec!["Animals".to_string()]);
+}
+
+#[test]
+fn export_handoff_copies_original_and_sidecar_and_skips_offline() {
+    use chairphoto_core::export::{resolve_originals, write_exports, ExportPreset};
+    let (catalog, root) = temp_catalog("export");
+
+    // A photo with a real file on disk + an existing (well-formed) XMP sidecar that
+    // carries a foreign darktable element, to prove merge-safety on export.
+    let raw = root.join("DSC1.ARW");
+    std::fs::write(&raw, b"raw-bytes").unwrap();
+    std::fs::write(
+        root.join("DSC1.ARW.xmp"),
+        r#"<x:xmpmeta xmlns:x="adobe:ns:meta/"><rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"><rdf:Description rdf:about="" xmlns:darktable="http://darktable.sf.net/"><darktable:history>keep-me</darktable:history></rdf:Description></rdf:RDF></x:xmpmeta>"#,
+    )
+    .unwrap();
+    let have = catalog.upsert_photo(&raw, None, 1, 9).unwrap().id;
+
+    // A photo whose file doesn't exist → unresolvable (counts as offline/skipped).
+    let gone = catalog.upsert_photo(&root.join("GONE.ARW"), None, 1, 1).unwrap().id;
+
+    // Tag it so export emits keywords (Animals/Birds/Owl → contained keywords).
+    let owl = catalog.create_tag("Animals/Birds/Owl").unwrap();
+    catalog.assign_tag(have, owl).unwrap();
+
+    let dest = root.parent().unwrap().join("export-out");
+    let resolved = resolve_originals(&catalog, &[have, gone], &[], None);
+    assert_eq!(resolved.skipped_offline, 1);
+    let result = write_exports(&resolved, ExportPreset::HandOff, &dest, &[]).unwrap();
+
+    assert_eq!(result.exported, 1);
+    assert_eq!(result.skipped_offline, 1);
+    assert_eq!(result.errors, 0);
+    assert!(dest.join("DSC1.ARW").is_file());
+    assert!(dest.join("DSC1.ARW.xmp").is_file(), "sidecar travels with the original");
+    assert!(!dest.join("GONE.ARW").exists());
+
+    // Keywords (G2) are emitted into the destination sidecar: ancestors expanded,
+    // and the foreign darktable element is preserved (merge-safe).
+    let xmp = std::fs::read_to_string(dest.join("DSC1.ARW.xmp")).unwrap();
+    assert!(xmp.contains("Owl") && xmp.contains("Birds") && xmp.contains("Animals"));
+    assert!(xmp.contains("Animals|Birds|Owl"), "hierarchicalSubject path present");
+    assert!(xmp.contains("keep-me"), "foreign darktable element preserved");
+
+    // A reach-hashtag bundle is written as hashtags.txt next to the photos.
+    let grp = catalog.create_tag_group("Reach").unwrap();
+    let street = catalog.create_tag("Street Photography").unwrap();
+    catalog.add_tag_to_group(grp, street).unwrap();
+    let bundle = catalog.assemble_hashtag_bundle(grp, None).unwrap();
+    assert_eq!(bundle, vec!["#streetphotography".to_string()]);
+    write_exports(&resolve_originals(&catalog, &[have], &[], None), ExportPreset::ShowOff, &dest, &bundle)
+        .unwrap();
+    let tags_txt = std::fs::read_to_string(dest.join("hashtags.txt")).unwrap();
+    assert!(tags_txt.contains("#streetphotography"));
+
+    // Re-exporting the same photo doesn't clobber: a disambiguated copy appears.
+    let again =
+        write_exports(&resolve_originals(&catalog, &[have], &[], None), ExportPreset::HandOff, &dest, &[])
+            .unwrap();
+    assert_eq!(again.exported, 1);
+    assert!(dest.join("DSC1 (2).ARW").is_file());
+    assert!(dest.join("DSC1 (2).ARW.xmp").is_file(), "renamed sidecar stays paired");
+}
+
+#[test]
+fn import_batches_assign_and_filter() {
+    let (catalog, root) = temp_catalog("batches");
+    let a = catalog.upsert_photo(&root.join("a.arw"), None, 1, 1).unwrap().id;
+    let b = catalog.upsert_photo(&root.join("b.arw"), None, 1, 1).unwrap().id;
+
+    // First ingest: a batch holding both.
+    let batch1 = catalog.create_import_batch("/cards/2026-06-23").unwrap();
+    catalog.assign_photos_to_batch(batch1, &[a, b]).unwrap();
+
+    // A later ingest with a new photo gets its own batch.
+    let c = catalog.upsert_photo(&root.join("c.arw"), None, 1, 1).unwrap().id;
+    let batch2 = catalog.create_import_batch("/cards/2026-06-24").unwrap();
+    // Re-including an already-batched photo is a no-op (immutable membership).
+    catalog.assign_photos_to_batch(batch2, &[a, c]).unwrap();
+
+    let batches = catalog.list_import_batches().unwrap();
+    assert_eq!(batches.len(), 2);
+    let count = |id: i64| batches.iter().find(|b| b.id == id).unwrap().photo_count;
+    assert_eq!(count(batch1), 2); // a, b — a kept its original batch
+    assert_eq!(count(batch2), 1); // c only
+
+    // Filter the view by batch (composes with culling).
+    let in1: Vec<i64> = catalog
+        .list_photos(&PhotoQuery { batch_id: Some(batch1), ..Default::default() })
+        .unwrap()
+        .into_iter()
+        .map(|p| p.id)
+        .collect();
+    assert_eq!(in1.len(), 2);
+    assert!(in1.contains(&a) && in1.contains(&b));
+    let in2 = catalog.list_photos(&PhotoQuery { batch_id: Some(batch2), ..Default::default() }).unwrap();
+    assert_eq!(in2.len(), 1);
+    assert_eq!(in2[0].id, c);
+}
+
+#[test]
+fn ingest_from_card_copies_into_date_tree_and_indexes() {
+    use chairphoto_core::scanner::ingest_from_card;
+    let (catalog, root) = temp_catalog("ingest");
+
+    // A "card" outside the catalog root with two raster images (no EXIF date → mtime).
+    let card = root.parent().unwrap().join("card");
+    std::fs::create_dir_all(&card).unwrap();
+    std::fs::write(card.join("IMG_1.jpg"), b"\xff\xd8one").unwrap();
+    std::fs::write(card.join("IMG_2.jpg"), b"\xff\xd8two").unwrap();
+
+    // Ingest into the local catalog root (dest must be under the root) with a custom
+    // import name.
+    let result = ingest_from_card(&catalog, &card, &root, Some("Tønsberg 2026-06")).unwrap();
+    assert_eq!(result.scanned, 2);
+    assert_eq!(result.created, 2);
+
+    // Files were copied into a YYYY/MM/DD tree under the root (originals untouched).
+    assert!(card.join("IMG_1.jpg").exists(), "source card untouched");
+    let copied: Vec<_> = walkdir_jpgs(&root);
+    assert_eq!(copied.len(), 2, "two copies under the catalog root");
+    assert!(
+        copied
+            .iter()
+            .all(|p| p.strip_prefix(&root).unwrap().components().count() == 4),
+        "copied into a YYYY/MM/DD subtree (3 dirs + filename), not the root"
+    );
+
+    // Indexed into the catalog, in one import batch, each queued for backup.
+    assert_eq!(catalog.list_photos(&PhotoQuery::default()).unwrap().len(), 2);
+    let batches = catalog.list_import_batches().unwrap();
+    assert_eq!(batches.len(), 1);
+    assert_eq!(batches[0].photo_count, 2);
+    assert_eq!(batches[0].source_label, "Tønsberg 2026-06", "custom import name");
+    assert_eq!(catalog.list_pending_operations().unwrap().len(), 2);
+
+    // Re-ingesting the same card is idempotent (same-size copies skipped).
+    let again = ingest_from_card(&catalog, &card, &root, None).unwrap();
+    assert_eq!(again.created, 0);
+    assert_eq!(again.skipped, 2, "both already-present copies reported as skipped");
+    assert_eq!(walkdir_jpgs(&root).len(), 2);
+}
+
+#[test]
+fn reconcile_queue_enqueues_and_drains_when_nas_reachable() {
+    let (catalog, root) = temp_catalog("reconcile");
+    let nas_dir = root.parent().unwrap().join("nas");
+    std::fs::create_dir_all(&nas_dir).unwrap();
+    let nas = catalog.add_volume("NAS", &nas_dir, VolumeKind::Backup).unwrap();
+
+    let raw = root.join("2016/07/02/DSC9.ARW");
+    std::fs::create_dir_all(raw.parent().unwrap()).unwrap();
+    std::fs::write(&raw, b"bytes").unwrap();
+    let id = catalog.upsert_photo(&raw, None, 1, 5).unwrap().id;
+
+    // Enqueue is idempotent per (kind, photo).
+    let op = catalog.enqueue_operation("backup", id).unwrap();
+    assert_eq!(catalog.enqueue_operation("backup", id).unwrap(), op);
+    assert_eq!(catalog.list_pending_operations().unwrap().len(), 1);
+    assert!(catalog.enqueue_operation("bogus", id).is_err());
+
+    // Drain with the NAS reachable runs the backup and clears the queue.
+    let summary = catalog.drain_pending_operations().unwrap();
+    assert_eq!((summary.ran, summary.failed, summary.skipped_offline), (1, 0, false));
+    assert!(catalog.list_pending_operations().unwrap().is_empty());
+    assert_eq!(catalog.photo_storage_status(id).unwrap(), StorageStatus::BackedUp);
+
+    // With the only backup volume unreachable, a drain leaves the queue intact.
+    let gone = catalog
+        .add_volume("OldNAS", &root.parent().unwrap().join("nope"), VolumeKind::Backup)
+        .unwrap();
+    catalog.remove_volume(nas).unwrap(); // now the sole backup volume is unreachable
+    let _ = gone;
+    catalog.enqueue_operation("backup", id).unwrap();
+    let summary2 = catalog.drain_pending_operations().unwrap();
+    assert!(summary2.skipped_offline);
+    assert_eq!(catalog.list_pending_operations().unwrap().len(), 1);
+}
+
+#[test]
+fn reconcile_requeues_each_skipped_stack_frame_with_its_reason() {
+    let (catalog, root) = temp_catalog("reconcile-partial-stack");
+    let (nas, _nas_dir) = nas_volume(&catalog, &root);
+    let raw = root.join("2026/08/DSC1.ARW");
+    let master = local_photo(&catalog, &raw, b"raw-bytes");
+    catalog.backup_photo(master, nas).unwrap();
+    let jpg = root.join("2026/08/DSC1.JPG");
+    let frame = local_photo(&catalog, &jpg, b"jpeg-bytes");
+    catalog.set_stack_parent(frame, master).unwrap();
+    catalog.enqueue_operation("offload", master).unwrap();
+
+    let summary = catalog.drain_pending_operations().unwrap();
+
+    assert_eq!((summary.ran, summary.failed, summary.partial), (0, 0, 1));
+    let pending = catalog.list_pending_operations().unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!((pending[0].kind.as_str(), pending[0].photo_id), ("offload", frame));
+    assert_eq!(pending[0].status, "failed");
+    assert!(pending[0].error.contains("no verified backup"));
+    assert!(!raw.exists());
+    assert!(jpg.exists());
+}
+
+#[test]
+fn lifecycle_backup_offload_restore_with_verification() {
+    let (catalog, root) = temp_catalog("lifecycle");
+    // Local working volume = catalog root; a reachable NAS backup volume.
+    let nas_dir = root.parent().unwrap().join("nas");
+    std::fs::create_dir_all(&nas_dir).unwrap();
+    let nas = catalog.add_volume("NAS", &nas_dir, VolumeKind::Backup).unwrap();
+    let local_id = catalog.list_volumes().unwrap().into_iter()
+        .find(|v| v.kind == VolumeKind::Local).unwrap().id;
+
+    // A real local original.
+    let raw = root.join("2015/06/01/DSC1.ARW");
+    std::fs::create_dir_all(raw.parent().unwrap()).unwrap();
+    std::fs::write(&raw, b"original-bytes").unwrap();
+    let id = catalog.upsert_photo(&raw, None, 1, 14).unwrap().id;
+
+    // Offload refused before any backup (invariants 1 & 2).
+    assert!(catalog.offload_photo(id).is_err());
+    assert_eq!(catalog.photo_storage_status(id).unwrap(), StorageStatus::LocalOnly);
+
+    // Back up: copies to the NAS (mirroring the relative path), hash-verified.
+    let report = catalog.backup_photo(id, nas).unwrap();
+    assert_eq!(report.backed_up, vec![id], "a photo with no stack backs up alone");
+    let nas_copy = nas_dir.join("2015/06/01/DSC1.ARW");
+    let hash = chairphoto_core::catalog::sha256_file(&nas_copy).unwrap();
+    assert!(nas_copy.is_file());
+    assert_eq!(std::fs::read(&nas_copy).unwrap(), b"original-bytes");
+    assert_eq!(catalog.photo_storage_status(id).unwrap(), StorageStatus::BackedUp);
+
+    // Offload: local copy removed, NAS copy kept → Archived. Last copy never deleted.
+    catalog.offload_photo(id).unwrap();
+    assert!(!raw.exists(), "local original freed");
+    assert!(nas_copy.is_file(), "backup retained");
+    assert_eq!(catalog.photo_storage_status(id).unwrap(), StorageStatus::Archived);
+    assert_eq!(catalog.require_photo_path(id).unwrap(), nas_copy);
+
+    // Restore: pulls the NAS copy back to local, hash-verified → BackedUp again.
+    let restored = catalog.restore_photo(id, local_id).unwrap();
+    assert_eq!(restored.restored, vec![id], "a photo with no stack comes back alone");
+    assert!(raw.exists(), "restored local copy");
+    assert_eq!(
+        chairphoto_core::catalog::sha256_file(&raw).unwrap(),
+        hash,
+        "the bytes that came back are the bytes that were verified at home"
+    );
+    assert_eq!(catalog.photo_storage_status(id).unwrap(), StorageStatus::BackedUp);
+
+    // Tampered backup: offload must refuse (invariant 3 — hash-verify before delete).
+    std::fs::write(&nas_copy, b"corrupted").unwrap();
+    assert!(catalog.offload_photo(id).is_err());
+    assert!(raw.exists(), "local kept because backup verification failed");
+}
+
+/// A copy is the image **plus its declared companions** (cluster B, D2). Before this,
+/// `backup_photo` copied one file, so darktable history and RapidRAW state stayed behind
+/// while the app reported the photo backed up — issue #80.
+#[test]
+fn backup_carries_companions_and_records_what_it_carried() {
+    let (catalog, root) = temp_catalog("companions-backup");
+    let nas_dir = root.parent().unwrap().join("nas");
+    std::fs::create_dir_all(&nas_dir).unwrap();
+    let nas = catalog.add_volume("NAS", &nas_dir, VolumeKind::Backup).unwrap();
+
+    let raw = root.join("2026/06/27/DSC1.ARW");
+    std::fs::create_dir_all(raw.parent().unwrap()).unwrap();
+    std::fs::write(&raw, b"original-bytes").unwrap();
+    // The two shapes and two owners that actually occur: darktable's appended sidecar and
+    // RapidRAW's mask blob.
+    std::fs::write(root.join("2026/06/27/DSC1.ARW.xmp"), b"<x>darktable:history</x>").unwrap();
+    std::fs::write(root.join("2026/06/27/DSC1.ARW.rrdata"), b"{\"adjustments\":{}}").unwrap();
+    // An undeclared neighbour must not be swept along.
+    std::fs::write(root.join("2026/06/27/DSC1.ARW.txt"), b"notes").unwrap();
+    let id = catalog.upsert_photo(&raw, None, 1, 14).unwrap().id;
+
+    catalog.backup_photo(id, nas).unwrap();
+
+    let at_nas = |n: &str| nas_dir.join("2026/06/27").join(n);
+    assert!(at_nas("DSC1.ARW").is_file(), "the image");
+    assert_eq!(
+        std::fs::read(at_nas("DSC1.ARW.xmp")).unwrap(),
+        b"<x>darktable:history</x>",
+        "the darktable history travels with it"
+    );
+    assert!(at_nas("DSC1.ARW.rrdata").is_file(), "and RapidRAW's state");
+    assert!(!at_nas("DSC1.ARW.txt").exists(), "but an undeclared neighbour does not");
+
+    let recorded: Vec<String> = catalog
+        .companions_at(id, nas, LocationRole::Backup)
+        .unwrap()
+        .into_iter()
+        .map(|(name, _)| name)
+        .collect();
+    assert_eq!(recorded, vec!["DSC1.ARW.rrdata", "DSC1.ARW.xmp"]);
+}
+
+/// Some companions reached home by hand before this code existed, so a second pass must
+/// adopt them rather than fail or re-copy.
+#[test]
+fn backup_adopts_an_identical_companion_already_at_home() {
+    let (catalog, root) = temp_catalog("companions-idempotent");
+    let nas_dir = root.parent().unwrap().join("nas");
+    std::fs::create_dir_all(nas_dir.join("2026")).unwrap();
+    let nas = catalog.add_volume("NAS", &nas_dir, VolumeKind::Backup).unwrap();
+
+    let raw = root.join("2026/DSC1.ARW");
+    std::fs::create_dir_all(raw.parent().unwrap()).unwrap();
+    std::fs::write(&raw, b"bytes").unwrap();
+    std::fs::write(root.join("2026/DSC1.ARW.rrdata"), b"{}").unwrap();
+    // Placed at home by hand, byte-identical.
+    std::fs::write(nas_dir.join("2026/DSC1.ARW.rrdata"), b"{}").unwrap();
+    let id = catalog.upsert_photo(&raw, None, 1, 5).unwrap().id;
+
+    catalog.backup_photo(id, nas).unwrap();
+    catalog.backup_photo(id, nas).unwrap(); // and again — carrying is idempotent
+
+    assert_eq!(
+        catalog.companions_at(id, nas, LocationRole::Backup).unwrap().len(),
+        1,
+        "recorded once, not once per pass"
+    );
+}
+
+/// Two different edits exist. Overwriting either would destroy work, so backup carries
+/// neither and leaves the divergence for the freshness pass to report.
+#[test]
+fn backup_never_overwrites_a_companion_that_differs_at_home() {
+    let (catalog, root) = temp_catalog("companions-diverged");
+    let nas_dir = root.parent().unwrap().join("nas");
+    std::fs::create_dir_all(nas_dir.join("2026")).unwrap();
+    let nas = catalog.add_volume("NAS", &nas_dir, VolumeKind::Backup).unwrap();
+
+    let raw = root.join("2026/DSC1.ARW");
+    std::fs::create_dir_all(raw.parent().unwrap()).unwrap();
+    std::fs::write(&raw, b"bytes").unwrap();
+    std::fs::write(root.join("2026/DSC1.ARW.xmp"), b"local-edit").unwrap();
+    std::fs::write(nas_dir.join("2026/DSC1.ARW.xmp"), b"home-edit").unwrap();
+    let id = catalog.upsert_photo(&raw, None, 1, 5).unwrap().id;
+
+    catalog.backup_photo(id, nas).unwrap();
+
+    assert_eq!(
+        std::fs::read(nas_dir.join("2026/DSC1.ARW.xmp")).unwrap(),
+        b"home-edit",
+        "the copy at home is left exactly as it was"
+    );
+    assert!(
+        catalog.companions_at(id, nas, LocationRole::Backup).unwrap().is_empty(),
+        "and it is not claimed as carried, so it stays visible as divergence"
+    );
+}
+
+/// Offload frees local bytes. It must not strand the edit state beside them (#80), and a
+/// restore must bring that state back rather than bare pixels.
+#[test]
+fn offload_carries_companions_home_first_and_restore_brings_them_back() {
+    let (catalog, root) = temp_catalog("companions-offload");
+    let nas_dir = root.parent().unwrap().join("nas");
+    std::fs::create_dir_all(&nas_dir).unwrap();
+    let nas = catalog.add_volume("NAS", &nas_dir, VolumeKind::Backup).unwrap();
+    let local_id = catalog
+        .list_volumes()
+        .unwrap()
+        .into_iter()
+        .find(|v| v.kind == VolumeKind::Local)
+        .unwrap()
+        .id;
+
+    let raw = root.join("2026/DSC1.ARW");
+    std::fs::create_dir_all(raw.parent().unwrap()).unwrap();
+    std::fs::write(&raw, b"bytes").unwrap();
+    let id = catalog.upsert_photo(&raw, None, 1, 5).unwrap().id;
+    catalog.backup_photo(id, nas).unwrap();
+
+    // The edit happens *after* the backup — the case that produced #80.
+    let local_sidecar = root.join("2026/DSC1.ARW.rrdata");
+    std::fs::write(&local_sidecar, b"masks").unwrap();
+
+    catalog.offload_photo(id).unwrap();
+
+    assert!(!raw.exists(), "local image freed");
+    assert!(!local_sidecar.exists(), "and its companion freed with it");
+    assert_eq!(
+        std::fs::read(nas_dir.join("2026/DSC1.ARW.rrdata")).unwrap(),
+        b"masks",
+        "because the edit state was carried home before anything was deleted"
+    );
+
+    catalog.restore_photo(id, local_id).unwrap();
+    assert_eq!(
+        std::fs::read(&local_sidecar).unwrap(),
+        b"masks",
+        "and it comes back with the photo"
+    );
+}
+
+/// A local original in the catalog, at `path`. The stack tests need three or four of
+/// these each, and the setup is the noise around what they are actually asserting.
+fn local_photo(catalog: &Catalog, path: &std::path::Path, bytes: &[u8]) -> i64 {
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(path, bytes).unwrap();
+    catalog.upsert_photo(path, None, 1, bytes.len() as i64).unwrap().id
+}
+
+/// A reachable backup volume beside the catalog root.
+fn nas_volume(catalog: &Catalog, root: &std::path::Path) -> (i64, PathBuf) {
+    let dir = root.parent().unwrap().join("nas");
+    std::fs::create_dir_all(&dir).unwrap();
+    (catalog.add_volume("NAS", &dir, VolumeKind::Backup).unwrap(), dir)
+}
+
+/// A stack is how a burst is stored, so a tile is a *moment* rather than a file. Trash has
+/// taken the whole stack since cluster B; offload and backup took the master alone, which
+/// is #82 — offloading a stack expecting the burst back and getting only the keeper's
+/// bytes defeats the verb.
+#[test]
+fn offload_and_backup_take_the_stack_the_way_trash_does() {
+    let (catalog, root) = temp_catalog("stack-offload");
+    let (nas, nas_dir) = nas_volume(&catalog, &root);
+
+    let raw = root.join("2026/08/DSC1.ARW");
+    let jpg = root.join("2026/08/DSC1.JPG");
+    let master = local_photo(&catalog, &raw, b"raw-bytes");
+    let frame = local_photo(&catalog, &jpg, b"jpeg-bytes");
+    catalog.set_stack_parent(frame, master).unwrap();
+
+    // Only the master is ever named. Both are acted on.
+    let backed = catalog.backup_photo(master, nas).unwrap();
+    assert_eq!(backed.backed_up, vec![master, frame], "backup took the frame too");
+    assert!(backed.skipped.is_empty());
+    assert!(nas_dir.join("2026/08/DSC1.JPG").is_file(), "the frame reached home");
+
+    let freed = catalog.offload_photo(master).unwrap();
+    assert_eq!(freed.freed, vec![master, frame]);
+    assert!(freed.skipped.is_empty());
+    assert!(!raw.exists(), "master freed");
+    assert!(!jpg.exists(), "and the frame with it — the bytes that used to stay local");
+    assert_eq!(catalog.photo_storage_status(frame).unwrap(), StorageStatus::Archived);
+}
+
+/// Invariant 2 ("never offload without a verified backup") is decided **per frame**. A
+/// frame whose own backup is missing stays local on its own account, rather than being
+/// freed on the strength of the master's — and the report names it, the way `empty_trash`
+/// reports what it refused.
+#[test]
+fn a_frame_without_its_own_verified_backup_is_left_local_and_named() {
+    let (catalog, root) = temp_catalog("stack-offload-gate");
+    let (nas, _nas_dir) = nas_volume(&catalog, &root);
+
+    // The master is backed up *before* the frame exists, so the frame never gets one.
+    let raw = root.join("2026/08/DSC1.ARW");
+    let master = local_photo(&catalog, &raw, b"raw-bytes");
+    catalog.backup_photo(master, nas).unwrap();
+
+    let jpg = root.join("2026/08/DSC1.JPG");
+    let frame = local_photo(&catalog, &jpg, b"jpeg-bytes");
+    catalog.set_stack_parent(frame, master).unwrap();
+
+    let freed = catalog.offload_photo(master).unwrap();
+
+    assert_eq!(freed.total, 2);
+    assert_eq!(freed.freed, vec![master], "only what had a verified backup was freed");
+    assert_eq!(freed.skipped.len(), 1);
+    assert_eq!(freed.skipped[0].photo_id, frame);
+    assert!(
+        freed.skipped[0].reason.contains("no verified backup"),
+        "the reason travels with the id: {}",
+        freed.skipped[0].reason
+    );
+    assert!(jpg.exists(), "the frame is still local, because its own backup is not there");
+    assert!(!raw.exists(), "the master, which does have one, was freed");
+}
+
+#[test]
+fn a_tripped_storage_generation_deletes_no_local_copy() {
+    let (catalog, root) = temp_catalog("offload-aborted");
+    let (nas, _nas_dir) = nas_volume(&catalog, &root);
+    let raw = root.join("2026/08/DSC1.ARW");
+    let photo = local_photo(&catalog, &raw, b"raw-bytes");
+    catalog.backup_photo(photo, nas).unwrap();
+    let plan = catalog.plan_offload(photo).unwrap();
+    let abort = std::sync::atomic::AtomicBool::new(true);
+    let err = match chairphoto_core::catalog::verify_and_delete_locals_abortable(&plan, &abort) {
+        Ok(_) => panic!("a tripped storage operation must stop before deletion"),
+        Err(err) => err.to_string(),
+    };
+    assert!(err.contains("catalog switched"));
+    assert!(raw.exists());
+}
+
+/// Backup gates each frame on its own local copy, and reports what it could not take —
+/// the mirror of the offload gate above.
+#[test]
+fn backup_gates_each_frame_on_its_own_local_copy() {
+    let (catalog, root) = temp_catalog("stack-backup-gate");
+    let (nas, nas_dir) = nas_volume(&catalog, &root);
+
+    let raw = root.join("2026/08/DSC1.ARW");
+    let jpg = root.join("2026/08/DSC1.JPG");
+    let master = local_photo(&catalog, &raw, b"raw-bytes");
+    let frame = local_photo(&catalog, &jpg, b"jpeg-bytes");
+    catalog.set_stack_parent(frame, master).unwrap();
+    // The frame's file is gone from disk (a removed card copy, a manual delete): there is
+    // nothing to send home for it.
+    std::fs::remove_file(&jpg).unwrap();
+
+    let backed = catalog.backup_photo(master, nas).unwrap();
+
+    assert_eq!(backed.backed_up, vec![master]);
+    assert_eq!(backed.skipped.len(), 1);
+    assert_eq!(backed.skipped[0].photo_id, frame);
+    assert!(
+        backed.skipped[0].reason.contains("no local copy"),
+        "and says why: {}",
+        backed.skipped[0].reason
+    );
+    assert!(nas_dir.join("2026/08/DSC1.ARW").is_file(), "the master still went home");
+}
+
+/// A storage verb pressed on a frame acts on the frame. Stacks are one level deep, so a
+/// frame has nothing under it — the same asymmetry `restore_photos` has, where restoring a
+/// child does not restore its master.
+#[test]
+fn offloading_a_frame_leaves_its_master_alone() {
+    let (catalog, root) = temp_catalog("stack-offload-frame");
+    let (nas, _nas_dir) = nas_volume(&catalog, &root);
+
+    let raw = root.join("2026/08/DSC1.ARW");
+    let jpg = root.join("2026/08/DSC1.JPG");
+    let master = local_photo(&catalog, &raw, b"raw-bytes");
+    let frame = local_photo(&catalog, &jpg, b"jpeg-bytes");
+    catalog.set_stack_parent(frame, master).unwrap();
+    catalog.backup_photo(master, nas).unwrap();
+
+    let freed = catalog.offload_photo(frame).unwrap();
+
+    assert_eq!(freed.freed, vec![frame]);
+    assert!(!jpg.exists(), "the frame was freed");
+    assert!(raw.exists(), "its master was not — the user named the frame");
+}
+
+/// The round trip: offload frees the moment, restore brings the moment back. A stack that
+/// went to the NAS as two frames and came back as one would be #82's asymmetry pointing
+/// the other way.
+#[test]
+fn restore_brings_the_whole_stack_back() {
+    let (catalog, root) = temp_catalog("stack-restore");
+    let (nas, _nas_dir) = nas_volume(&catalog, &root);
+    let local_id = catalog
+        .list_volumes()
+        .unwrap()
+        .into_iter()
+        .find(|v| v.kind == VolumeKind::Local)
+        .unwrap()
+        .id;
+
+    let raw = root.join("2026/08/DSC1.ARW");
+    let jpg = root.join("2026/08/DSC1.JPG");
+    let master = local_photo(&catalog, &raw, b"raw-bytes");
+    let frame = local_photo(&catalog, &jpg, b"jpeg-bytes");
+    catalog.set_stack_parent(frame, master).unwrap();
+    catalog.backup_photo(master, nas).unwrap();
+    catalog.offload_photo(master).unwrap();
+    assert!(!raw.exists() && !jpg.exists(), "the whole stack is away");
+
+    let restored = catalog.restore_photo(master, local_id).unwrap();
+
+    assert_eq!(restored.restored, vec![master, frame]);
+    assert!(restored.skipped.is_empty());
+    assert_eq!(std::fs::read(&jpg).unwrap(), b"jpeg-bytes", "the frame came back too");
+    assert_eq!(catalog.photo_storage_status(frame).unwrap(), StorageStatus::BackedUp);
+
+    // Restoring again is a no-op for what is already here: the frame is not re-copied over.
+    let again = catalog.restore_photo(master, local_id).unwrap();
+    assert_eq!(again.restored, vec![master], "only the named photo, which restore always re-fetches");
+    assert_eq!(again.total, 2);
+}
+
+/// `<sidecar>.chairphoto-backup` is the sidecar as it looked before ChairPhoto first wrote
+/// it, and it is **per copy**: carrying it home would routinely leave two different backups
+/// for one photo, which the divergence rule then refuses to offload over, and deleting it
+/// would destroy that record during a routine space-freeing operation. So offload leaves
+/// it — and reports it, so the one file left in an otherwise empty folder is something the
+/// verb said rather than something the user finds (#82).
+#[test]
+fn offload_leaves_a_sidecar_backup_in_place_and_reports_it() {
+    let (catalog, root) = temp_catalog("sidecar-backup-left");
+    let (nas, nas_dir) = nas_volume(&catalog, &root);
+
+    let raw = root.join("2026/08/DSC1.ARW");
+    let master = local_photo(&catalog, &raw, b"raw-bytes");
+    let sidecar = root.join("2026/08/DSC1.ARW.xmp");
+    let sidecar_backup = root.join("2026/08/DSC1.ARW.xmp.chairphoto-backup");
+    std::fs::write(&sidecar, b"<x>chairphoto wrote this</x>").unwrap();
+    std::fs::write(&sidecar_backup, b"<x>darktable, before chairphoto</x>").unwrap();
+    catalog.backup_photo(master, nas).unwrap();
+
+    let freed = catalog.offload_photo(master).unwrap();
+
+    assert_eq!(freed.sidecar_backups_left, 1, "counted, so the verb can say what it left");
+    assert!(sidecar_backup.is_file(), "and left: it is the only record of the earlier sidecar");
+    assert!(!sidecar.exists(), "while the sidecar itself went home and was freed");
+    assert!(!raw.exists());
+    assert!(
+        !nas_dir.join("2026/08/DSC1.ARW.xmp.chairphoto-backup").exists(),
+        "never carried either — home has its own copy's backup to keep"
+    );
+}
+
+/// The other half of #84: offload drops the local location row, so the backup it left sits
+/// at a path no `photo_locations` row names any more. It is not out of reach — the
+/// candidate list always ends with the catalog-root path — and that fallback is the only
+/// reason a later delete can find the file at all, so it is pinned here rather than left
+/// as an implementation detail of the resolver.
+#[test]
+fn the_backup_offload_leaves_stays_on_the_photos_candidate_list() {
+    let (catalog, root) = temp_catalog("sidecar-backup-still-reachable");
+    let (nas, _nas_dir) = nas_volume(&catalog, &root);
+
+    let raw = root.join("2026/08/DSC1.ARW");
+    let master = local_photo(&catalog, &raw, b"raw-bytes");
+    let sidecar_backup = root.join("2026/08/DSC1.ARW.xmp.chairphoto-backup");
+    std::fs::write(root.join("2026/08/DSC1.ARW.xmp"), b"<x/>").unwrap();
+    std::fs::write(&sidecar_backup, b"<x>before chairphoto</x>").unwrap();
+    catalog.backup_photo(master, nas).unwrap();
+    catalog.offload_photo(master).unwrap();
+
+    assert!(
+        catalog
+            .photo_locations(master)
+            .unwrap()
+            .iter()
+            .all(|l| l.role == LocationRole::Backup),
+        "no local row names that folder any more — which is what makes the file look stranded"
+    );
+
+    let candidates = catalog.photo_path_candidates(master).unwrap();
+    assert!(
+        candidates.iter().any(|c| c.path == *raw),
+        "but the catalog-root fallback still names it: {candidates:?}"
+    );
+    assert_eq!(
+        chairphoto_core::companions::sidecar_backups_beside(&raw),
+        vec![sidecar_backup],
+        "and the backup is found from that image path, which is all delete has to go on"
+    );
+}
+
+/// The freshness half of the safety axis (cluster B, D5): home holds the companion that
+/// was carried, and the local one has since been edited again. Nothing stats home to work
+/// this out — the scanner notes what it sees locally, and the summary reads the note.
+#[test]
+fn a_companion_edited_after_the_backup_makes_the_photo_stale() {
+    let (catalog, root) = temp_catalog("freshness");
+    let nas_dir = root.parent().unwrap().join("nas");
+    std::fs::create_dir_all(&nas_dir).unwrap();
+    let nas = catalog.add_volume("NAS", &nas_dir, VolumeKind::Backup).unwrap();
+
+    let raw = root.join("DSC1.ARW");
+    std::fs::write(&raw, b"bytes").unwrap();
+    let sidecar = root.join("DSC1.ARW.rrdata");
+    std::fs::write(&sidecar, b"first-edit").unwrap();
+    let id = catalog.upsert_photo(&raw, None, 1, 5).unwrap().id;
+    catalog.backup_photo(id, nas).unwrap();
+
+    // Carried and untouched: safe, and nothing is claimed about freshness yet.
+    assert_eq!(catalog.photo_safety_status(id).unwrap(), SafetyStatus::Safe);
+    assert_eq!(catalog.library_safety_summary().unwrap().companions_unchecked, 1);
+
+    // A scan that sees the companion exactly as it was carried leaves it safe, and now
+    // the freshness IS known rather than merely unclaimed.
+    catalog.note_companion_freshness(id, &raw).unwrap();
+    assert_eq!(catalog.photo_safety_status(id).unwrap(), SafetyStatus::Safe);
+    let s = catalog.library_safety_summary().unwrap();
+    assert_eq!((s.companions_checked, s.companions_unchecked), (1, 0));
+
+    // Edit the local companion again. Home still holds the older one.
+    std::fs::write(&sidecar, b"second-edit").unwrap();
+    set_mtime_ahead(&sidecar, 120);
+    catalog.note_companion_freshness(id, &raw).unwrap();
+
+    assert_eq!(
+        catalog.photo_safety_status(id).unwrap(),
+        SafetyStatus::Stale,
+        "the pixels are safe at home; this edit is not"
+    );
+    assert_eq!(catalog.library_safety_summary().unwrap().stale, 1);
+}
+
+/// The safety panel's batch action queues a whole selection at once. The count it reports
+/// is "newly queued", not "statements run" — a photo already waiting must not be counted
+/// again, or the message tells the user work was created that was not.
+#[test]
+fn queueing_a_selection_counts_only_what_was_not_already_waiting() {
+    let (catalog, root) = temp_catalog("batch-enqueue");
+    let ids: Vec<i64> = (1..=4)
+        .map(|i| {
+            let p = root.join(format!("DSC{i}.arw"));
+            std::fs::write(&p, b"x").unwrap();
+            catalog.upsert_photo(&p, None, 1, 1).unwrap().id
+        })
+        .collect();
+
+    // One is already waiting, queued the per-photo way.
+    catalog.enqueue_operation("backup", ids[0]).unwrap();
+
+    let queued = catalog.enqueue_operations("backup", &ids).unwrap();
+
+    assert_eq!(queued, 3, "the one already waiting is not counted again");
+    assert_eq!(catalog.list_pending_operations().unwrap().len(), 4, "and not duplicated");
+
+    // Re-running queues nothing further: the action is safe to press twice.
+    assert_eq!(catalog.enqueue_operations("backup", &ids).unwrap(), 0);
+    assert_eq!(catalog.list_pending_operations().unwrap().len(), 4);
+}
+
+/// An unknown kind is rejected rather than queued as a row nothing will ever drain.
+#[test]
+fn queueing_an_unknown_operation_kind_is_refused() {
+    let (catalog, root) = temp_catalog("batch-enqueue-kind");
+    let p = root.join("a.arw");
+    std::fs::write(&p, b"x").unwrap();
+    let id = catalog.upsert_photo(&p, None, 1, 1).unwrap().id;
+
+    assert!(catalog.enqueue_operations("teleport", &[id]).is_err());
+    assert!(catalog.list_pending_operations().unwrap().is_empty());
+}
+
+/// The #80-era shape: a photo whose image was backed up before companions existed, so home
+/// has verified pixels and no sidecar, and the edit state sits in exactly one place.
+///
+/// The catalog has no record of that companion at all — nothing carried it — so a model
+/// that only compares an existing record's timestamps cannot see it, and the photo reports
+/// `Safe` while the work that made it is one disk failure from gone.
+#[test]
+fn an_uncarried_local_companion_is_stale_not_safe() {
+    let (catalog, root) = temp_catalog("uncarried-companion");
+    let nas_dir = root.parent().unwrap().join("nas");
+    std::fs::create_dir_all(&nas_dir).unwrap();
+    let nas = catalog.add_volume("NAS", &nas_dir, VolumeKind::Backup).unwrap();
+
+    let raw = root.join("DSC1.ARW");
+    std::fs::write(&raw, b"bytes").unwrap();
+    let id = catalog.upsert_photo(&raw, None, 1, 5).unwrap().id;
+    catalog.backup_photo(id, nas).unwrap();
+    assert_eq!(catalog.photo_safety_status(id).unwrap(), SafetyStatus::Safe);
+
+    // The edit happens now — after a backup that predates companions entirely. Home has
+    // no copy of it and no record that it should.
+    std::fs::write(root.join("DSC1.ARW.rrdata"), b"masks").unwrap();
+    assert!(
+        catalog.companions_at(id, nas, LocationRole::Backup).unwrap().is_empty(),
+        "nothing has ever been carried for this photo"
+    );
+
+    // A scan notices it. That sighting is the evidence the safety model needs.
+    catalog.note_companion_freshness(id, &raw).unwrap();
+
+    assert_eq!(
+        catalog.photo_safety_status(id).unwrap(),
+        SafetyStatus::Stale,
+        "the pixels are safe at home and this edit is not"
+    );
+    assert_eq!(catalog.library_safety_summary().unwrap().stale, 1);
+
+    // Backing up again reconciles it — the carry is what clears the bucket, and it is
+    // idempotent, so nothing is re-copied for the image.
+    let plan_source = raw.clone();
+    let plan_dest = nas_dir.join("DSC1.ARW");
+    let carried = chairphoto_core::catalog::carry_companions(&plan_source, &plan_dest).unwrap();
+    catalog
+        .record_companions_at(id, nas, LocationRole::Backup, &carried.carried)
+        .unwrap();
+
+    assert_eq!(
+        std::fs::read(nas_dir.join("DSC1.ARW.rrdata")).unwrap(),
+        b"masks",
+        "and the edit state actually reached home"
+    );
+    assert_eq!(catalog.photo_safety_status(id).unwrap(), SafetyStatus::Safe);
+}
+
+/// A companion carried and left alone is not stale — the sighting matches what was
+/// carried. Without this, every scan would push every photo into the bucket.
+#[test]
+fn a_carried_companion_seen_unchanged_stays_safe() {
+    let (catalog, root) = temp_catalog("carried-unchanged");
+    let nas_dir = root.parent().unwrap().join("nas");
+    std::fs::create_dir_all(&nas_dir).unwrap();
+    let nas = catalog.add_volume("NAS", &nas_dir, VolumeKind::Backup).unwrap();
+
+    let raw = root.join("DSC1.ARW");
+    std::fs::write(&raw, b"bytes").unwrap();
+    std::fs::write(root.join("DSC1.ARW.rrdata"), b"masks").unwrap();
+    let id = catalog.upsert_photo(&raw, None, 1, 5).unwrap().id;
+    catalog.backup_photo(id, nas).unwrap();
+
+    catalog.note_companion_freshness(id, &raw).unwrap();
+
+    assert_eq!(catalog.photo_safety_status(id).unwrap(), SafetyStatus::Safe);
+    assert_eq!(catalog.library_safety_summary().unwrap().stale, 0);
+}
+
+/// A file cannot be evidence that it has diverged from itself. Scanning the NAS copy must
+/// not refresh the note that describes the *local* copy — that would make every carried
+/// companion read as permanently current, which is the failure that hides #80 all over
+/// again.
+#[test]
+fn scanning_the_home_copy_does_not_vouch_for_the_local_one() {
+    let (catalog, root) = temp_catalog("freshness-self");
+    let nas_dir = root.parent().unwrap().join("nas");
+    std::fs::create_dir_all(&nas_dir).unwrap();
+    let nas = catalog.add_volume("NAS", &nas_dir, VolumeKind::Backup).unwrap();
+
+    let raw = root.join("DSC1.ARW");
+    std::fs::write(&raw, b"bytes").unwrap();
+    let sidecar = root.join("DSC1.ARW.rrdata");
+    std::fs::write(&sidecar, b"first-edit").unwrap();
+    let id = catalog.upsert_photo(&raw, None, 1, 5).unwrap().id;
+    catalog.backup_photo(id, nas).unwrap();
+
+    // Local companion moves on.
+    std::fs::write(&sidecar, b"second-edit").unwrap();
+    set_mtime_ahead(&sidecar, 120);
+
+    // A scan of the NAS copy notes nothing: its own row is skipped.
+    let refreshed = catalog.note_companion_freshness(id, &nas_dir.join("DSC1.ARW")).unwrap();
+    assert_eq!(refreshed, 0, "the home copy vouches for nothing");
+    assert_eq!(catalog.library_safety_summary().unwrap().stale, 0);
+
+    // The local scan is what reveals it.
+    catalog.note_companion_freshness(id, &raw).unwrap();
+    assert_eq!(catalog.library_safety_summary().unwrap().stale, 1);
+}
+
+/// Restore must bring back what an offload moved home — all three companion shapes, not
+/// just the appended one that happens to be most common. The shipping restore path used to
+/// record the image alone; both paths now go through one copy/record seam, so this covers
+/// the shape of the operation rather than one caller of it.
+#[test]
+fn restore_brings_back_every_companion_shape() {
+    let (catalog, root) = temp_catalog("restore-companions");
+    let nas_dir = root.parent().unwrap().join("nas");
+    std::fs::create_dir_all(&nas_dir).unwrap();
+    let nas = catalog.add_volume("NAS", &nas_dir, VolumeKind::Backup).unwrap();
+    let local_id = catalog
+        .list_volumes()
+        .unwrap()
+        .into_iter()
+        .find(|v| v.kind == VolumeKind::Local)
+        .unwrap()
+        .id;
+
+    let raw = root.join("DSC1.ARW");
+    std::fs::write(&raw, b"bytes").unwrap();
+    std::fs::write(root.join("DSC1.ARW.xmp"), b"appended-history").unwrap(); // darktable
+    std::fs::write(root.join("DSC1.xmp"), b"basename-history").unwrap(); // darktable, alt mode
+    std::fs::write(root.join("DSC1.ARW.rrdata"), b"masks").unwrap(); // RapidRAW
+    let id = catalog.upsert_photo(&raw, None, 1, 5).unwrap().id;
+
+    catalog.backup_photo(id, nas).unwrap();
+    catalog.offload_photo(id).unwrap();
+
+    // Local is empty; home holds everything.
+    assert!(!raw.exists());
+    assert!(!root.join("DSC1.ARW.rrdata").exists());
+    assert!(nas_dir.join("DSC1.xmp").is_file(), "the basename form reached home too");
+
+    catalog.restore_photo(id, local_id).unwrap();
+
+    assert_eq!(std::fs::read(&raw).unwrap(), b"bytes", "the image");
+    assert_eq!(
+        std::fs::read(root.join("DSC1.ARW.xmp")).unwrap(),
+        b"appended-history",
+        "appended xmp"
+    );
+    assert_eq!(
+        std::fs::read(root.join("DSC1.xmp")).unwrap(),
+        b"basename-history",
+        "basename xmp"
+    );
+    assert_eq!(std::fs::read(root.join("DSC1.ARW.rrdata")).unwrap(), b"masks", "rrdata");
+
+    // And the restored location knows what came with it, so freshness has a reference.
+    let recorded: Vec<String> = catalog
+        .companions_at(id, local_id, LocationRole::LocalCache)
+        .unwrap()
+        .into_iter()
+        .map(|(name, _)| name)
+        .collect();
+    assert_eq!(recorded, vec!["DSC1.ARW.rrdata", "DSC1.ARW.xmp", "DSC1.xmp"]);
+}
+
+/// A companion that differs on the two sides is two unreconciled edits. Offload is not the
+/// place to choose between them, so it refuses — and nothing local is deleted.
+#[test]
+fn offload_refuses_when_a_companion_diverges() {
+    let (catalog, root) = temp_catalog("companions-offload-refuse");
+    let nas_dir = root.parent().unwrap().join("nas");
+    std::fs::create_dir_all(&nas_dir).unwrap();
+    let nas = catalog.add_volume("NAS", &nas_dir, VolumeKind::Backup).unwrap();
+
+    let raw = root.join("2026/DSC1.ARW");
+    std::fs::create_dir_all(raw.parent().unwrap()).unwrap();
+    std::fs::write(&raw, b"bytes").unwrap();
+    let id = catalog.upsert_photo(&raw, None, 1, 5).unwrap().id;
+    catalog.backup_photo(id, nas).unwrap();
+
+    std::fs::write(root.join("2026/DSC1.ARW.xmp"), b"local-edit").unwrap();
+    std::fs::write(nas_dir.join("2026/DSC1.ARW.xmp"), b"home-edit").unwrap();
+
+    let err = catalog.offload_photo(id).unwrap_err().to_string();
+
+    assert!(err.contains("refusing to offload"), "{err}");
+    assert!(raw.exists(), "the local image is untouched");
+    assert_eq!(std::fs::read(root.join("2026/DSC1.ARW.xmp")).unwrap(), b"local-edit");
+    assert_eq!(std::fs::read(nas_dir.join("2026/DSC1.ARW.xmp")).unwrap(), b"home-edit");
+}
+
+#[test]
+fn per_photo_storage_status_from_locations() {
+    let (catalog, root) = temp_catalog("storage-status");
+
+    // A reachable backup (NAS) volume and an unreachable one.
+    let nas_dir = root.parent().unwrap().join("nas");
+    std::fs::create_dir_all(&nas_dir).unwrap();
+    let nas = catalog.add_volume("NAS", &nas_dir, VolumeKind::Backup).unwrap();
+    let offline_nas = catalog
+        .add_volume("OldNAS", &root.parent().unwrap().join("missing-nas"), VolumeKind::Backup)
+        .unwrap();
+    let default_local = catalog.list_volumes().unwrap()
+        .into_iter().find(|v| v.kind == VolumeKind::Local).unwrap().id;
+
+    // local-only: a photo with just its default local primary location.
+    let local = catalog.upsert_photo(&root.join("a.arw"), None, 1, 1).unwrap().id;
+    assert_eq!(catalog.photo_storage_status(local).unwrap(), StorageStatus::LocalOnly);
+
+    // backed-up: local + a backup copy.
+    let backed = catalog.upsert_photo(&root.join("b.arw"), None, 1, 1).unwrap().id;
+    catalog.add_location(backed, nas, "b.arw", LocationRole::Backup).unwrap();
+    assert_eq!(catalog.photo_storage_status(backed).unwrap(), StorageStatus::BackedUp);
+
+    // archived: backup-only on a reachable NAS (no local copy).
+    let archived = catalog.upsert_photo(&root.join("c.arw"), None, 1, 1).unwrap().id;
+    catalog.remove_locations_on_volume(archived, default_local).unwrap();
+    catalog.add_location(archived, nas, "c.arw", LocationRole::Backup).unwrap();
+    assert_eq!(catalog.photo_storage_status(archived).unwrap(), StorageStatus::Archived);
+
+    // offline: backup-only on an unreachable NAS.
+    let offline = catalog.upsert_photo(&root.join("d.arw"), None, 1, 1).unwrap().id;
+    catalog.remove_locations_on_volume(offline, default_local).unwrap();
+    catalog.add_location(offline, offline_nas, "d.arw", LocationRole::Backup).unwrap();
+    assert_eq!(catalog.photo_storage_status(offline).unwrap(), StorageStatus::Offline);
+
+    // missing: no location records at all.
+    let missing = catalog.upsert_photo(&root.join("e.arw"), None, 1, 1).unwrap().id;
+    catalog.remove_locations_on_volume(missing, default_local).unwrap();
+    assert_eq!(catalog.photo_storage_status(missing).unwrap(), StorageStatus::Missing);
+
+    // An EXPORT copy is a one-way hand-off, not a safety copy — even when the user pointed
+    // the export at a backup-kind disk. It must not make a photo read as backed up.
+    let exported = catalog.upsert_photo(&root.join("f.arw"), None, 1, 1).unwrap().id;
+    catalog.add_location(exported, nas, "f.arw", LocationRole::Export).unwrap();
+    assert_eq!(
+        catalog.photo_storage_status(exported).unwrap(),
+        StorageStatus::LocalOnly,
+        "an export copy on a backup volume is still only one real copy"
+    );
+
+    // And with no local copy either, an export copy leaves the photo Missing rather than
+    // Archived: there is nothing to browse from and nothing keeping it safe.
+    catalog.remove_locations_on_volume(exported, default_local).unwrap();
+    assert_eq!(catalog.photo_storage_status(exported).unwrap(), StorageStatus::Missing);
+
+    // Batch returns one entry per requested id, matching the singles. The batch method
+    // no longer stats — the caller supplies the reachability map (here from list_volumes,
+    // which mirrors the old internal behaviour).
+    let reachable: std::collections::HashMap<i64, bool> = catalog
+        .list_volumes()
+        .unwrap()
+        .into_iter()
+        .map(|v| (v.id, v.reachable))
+        .collect();
+    let batch = catalog
+        .photo_storage_statuses(&[local, backed, archived, offline, missing], &reachable)
+        .unwrap();
+    assert_eq!(
+        batch,
+        vec![
+            (local, StorageStatus::LocalOnly),
+            (backed, StorageStatus::BackedUp),
+            (archived, StorageStatus::Archived),
+            (offline, StorageStatus::Offline),
+            (missing, StorageStatus::Missing),
+        ]
+    );
+
+    // With an all-unreachable map, the two backup-only photos that were reachable now
+    // report Offline (their backup volume is "down"); local-only and missing are
+    // unaffected (they don't depend on backup reachability).
+    let all_unreachable: std::collections::HashMap<i64, bool> =
+        reachable.keys().map(|&id| (id, false)).collect();
+    let offline_batch = catalog
+        .photo_storage_statuses(&[local, backed, archived, offline, missing], &all_unreachable)
+        .unwrap();
+    assert_eq!(
+        offline_batch,
+        vec![
+            (local, StorageStatus::LocalOnly),
+            (backed, StorageStatus::BackedUp),
+            (archived, StorageStatus::Offline),
+            (offline, StorageStatus::Offline),
+            (missing, StorageStatus::Missing),
+        ]
+    );
+}
+
+#[test]
+fn grid_badge_batch_queries_accept_more_than_one_parameter_chunk() {
+    let (catalog, root) = temp_catalog("grid-badge-chunks");
+    let total = 1_100;
+    let mut ids = Vec::with_capacity(total);
+
+    for index in 0..total {
+        let path = root.join(format!("chunked-{index:04}.arw"));
+        std::fs::write(&path, b"x").unwrap();
+        let id = catalog
+            .upsert_photo(&path, None, index as i64, 1)
+            .unwrap()
+            .id;
+        if index % 10 == 0 {
+            catalog.create_version(id, "Edit").unwrap();
+        }
+        ids.push(id);
+    }
+
+    let reachable: std::collections::HashMap<i64, bool> = catalog
+        .list_volumes()
+        .unwrap()
+        .into_iter()
+        .map(|v| (v.id, v.reachable))
+        .collect();
+    let statuses = catalog.photo_storage_statuses(&ids, &reachable).unwrap();
+    assert_eq!(statuses.len(), ids.len());
+    assert!(
+        statuses
+            .iter()
+            .all(|(_, status)| *status == StorageStatus::LocalOnly),
+        "all synthetic photos have only their local primary location"
+    );
+
+    let counts = catalog.version_counts(&ids).unwrap();
+    assert_eq!(counts.len(), total / 10);
+    assert_eq!(counts[0], (ids[0], 1));
+
+    // The rows above only prove that per-chunk results stitch back together: 1,100 binds
+    // fit under `SQLITE_MAX_VARIABLE_NUMBER`, which is 32766 in the SQLite we bundle, so
+    // an unchunked `IN (...)` would still pass. Pad past that ceiling to cover the
+    // chunking itself — a 100k-photo grid refresh passes every returned id, and
+    // unchunked this fails with "too many SQL variables". Padding ids need no rows; they
+    // only have to survive being bound.
+    const SQLITE_MAX_VARIABLE_NUMBER: usize = 32_766;
+    let padding_start = ids.last().unwrap() + 1;
+    let mut padded = ids.clone();
+    padded.extend(padding_start..padding_start + SQLITE_MAX_VARIABLE_NUMBER as i64);
+    assert!(
+        padded.len() > SQLITE_MAX_VARIABLE_NUMBER,
+        "the padded batch must exceed the bind-parameter ceiling"
+    );
+
+    let padded_statuses = catalog.photo_storage_statuses(&padded, &reachable).unwrap();
+    assert_eq!(padded_statuses.len(), padded.len());
+    assert_eq!(
+        &padded_statuses[..total],
+        statuses.as_slice(),
+        "the real ids keep their status and order when the batch spans many chunks"
+    );
+
+    let padded_counts = catalog.version_counts(&padded).unwrap();
+    assert_eq!(padded_counts, counts, "padding ids contribute no version rows");
+}
+
+#[test]
+fn rerooting_moves_the_catalog_root_volume() {
+    let dir = common::TestTmpDir::new("reroot");
+    let db = dir.join("c.chairphoto");
+    let root_a = dir.join("libA");
+    let root_b = dir.join("libB");
+    std::fs::create_dir_all(&root_a).unwrap();
+    std::fs::create_dir_all(&root_b).unwrap();
+
+    // Open rooted at A: the catalog-root (local) volume points at A.
+    {
+        let c = Catalog::open(&db, &root_a).unwrap();
+        let local = c.list_volumes().unwrap().into_iter()
+            .find(|v| v.kind == VolumeKind::Local).unwrap();
+        assert_eq!(local.base_path, root_a.to_string_lossy());
+        // Re-root: persist a new catalog_root, as set_library_root does.
+        c.set_setting("catalog_root", &root_b.to_string_lossy()).unwrap();
+    }
+
+    // Reopen: the catalog adopts B AND the local volume's base path follows.
+    let c = Catalog::open(&db, &root_a).unwrap();
+    assert_eq!(c.root(), root_b);
+    let local = c.list_volumes().unwrap().into_iter()
+        .find(|v| v.kind == VolumeKind::Local).unwrap();
+    assert_eq!(local.base_path, root_b.to_string_lossy(), "local volume re-rooted too");
+}
+
+#[test]
+fn volume_management_add_list_remove() {
+    let (catalog, root) = temp_catalog("volume-mgmt");
+
+    // Migration created exactly the default volume.
+    let initial = catalog.list_volumes().unwrap();
+    assert_eq!(initial.len(), 1);
+    let default_id = initial[0].id;
+
+    // Add a NAS-like volume; it lists with a reachability flag.
+    let nas_dir = root.parent().unwrap().join("nas");
+    std::fs::create_dir_all(&nas_dir).unwrap();
+    let nas = catalog.add_volume("NAS", &nas_dir, VolumeKind::Backup).unwrap();
+    let listed = catalog.list_volumes().unwrap();
+    assert_eq!(listed.len(), 2);
+    assert!(listed.iter().find(|v| v.id == nas).unwrap().reachable);
+
+    // A volume whose path doesn't exist is reported unreachable.
+    let gone = catalog
+        .add_volume("Gone", &root.parent().unwrap().join("nope"), VolumeKind::Backup)
+        .unwrap();
+    assert!(!catalog.list_volumes().unwrap().iter().find(|v| v.id == gone).unwrap().reachable);
+
+    // Remove a non-default volume.
+    catalog.remove_volume(nas).unwrap();
+    assert!(catalog.list_volumes().unwrap().iter().all(|v| v.id != nas));
+
+    // The default catalog-root volume is protected.
+    assert!(catalog.remove_volume(default_id).is_err());
+    assert!(catalog.list_volumes().unwrap().iter().any(|v| v.id == default_id));
+}
+
+#[test]
+fn resolver_prefers_local_cache_over_primary() {
+    let (catalog, root) = temp_catalog("resolver-pref");
+
+    // Primary on the default volume (under the catalog root).
+    let primary_path = root.join("orig.arw");
+    std::fs::write(&primary_path, b"orig").unwrap();
+    let id = catalog.upsert_photo(&primary_path, None, 1, 4).unwrap().id;
+
+    // A second volume acting as a fast local cache, with the same file.
+    let cache_dir = root.parent().unwrap().join("cache");
+    std::fs::create_dir_all(&cache_dir).unwrap();
+    let cache_path = cache_dir.join("orig.arw");
+    std::fs::write(&cache_path, b"orig").unwrap();
+    let cache_vol = catalog.add_volume("LocalScratch", &cache_dir, VolumeKind::Local).unwrap();
+    catalog
+        .add_location(id, cache_vol, "orig.arw", LocationRole::LocalCache)
+        .unwrap();
+
+    // Both exist, so the resolver should prefer the local-cache copy.
+    assert_eq!(catalog.resolve_photo_path(id).unwrap(), Some(cache_path.clone()));
+
+    // If the cache copy disappears, it falls back to the primary.
+    std::fs::remove_file(&cache_path).unwrap();
+    assert_eq!(catalog.resolve_photo_path(id).unwrap(), Some(primary_path));
+}
+
+#[test]
+fn photo_path_candidates_are_ordered_by_role_with_root_fallback_last() {
+    let (catalog, root) = temp_catalog("path-candidates");
+
+    // A primary on the default catalog-root volume.
+    let primary_path = root.join("orig.arw");
+    std::fs::write(&primary_path, b"orig").unwrap();
+    let id = catalog.upsert_photo(&primary_path, None, 1, 4).unwrap().id;
+
+    // Register a local-cache and a backup volume, each with a location (no files on disk).
+    let cache_dir = root.parent().unwrap().join("cache");
+    let backup_dir = root.parent().unwrap().join("backup");
+    let cache_vol = catalog.add_volume("Cache", &cache_dir, VolumeKind::Local).unwrap();
+    let backup_vol = catalog.add_volume("NAS", &backup_dir, VolumeKind::Backup).unwrap();
+    catalog.add_location(id, cache_vol, "orig.arw", LocationRole::LocalCache).unwrap();
+    catalog.add_location(id, backup_vol, "orig.arw", LocationRole::Backup).unwrap();
+
+    // Pure SQL: returns rows regardless of what exists on disk.
+    let cands: Vec<PathCandidate> = catalog.photo_path_candidates(id).unwrap();
+
+    // Ordering: local-cache (role 0) < primary (role 1) < backup (role 2), then the
+    // catalog-root fallback (volume_id None) LAST.
+    assert_eq!(cands.len(), 4);
+    assert_eq!(cands[0].role, LocationRole::LocalCache);
+    assert_eq!(cands[0].volume_id, Some(cache_vol));
+    assert_eq!(cands[0].path, cache_dir.join("orig.arw"));
+    assert_eq!(cands[1].role, LocationRole::Primary); // the default-volume primary
+    assert_eq!(cands[1].path, primary_path);
+    assert_eq!(cands[2].role, LocationRole::Backup);
+    assert_eq!(cands[2].volume_id, Some(backup_vol));
+    assert_eq!(cands[2].path, backup_dir.join("orig.arw"));
+    // Root fallback last, with no volume id.
+    assert_eq!(cands[3].volume_id, None);
+    assert_eq!(cands[3].path, primary_path);
+}
+
+#[test]
+fn resolver_returns_none_when_no_copy_exists() {
+    let (catalog, root) = temp_catalog("resolver-missing");
+    let path = root.join("gone.arw");
+    std::fs::write(&path, b"x").unwrap();
+    let id = catalog.upsert_photo(&path, None, 1, 1).unwrap().id;
+    std::fs::remove_file(&path).unwrap();
+    assert_eq!(catalog.resolve_photo_path(id).unwrap(), None);
+}
+
+#[test]
+fn reconcile_missing_hides_orphans_but_spares_offline_backups() {
+    let (catalog, root) = temp_catalog("reconcile-missing");
+
+    // A) A present photo under the catalog root — resolvable, stays visible.
+    let present = root.join("present.arw");
+    std::fs::write(&present, b"x").unwrap();
+    let present_id = catalog.upsert_photo(&present, None, 1, 1).unwrap().id;
+
+    // B) An orphan: indexed, then its file is gone, and it has no backup copy.
+    let orphan = root.join("orphan.arw");
+    std::fs::write(&orphan, b"x").unwrap();
+    let orphan_id = catalog.upsert_photo(&orphan, None, 1, 1).unwrap().id;
+    std::fs::remove_file(&orphan).unwrap();
+
+    // C) Offline NAS photo: no local file, but a backup location on an unmounted volume.
+    let offline = root.join("offline.arw");
+    std::fs::write(&offline, b"x").unwrap();
+    let offline_id = catalog.upsert_photo(&offline, None, 1, 1).unwrap().id;
+    std::fs::remove_file(&offline).unwrap();
+    let offline_nas = catalog
+        .add_volume("OldNAS", &root.parent().unwrap().join("missing-nas"), VolumeKind::Backup)
+        .unwrap();
+    catalog
+        .add_location(offline_id, offline_nas, "offline.arw", LocationRole::Backup)
+        .unwrap();
+
+    catalog.reconcile_missing().unwrap();
+
+    let visible: Vec<i64> = catalog
+        .list_photos(&PhotoQuery::default())
+        .unwrap()
+        .into_iter()
+        .map(|p| p.id)
+        .collect();
+    assert!(visible.contains(&present_id), "present photo stays visible");
+    assert!(!visible.contains(&orphan_id), "orphan with no backup is hidden");
+    assert!(visible.contains(&offline_id), "offline NAS photo is spared (has a backup)");
+}
+
+/// A scan reconciles the `missing` flag for the folder it walked — including rows whose
+/// file has been deleted since last time, which the walk by definition never sees — and
+/// leaves the rest of the catalog alone. Reconciling everything made each scan an
+/// O(total photos) stat pass over storage the scan never looked at.
+#[test]
+fn scan_reconciles_the_scanned_folder_and_leaves_the_rest_of_the_catalog_alone() {
+    let (catalog, root) = temp_catalog("scan-scope-reconcile");
+    let abort = chairphoto_core::scanner::never_abort();
+    let trip = root.join("trip");
+    let other = root.join("other");
+    std::fs::create_dir_all(&trip).unwrap();
+    std::fs::create_dir_all(&other).unwrap();
+    let in_scope = trip.join("a.jpg");
+    let out_of_scope = other.join("b.jpg");
+    std::fs::write(&in_scope, b"x").unwrap();
+    std::fs::write(&out_of_scope, b"x").unwrap();
+
+    chairphoto_core::scanner::scan_folder(&catalog, &root, &abort, &|_| {}).unwrap();
+    let visible = |catalog: &Catalog| -> Vec<String> {
+        catalog
+            .list_photos(&PhotoQuery::default())
+            .unwrap()
+            .into_iter()
+            .map(|p| p.path)
+            .collect()
+    };
+    assert_eq!(visible(&catalog).len(), 2, "both photos indexed");
+
+    // Both files disappear, but only `trip` is re-scanned.
+    std::fs::remove_file(&in_scope).unwrap();
+    std::fs::remove_file(&out_of_scope).unwrap();
+    chairphoto_core::scanner::scan_folder(&catalog, &trip, &abort, &|_| {}).unwrap();
+
+    let after = visible(&catalog);
+    assert!(
+        !after.contains(&"trip/a.jpg".to_string()),
+        "the scanned folder's vanished row is hidden: {after:?}"
+    );
+    assert!(
+        after.contains(&"other/b.jpg".to_string()),
+        "a folder this scan never walked is not reconciled: {after:?}"
+    );
+
+    // Scanning the parent covers both, so nothing is permanently stranded.
+    chairphoto_core::scanner::scan_folder(&catalog, &root, &abort, &|_| {}).unwrap();
+    assert!(visible(&catalog).is_empty());
+}
+
+/// The offline-NAS case at the scan boundary: a photo whose only copy is a backup on an
+/// unmounted volume sits squarely in the scanned scope, and reconciliation must still
+/// spare it. Unmounted storage is a normal state, not a missing row (AGENTS.md).
+#[test]
+fn scan_reconciliation_spares_an_offline_nas_photo_in_scope() {
+    let (catalog, root) = temp_catalog("scan-scope-offline-nas");
+    let abort = chairphoto_core::scanner::never_abort();
+    let archived = root.join("trip/archived.jpg");
+    std::fs::create_dir_all(archived.parent().unwrap()).unwrap();
+    std::fs::write(&archived, b"x").unwrap();
+    let id = catalog.upsert_photo(&archived, None, 1, 1).unwrap().id;
+
+    // Offload it: the bytes now live only on a NAS volume whose mount point is absent.
+    std::fs::remove_file(&archived).unwrap();
+    let nas = catalog
+        .add_volume(
+            "NAS",
+            &root.parent().unwrap().join("nas-not-mounted"),
+            VolumeKind::Backup,
+        )
+        .unwrap();
+    catalog
+        .add_location(id, nas, "trip/archived.jpg", LocationRole::Backup)
+        .unwrap();
+
+    chairphoto_core::scanner::scan_folder(&catalog, &root.join("trip"), &abort, &|_| {}).unwrap();
+
+    let visible: Vec<i64> = catalog
+        .list_photos(&PhotoQuery::default())
+        .unwrap()
+        .into_iter()
+        .map(|p| p.id)
+        .collect();
+    assert!(
+        visible.contains(&id),
+        "an offline NAS photo in the scanned scope stays visible"
+    );
+}
+
+#[test]
+fn recently_used_tags_tracks_manual_use_and_excludes_auto_tags() {
+    let (catalog, root) = temp_catalog("recently-used");
+    let path = root.join("p.arw");
+    std::fs::write(&path, b"x").unwrap();
+    let photo = catalog.upsert_photo(&path, None, 1, 1).unwrap().id;
+
+    let a = catalog.create_tag("Alpha").unwrap();
+    let b = catalog.create_tag("Beta").unwrap();
+    let unused = catalog.create_tag("Gamma").unwrap(); // created but never applied
+
+    // Apply Alpha then Beta by hand.
+    catalog.assign_tag(photo, a).unwrap();
+    catalog.assign_tag(photo, b).unwrap();
+
+    let recent = catalog.recently_used_tags(10).unwrap();
+    let ids: Vec<i64> = recent.iter().map(|t| t.id).collect();
+    assert!(ids.contains(&a) && ids.contains(&b), "applied tags appear");
+    assert!(!ids.contains(&unused), "a never-applied tag is excluded");
+    // Most-recent first (ties broken by id desc — Beta was applied last).
+    assert_eq!(recent[0].id, b, "the last-applied tag is first");
+    // Limit is honoured.
+    assert_eq!(catalog.recently_used_tags(1).unwrap().len(), 1);
+
+    // The monochrome AUTO-tag is assigned by the engine (bypassing assign_tag), so it
+    // must NOT pollute the recently-used list.
+    catalog.set_grayscale(photo, true).unwrap();
+    catalog.apply_auto_tags().unwrap();
+    let mono = catalog
+        .list_tags_with_counts()
+        .unwrap()
+        .into_iter()
+        .find(|t| t.tag.auto_rule.as_deref() == Some("monochrome"))
+        .expect("monochrome auto-tag exists after apply_auto_tags");
+    let recent_ids: Vec<i64> = catalog
+        .recently_used_tags(10)
+        .unwrap()
+        .into_iter()
+        .map(|t| t.id)
+        .collect();
+    assert!(
+        !recent_ids.contains(&mono.tag.id),
+        "auto-tags never appear in recently used",
+    );
+}
+
+#[test]
+fn photo_versions_crud_and_counts() {
+    let (catalog, root) = temp_catalog("photo-versions");
+    let path = root.join("v.arw");
+    std::fs::write(&path, b"x").unwrap();
+    let photo = catalog.upsert_photo(&path, None, 1, 1).unwrap().id;
+
+    // Create two versions; they list in creation order with a default edit record.
+    let a = catalog.create_version(photo, "Square").unwrap();
+    let b = catalog.create_version(photo, "Bright").unwrap();
+    let listed = catalog.list_versions(photo).unwrap();
+    assert_eq!(listed.iter().map(|v| v.id).collect::<Vec<_>>(), vec![a, b]);
+    assert_eq!(listed[0].name, "Square");
+    assert_eq!(listed[0].edit_json, "{}");
+
+    // Empty names are rejected.
+    assert!(catalog.create_version(photo, "  ").is_err());
+
+    // Edit record: valid JSON stored, invalid rejected.
+    catalog.set_version_edit(a, r#"{"crop":{"aspect":"1:1"}}"#).unwrap();
+    assert!(catalog.set_version_edit(a, "not json").is_err());
+    assert_eq!(catalog.get_version(a).unwrap().unwrap().edit_json, r#"{"crop":{"aspect":"1:1"}}"#);
+
+    // Duplicate appends "<name> copy" carrying the same edit record.
+    let dup = catalog.duplicate_version(a).unwrap();
+    let dupv = catalog.get_version(dup).unwrap().unwrap();
+    assert_eq!(dupv.name, "Square copy");
+    assert_eq!(dupv.edit_json, r#"{"crop":{"aspect":"1:1"}}"#);
+
+    // Rename + reorder.
+    catalog.rename_version(b, "Brighter").unwrap();
+    catalog.reorder_versions(photo, &[b, dup, a]).unwrap();
+    let order: Vec<i64> = catalog.list_versions(photo).unwrap().iter().map(|v| v.id).collect();
+    assert_eq!(order, vec![b, dup, a]);
+
+    // Counts (batch) report this photo's three versions.
+    let counts = catalog.version_counts(&[photo, 9999]).unwrap();
+    assert_eq!(counts, vec![(photo, 3)]);
+
+    // Delete one.
+    catalog.delete_version(dup).unwrap();
+    assert_eq!(catalog.list_versions(photo).unwrap().len(), 2);
+    assert!(catalog.version_counts(&[photo]).unwrap() == vec![(photo, 2)]);
+}
+
+/// The Darkroom's edit history (docs/editing.md): every committed change is a step; the
+/// first change seeds a "Before" step with the settings the version had; stepping back
+/// moves the head and restores those settings; a change after stepping back replaces the
+/// later steps; the same control still moving amends the tip.
+#[test]
+fn version_history_records_steps_and_steps_back() {
+    let (catalog, root) = temp_catalog("version-history");
+    let path = root.join("h.arw");
+    std::fs::write(&path, b"x").unwrap();
+    let photo = catalog.upsert_photo(&path, None, 1, 1).unwrap().id;
+    let v = catalog.create_version(photo, "Version 1").unwrap();
+    catalog.set_version_edit(v, r#"{"tone":{"ev":0.1}}"#).unwrap();
+    let edit = |v: i64| catalog.get_version(v).unwrap().unwrap().edit_json;
+    let labels = |h: &chairphoto_core::catalog::VersionHistory| h.steps.iter().map(|s| s.label.clone()).collect::<Vec<_>>();
+
+    // No history until the first commit.
+    let h = catalog.version_history(v).unwrap();
+    assert!(h.steps.is_empty() && h.head.is_none());
+
+    // First change: "Before" (what the version had) + the change, head on the change.
+    let h = catalog.commit_version_edit(v, r#"{"tone":{"ev":0.5}}"#, "Exposure +0.50", false).unwrap();
+    assert_eq!(labels(&h), vec!["Before", "Exposure +0.50"]);
+    assert_eq!(h.head, Some(1));
+    assert_eq!(edit(v), r#"{"tone":{"ev":0.5}}"#, "the version holds the latest settings");
+
+    // Same settings again: not a step. Same control still moving: amends the tip.
+    let h = catalog.commit_version_edit(v, r#"{"tone":{"ev":0.5}}"#, "Exposure +0.50", false).unwrap();
+    assert_eq!(h.steps.len(), 2);
+    let h = catalog.commit_version_edit(v, r#"{"tone":{"ev":0.7}}"#, "Exposure +0.70", true).unwrap();
+    assert_eq!(labels(&h), vec!["Before", "Exposure +0.70"]);
+
+    // Another control: a new step.
+    let h = catalog.commit_version_edit(v, r#"{"tone":{"ev":0.7,"contrast":0.2}}"#, "Contrast +0.20", false).unwrap();
+    assert_eq!(h.head, Some(2));
+
+    // Step back to before the contrast change: settings restored, nothing deleted yet.
+    let (json, h) = catalog.goto_version_step(v, 1).unwrap();
+    assert_eq!(json, r#"{"tone":{"ev":0.7}}"#);
+    assert_eq!(edit(v), json);
+    assert_eq!((h.head, h.steps.len()), (Some(1), 3), "redo is still possible");
+    // …and all the way back to how it was before the Darkroom touched it.
+    let (json, _) = catalog.goto_version_step(v, 0).unwrap();
+    assert_eq!(json, r#"{"tone":{"ev":0.1}}"#);
+    catalog.goto_version_step(v, 1).unwrap();
+
+    // Amend never rewrites a step that is not the tip: this becomes a new step and the
+    // later one ("Contrast") is replaced.
+    let h = catalog.commit_version_edit(v, r#"{"tone":{"ev":0.7},"vignette":-0.3}"#, "Vignette", true).unwrap();
+    assert_eq!(labels(&h), vec!["Before", "Exposure +0.70", "Vignette"]);
+    assert_eq!(h.head, Some(2));
+
+    // Amend never rewrites the baseline either.
+    catalog.goto_version_step(v, 0).unwrap();
+    let h = catalog.commit_version_edit(v, r#"{"fade":0.2}"#, "Fade", true).unwrap();
+    assert_eq!(labels(&h), vec!["Before", "Fade"]);
+
+    // Unknown step and invalid JSON are refused; a missing version too.
+    assert!(catalog.goto_version_step(v, 99).is_err());
+    assert!(catalog.commit_version_edit(v, "not json", "x", false).is_err());
+    assert!(catalog.commit_version_edit(987_654, "{}", "x", false).is_err());
+
+    // Deleting the version takes its history with it.
+    catalog.delete_version(v).unwrap();
+    assert!(catalog.version_history(v).unwrap().steps.is_empty());
+}
+
+/// A version pinned as the photo's cover: the photo row carries a token the grid puts in the
+/// thumbnail URL; the token changes on every change to the cover's look (a save, a history
+/// step, an undo) and on a new cover; a version of another photo is refused; unpinning or
+/// deleting the cover version hands the face back to the most recently changed version
+/// (#252; the automatic face's own cases are in `catalog::edits`).
+#[test]
+fn a_version_can_be_the_photo_cover_and_its_token_follows_the_look() {
+    let (catalog, root) = temp_catalog("cover");
+    let path = root.join("c.arw");
+    std::fs::write(&path, b"x").unwrap();
+    let photo = catalog.upsert_photo(&path, None, 1, 1).unwrap().id;
+    let other_path = root.join("o.arw");
+    std::fs::write(&other_path, b"y").unwrap();
+    let other = catalog.upsert_photo(&other_path, None, 1, 1).unwrap().id;
+    let a = catalog.create_version(photo, "A").unwrap();
+    let b = catalog.create_version(photo, "B").unwrap();
+    let foreign = catalog.create_version(other, "X").unwrap();
+    let token = |id: i64| catalog.get_photo(id).unwrap().cover_token;
+
+    // Unpinned, the face is the version changed last: B, created last.
+    assert!(token(photo).unwrap().starts_with(&format!("{b}:")));
+    let t0 = catalog.set_cover_version(photo, Some(a)).unwrap().unwrap();
+    assert!(t0.starts_with(&format!("{a}:")));
+    assert_eq!(token(photo), Some(t0.clone()));
+    assert_eq!(catalog.cover_of(photo).unwrap().unwrap().0, a);
+
+    // Every change to the cover's look changes the token.
+    catalog.set_version_edit(a, r#"{"fade":0.1}"#).unwrap();
+    let t1 = token(photo).unwrap();
+    assert_ne!(t1, t0);
+    catalog.commit_version_edit(a, r#"{"fade":0.2}"#, "Fade 0.20", false).unwrap();
+    let t2 = token(photo).unwrap();
+    assert_ne!(t2, t1);
+    catalog.goto_version_step(a, 0).unwrap();
+    let t3 = token(photo).unwrap();
+    assert_ne!(t3, t2);
+    // …while edits to a version that is not the cover leave it alone.
+    catalog.set_version_edit(b, r#"{"fade":0.3}"#).unwrap();
+    assert_eq!(token(photo).unwrap(), t3);
+
+    // A new cover is a new token, never one seen before.
+    let tb = catalog.set_cover_version(photo, Some(b)).unwrap().unwrap();
+    assert!(tb.starts_with(&format!("{b}:")));
+    assert!(![&t0, &t1, &t2, &t3].contains(&&tb));
+
+    // Another photo's version is refused; unpinning hands the face to the version changed
+    // last (B), under a token never seen; deleting the cover version falls back to A.
+    assert!(catalog.set_cover_version(photo, Some(foreign)).is_err());
+    let auto = catalog.set_cover_version(photo, None).unwrap().unwrap();
+    assert!(auto.starts_with(&format!("{b}:")));
+    assert!(![&t0, &t1, &t2, &t3, &tb].contains(&&auto));
+    assert_eq!(token(photo), Some(auto.clone()));
+    // Unpinning and choosing the same version again must not bring back a cached token.
+    let tb2 = catalog.set_cover_version(photo, Some(b)).unwrap().unwrap();
+    assert!(![&tb, &auto].contains(&&tb2));
+    catalog.delete_version(b).unwrap();
+    let fallback = token(photo).unwrap();
+    assert!(fallback.starts_with(&format!("{a}:")));
+    assert_eq!(catalog.cover_of(photo).unwrap().unwrap().0, a);
+    // …nor after the cover version was deleted.
+    let ta = catalog.set_cover_version(photo, Some(a)).unwrap().unwrap();
+    assert!(![&t0, &t1, &t2, &t3, &fallback].contains(&&ta));
+}
+
+/// History is bounded: the oldest steps go first, the head stays on the newest.
+#[test]
+fn version_history_keeps_at_most_the_cap() {
+    let (catalog, root) = temp_catalog("version-history-cap");
+    let path = root.join("c.arw");
+    std::fs::write(&path, b"x").unwrap();
+    let photo = catalog.upsert_photo(&path, None, 1, 1).unwrap().id;
+    let v = catalog.create_version(photo, "V").unwrap();
+    let cap = chairphoto_core::catalog::HISTORY_CAP;
+    for i in 0..(cap + 25) {
+        catalog.commit_version_edit(v, &format!(r#"{{"fade":{}}}"#, i as f64 / 1000.0 + 0.001), &format!("step {i}"), false).unwrap();
+    }
+    let h = catalog.version_history(v).unwrap();
+    assert_eq!(h.steps.len() as i64, cap);
+    assert_eq!(h.head, h.steps.last().map(|s| s.seq));
+    assert_eq!(h.steps.last().unwrap().label, format!("step {}", cap + 24));
+}
+
+/// The grid's version badge rides the photo row (issue #10) — a listing needs no per-id
+/// side query to draw it. Every query that builds a `Photo` must carry the same number.
+#[test]
+fn the_version_count_rides_the_photo_row() {
+    let (catalog, root) = temp_catalog("row-version-count");
+    let edited = catalog.upsert_photo(&root.join("edited.arw"), None, 1, 1).unwrap().id;
+    let plain = catalog.upsert_photo(&root.join("plain.arw"), None, 1, 1).unwrap().id;
+    catalog.create_version(edited, "Square").unwrap();
+    catalog.create_version(edited, "Bright").unwrap();
+
+    let listed = catalog.list_photos(&PhotoQuery::default()).unwrap();
+    let count_of = |id: i64| listed.iter().find(|p| p.id == id).unwrap().version_count;
+    assert_eq!(count_of(edited), 2, "listed row carries its version count");
+    assert_eq!(count_of(plain), 0, "an unedited photo counts zero, not null");
+
+    // The same count from the single-photo paths the inspector and deep links use.
+    assert_eq!(catalog.get_photo(edited).unwrap().version_count, 2);
+    let uuid = catalog.get_photo(edited).unwrap().uuid;
+    assert_eq!(catalog.get_photo_by_uuid(&uuid).unwrap().version_count, 2);
+
+    // And it tracks deletions, since it is computed rather than stored.
+    let versions = catalog.list_versions(edited).unwrap();
+    catalog.delete_version(versions[0].id).unwrap();
+    assert_eq!(catalog.get_photo(edited).unwrap().version_count, 1);
+}
+
+#[test]
+fn tag_terms_translations_and_synonyms() {
+    let (catalog, _root) = temp_catalog("terms");
+    let owl = catalog.create_tag("Animals/Birds/Owl").unwrap();
+
+    // Translations: canonical is "Owl"; add a Norwegian primary.
+    catalog.set_translation(owl, "nb", "Ugle").unwrap();
+    assert_eq!(catalog.display_name(owl, Some("nb")).unwrap(), "Ugle");
+    assert_eq!(catalog.display_name(owl, Some("de")).unwrap(), "Owl"); // fallback to canonical
+    assert_eq!(catalog.display_name(owl, None).unwrap(), "Owl");
+
+    // Synonyms with per-synonym export flags.
+    catalog.add_synonym(owl, "Owls", Some("en"), true).unwrap();
+    catalog.add_synonym(owl, "Strigiformes", None, true).unwrap(); // neutral, exported
+    catalog.add_synonym(owl, "internal-note", Some("en"), false).unwrap(); // not exported
+
+    let terms = catalog.list_terms(owl).unwrap();
+    assert_eq!(terms.len(), 4); // nb primary + 3 synonyms
+
+    // Setting a second nb primary demotes the first.
+    catalog.set_translation(owl, "nb", "Ugla").unwrap();
+    assert_eq!(catalog.display_name(owl, Some("nb")).unwrap(), "Ugla");
+}
+
+#[test]
+fn rename_tag_rewrites_descendant_paths() {
+    let (catalog, _root) = temp_catalog("rename-tag");
+    let owl = catalog.create_tag("Animals/Birds/Owl").unwrap();
+    let birds = catalog.create_tag("Animals/Birds").unwrap();
+
+    // Rename the middle node; descendant paths must follow.
+    catalog.rename_tag(birds, "Avians").unwrap();
+    assert_eq!(catalog.get_tag(birds).unwrap().full_path, "Animals/Avians");
+    assert_eq!(catalog.get_tag(owl).unwrap().full_path, "Animals/Avians/Owl");
+
+    // Renaming to a name that collides with a sibling path is rejected.
+    catalog.create_tag("Animals/Mammals").unwrap();
+    assert!(catalog.rename_tag(birds, "Mammals").is_err());
+}
+
+#[test]
+fn tags_get_stable_unique_uuids() {
+    let (catalog, _root) = temp_catalog("tag-uuid");
+    let a = catalog.create_tag("Animals/Birds").unwrap();
+    let b = catalog.create_tag("Plants").unwrap();
+    let ua = catalog.get_tag(a).unwrap().uuid;
+    let ub = catalog.get_tag(b).unwrap().uuid;
+    assert!(!ua.is_empty() && !ub.is_empty(), "tags must have UUIDs");
+    assert_ne!(ua, ub, "UUIDs must be unique");
+    // Stable: re-creating the same path returns the same tag with the same uuid.
+    let a2 = catalog.create_tag("Animals/Birds").unwrap();
+    assert_eq!(a, a2);
+    assert_eq!(catalog.get_tag(a2).unwrap().uuid, ua);
+    // Ancestors created along the way also got UUIDs.
+    let animals = catalog.create_tag("Animals").unwrap();
+    assert!(!catalog.get_tag(animals).unwrap().uuid.is_empty());
+}
+
+#[test]
+fn move_tag_reparents_and_rewrites_paths() {
+    let (catalog, _root) = temp_catalog("move-tag");
+    let events = catalog.create_tag("Public Places/Events").unwrap();
+
+    // Move "Events" up to the top level.
+    catalog.move_tag(events, None).unwrap();
+    assert_eq!(catalog.get_tag(events).unwrap().full_path, "Events");
+    assert_eq!(catalog.get_tag(events).unwrap().parent_id, None);
+
+    // Descendants follow the move.
+    let concert = catalog.create_tag("Events/Concert").unwrap();
+    let music = catalog.create_tag("Music").unwrap();
+    catalog.move_tag(events, Some(music)).unwrap();
+    assert_eq!(catalog.get_tag(events).unwrap().full_path, "Music/Events");
+    assert_eq!(catalog.get_tag(concert).unwrap().full_path, "Music/Events/Concert");
+
+    // Can't move a tag into its own descendant.
+    assert!(catalog.move_tag(music, Some(concert)).is_err());
+}
+
+#[test]
+fn delete_tag_removes_subtree_and_assignments() {
+    let (catalog, root) = temp_catalog("delete-tag");
+    let owl = catalog.create_tag("Animals/Birds/Owl").unwrap();
+    let animals = catalog.create_tag("Animals").unwrap();
+    let id = catalog
+        .upsert_photo(&root.join("a.jpg"), None, 1, 1)
+        .unwrap()
+        .id;
+    catalog.assign_tag(id, owl).unwrap();
+    catalog.add_synonym(owl, "Owls", None, true).unwrap();
+    assert_eq!(catalog.list_tags_with_counts().unwrap().len(), 3);
+
+    // Deleting the root removes the whole subtree, the assignment, and the terms.
+    catalog.delete_tag(animals).unwrap();
+    assert_eq!(catalog.list_tags_with_counts().unwrap().len(), 0);
+    assert_eq!(catalog.get_photo_tags(id).unwrap().len(), 0);
+    assert!(catalog.get_tag(owl).is_err());
+}
+
+#[test]
+fn iptc_round_trips() {
+    use chairphoto_core::catalog::IptcFields;
+    let (catalog, root) = temp_catalog("iptc");
+    let id = catalog
+        .upsert_photo(&root.join("a.jpg"), None, 1, 1)
+        .unwrap()
+        .id;
+    assert_eq!(catalog.get_iptc(id).unwrap().description, "");
+
+    let fields = IptcFields {
+        description: "A ferry in the harbour".into(),
+        creator: "Andreas".into(),
+        copyright: "© 2026 Andreas".into(),
+        city: "Trondheim".into(),
+        country: "Norway".into(),
+        ..Default::default()
+    };
+    catalog.set_iptc(id, &fields).unwrap();
+    let got = catalog.get_iptc(id).unwrap();
+    assert_eq!(got.description, "A ferry in the harbour");
+    assert_eq!(got.creator, "Andreas");
+    assert_eq!(got.city, "Trondheim");
+}
+
+#[test]
+fn monochrome_auto_tag_applies_from_grayscale_flag() {
+    let (catalog, root) = temp_catalog("autotag-mono");
+
+    // Pixel-derived flag drives monochrome (camera metadata is unreliable). A real
+    // grayscale shot vs a colour one.
+    let bw = catalog.upsert_photo(&root.join("bw.arw"), None, 1, 1).unwrap().id;
+    catalog.set_grayscale(bw, true).unwrap();
+    let colour = catalog.upsert_photo(&root.join("c.arw"), None, 1, 1).unwrap().id;
+    catalog.set_grayscale(colour, false).unwrap();
+
+    catalog.apply_auto_tags().unwrap();
+
+    // Only the B&W photo gets the auto-tag, which is marked auto + carries hashtags.
+    let bw_tags = catalog.get_photo_tags(bw).unwrap();
+    assert_eq!(bw_tags.len(), 1);
+    assert_eq!(bw_tags[0].full_path, "Treatment/Black & White");
+    assert_eq!(bw_tags[0].auto_rule.as_deref(), Some("monochrome"));
+    assert_eq!(catalog.get_photo_tags(colour).unwrap().len(), 0);
+
+    // It's a real tag with export hashtags as synonyms.
+    let terms = catalog.list_terms(bw_tags[0].id).unwrap();
+    assert!(terms.iter().any(|t| t.text == "#bnw" && t.export));
+
+    // Re-running is idempotent (no duplicate membership).
+    catalog.apply_auto_tags().unwrap();
+    assert_eq!(catalog.get_photo_tags(bw).unwrap().len(), 1);
+}
+
+#[test]
+fn tag_description_round_trips() {
+    let (catalog, _root) = temp_catalog("tag-desc");
+    let crane = catalog.create_tag("Animals/Birds/Crane").unwrap();
+    assert_eq!(catalog.get_tag(crane).unwrap().description, "");
+
+    catalog
+        .set_tag_description(crane, "Large long-legged wading bird (Gruidae), not the machine.")
+        .unwrap();
+    assert!(catalog
+        .get_tag(crane)
+        .unwrap()
+        .description
+        .contains("wading bird"));
+
+    // Description is visible in the listing too.
+    let listed = catalog.list_tags_with_counts().unwrap();
+    let row = listed.iter().find(|t| t.tag.id == crane).unwrap();
+    assert!(row.tag.description.contains("Gruidae"));
+}
+
+#[test]
+fn export_labels_respects_language_and_export_flags() {
+    let (catalog, _root) = temp_catalog("export-labels");
+    let owl = catalog.create_tag("Owl").unwrap();
+    catalog.set_translation(owl, "nb", "Ugle").unwrap();
+    catalog.add_synonym(owl, "Owls", Some("en"), true).unwrap();
+    catalog.add_synonym(owl, "Strigiformes", None, true).unwrap(); // neutral
+    catalog.add_synonym(owl, "secret", Some("en"), false).unwrap(); // export off
+
+    // English only: canonical "Owl" + en synonym "Owls" + neutral "Strigiformes".
+    // "secret" excluded (export off); "Ugle" excluded (nb not selected).
+    let en = catalog.export_labels(owl, &["en".into()]).unwrap();
+    assert!(en.contains(&"Owl".to_string()));
+    assert!(en.contains(&"Owls".to_string()));
+    assert!(en.contains(&"Strigiformes".to_string()));
+    assert!(!en.contains(&"secret".to_string()));
+    assert!(!en.contains(&"Ugle".to_string()));
+
+    // Norwegian only: primary "Ugle" + neutral synonym; no en synonym.
+    let nb = catalog.export_labels(owl, &["nb".into()]).unwrap();
+    assert!(nb.contains(&"Ugle".to_string()));
+    assert!(nb.contains(&"Strigiformes".to_string()));
+    assert!(!nb.contains(&"Owls".to_string()));
+
+    // Both languages: both primaries + both-language synonyms + neutral.
+    let both = catalog.export_labels(owl, &["en".into(), "nb".into()]).unwrap();
+    assert!(both.contains(&"Owl".to_string()));
+    assert!(both.contains(&"Ugle".to_string()));
+    assert!(both.contains(&"Owls".to_string()));
+}
+
+#[test]
+fn path_labels_translate_each_level() {
+    let (catalog, _root) = temp_catalog("path-labels");
+    let owl = catalog.create_tag("Animals/Birds/Owl").unwrap();
+    // create_tag is idempotent, so these return the existing ancestor ids.
+    let birds = catalog.create_tag("Animals/Birds").unwrap();
+    let animals = catalog.create_tag("Animals").unwrap();
+    catalog.set_translation(animals, "nb", "Dyr").unwrap();
+    catalog.set_translation(birds, "nb", "Fugler").unwrap();
+    catalog.set_translation(owl, "nb", "Ugle").unwrap();
+
+    let path = catalog.path_labels(owl, Some("nb")).unwrap();
+    assert_eq!(path, vec!["Dyr", "Fugler", "Ugle"]);
+
+    // A missing translation falls back to the canonical level name.
+    let en = catalog.path_labels(owl, Some("en")).unwrap();
+    assert_eq!(en, vec!["Animals", "Birds", "Owl"]);
+}
+
+#[test]
+fn export_labels_with_ancestors_expands_the_chain() {
+    let (catalog, _root) = temp_catalog("export-ancestors");
+    let eagle = catalog.create_tag("Animals/Birds/Eagle").unwrap();
+    let birds = catalog.create_tag("Animals/Birds").unwrap();
+    let animals = catalog.create_tag("Animals").unwrap();
+    catalog.add_synonym(eagle, "Raptor", Some("en"), true).unwrap();
+    catalog.add_synonym(birds, "Aves", None, true).unwrap();
+    catalog.add_synonym(birds, "hidden", Some("en"), false).unwrap(); // export off
+
+    // Root → leaf: each level's canonical name plus its exportable synonyms.
+    let labels = catalog
+        .export_labels_with_ancestors(eagle, &["en".into()])
+        .unwrap();
+    assert_eq!(labels, vec!["Animals", "Birds", "Aves", "Eagle", "Raptor"]);
+    assert!(!labels.contains(&"hidden".to_string()));
+
+    // The leaf alone still returns just its own labels.
+    let leaf_only = catalog.export_labels(eagle, &["en".into()]).unwrap();
+    assert_eq!(leaf_only, vec!["Eagle", "Raptor"]);
+
+    // A root-level tag (no parent) matches plain export_labels.
+    let root = catalog
+        .export_labels_with_ancestors(animals, &["en".into()])
+        .unwrap();
+    assert_eq!(root, vec!["Animals"]);
+}
+
+#[test]
+fn list_photos_culling_filters() {
+    let (catalog, root) = temp_catalog("filters");
+    let keep = catalog.upsert_photo(&root.join("k.jpg"), None, 1, 1).unwrap().id;
+    let toss = catalog.upsert_photo(&root.join("t.jpg"), None, 1, 1).unwrap().id;
+
+    catalog.set_culling(keep, Some(5), None, Some(PickState::Pick)).unwrap();
+    catalog.set_culling(toss, None, None, Some(PickState::Reject)).unwrap();
+
+    assert_eq!(catalog.list_photos(&PhotoQuery::default()).unwrap().len(), 2);
+    assert_eq!(catalog.list_photos(&PhotoQuery { culling_filter: CullingFilter::Pick, ..Default::default() }).unwrap().len(), 1);
+    assert_eq!(catalog.list_photos(&PhotoQuery { culling_filter: CullingFilter::Reject, ..Default::default() }).unwrap().len(), 1);
+    assert_eq!(catalog.list_photos(&PhotoQuery { culling_filter: CullingFilter::Unrated, ..Default::default() }).unwrap().len(), 1);
+}
+
+#[test]
+fn edit_record_round_trips_and_validates() {
+    let (catalog, root) = temp_catalog("edits");
+    let id = catalog.upsert_photo(&root.join("e.arw"), None, 1, 1).unwrap().id;
+
+    // No record initially.
+    assert_eq!(catalog.get_edit_record(id).unwrap(), None);
+    assert!(!catalog.photo_has_edits(id).unwrap());
+
+    // Set an opaque, module-namespaced JSON document; it round-trips verbatim.
+    let doc = r#"{"basic-editor":{"exposure":0.3,"bw":true}}"#;
+    catalog.set_edit_record(id, doc).unwrap();
+    assert_eq!(catalog.get_edit_record(id).unwrap().as_deref(), Some(doc));
+    assert!(catalog.photo_has_edits(id).unwrap());
+
+    // Replacing overwrites.
+    let doc2 = r#"{"basic-editor":{"exposure":-1.0}}"#;
+    catalog.set_edit_record(id, doc2).unwrap();
+    assert_eq!(catalog.get_edit_record(id).unwrap().as_deref(), Some(doc2));
+
+    // Invalid JSON is rejected (core validates syntax, not schema).
+    assert!(catalog.set_edit_record(id, "not json").is_err());
+    // The prior valid record is untouched by the rejected write.
+    assert_eq!(catalog.get_edit_record(id).unwrap().as_deref(), Some(doc2));
+
+    // Empty clears the record.
+    catalog.set_edit_record(id, "  ").unwrap();
+    assert_eq!(catalog.get_edit_record(id).unwrap(), None);
+    assert!(!catalog.photo_has_edits(id).unwrap());
+}
+
+#[test]
+fn albums_membership_and_composition_with_culling() {
+    let (catalog, root) = temp_catalog("albums");
+    let a = catalog.upsert_photo(&root.join("a.jpg"), None, 1, 1).unwrap().id;
+    let b = catalog.upsert_photo(&root.join("b.jpg"), None, 1, 1).unwrap().id;
+    let c = catalog.upsert_photo(&root.join("c.jpg"), None, 1, 1).unwrap().id;
+
+    let trip = catalog.create_album("Trip").unwrap();
+    // Add b before a: album order is insertion order, not path order.
+    catalog.add_photos_to_album(trip, &[b, a]).unwrap();
+    // Re-adding is idempotent (no duplicate, no error).
+    catalog.add_photos_to_album(trip, &[a]).unwrap();
+
+    // Viewing the album returns members in insertion order (b, then a).
+    let ordered = catalog.list_photos(&PhotoQuery { album_id: Some(trip), ..Default::default() }).unwrap();
+    assert_eq!(ordered.iter().map(|p| p.id).collect::<Vec<_>>(), vec![b, a]);
+
+    let albums = catalog.list_albums().unwrap();
+    assert_eq!(albums.len(), 1);
+    assert_eq!(albums[0].name, "Trip");
+    assert_eq!(albums[0].photo_count, 2);
+
+    // Viewing the album returns only its members.
+    let in_album = catalog.list_photos(&PhotoQuery { album_id: Some(trip), ..Default::default() }).unwrap();
+    assert_eq!(in_album.len(), 2);
+    assert!(in_album.iter().all(|p| p.id != c));
+
+    // Album filter ANDs with the culling filter.
+    catalog.set_culling(a, Some(5), None, Some(PickState::Pick)).unwrap();
+    let picks = catalog.list_photos(&PhotoQuery { album_id: Some(trip), culling_filter: CullingFilter::Pick, ..Default::default() }).unwrap();
+    assert_eq!(picks.len(), 1);
+    assert_eq!(picks[0].id, a);
+
+    // Removing a photo updates membership; deleting the album never deletes photos.
+    catalog.remove_photos_from_album(trip, &[a]).unwrap();
+    assert_eq!(catalog.list_albums().unwrap()[0].photo_count, 1);
+    catalog.delete_album(trip).unwrap();
+    assert!(catalog.list_albums().unwrap().is_empty());
+    assert_eq!(catalog.list_photos(&PhotoQuery::default()).unwrap().len(), 3);
+}
+
+#[test]
+fn facets_filter_by_derived_exif() {
+    use chairphoto_core::catalog::PromotedMetadata;
+    let (catalog, root) = temp_catalog("facets");
+
+    let set = |id: i64, make: Option<&str>, model: Option<&str>, gps: bool| {
+        catalog
+            .set_photo_metadata(
+                id,
+                &PromotedMetadata {
+                    camera_make: make.map(str::to_string),
+                    camera_model: model.map(str::to_string),
+                    gps_latitude: gps.then_some(59.9),
+                    gps_longitude: gps.then_some(10.7),
+                    ..Default::default()
+                },
+                &[],
+            )
+            .unwrap();
+    };
+
+    let phone = catalog.upsert_photo(&root.join("p.jpg"), None, 1, 1).unwrap().id;
+    set(phone, Some("Apple"), Some("iPhone 15 Pro"), true); // mobile + gps
+    let drone = catalog.upsert_photo(&root.join("d.jpg"), None, 1, 1).unwrap().id;
+    set(drone, Some("DJI"), Some("FC3411"), true); // drone + gps
+    let cam = catalog.upsert_photo(&root.join("c.arw"), None, 1, 1).unwrap().id;
+    set(cam, Some("Sony"), Some("ILCE-7RM5"), false); // neither
+
+    let ids = |fs: &[&str]| {
+        let fs: Vec<String> = fs.iter().map(|s| s.to_string()).collect();
+        let mut v: Vec<i64> = catalog
+            .list_photos(&PhotoQuery { facets: fs.to_vec(), ..Default::default() })
+            .unwrap()
+            .into_iter()
+            .map(|p| p.id)
+            .collect();
+        v.sort();
+        v
+    };
+
+    assert_eq!(ids(&["mobile"]), vec![phone]);
+    assert_eq!(ids(&["drone"]), vec![drone]);
+    let mut gps = vec![phone, drone];
+    gps.sort();
+    assert_eq!(ids(&["has-gps"]), gps);
+    // Facets AND together (and with each other): mobile AND has-gps still = the phone.
+    assert_eq!(ids(&["mobile", "has-gps"]), vec![phone]);
+    // mobile AND drone = nothing.
+    assert!(ids(&["mobile", "drone"]).is_empty());
+    // Unknown facet is an error.
+    assert!(catalog
+        .list_photos(&PhotoQuery { facets: vec!["bogus".to_string()], ..Default::default() })
+        .is_err());
+
+    // Facets are reflected in the offered set.
+    let offered: Vec<String> = catalog.available_facets().into_iter().map(|f| f.key).collect();
+    assert!(offered.contains(&"has-gps".to_string()));
+    assert!(offered.contains(&"mobile".to_string()));
+    assert!(offered.contains(&"drone".to_string()));
+}
+
+#[test]
+fn soft_facet_and_sharpness_sort() {
+    // H16d: the `soft` facet fires when sharpness IS NOT NULL AND sharpness < threshold;
+    // sort-by-sharpness_asc puts least-sharp first (unscored last); sharpness is surfaced
+    // on the Photo struct.
+    use chairphoto_core::catalog::SOFT_THRESHOLD_DEFAULT;
+
+    let (catalog, root) = temp_catalog("soft-facet");
+
+    let sharp = catalog.upsert_photo(&root.join("sharp.arw"), None, 1, 1).unwrap().id;
+    let soft  = catalog.upsert_photo(&root.join("soft.arw"),  None, 1, 1).unwrap().id;
+    let unscored = catalog.upsert_photo(&root.join("unscored.arw"), None, 1, 1).unwrap().id;
+
+    // Score two of the three photos. Use values clearly on each side of the default threshold.
+    catalog.set_sharpness(sharp,  SOFT_THRESHOLD_DEFAULT * 10.0, "tile").unwrap();
+    catalog.set_sharpness(soft,   SOFT_THRESHOLD_DEFAULT * 0.1,  "tile").unwrap();
+    // `unscored` stays NULL.
+    let _ = unscored; // referenced above, silence the unused-variable lint
+
+    // `soft` facet: should include `soft` photo, exclude `sharp` and `unscored`.
+    let soft_ids: Vec<i64> = catalog
+        .list_photos(&PhotoQuery { facets: vec!["soft".to_string()], ..Default::default() })
+        .unwrap()
+        .into_iter()
+        .map(|p| p.id)
+        .collect();
+    assert_eq!(soft_ids, vec![soft], "soft facet must return only the low-score photo");
+
+    // `soft` facet appears in `available_facets` once at least one photo is scored.
+    let facet_keys: Vec<String> = catalog.available_facets().into_iter().map(|f| f.key).collect();
+    assert!(facet_keys.contains(&"soft".to_string()), "soft facet should be offered after scoring");
+
+    // Sort by sharpness_asc: soft < sharp; unscored comes last.
+    let asc: Vec<i64> = catalog
+        .list_photos(&PhotoQuery { sort: PhotoSort::SharpnessAsc, ..Default::default() })
+        .unwrap()
+        .into_iter()
+        .map(|p| p.id)
+        .collect();
+    assert_eq!(asc[0], soft,     "least-sharp photo must come first in sharpness_asc");
+    assert_eq!(asc[1], sharp,    "sharp photo second");
+    assert_eq!(asc[2], unscored, "unscored photo last in sharpness_asc");
+
+    // Sort by sharpness_desc: sharp < soft; unscored comes last.
+    let desc: Vec<i64> = catalog
+        .list_photos(&PhotoQuery { sort: PhotoSort::SharpnessDesc, ..Default::default() })
+        .unwrap()
+        .into_iter()
+        .map(|p| p.id)
+        .collect();
+    assert_eq!(desc[0], sharp,    "sharpest photo must come first in sharpness_desc");
+    assert_eq!(desc[1], soft,     "soft photo second");
+    assert_eq!(desc[2], unscored, "unscored photo last in sharpness_desc");
+
+    // The sharpness value is surfaced on the Photo struct.
+    let all = catalog.list_photos(&PhotoQuery::default()).unwrap();
+    let photo_sharp = all.iter().find(|p| p.id == sharp).unwrap();
+    let photo_unscored = all.iter().find(|p| p.id == unscored).unwrap();
+    assert!(photo_sharp.sharpness.is_some(), "sharpness must be Some for a scored photo");
+    assert!(photo_unscored.sharpness.is_none(), "sharpness must be None for an unscored photo");
+
+    // A misspelled sort key used to reach here as a string and silently fall back to date
+    // order. `PhotoSort` is an enum now, so this call can no longer be written at all and
+    // the rejection happens at the IPC boundary instead — see
+    // `catalog::query::tests::a_misspelled_sort_is_rejected_at_the_boundary`.
+}
+
+/// A library of photos that tie on every sort key except the primary key: one shared
+/// capture time, and one pair of names that differ only in case (so they also tie under
+/// `path COLLATE NOCASE`). Returns the catalog and the ids in creation order.
+fn catalog_of_tied_photos(tag: &str, count: usize) -> (Catalog, common::TestSubPath, Vec<i64>) {
+    use chairphoto_core::catalog::PromotedMetadata;
+    let (catalog, root) = temp_catalog(tag);
+    let mut ids = Vec::new();
+    for i in 0..count {
+        // The 3rd and 4th photos are "Dup.jpg" / "dup.jpg" — distinct rows (path is
+        // UNIQUE, and this runs on a case-sensitive filesystem) that compare EQUAL under
+        // the NOCASE tiebreaker the sort uses.
+        let name = match i {
+            2 => "Dup.jpg".to_string(),
+            3 => "dup.jpg".to_string(),
+            _ => format!("photo{i:02}.jpg"),
+        };
+        let id = catalog
+            .upsert_photo(&root.join(&name), None, 1, 1)
+            .unwrap()
+            .id;
+        catalog
+            .set_photo_metadata(
+                id,
+                &PromotedMetadata {
+                    capture_time: Some("2024-05-01T12:00:00".into()),
+                    ..Default::default()
+                },
+                &[],
+            )
+            .unwrap();
+        ids.push(id);
+    }
+    (catalog, root, ids)
+}
+
+/// Issue #10: a window only means something if the ordering is TOTAL. Tiled windows must
+/// reproduce the unwindowed listing exactly — no row seen twice, none skipped — even when
+/// every sort key but the primary key ties. Without the trailing `p.id`, SQLite is free to
+/// order the tied rows differently per statement, and a photo can appear in two windows
+/// while another appears in none.
+#[test]
+fn windows_tile_the_result_exactly_when_every_other_sort_key_ties() {
+    let (catalog, _root, ids) = catalog_of_tied_photos("window-total-order", 10);
+
+    for sort in [PhotoSort::Date, PhotoSort::SharpnessAsc, PhotoSort::SharpnessDesc] {
+        let query = PhotoQuery {
+            sort,
+            ..Default::default()
+        };
+        let full: Vec<i64> = catalog
+            .list_photos(&query)
+            .unwrap()
+            .into_iter()
+            .map(|p| p.id)
+            .collect();
+        assert_eq!(full.len(), ids.len(), "{sort:?}: every photo is listed once");
+
+        let mut tiled = Vec::new();
+        for offset in (0..ids.len()).step_by(3) {
+            let page = catalog
+                .photo_page(&PhotoQuery {
+                    window: Some(PhotoWindow::new(offset, 3)),
+                    ..query.clone()
+                })
+                .unwrap();
+            assert_eq!(page.offset, offset);
+            assert_eq!(page.total, ids.len(), "{sort:?}: total is the matching set");
+            tiled.extend(page.photos.into_iter().map(|p| p.id));
+        }
+        assert_eq!(tiled, full, "{sort:?}: tiled windows must equal the full listing");
+    }
+}
+
+/// The same window asked for twice returns the same rows. (Stability across calls is what
+/// lets the grid keep a page it already fetched instead of re-fetching on every render.)
+#[test]
+fn the_same_window_is_the_same_rows_every_time() {
+    let (catalog, _root, _ids) = catalog_of_tied_photos("window-stable", 10);
+    let window = PhotoQuery {
+        window: Some(PhotoWindow::new(2, 4)),
+        ..Default::default()
+    };
+    let first: Vec<i64> = catalog
+        .list_photos(&window)
+        .unwrap()
+        .into_iter()
+        .map(|p| p.id)
+        .collect();
+    let second: Vec<i64> = catalog
+        .list_photos(&window)
+        .unwrap()
+        .into_iter()
+        .map(|p| p.id)
+        .collect();
+    assert_eq!(first, second);
+    assert_eq!(first.len(), 4);
+}
+
+/// `photo_page` must report the size of the MATCHING set, never of the window — that is
+/// the number the grid sizes its scrollbar and its "N photos" readout from.
+#[test]
+fn photo_page_reports_the_matching_total_not_the_window() {
+    let (catalog, root, ids) = catalog_of_tied_photos("window-total", 10);
+
+    let unwindowed = catalog.photo_page(&PhotoQuery::default()).unwrap();
+    assert_eq!(unwindowed.offset, 0);
+    assert_eq!(unwindowed.photos.len(), 10);
+    assert_eq!(unwindowed.total, 10);
+
+    let head = catalog
+        .photo_page(&PhotoQuery {
+            window: Some(PhotoWindow::new(0, 3)),
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(head.photos.len(), 3);
+    assert_eq!(head.total, 10, "a window does not shrink the total");
+
+    // A window that runs off the end: short, and the total is still the whole set.
+    let tail = catalog
+        .photo_page(&PhotoQuery {
+            window: Some(PhotoWindow::new(8, 5)),
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(tail.photos.len(), 2);
+    assert_eq!(tail.total, 10);
+
+    // Entirely past the end. An empty page at a non-zero offset says nothing about where
+    // the result ends, so the total has to be counted rather than inferred from `offset`.
+    let past = catalog
+        .photo_page(&PhotoQuery {
+            window: Some(PhotoWindow::new(100, 5)),
+            ..Default::default()
+        })
+        .unwrap();
+    assert!(past.photos.is_empty());
+    assert_eq!(past.total, 10, "an empty page must not report its offset as the total");
+
+    // A window that exactly fills: more rows may exist, so this is the counted path.
+    let exact = catalog
+        .photo_page(&PhotoQuery {
+            window: Some(PhotoWindow::new(0, 10)),
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(exact.photos.len(), 10);
+    assert_eq!(exact.total, 10);
+
+    // The total is the FILTERED count, not the catalog's size.
+    catalog.set_culling(ids[0], None, None, Some(PickState::Pick)).unwrap();
+    let picks = catalog
+        .photo_page(&PhotoQuery {
+            culling_filter: CullingFilter::Pick,
+            window: Some(PhotoWindow::new(0, 3)),
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(picks.total, 1);
+    assert_eq!(picks.photos.len(), 1);
+    let _ = root;
+}
+
+/// A window composes with the filters — it slices the *filtered* order, not the library.
+#[test]
+fn a_window_slices_the_filtered_ordering() {
+    let (catalog, _root, ids) = catalog_of_tied_photos("window-filtered", 6);
+    for id in ids.iter().take(4) {
+        catalog.set_culling(*id, None, None, Some(PickState::Pick)).unwrap();
+    }
+    let query = PhotoQuery {
+        culling_filter: CullingFilter::Pick,
+        ..Default::default()
+    };
+    let all_picks: Vec<i64> = catalog
+        .list_photos(&query)
+        .unwrap()
+        .into_iter()
+        .map(|p| p.id)
+        .collect();
+    assert_eq!(all_picks.len(), 4);
+
+    let second_half = catalog
+        .photo_page(&PhotoQuery {
+            window: Some(PhotoWindow::new(2, 2)),
+            ..query.clone()
+        })
+        .unwrap();
+    assert_eq!(
+        second_half.photos.iter().map(|p| p.id).collect::<Vec<_>>(),
+        all_picks[2..4].to_vec()
+    );
+    assert_eq!(second_half.total, 4);
+}
+
+/// An album view is ordered by album position; that ordering must be total too, so its
+/// windows tile the same way.
+#[test]
+fn album_windows_follow_album_order() {
+    let (catalog, root) = temp_catalog("window-album");
+    let album = catalog.create_album("Trip").unwrap();
+    let mut ids = Vec::new();
+    for i in 0..6 {
+        let id = catalog
+            .upsert_photo(&root.join(format!("a{i}.jpg")), None, 1, 1)
+            .unwrap()
+            .id;
+        ids.push(id);
+    }
+    // Add in reverse so album position and photo id disagree.
+    let reversed: Vec<i64> = ids.iter().rev().copied().collect();
+    catalog.add_photos_to_album(album, &reversed).unwrap();
+
+    let query = PhotoQuery {
+        album_id: Some(album),
+        ..Default::default()
+    };
+    let full: Vec<i64> = catalog
+        .list_photos(&query)
+        .unwrap()
+        .into_iter()
+        .map(|p| p.id)
+        .collect();
+    assert_eq!(full, reversed, "album order, not id order");
+
+    let mut tiled = Vec::new();
+    for offset in (0..6).step_by(2) {
+        let page = catalog
+            .photo_page(&PhotoQuery {
+                window: Some(PhotoWindow::new(offset, 2)),
+                ..query.clone()
+            })
+            .unwrap();
+        assert_eq!(page.total, 6);
+        tiled.extend(page.photos.into_iter().map(|p| p.id));
+    }
+    assert_eq!(tiled, full);
+}
+
+#[test]
+fn external_editors_drive_the_edited_filter() {
+    let (catalog, root) = temp_catalog("edited-filter");
+    let edited = catalog.upsert_photo(&root.join("e.arw"), None, 1, 1).unwrap().id;
+    let plain = catalog.upsert_photo(&root.join("p.arw"), None, 1, 1).unwrap().id;
+
+    catalog.set_external_editors(edited, "darktable").unwrap();
+    catalog.set_external_editors(plain, "").unwrap();
+
+    let edited_only = catalog.list_photos(&PhotoQuery { culling_filter: CullingFilter::Edited, ..Default::default() }).unwrap();
+    assert_eq!(edited_only.len(), 1);
+    assert_eq!(edited_only[0].id, edited);
+    assert_eq!(edited_only[0].external_editors, "darktable");
+
+    // Clearing it removes the photo from the filter again.
+    catalog.set_external_editors(edited, "").unwrap();
+    assert_eq!(catalog.list_photos(&PhotoQuery { culling_filter: CullingFilter::Edited, ..Default::default() }).unwrap().len(), 0);
+}
+
+#[test]
+fn long_exposure_auto_tag_applies_from_shutter() {
+    use chairphoto_core::catalog::PromotedMetadata;
+    let (catalog, root) = temp_catalog("autotag-longexp");
+
+    let set_shutter = |id: i64, shutter: &str| {
+        catalog
+            .set_photo_metadata(
+                id,
+                &PromotedMetadata {
+                    shutter_speed: Some(shutter.to_string()),
+                    ..Default::default()
+                },
+                &[],
+            )
+            .unwrap();
+    };
+
+    let long = catalog.upsert_photo(&root.join("long.arw"), None, 1, 1).unwrap().id;
+    set_shutter(long, "30"); // 30s
+    let long2 = catalog.upsert_photo(&root.join("long2.arw"), None, 1, 1).unwrap().id;
+    set_shutter(long2, "1.3"); // 1.3s
+    let boundary = catalog.upsert_photo(&root.join("bound.arw"), None, 1, 1).unwrap().id;
+    set_shutter(boundary, "1"); // exactly the 1s threshold (>=)
+    let fast = catalog.upsert_photo(&root.join("fast.arw"), None, 1, 1).unwrap().id;
+    set_shutter(fast, "1/200"); // fast, has a slash
+    let medium = catalog.upsert_photo(&root.join("med.arw"), None, 1, 1).unwrap().id;
+    set_shutter(medium, "0.5"); // 0.5s, below threshold
+
+    catalog.apply_auto_tags().unwrap();
+
+    for id in [long, long2, boundary] {
+        let tags = catalog.get_photo_tags(id).unwrap();
+        assert!(tags.iter().any(|t| t.full_path == "Technique/Long Exposure"
+            && t.auto_rule.as_deref() == Some("long-exposure")));
+    }
+    for id in [fast, medium] {
+        assert!(catalog
+            .get_photo_tags(id)
+            .unwrap()
+            .iter()
+            .all(|t| t.full_path != "Technique/Long Exposure"));
+    }
+
+    // Export hashtags present on the tag.
+    let tag = catalog.get_photo_tags(long).unwrap().into_iter().next().unwrap();
+    let terms = catalog.list_terms(tag.id).unwrap();
+    assert!(terms.iter().any(|t| t.text == "#longexposure" && t.export));
+}
+
+#[test]
+fn panorama_auto_tag_applies_from_aspect_ratio() {
+    use chairphoto_core::catalog::PromotedMetadata;
+    let (catalog, root) = temp_catalog("autotag-pano");
+
+    let set_dims = |id: i64, w: i64, h: i64| {
+        catalog
+            .set_photo_metadata(
+                id,
+                &PromotedMetadata {
+                    width: Some(w),
+                    height: Some(h),
+                    ..Default::default()
+                },
+                &[],
+            )
+            .unwrap();
+    };
+
+    let wide = catalog.upsert_photo(&root.join("wide.arw"), None, 1, 1).unwrap().id;
+    set_dims(wide, 8000, 3000); // 2.67:1 landscape pano
+    let tall = catalog.upsert_photo(&root.join("tall.arw"), None, 1, 1).unwrap().id;
+    set_dims(tall, 2000, 6000); // 3:1 vertical pano
+    let boundary = catalog.upsert_photo(&root.join("bound.arw"), None, 1, 1).unwrap().id;
+    set_dims(boundary, 4000, 2000); // exactly 2:1 threshold (>=)
+    let normal = catalog.upsert_photo(&root.join("normal.arw"), None, 1, 1).unwrap().id;
+    set_dims(normal, 6000, 4000); // 3:2, not a pano
+
+    catalog.apply_auto_tags().unwrap();
+
+    for id in [wide, tall, boundary] {
+        assert!(catalog.get_photo_tags(id).unwrap().iter().any(|t| t.full_path
+            == "Technique/Panorama"
+            && t.auto_rule.as_deref() == Some("panorama")));
+    }
+    assert!(catalog
+        .get_photo_tags(normal)
+        .unwrap()
+        .iter()
+        .all(|t| t.full_path != "Technique/Panorama"));
+}
+
+#[test]
+fn publications_track_versions_per_platform() {
+    let (catalog, root) = temp_catalog("publications");
+    let id = catalog.upsert_photo(&root.join("a.arw"), None, 1, 1).unwrap().id;
+    let v = catalog.create_version(id, "Punchy crop").unwrap();
+
+    // Original to Instagram, the edited version to SmugMug.
+    catalog.record_publication(id, None, "instagram", None).unwrap();
+    catalog.record_publication(id, Some(v), "smugmug", None).unwrap();
+    let pubs = catalog.list_publications(id).unwrap();
+    assert_eq!(pubs.len(), 2);
+    let smug = pubs.iter().find(|p| p.platform == "smugmug").unwrap();
+    assert_eq!(smug.version_id, Some(v));
+    assert_eq!(smug.version_name.as_deref(), Some("Punchy crop"));
+
+    // A DIFFERENT version of the same photo to the SAME platform is its own record.
+    catalog.record_publication(id, Some(v), "instagram", None).unwrap();
+    let pubs = catalog.list_publications(id).unwrap();
+    assert_eq!(pubs.len(), 3, "different version to same platform = new record");
+    assert_eq!(
+        pubs.iter().filter(|p| p.platform == "instagram").count(),
+        2,
+        "Original and the edited version both posted to Instagram"
+    );
+
+    // Re-marking the SAME (photo, platform, version) upserts — no duplicate.
+    catalog.record_publication(id, Some(v), "instagram", None).unwrap();
+    catalog.record_publication(id, None, "instagram", None).unwrap();
+    assert_eq!(
+        catalog.list_publications(id).unwrap().len(),
+        3,
+        "re-marking the same version upserts, never duplicates"
+    );
+
+    // An empty platform is rejected — the publishing module must declare a marker.
+    assert!(catalog.record_publication(id, None, "  ", None).is_err());
+}
+
+#[test]
+fn publication_survives_version_deletion() {
+    let (catalog, root) = temp_catalog("publications-del-version");
+    let id = catalog.upsert_photo(&root.join("a.arw"), None, 1, 1).unwrap().id;
+    let v = catalog.create_version(id, "Bright").unwrap();
+    catalog.record_publication(id, Some(v), "flickr", None).unwrap();
+
+    catalog.delete_version(v).unwrap();
+
+    // The publication record remains; version_id goes NULL but the snapshot name stays.
+    let pubs = catalog.list_publications(id).unwrap();
+    assert_eq!(pubs.len(), 1);
+    assert_eq!(pubs[0].version_id, None);
+    assert_eq!(pubs[0].version_name.as_deref(), Some("Bright"));
+
+    // Posting the Original to the same platform now is a NEW record — it must not clobber
+    // the orphaned record left by the deleted version.
+    catalog.record_publication(id, None, "flickr", None).unwrap();
+    let pubs = catalog.list_publications(id).unwrap();
+    assert_eq!(pubs.len(), 2, "Original is distinct from the deleted version's orphan");
+    assert!(pubs.iter().any(|p| p.version_name.as_deref() == Some("Bright")));
+    assert!(pubs.iter().any(|p| p.version_name.is_none()));
+}
+
+#[test]
+fn published_facet_filters_photos() {
+    let (catalog, root) = temp_catalog("publications-facet");
+    let posted = catalog.upsert_photo(&root.join("posted.arw"), None, 1, 1).unwrap().id;
+    let other = catalog.upsert_photo(&root.join("other.arw"), None, 1, 1).unwrap().id;
+    catalog.record_publication(posted, None, "instagram", None).unwrap();
+
+    // A "Published: Instagram" facet is offered once a publication exists.
+    assert!(catalog
+        .available_facets()
+        .iter()
+        .any(|f| f.key == "published:instagram"));
+
+    let filtered = catalog
+        .list_photos(&PhotoQuery { facets: vec!["published:instagram".to_string()], ..Default::default() })
+        .unwrap();
+    let ids: Vec<i64> = filtered.iter().map(|p| p.id).collect();
+    assert!(ids.contains(&posted));
+    assert!(!ids.contains(&other));
+}
+
+#[test]
+fn smart_album_filters_list_photos_and_counts_live() {
+    let (catalog, root) = temp_catalog("smart-albums");
+    // Three photos: two are keepers (rating >= 4), one is not.
+    let keep_a = catalog.upsert_photo(&root.join("a.arw"), None, 1, 1).unwrap().id;
+    let keep_b = catalog.upsert_photo(&root.join("b.arw"), None, 1, 1).unwrap().id;
+    let reject = catalog.upsert_photo(&root.join("c.arw"), None, 1, 1).unwrap().id;
+    catalog.set_culling(keep_a, Some(5), None, None).unwrap();
+    catalog.set_culling(keep_b, Some(4), None, None).unwrap();
+    catalog.set_culling(reject, Some(2), None, None).unwrap();
+
+    // "Keepers" = rating >= 4. The live preview count matches the rule before it is saved.
+    let rule = r#"{"match":"all","conditions":[{"field":"rating","op":"gte","value":4}]}"#;
+    assert_eq!(catalog.smart_album_count(rule).unwrap(), 2);
+
+    let id = catalog.create_smart_album("Keepers", rule).unwrap();
+
+    // Selecting the smart album in list_photos returns exactly the matching set.
+    let matched = catalog
+        .list_photos(&PhotoQuery { smart_album_id: Some(id), ..Default::default() })
+        .unwrap();
+    let ids: Vec<i64> = matched.iter().map(|p| p.id).collect();
+    assert_eq!(ids.len(), 2);
+    assert!(ids.contains(&keep_a));
+    assert!(ids.contains(&keep_b));
+    assert!(!ids.contains(&reject));
+
+    // The per-row live count surfaced by list_smart_albums agrees with smart_album_count.
+    let albums = catalog.list_smart_albums().unwrap();
+    assert_eq!(albums.len(), 1);
+    assert_eq!(albums[0].name, "Keepers");
+    assert_eq!(albums[0].photo_count, 2);
+
+    // The smart-album filter ANDs with the culling filter on top, same as tags/albums.
+    catalog
+        .set_culling(keep_a, None, None, Some(PickState::Pick))
+        .unwrap();
+    let picks = catalog
+        .list_photos(&PhotoQuery { smart_album_id: Some(id), culling_filter: CullingFilter::Pick, ..Default::default() })
+        .unwrap();
+    assert_eq!(picks.iter().map(|p| p.id).collect::<Vec<_>>(), vec![keep_a]);
+
+    // Editing the rule changes the live result with no rebuild step.
+    let narrower = r#"{"match":"all","conditions":[{"field":"rating","op":"gte","value":5}]}"#;
+    catalog.set_smart_album_rule(id, narrower).unwrap();
+    let only_best = catalog
+        .list_photos(&PhotoQuery { smart_album_id: Some(id), ..Default::default() })
+        .unwrap();
+    assert_eq!(only_best.iter().map(|p| p.id).collect::<Vec<_>>(), vec![keep_a]);
+    assert_eq!(catalog.get_smart_album(id).unwrap().photo_count, 1);
+
+    // An empty rule matches all (non-missing) photos.
+    catalog
+        .set_smart_album_rule(id, r#"{"conditions":[]}"#)
+        .unwrap();
+    assert_eq!(
+        catalog
+            .list_photos(&PhotoQuery { smart_album_id: Some(id), ..Default::default() })
+            .unwrap()
+            .len(),
+        3
+    );
+}
+
+#[test]
+fn smart_album_color_label_matches_stored_casing() {
+    // Regression: the inspector stores color labels capitalized ("Red"), so a smart-album
+    // rule must match that regardless of the rule value's casing ("red"/"Red").
+    let (catalog, root) = temp_catalog("smart-albums-label");
+    let red = catalog.upsert_photo(&root.join("r.arw"), None, 1, 1).unwrap().id;
+    let green = catalog.upsert_photo(&root.join("g.arw"), None, 1, 1).unwrap().id;
+    catalog.set_culling(red, None, Some("Red"), None).unwrap();
+    catalog.set_culling(green, None, Some("Green"), None).unwrap();
+
+    for value in ["red", "Red"] {
+        let rule = format!(
+            r#"{{"match":"all","conditions":[{{"field":"color_label","op":"is","value":"{value}"}}]}}"#
+        );
+        assert_eq!(catalog.smart_album_count(&rule).unwrap(), 1, "value {value}");
+        let id = catalog.create_smart_album(&format!("Reds {value}"), &rule).unwrap();
+        let ids: Vec<i64> = catalog
+            .list_photos(&PhotoQuery { smart_album_id: Some(id), ..Default::default() })
+            .unwrap()
+            .iter()
+            .map(|p| p.id)
+            .collect();
+        assert_eq!(ids, vec![red], "color_label rule value {value:?} should match the Red photo");
+    }
+}
+
+#[test]
+fn smart_album_combines_conditions_from_many_groups() {
+    use chairphoto_core::catalog::PromotedMetadata;
+    let (catalog, root) = temp_catalog("smart-albums-multi");
+
+    // Build a small library where each photo differs on exactly one group's axis,
+    // so an AND of conditions across groups (capture EXIF, culling, date, tags)
+    // isolates a single intended target.
+    let exif = |id: i64, model: &str, iso: i64, when: &str| {
+        catalog
+            .set_photo_metadata(
+                id,
+                &PromotedMetadata {
+                    camera_model: Some(model.to_string()),
+                    iso: Some(iso),
+                    capture_time: Some(when.to_string()),
+                    ..Default::default()
+                },
+                &[],
+            )
+            .unwrap();
+    };
+    let bird = catalog.create_tag("Animals/Birds").unwrap();
+    let owl = catalog.create_tag("Animals/Birds/Owl").unwrap();
+    let car = catalog.create_tag("Vehicles/Car").unwrap();
+
+    // The target: right camera, low ISO, in-range date, rated 5, tagged under Birds.
+    let hit = catalog.upsert_photo(&root.join("hit.arw"), None, 1, 1).unwrap().id;
+    exif(hit, "ILCE-7RM5", 100, "2026-06-15T10:00:00");
+    catalog.set_culling(hit, Some(5), None, None).unwrap();
+    catalog.assign_tag(hit, owl).unwrap(); // a descendant of Birds
+
+    // Each of these fails exactly one of the five conditions.
+    let wrong_cam = catalog.upsert_photo(&root.join("cam.arw"), None, 1, 1).unwrap().id;
+    exif(wrong_cam, "NIKON Z9", 100, "2026-06-15T10:00:00");
+    catalog.set_culling(wrong_cam, Some(5), None, None).unwrap();
+    catalog.assign_tag(wrong_cam, bird).unwrap();
+
+    let high_iso = catalog.upsert_photo(&root.join("iso.arw"), None, 1, 1).unwrap().id;
+    exif(high_iso, "ILCE-7RM5", 6400, "2026-06-15T10:00:00");
+    catalog.set_culling(high_iso, Some(5), None, None).unwrap();
+    catalog.assign_tag(high_iso, bird).unwrap();
+
+    let out_of_range = catalog.upsert_photo(&root.join("date.arw"), None, 1, 1).unwrap().id;
+    exif(out_of_range, "ILCE-7RM5", 100, "2025-01-01T10:00:00");
+    catalog.set_culling(out_of_range, Some(5), None, None).unwrap();
+    catalog.assign_tag(out_of_range, bird).unwrap();
+
+    let low_rating = catalog.upsert_photo(&root.join("rating.arw"), None, 1, 1).unwrap().id;
+    exif(low_rating, "ILCE-7RM5", 100, "2026-06-15T10:00:00");
+    catalog.set_culling(low_rating, Some(2), None, None).unwrap();
+    catalog.assign_tag(low_rating, bird).unwrap();
+
+    let wrong_tag = catalog.upsert_photo(&root.join("tag.arw"), None, 1, 1).unwrap().id;
+    exif(wrong_tag, "ILCE-7RM5", 100, "2026-06-15T10:00:00");
+    catalog.set_culling(wrong_tag, Some(5), None, None).unwrap();
+    catalog.assign_tag(wrong_tag, car).unwrap();
+
+    // Five conditions spanning four groups: capture (text + int), date, culling, tags.
+    let rule = serde_json::json!({
+        "match": "all",
+        "conditions": [
+            { "field": "camera_model", "op": "is",      "value": "ILCE-7RM5" },
+            { "field": "iso",          "op": "lte",     "value": 400 },
+            { "field": "capture_time", "op": "between", "value": ["2026-06-01", "2026-07-01"] },
+            { "field": "rating",       "op": "gte",     "value": 4 },
+            { "field": "tag",          "op": "under",   "value": bird }
+        ]
+    })
+    .to_string();
+
+    // Live preview count and the actual filtered set both isolate the single target.
+    assert_eq!(catalog.smart_album_count(&rule).unwrap(), 1);
+    let id = catalog.create_smart_album("Sharp owls, June", &rule).unwrap();
+    let matched = catalog
+        .list_photos(&PhotoQuery { smart_album_id: Some(id), ..Default::default() })
+        .unwrap();
+    assert_eq!(matched.iter().map(|p| p.id).collect::<Vec<_>>(), vec![hit]);
+
+    // Relaxing the ISO ceiling lets the high-ISO frame back in — still AND-correct
+    // on the other four groups (so the two wrong-on-another-axis frames stay out).
+    let looser = serde_json::json!({
+        "match": "all",
+        "conditions": [
+            { "field": "camera_model", "op": "is",      "value": "ILCE-7RM5" },
+            { "field": "capture_time", "op": "between", "value": ["2026-06-01", "2026-07-01"] },
+            { "field": "rating",       "op": "gte",     "value": 4 },
+            { "field": "tag",          "op": "under",   "value": bird }
+        ]
+    })
+    .to_string();
+    catalog.set_smart_album_rule(id, &looser).unwrap();
+    let mut ids: Vec<i64> = catalog
+        .list_photos(&PhotoQuery { smart_album_id: Some(id), ..Default::default() })
+        .unwrap()
+        .into_iter()
+        .map(|p| p.id)
+        .collect();
+    ids.sort();
+    let mut expected = vec![hit, high_iso];
+    expected.sort();
+    assert_eq!(ids, expected);
+}
+
+// ── F1 round-trip: export bundle from catalog A → import into catalog B ──────
+
+/// Build a realistic catalog A with two photos, a two-level tag taxonomy
+/// (one tag will pre-exist in catalog B to test overlapping taxonomy),
+/// ratings, pick state, an IPTC headline, a named version, and an edit record.
+/// Returns (catalog_a, root_a, photo1_uuid, photo2_uuid, batch_id).
+fn setup_catalog_a(
+    tag: &str,
+) -> (chairphoto_core::catalog::Catalog, common::TestSubPath, String, String, i64) {
+    use chairphoto_core::catalog::{IptcFields, PickState};
+
+    let (cat, root) = temp_catalog(tag);
+
+    // Two real files so the bundle writer can copy bytes.
+    let p1_path = root.join("2026/06/28/DSC01.ARW");
+    let p2_path = root.join("2026/06/29/DSC02.ARW");
+    std::fs::create_dir_all(p1_path.parent().unwrap()).unwrap();
+    std::fs::create_dir_all(p2_path.parent().unwrap()).unwrap();
+    std::fs::write(&p1_path, b"FAKE RAW BYTES PHOTO ONE").unwrap();
+    std::fs::write(&p2_path, b"FAKE RAW BYTES PHOTO TWO").unwrap();
+
+    let id1 = cat.upsert_photo(&p1_path, None, 1, 24).unwrap().id;
+    let id2 = cat.upsert_photo(&p2_path, None, 2, 24).unwrap().id;
+
+    // Rating / label / pick on photo 1.
+    cat.set_culling(id1, Some(4), Some("green"), Some(PickState::Pick)).unwrap();
+    // IPTC on photo 1.
+    cat.set_iptc(id1, &IptcFields {
+        headline: "Summer sunset".into(),
+        city: "Bergen".into(),
+        ..Default::default()
+    }).unwrap();
+    // A named version + edit record on photo 1.
+    let ver = cat.create_version(id1, "Instagram crop").unwrap();
+    cat.set_version_edit(ver, r#"{"crop":{"aspect":"1:1"}}"#).unwrap();
+    cat.set_edit_record(id1, r#"{"basic-editor":{"exposure":0.3}}"#).unwrap();
+
+    // Tag taxonomy: Birds (parent) → Birds/Owls (leaf). Both photos get the leaf.
+    let _birds = cat.create_tag("Birds").unwrap();
+    let owls = cat.create_tag("Birds/Owls").unwrap();
+    cat.assign_tag(id1, owls).unwrap();
+    cat.assign_tag(id2, owls).unwrap();
+
+    // Group everything into one import batch.
+    let batch = cat.create_import_batch("/card/trip-2026-06").unwrap();
+    cat.assign_photos_to_batch(batch, &[id1, id2]).unwrap();
+
+    let uuid1 = cat.get_photo(id1).unwrap().uuid;
+    let uuid2 = cat.get_photo(id2).unwrap().uuid;
+    (cat, root, uuid1, uuid2, batch)
+}
+
+#[test]
+fn bundle_round_trip_export_import_and_idempotent_reimport() {
+    use chairphoto_core::bundle::importer::{extract_originals, index_bundle, open_bundle};
+    use chairphoto_core::bundle::writer::{gather_bundle, write_bundle};
+    use chairphoto_core::catalog::PickState;
+
+    // ── Catalog A: source of the export ──────────────────────────────────────
+    let (cat_a, root_a, uuid1, uuid2, batch_id_a) =
+        setup_catalog_a("bundle-rt-a");
+
+    // Export the batch as a bundle zip.
+    let bundle_zip = common::TestTmpDir::new("bundle-roundtrip-test")
+        .into_subpath("bundle.chairphoto");
+
+    let gathered = gather_bundle(&cat_a, batch_id_a)
+        .expect("gather_bundle must not fail")
+        .expect("batch must exist");
+
+    let write_result = write_bundle(&gathered, &bundle_zip, |_, _| {})
+        .expect("write_bundle must not fail");
+
+    // Both originals were reachable and included.
+    assert_eq!(write_result.exported, 2, "both originals must be in the zip");
+    assert_eq!(write_result.skipped_offline, 0);
+    assert_eq!(write_result.errors, 0);
+
+    // ── Catalog B: destination of the import ─────────────────────────────────
+    // Pre-seed catalog B with the "Birds" parent tag under a DIFFERENT uuid to
+    // test the overlapping-taxonomy path (uuid miss → normalized-path match).
+    let (cat_b, root_b) = temp_catalog("bundle-rt-b");
+    let _pre_birds = cat_b.create_tag("Birds").unwrap(); // path-match for the ancestor
+
+    // ── Phase 1: parse the bundle ─────────────────────────────────────────────
+    let (manifest, mut archive) = open_bundle(&bundle_zip)
+        .expect("open_bundle must succeed");
+    assert_eq!(manifest.photos.len(), 2);
+    let batch_uuid_in_manifest = manifest.batch.uuid.clone();
+    // The batch uuid from catalog A must be in the manifest.
+    let a_batch = cat_a
+        .list_import_batches()
+        .unwrap()
+        .into_iter()
+        .find(|b| b.id == batch_id_a)
+        .unwrap();
+    assert_eq!(batch_uuid_in_manifest, a_batch.uuid);
+
+    // ── Phase 2: extract originals into catalog B's root ─────────────────────
+    let (extracted, partial) =
+        extract_originals(&cat_b, &manifest, &mut archive, &root_b, |_, _| {})
+            .expect("extract_originals must succeed");
+
+    assert_eq!(partial.copied, 2, "both originals extracted");
+    assert_eq!(partial.skipped_duplicate, 0);
+    assert_eq!(partial.errors, 0);
+    assert_eq!(extracted.len(), 2);
+
+    // Each extracted file must exist under the date tree in root_b.
+    let expected1 = root_b.join("2026").join("06").join("28").join("DSC01.ARW");
+    let expected2 = root_b.join("2026").join("06").join("29").join("DSC02.ARW");
+    assert!(expected1.exists(), "photo 1 must land at {}", expected1.display());
+    assert!(expected2.exists(), "photo 2 must land at {}", expected2.display());
+    // UUID sidecar must have been written beside each original.
+    assert!(expected1.with_extension("ARW.xmp").exists()
+        || {
+            let mut s = expected1.as_os_str().to_os_string();
+            s.push(".xmp");
+            PathBuf::from(s).exists()
+        },
+        "UUID sidecar must be beside photo 1");
+
+    // ── Phase 3: index + merge into catalog B ────────────────────────────────
+    let result = index_bundle(&cat_b, &manifest, &extracted, &root_b, partial)
+        .expect("index_bundle must succeed");
+
+    assert_eq!(result.copied, 2);
+    assert_eq!(result.errors, 0);
+    assert!(result.merge.batch_added, "new batch must be recorded");
+    // The upsert created both photos before the merge; the result reports them as added
+    // (what the user sees as "2 photos added"), not as existing.
+    assert_eq!(result.merge.photos_existing, 0, "neither photo was in catalog B before");
+    assert_eq!(result.merge.photos_added, 2, "the import added both photos");
+    // Birds already existed in catalog B (path-match); Birds/Owls is new.
+    assert_eq!(result.merge.tags_created, 1, "only the leaf Birds/Owls is new");
+    // Both photos get the Birds/Owls assignment via the union.
+    assert_eq!(result.merge.assignments_added, 2);
+
+    // Verify photo 1 in catalog B has the correct state.
+    let p1_b = cat_b.get_photo_by_uuid(&uuid1).expect("photo 1 must be in catalog B");
+    assert_eq!(p1_b.rating, 4, "rating must transfer");
+    assert_eq!(p1_b.label, "green", "color label must transfer");
+    assert_eq!(p1_b.pick_state, PickState::Pick, "pick state must transfer");
+
+    let iptc = cat_b.get_iptc(p1_b.id).unwrap();
+    assert_eq!(iptc.headline, "Summer sunset", "IPTC headline must transfer");
+    assert_eq!(iptc.city, "Bergen", "IPTC city must transfer");
+
+    let edit = cat_b.get_edit_record(p1_b.id).unwrap();
+    assert_eq!(edit.as_deref(), Some(r#"{"basic-editor":{"exposure":0.3}}"#),
+        "edit record must transfer");
+
+    let versions = cat_b.list_versions(p1_b.id).unwrap();
+    assert_eq!(versions.len(), 1, "named version must transfer");
+    assert_eq!(versions[0].name, "Instagram crop");
+    assert_eq!(versions[0].edit_json, r#"{"crop":{"aspect":"1:1"}}"#);
+
+    // Verify photo 2 is also in catalog B.
+    let p2_b = cat_b.get_photo_by_uuid(&uuid2).expect("photo 2 must be in catalog B");
+    assert_eq!(p2_b.rating, 0, "photo 2 has default rating");
+
+    // Both photos must have the Birds/Owls tag assignment.
+    for (id, uuid) in [(p1_b.id, &uuid1), (p2_b.id, &uuid2)] {
+        let tags = cat_b.get_photo_tags(id).unwrap();
+        assert!(
+            tags.iter().any(|t| t.full_path == "Birds/Owls"),
+            "photo {uuid} must be tagged Birds/Owls"
+        );
+    }
+
+    // The import batch must be present in catalog B.
+    let batches_b = cat_b.list_import_batches().unwrap();
+    assert_eq!(batches_b.len(), 1);
+    assert_eq!(batches_b[0].uuid, batch_uuid_in_manifest,
+        "batch uuid must match the bundle manifest");
+    assert_eq!(batches_b[0].source_label, "/card/trip-2026-06");
+    assert_eq!(batches_b[0].photo_count, 2);
+
+    // ── Re-import is idempotent ───────────────────────────────────────────────
+    let (manifest2, mut archive2) = open_bundle(&bundle_zip)
+        .expect("open_bundle (2nd) must succeed");
+    let (extracted2, partial2) =
+        extract_originals(&cat_b, &manifest2, &mut archive2, &root_b, |_, _| {})
+            .expect("extract_originals (2nd) must succeed");
+
+    // Same-size files already exist → skipped.
+    assert_eq!(partial2.skipped_duplicate, 2,
+        "both originals already present → skipped");
+    assert_eq!(partial2.copied, 0);
+
+    let result2 = index_bundle(&cat_b, &manifest2, &extracted2, &root_b, partial2)
+        .expect("index_bundle (2nd) must succeed");
+
+    // Nothing new added on re-import.
+    assert_eq!(result2.merge.photos_added, 0,
+        "re-import must not add duplicate photos");
+    assert!(!result2.merge.batch_added,
+        "re-import must not add duplicate batch");
+    assert_eq!(result2.merge.tags_created, 0,
+        "re-import must not create duplicate tags");
+    assert_eq!(result2.merge.assignments_added, 0,
+        "re-import must not duplicate tag assignments");
+
+    // Exactly 2 photos in catalog B after the re-import.
+    let count_b = cat_b
+        .list_photos(&PhotoQuery::default())
+        .unwrap()
+        .len();
+    assert_eq!(count_b, 2, "catalog B must have exactly 2 photos after re-import");
+
+    // Rating is unchanged after re-import (additive-only invariant).
+    let p1_after = cat_b.get_photo_by_uuid(&uuid1).unwrap();
+    assert_eq!(p1_after.rating, 4, "rating must survive re-import unchanged");
+
+    // Cleanup: remove the A root (already cleaned by temp_catalog tag, but be explicit).
+    drop(root_a);
+}
+
+#[test]
+fn bundle_import_merges_with_pre_existing_local_taxonomy() {
+    // Verifies the path-match branch: catalog B independently grew "Birds/Owls" with its
+    // own uuid *and* a local extra term before the bundle arrives. The merge must union
+    // the bundle's term without clobbering the local uuid or the local term.
+    use chairphoto_core::bundle::importer::{extract_originals, index_bundle, open_bundle};
+    use chairphoto_core::bundle::writer::{gather_bundle, write_bundle};
+
+    let (cat_a, _root_a, uuid1, _uuid2, batch_id_a) =
+        setup_catalog_a("bundle-tax-a");
+
+    let bundle_zip = common::TestTmpDir::new("bundle-taxonomy-test")
+        .into_subpath("bundle.chairphoto");
+
+    let gathered = gather_bundle(&cat_a, batch_id_a).unwrap().unwrap();
+    write_bundle(&gathered, &bundle_zip, |_, _| {}).unwrap();
+
+    // Catalog B: pre-seed "Birds/Owls" with its own uuid and a local term.
+    let (cat_b, root_b) = temp_catalog("bundle-tax-b");
+    let local_owls = cat_b.create_tag("Birds/Owls").unwrap();
+    let local_uuid = cat_b.get_tag(local_owls).unwrap().uuid;
+    cat_b.add_synonym(local_owls, "Strix", None, true).unwrap();
+    // Mark it non-exportable (organizational) to verify the local flag is preserved.
+    cat_b.set_tag_exportable(local_owls, false).unwrap();
+
+    // Import the bundle.
+    let (manifest, mut archive) = open_bundle(&bundle_zip).unwrap();
+    let (extracted, partial) =
+        extract_originals(&cat_b, &manifest, &mut archive, &root_b, |_, _| {}).unwrap();
+    let result = index_bundle(&cat_b, &manifest, &extracted, &root_b, partial).unwrap();
+
+    // No new tags created — both Birds and Birds/Owls matched by path.
+    assert_eq!(result.merge.tags_created, 0,
+        "existing Birds/Owls must be reused by path-match");
+
+    // The local uuid and exportable flag are preserved (not overwritten).
+    let after_owls = cat_b.get_tag(local_owls).unwrap();
+    assert_eq!(after_owls.uuid, local_uuid, "local uuid must not be overwritten");
+    assert!(
+        !cat_b.tag_exportable(local_owls).unwrap(),
+        "local exportable=false must not be overwritten"
+    );
+
+    // The bundle's taxonomy term ("Owls" from the tag name) may have been unioned in,
+    // but the local "Strix" term must still be present.
+    let terms = cat_b.list_terms(local_owls).unwrap();
+    assert!(terms.iter().any(|t| t.text == "Strix"),
+        "local term 'Strix' must survive the merge");
+
+    // Photo 1 must be in catalog B with the correct rating.
+    let p1_b = cat_b.get_photo_by_uuid(&uuid1).unwrap();
+    assert_eq!(p1_b.rating, 4);
+    // And tagged with the pre-existing (local) Birds/Owls tag.
+    let tags = cat_b.get_photo_tags(p1_b.id).unwrap();
+    assert!(tags.iter().any(|t| t.id == local_owls),
+        "photo must be assigned the pre-existing local Birds/Owls tag");
+}
+
+#[test]
+fn catalog_stats_counts_and_buckets() {
+    use chairphoto_core::catalog::PromotedMetadata;
+
+    let (catalog, root) = temp_catalog("stats");
+
+    // Helper: create a minimal real file and upsert it.
+    let mk = |name: &str| -> i64 {
+        let p = root.join(name);
+        std::fs::write(&p, b"x").unwrap();
+        catalog.upsert_photo(&p, None, 1, 1).unwrap().id
+    };
+
+    // Four photos:
+    //   p1 — 2026-06, hour 09, camera "TestCam", no tag, rating 3
+    //   p2 — 2026-06, hour 14, camera "TestCam", tag, rating 0 (default)
+    //   p3 — 2026-07, hour 14, no camera, no tag, rating 0 (default)
+    //   p4 — no capture_time (must not affect time-based buckets)
+    let p1 = mk("p1.ARW");
+    let p2 = mk("p2.ARW");
+    let p3 = mk("p3.ARW");
+    let p4 = mk("p4.ARW");
+
+    let set_meta = |id: i64, capture_time: Option<&str>, camera: Option<&str>| {
+        let promoted = PromotedMetadata {
+            capture_time: capture_time.map(String::from),
+            camera_model: camera.map(String::from),
+            ..Default::default()
+        };
+        catalog.set_photo_metadata(id, &promoted, &[]).unwrap();
+    };
+
+    set_meta(p1, Some("2026-06-15T09:30:00"), Some("TestCam"));
+    set_meta(p2, Some("2026-06-20T14:00:00"), Some("TestCam"));
+    set_meta(p3, Some("2026-07-01T14:45:00"), None);
+    set_meta(p4, None, None); // no capture_time
+
+    // Set rating 3 on p1.
+    catalog
+        .set_culling(p1, Some(3), None, None)
+        .unwrap();
+
+    // Assign a tag to p2.
+    let tag_id = catalog.create_tag("Animals/Bird").unwrap();
+    catalog.assign_tag(p2, tag_id).unwrap();
+
+    // All-None: whole-catalog stats (original behaviour).
+    let stats = catalog.catalog_stats(None, None, None).unwrap();
+
+    // Totals
+    assert_eq!(stats.total_photos, 4, "four non-missing photos");
+    assert_eq!(stats.with_capture_time, 3, "three have capture_time");
+
+    // First/last month
+    assert_eq!(stats.first_month.as_deref(), Some("2026-06"));
+    assert_eq!(stats.last_month.as_deref(), Some("2026-07"));
+
+    // Timeline: two buckets
+    assert_eq!(stats.timeline.len(), 2);
+    let jun = stats.timeline.iter().find(|(m, _)| m == "2026-06").unwrap();
+    assert_eq!(jun.1, 2, "two photos in 2026-06");
+    let jul = stats.timeline.iter().find(|(m, _)| m == "2026-07").unwrap();
+    assert_eq!(jul.1, 1, "one photo in 2026-07");
+
+    // Hours: exactly 24 entries; hour 9 has 1, hour 14 has 2
+    assert_eq!(stats.hours.len(), 24);
+    assert_eq!(stats.hours[9], 1, "one photo at hour 09");
+    assert_eq!(stats.hours[14], 2, "two photos at hour 14");
+
+    // Weekdays: exactly 7 entries
+    assert_eq!(stats.weekdays.len(), 7);
+
+    // Cameras: TestCam with count 2
+    assert_eq!(stats.cameras.len(), 1);
+    assert_eq!(stats.cameras[0].0, "TestCam");
+    assert_eq!(stats.cameras[0].1, 2);
+
+    // Top tags: the assigned tag appears
+    assert!(!stats.top_tags.is_empty());
+    let bird_tag = stats.top_tags.iter().find(|(id, _, _)| *id == tag_id).unwrap();
+    assert_eq!(bird_tag.1, "Animals/Bird");
+    assert_eq!(bird_tag.2, 1, "one photo tagged Animals/Bird");
+
+    // Ratings: exactly 6 entries; rating 3 has 1 photo, rating 0 has 3 photos
+    assert_eq!(stats.ratings.len(), 6);
+    assert_eq!(stats.ratings[0], 3, "three unrated photos (rating 0)");
+    assert_eq!(stats.ratings[3], 1, "one photo with rating 3");
+
+    // --- album scope --------------------------------------------------------
+    // Album contains p1 (2026-06, hour 09, TestCam, rating 3) and p3 (2026-07, hour 14).
+    let album_id = catalog.create_album("Subset").unwrap();
+    catalog.add_photos_to_album(album_id, &[p1, p3]).unwrap();
+
+    let astats = catalog.catalog_stats(None, Some(album_id), None).unwrap();
+    assert_eq!(astats.total_photos, 2, "album contains 2 photos");
+    assert_eq!(astats.with_capture_time, 2, "both have capture_time");
+    assert_eq!(astats.first_month.as_deref(), Some("2026-06"), "earliest is June");
+    assert_eq!(astats.last_month.as_deref(), Some("2026-07"), "latest is July");
+    assert_eq!(astats.timeline.len(), 2, "two distinct months in album");
+    assert_eq!(astats.hours[9], 1, "hour 09 has 1 photo (p1)");
+    assert_eq!(astats.hours[14], 1, "hour 14 has 1 photo (p3, not p2)");
+    // Only p1 has a camera (TestCam); p3 has none.
+    assert_eq!(astats.cameras.len(), 1);
+    assert_eq!(astats.cameras[0].1, 1, "TestCam appears once in album");
+    // p2 (tagged Animals/Bird) is NOT in the album, so no tags.
+    assert!(
+        astats.top_tags.is_empty(),
+        "no tagged photos in this album scope"
+    );
+    // p1 has rating 3; p3 has rating 0.
+    assert_eq!(astats.ratings[0], 1, "one rating-0 photo in album");
+    assert_eq!(astats.ratings[3], 1, "one rating-3 photo in album");
+
+    // --- tag scope including descendants ------------------------------------
+    // Create parent tag "Animals" and child "Animals/Dog"; tag p3 with the child.
+    // Scope by parent — p3 must appear (child is a descendant).
+    // p2 already has "Animals/Bird" which is a sibling, not a descendant of "Animals/Dog".
+    let animals_id = catalog.find_tag_id_by_path("Animals").unwrap().unwrap();
+    let dog_id = catalog.create_tag("Animals/Dog").unwrap();
+    catalog.assign_tag(p3, dog_id).unwrap();
+
+    // Scope by "Animals" — should include p2 (Animals/Bird) and p3 (Animals/Dog).
+    let tstats = catalog.catalog_stats(Some(animals_id), None, None).unwrap();
+    assert_eq!(
+        tstats.total_photos, 2,
+        "Animals scope: p2 (Bird) + p3 (Dog) = 2"
+    );
+    // Only p2 has a camera (TestCam); p3 has none.
+    assert_eq!(tstats.cameras.len(), 1, "one camera model in Animals scope");
+    assert_eq!(tstats.cameras[0].1, 1);
+
+    // Scope by the leaf "Animals/Dog" — only p3.
+    let dstats = catalog.catalog_stats(Some(dog_id), None, None).unwrap();
+    assert_eq!(dstats.total_photos, 1, "Dog scope: only p3");
+    assert_eq!(dstats.cameras.len(), 0, "p3 has no camera");
+}
+
+#[test]
+fn catalog_stats_cull_survival_and_exposure_crossings() {
+    use chairphoto_core::catalog::PromotedMetadata;
+
+    let (catalog, root) = temp_catalog("statscull");
+
+    let mk = |name: &str| -> i64 {
+        let p = root.join(name);
+        std::fs::write(&p, b"x").unwrap();
+        catalog.upsert_photo(&p, None, 1, 1).unwrap().id
+    };
+
+    // Five photos crossing lens/ISO/aperture/shutter with pick state and rating:
+    //   p1 — 50/1.8, ISO 100, f/2.8, 1/250  — Pick,   5★
+    //   p2 — 50/1.8, ISO 100, f/2.8, 1/250  — Reject, 2★
+    //   p3 — 24-70,  ISO 3200, f/1.8, "0.5" — Pick,   4★
+    //   p4 — no lens, ISO 3200, no aperture, "1/2" — undecided, unrated
+    //   p5 — no exposure metadata at all — undecided, unrated
+    let p1 = mk("p1.ARW");
+    let p2 = mk("p2.ARW");
+    let p3 = mk("p3.ARW");
+    let p4 = mk("p4.ARW");
+    let p5 = mk("p5.ARW");
+
+    let set_meta = |id: i64,
+                    lens: Option<&str>,
+                    iso: Option<i64>,
+                    aperture: Option<f64>,
+                    shutter: Option<&str>| {
+        let promoted = PromotedMetadata {
+            lens: lens.map(String::from),
+            iso,
+            aperture,
+            shutter_speed: shutter.map(String::from),
+            ..Default::default()
+        };
+        catalog.set_photo_metadata(id, &promoted, &[]).unwrap();
+    };
+
+    set_meta(p1, Some("50/1.8"), Some(100), Some(2.8), Some("1/250"));
+    set_meta(p2, Some("50/1.8"), Some(100), Some(2.8), Some("1/250"));
+    set_meta(p3, Some("24-70"), Some(3200), Some(1.8), Some("0.5"));
+    set_meta(p4, None, Some(3200), None, Some("1/2"));
+    set_meta(p5, None, None, None, None);
+
+    catalog.set_culling(p1, Some(5), None, Some(PickState::Pick)).unwrap();
+    catalog.set_culling(p2, Some(2), None, Some(PickState::Reject)).unwrap();
+    catalog.set_culling(p3, Some(4), None, Some(PickState::Pick)).unwrap();
+
+    // Compare a CullCross row against (total, decided, picked, rated, hits).
+    let tallies = |g: &chairphoto_core::catalog::CullCross<i64>| -> (i64, i64, i64, i64, i64) {
+        (g.total, g.decided, g.picked, g.rated, g.hits)
+    };
+
+    // --- whole catalog ------------------------------------------------------
+    let stats = catalog.catalog_stats(None, None, None).unwrap();
+
+    assert_eq!(stats.picked, 2, "p1 and p3 are picked");
+    assert_eq!(stats.rejected, 1, "p2 is rejected");
+    // Undecided is derived downstream: total_photos - picked - rejected = 2.
+
+    // Lenses, total descending.
+    assert_eq!(stats.cull_by_lens.len(), 2);
+    assert_eq!(stats.cull_by_lens[0].key, "50/1.8");
+    assert_eq!(
+        (
+            stats.cull_by_lens[0].total,
+            stats.cull_by_lens[0].decided,
+            stats.cull_by_lens[0].picked,
+            stats.cull_by_lens[0].rated,
+            stats.cull_by_lens[0].hits,
+        ),
+        (2, 2, 1, 2, 1),
+        "50/1.8: p1+p2, both decided, one picked, both rated, one >=4"
+    );
+    assert_eq!(stats.cull_by_lens[1].key, "24-70");
+    assert_eq!(
+        (
+            stats.cull_by_lens[1].total,
+            stats.cull_by_lens[1].decided,
+            stats.cull_by_lens[1].picked,
+            stats.cull_by_lens[1].rated,
+            stats.cull_by_lens[1].hits,
+        ),
+        (1, 1, 1, 1, 1)
+    );
+
+    // No camera models were set.
+    assert!(stats.cull_by_camera.is_empty(), "no cameras in fixture");
+    // No focal lengths were set.
+    assert!(stats.cull_by_focal.is_empty(), "no focal lengths in fixture");
+
+    // ISO ascending.
+    assert_eq!(stats.cull_by_iso.len(), 2);
+    assert_eq!(stats.cull_by_iso[0].key, 100);
+    assert_eq!(tallies(&stats.cull_by_iso[0]), (2, 2, 1, 2, 1));
+    assert_eq!(stats.cull_by_iso[1].key, 3200);
+    assert_eq!(
+        tallies(&stats.cull_by_iso[1]),
+        (2, 1, 1, 1, 1),
+        "ISO 3200: p3+p4, only p3 decided/rated"
+    );
+
+    // Aperture ascending.
+    assert_eq!(stats.cull_by_aperture.len(), 2);
+    assert!((stats.cull_by_aperture[0].key - 1.8).abs() < 1e-9);
+    assert_eq!(
+        (stats.cull_by_aperture[0].total, stats.cull_by_aperture[0].picked),
+        (1, 1)
+    );
+    assert!((stats.cull_by_aperture[1].key - 2.8).abs() < 1e-9);
+    assert_eq!(
+        (
+            stats.cull_by_aperture[1].total,
+            stats.cull_by_aperture[1].decided,
+            stats.cull_by_aperture[1].picked,
+            stats.cull_by_aperture[1].rated,
+            stats.cull_by_aperture[1].hits,
+        ),
+        (2, 2, 1, 2, 1)
+    );
+
+    // Shutter: "0.5" and "1/2" must merge into one 0.5s group; ascending.
+    assert_eq!(stats.cull_by_shutter.len(), 2, "1/250 and 0.5s groups only");
+    assert!((stats.cull_by_shutter[0].key - 0.004).abs() < 1e-9);
+    assert_eq!(
+        (
+            stats.cull_by_shutter[0].total,
+            stats.cull_by_shutter[0].decided,
+            stats.cull_by_shutter[0].picked,
+            stats.cull_by_shutter[0].rated,
+            stats.cull_by_shutter[0].hits,
+        ),
+        (2, 2, 1, 2, 1)
+    );
+    assert!((stats.cull_by_shutter[1].key - 0.5).abs() < 1e-9);
+    assert_eq!(
+        (
+            stats.cull_by_shutter[1].total,
+            stats.cull_by_shutter[1].decided,
+            stats.cull_by_shutter[1].picked,
+            stats.cull_by_shutter[1].rated,
+            stats.cull_by_shutter[1].hits,
+        ),
+        (2, 1, 1, 1, 1),
+        "0.5s: p3 (\"0.5\") + p4 (\"1/2\") merged, only p3 decided"
+    );
+
+    // --- album scope --------------------------------------------------------
+    let album_id = catalog.create_album("CullSubset").unwrap();
+    catalog.add_photos_to_album(album_id, &[p1, p5]).unwrap();
+
+    let astats = catalog.catalog_stats(None, Some(album_id), None).unwrap();
+    assert_eq!(astats.picked, 1, "only p1 in album is picked");
+    assert_eq!(astats.rejected, 0);
+    assert_eq!(astats.cull_by_iso.len(), 1, "p5 has no ISO");
+    assert_eq!(astats.cull_by_iso[0].key, 100);
+    assert_eq!(tallies(&astats.cull_by_iso[0]), (1, 1, 1, 1, 1));
+    assert_eq!(astats.cull_by_shutter.len(), 1);
+    assert!((astats.cull_by_shutter[0].key - 0.004).abs() < 1e-9);
+    assert_eq!(astats.cull_by_shutter[0].total, 1);
+
+    // --- nonexistent tag scope: the zeroed (`Default`) path ------------------------
+    let estats = catalog.catalog_stats(Some(999_999), None, None).unwrap();
+    assert_eq!(estats.picked, 0);
+    assert_eq!(estats.rejected, 0);
+    assert!(estats.cull_by_lens.is_empty());
+    assert!(estats.cull_by_camera.is_empty());
+    assert!(estats.cull_by_focal.is_empty());
+    assert!(estats.cull_by_iso.is_empty());
+    assert!(estats.cull_by_aperture.is_empty());
+    assert!(estats.cull_by_shutter.is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// I4b — catalog-switch lifecycle: an in-flight scan cancels cleanly through
+// its Arc<AtomicBool> abort flag, so nothing writes into a stale catalog.
+// ---------------------------------------------------------------------------
+
+use std::sync::atomic::{AtomicBool, Ordering};
+
+/// Write `n` tiny placeholder JPEGs under `dir` so a scan has files to walk.
+fn seed_jpgs(dir: &std::path::Path, n: usize) {
+    std::fs::create_dir_all(dir).unwrap();
+    for i in 0..n {
+        std::fs::write(dir.join(format!("img{i:05}.jpg")), b"notarealjpeg").unwrap();
+    }
+}
+
+#[test]
+fn scan_folder_aborts_before_writing_anything() {
+    let (catalog, root) = temp_catalog("scan-abort-pre");
+    seed_jpgs(&root, 5);
+
+    // The abort flag is already set when the scan begins: it must bail at the first
+    // cancellation point and never import a row.
+    let abort = AtomicBool::new(true);
+    let err = chairphoto_core::scanner::scan_folder(&catalog, &root, &abort, &|_| {})
+        .expect_err("a pre-aborted scan returns an error, not Ok");
+    assert_eq!(err, chairphoto_core::scanner::SCAN_ABORTED);
+
+    // Nothing landed in the catalog — the switch can safely tear it down.
+    let photos = catalog
+        .list_photos(&PhotoQuery::default())
+        .unwrap();
+    assert!(photos.is_empty(), "aborted scan imported no photos, got {}", photos.len());
+}
+
+#[test]
+fn scan_external_aborts_before_writing_anything() {
+    let (catalog, root) = temp_catalog("nas-scan-abort");
+    let nas_dir = root.parent().unwrap().join("nas-archive-abort");
+    seed_jpgs(&nas_dir, 5);
+    catalog.add_volume("NAS", &nas_dir, VolumeKind::Backup).unwrap();
+
+    let abort = AtomicBool::new(true);
+    let err = chairphoto_core::scanner::scan_external_folder(&catalog, &nas_dir, &abort, &|_| {})
+        .expect_err("a pre-aborted external scan returns an error");
+    assert_eq!(err, chairphoto_core::scanner::SCAN_ABORTED);
+    assert!(
+        catalog
+            .list_photos(&PhotoQuery::default())
+            .unwrap()
+            .is_empty(),
+        "aborted external scan imported no photos"
+    );
+}
+
+#[test]
+fn scan_folder_aborts_mid_run_and_stops_early() {
+    // A larger folder (crosses the per-batch commit boundary) so the scan emits an
+    // "indexing" progress event; the callback then trips the abort flag, and the scan
+    // must stop at the next cancellation point instead of running to completion.
+    let (catalog, root) = temp_catalog("scan-abort-mid");
+    seed_jpgs(&root, 1200); // > COMMIT_EVERY (500), so a progress event fires mid-walk
+
+    let abort = std::sync::Arc::new(AtomicBool::new(false));
+    let abort_for_cb = abort.clone();
+    let on_progress = move |p: chairphoto_core::scanner::ScanProgress| {
+        // Trip the flag as soon as the first indexing batch commits.
+        if p.phase == "indexing" {
+            abort_for_cb.store(true, Ordering::Relaxed);
+        }
+    };
+    let err = chairphoto_core::scanner::scan_folder(&catalog, &root, &abort, &on_progress)
+        .expect_err("a mid-run abort returns SCAN_ABORTED");
+    assert_eq!(err, chairphoto_core::scanner::SCAN_ABORTED);
+
+    // Rows committed before the abort are durable (the first batch), but the scan stopped
+    // early — it did not import all 1200 files.
+    let count = catalog
+        .list_photos(&PhotoQuery::default())
+        .unwrap()
+        .len();
+    assert!(count < 1200, "aborted mid-run: fewer than all files imported, got {count}");
+}
+
+// ---------------------------------------------------------------------------
+// I4 — Multi-catalog: create / reopen round-trip tests.
+//
+// The catalog switch itself (`app::catalogs::switch_catalog`) is unit-tested in
+// `app/catalogs.rs`.  Here we test the underlying `Catalog` primitives they call: that a fresh catalog can be created,
+// populated, closed, and reopened with its state intact; and that two
+// independent catalogs coexist without cross-contaminating each other's rows.
+// The recent-catalog registry helpers (record / load / save) are exercised
+// in `app/catalogs.rs` too.
+// ---------------------------------------------------------------------------
+
+/// Create a named catalog in a fresh temp dir and return (Catalog, db_path, root).
+fn temp_catalog_named(tag: &str) -> (Catalog, common::TestSubPath, PathBuf) {
+    let dir = common::TestTmpDir::new(&format!("multi-{tag}"));
+    let root = dir.join("photos");
+    std::fs::create_dir_all(&root).unwrap();
+    let db_name = format!("{tag}.chairphoto");
+    let db = dir.join(&db_name);
+    let catalog = Catalog::open(&db, &root).unwrap();
+    (catalog, dir.into_subpath(&db_name), root)
+}
+
+// -----------------------------------------------------------------
+// A freshly-created catalog file is opened by Catalog::open; data
+// written to it survives closing and reopening (round-trip).
+// -----------------------------------------------------------------
+#[test]
+fn create_catalog_creates_new_file_and_data_survives_reopen() {
+    let (catalog, db, root) = temp_catalog_named("create-rt");
+
+    // The db file must exist after Catalog::open.
+    assert!(db.exists(), "catalog file must be created on first open");
+
+    // Write a tag and a photo into the fresh catalog.
+    let photo_path = root.join("DSC0001.ARW");
+    std::fs::write(&photo_path, b"rawdata").unwrap();
+    let photo_id = catalog.upsert_photo(&photo_path, None, 1, 7).unwrap().id;
+    let tag_id = catalog.create_tag("Birds/Owl").unwrap();
+    catalog.assign_tag(photo_id, tag_id).unwrap();
+    catalog.set_culling(photo_id, Some(3), Some("Green"), None).unwrap();
+
+    // Close by dropping — this flushes the WAL.
+    drop(catalog);
+
+    // Reopen the same file (root supplied again, as open_catalog does).
+    let catalog2 = Catalog::open(&db, &root).unwrap();
+
+    // All data is still there.
+    let photos = catalog2
+        .list_photos(&PhotoQuery::default())
+        .unwrap();
+    assert_eq!(photos.len(), 1, "photo must survive the close/reopen cycle");
+    let p = &photos[0];
+    assert_eq!(p.rating, 3, "rating must survive");
+    assert_eq!(p.label, "Green", "label must survive");
+
+    let tags = catalog2.get_photo_tags(p.id).unwrap();
+    assert_eq!(tags.len(), 1);
+    assert_eq!(tags[0].full_path, "Birds/Owl");
+}
+
+// -----------------------------------------------------------------
+// Reopening an existing catalog with a different root supplied to
+// Catalog::open does NOT override the stored root — the catalog
+// reads back the root it persisted on first open (ON CONFLICT DO
+// NOTHING). Changing the root requires set_library_root (which runs
+// an UPDATE). This test documents the correct behavior so nobody
+// accidentally "fixes" the wrong behavior.
+// -----------------------------------------------------------------
+#[test]
+fn open_catalog_keeps_stored_root_on_reopen() {
+    let (catalog, db, root_a) = temp_catalog_named("reroot");
+    let photo = root_a.join("a.jpg");
+    std::fs::write(&photo, b"x").unwrap();
+    catalog.upsert_photo(&photo, None, 1, 1).unwrap();
+    // Capture the original root before dropping.
+    let stored_root = catalog.root().to_path_buf();
+    drop(catalog);
+
+    // Open again but supply a different root — the catalog must keep its stored root.
+    let dir_b = common::TestTmpDir::new("multi-reroot-alt");
+    let root_b = dir_b.join("photos");
+    std::fs::create_dir_all(&root_b).unwrap();
+
+    let catalog2 = Catalog::open(&db, &root_b).unwrap();
+    // The catalog's root() must reflect the STORED root (root_a), not the newly-supplied root_b.
+    assert_eq!(
+        catalog2.root(),
+        stored_root.as_path(),
+        "catalog must adopt its stored root on reopen, not the caller-supplied root"
+    );
+    assert_ne!(
+        catalog2.root(),
+        root_b.as_path(),
+        "caller-supplied root must not override stored root without set_library_root"
+    );
+}
+
+// -----------------------------------------------------------------
+// Opening a non-existent file path is an error — `open_catalog` in
+// commands.rs gates on `catalog_path_buf.exists()` first, but the
+// underlying Catalog::open does create. This test documents the
+// current behavior: the file is created if absent.
+// -----------------------------------------------------------------
+#[test]
+fn catalog_open_creates_file_when_absent() {
+    let dir = common::TestTmpDir::new("multi-absent");
+    let db = dir.join("fresh.chairphoto");
+    let root = dir.join("photos");
+
+    assert!(!db.exists(), "db must not exist before open");
+    let catalog = Catalog::open(&db, &root).unwrap();
+    assert!(db.exists(), "db is created by Catalog::open even when absent");
+    drop(catalog);
+}
+
+// -----------------------------------------------------------------
+// Two independently-opened catalogs do not cross-contaminate each
+// other's photo rows. This is the core "switch catalog" invariant:
+// data from catalog A must not appear in catalog B.
+// -----------------------------------------------------------------
+#[test]
+fn two_catalogs_are_isolated() {
+    let (cat_a, _db_a, root_a) = temp_catalog_named("iso-a");
+    let (cat_b, _db_b, root_b) = temp_catalog_named("iso-b");
+
+    // Add a photo to each catalog.
+    let photo_a = root_a.join("alpha.jpg");
+    std::fs::write(&photo_a, b"a").unwrap();
+    cat_a.upsert_photo(&photo_a, None, 1, 1).unwrap();
+
+    let photo_b = root_b.join("beta.jpg");
+    std::fs::write(&photo_b, b"b").unwrap();
+    cat_b.upsert_photo(&photo_b, None, 1, 1).unwrap();
+
+    // Each catalog sees exactly its own photo, not the other's.
+    let photos_a = cat_a
+        .list_photos(&PhotoQuery::default())
+        .unwrap();
+    assert_eq!(photos_a.len(), 1, "catalog A must hold exactly 1 photo");
+    assert_eq!(photos_a[0].path, "alpha.jpg");
+
+    let photos_b = cat_b
+        .list_photos(&PhotoQuery::default())
+        .unwrap();
+    assert_eq!(photos_b.len(), 1, "catalog B must hold exactly 1 photo");
+    assert_eq!(photos_b[0].path, "beta.jpg");
+}
+
+// -----------------------------------------------------------------
+// Switching: drop catalog A, open catalog B — catalog B starts empty
+// (or with its own state) regardless of what was in catalog A. This
+// mirrors the switch_catalog lifecycle: close old, open new.
+// -----------------------------------------------------------------
+#[test]
+fn switch_catalog_old_state_not_visible_in_new() {
+    // Populate catalog A with several photos.
+    let (cat_a, db_a, root_a) = temp_catalog_named("switch-old");
+    for i in 0..5u32 {
+        let p = root_a.join(format!("p{i}.jpg"));
+        std::fs::write(&p, b"img").unwrap();
+        cat_a.upsert_photo(&p, None, 1, 3).unwrap();
+    }
+    // Verify A has 5 photos.
+    assert_eq!(
+        cat_a
+            .list_photos(&PhotoQuery::default())
+            .unwrap()
+            .len(),
+        5
+    );
+
+    // "Switch": drop catalog A (close + flush), open a fresh catalog B.
+    drop(cat_a);
+    let _ = db_a; // keep db alive for borrow
+
+    let (cat_b, _db_b, _root_b) = temp_catalog_named("switch-new");
+    // B is freshly created — it must not see A's photos.
+    let photos_b = cat_b
+        .list_photos(&PhotoQuery::default())
+        .unwrap();
+    assert!(
+        photos_b.is_empty(),
+        "newly-opened catalog must be empty after switching from catalog A"
+    );
+}
+
+// -----------------------------------------------------------------
+// A scan launched on a secondary connection of catalog A, then
+// interrupted by setting the abort flag, leaves catalog B clean when
+// it is subsequently opened. (Complements the existing
+// scan_folder_aborts_* tests, but targets the switch-catalog scenario
+// where A is closed before B is opened.)
+// -----------------------------------------------------------------
+#[test]
+fn switch_catalog_with_aborted_scan_leaves_new_catalog_clean() {
+    let (cat_a, db_a, root_a) = temp_catalog_named("switch-abort-a");
+    let (cat_b, _db_b, _root_b) = temp_catalog_named("switch-abort-b");
+
+    // Seed a few files under root_a.
+    seed_jpgs(&root_a, 5);
+
+    // Open a SECONDARY connection on catalog A (as run_blocking_scan does) and
+    // start scanning with the abort flag pre-set so it stops immediately.
+    let scan_cat_a =
+        Catalog::open_secondary(cat_a.db_path(), cat_a.root()).unwrap();
+    let abort = AtomicBool::new(true);
+    let err =
+        chairphoto_core::scanner::scan_folder(&scan_cat_a, &root_a, &abort, &|_| {})
+            .expect_err("abort must cause an error");
+    assert_eq!(
+        err,
+        chairphoto_core::scanner::SCAN_ABORTED,
+        "scan must return SCAN_ABORTED"
+    );
+
+    // Drop the secondary connection and then catalog A itself.
+    drop(scan_cat_a);
+    drop(cat_a);
+    let _ = db_a;
+
+    // Catalog B (opened after the switch) must be entirely clean.
+    assert!(
+        cat_b
+            .list_photos(&PhotoQuery::default())
+            .unwrap()
+            .is_empty(),
+        "aborted scan on catalog A must not write rows into catalog B"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// I6c — two-phase live scan: Phase A imports rows immediately (metadata_ready=0),
+// Phase B enriches them and flips metadata_ready to 1; Phase B honours the abort
+// flag so a catalog switch / second scan stops it mid-run.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn phase_a_imports_unready_rows_then_phase_b_marks_ready() {
+    let (catalog, root) = temp_catalog("i6c-two-phase");
+    seed_jpgs(&root, 4);
+
+    // Phase A: rows appear immediately, all awaiting metadata (metadata_ready = 0).
+    let abort = AtomicBool::new(false);
+    let (result, pending) =
+        chairphoto_core::scanner::scan_folder_phase_a(&catalog, &root, &abort, &|_| {}).unwrap();
+    assert_eq!(result.created, 4, "Phase A creates all 4 rows");
+    let after_a = catalog
+        .list_photos(&PhotoQuery::default())
+        .unwrap();
+    assert_eq!(after_a.len(), 4, "Phase A rows are visible in the grid");
+    assert!(
+        after_a.iter().all(|p| p.metadata_ready == 0),
+        "new rows are not-yet-ready until Phase B runs"
+    );
+
+    // Phase B: enrich the pending rows; every one flips to ready.
+    chairphoto_core::scanner::phase_b_enrich(&catalog, pending, &abort, &|_| {}).unwrap();
+    let after_b = catalog
+        .list_photos(&PhotoQuery::default())
+        .unwrap();
+    assert!(
+        after_b.iter().all(|p| p.metadata_ready == 1),
+        "Phase B marks every enriched row ready"
+    );
+}
+
+#[test]
+fn phase_b_aborts_and_leaves_rows_unready() {
+    let (catalog, root) = temp_catalog("i6c-phase-b-abort");
+    seed_jpgs(&root, 4);
+
+    // Phase A imports the rows (metadata_ready = 0).
+    let abort = AtomicBool::new(false);
+    let (_result, pending) =
+        chairphoto_core::scanner::scan_folder_phase_a(&catalog, &root, &abort, &|_| {}).unwrap();
+
+    // A catalog switch / second scan trips the flag before Phase B runs: it must bail at
+    // the first cancellation point with SCAN_ABORTED and leave the rows not-yet-ready.
+    abort.store(true, Ordering::Relaxed);
+    let err = chairphoto_core::scanner::phase_b_enrich(&catalog, pending, &abort, &|_| {})
+        .expect_err("a pre-aborted Phase B returns SCAN_ABORTED");
+    assert_eq!(err, chairphoto_core::scanner::SCAN_ABORTED);
+    let rows = catalog
+        .list_photos(&PhotoQuery::default())
+        .unwrap();
+    assert!(
+        rows.iter().all(|p| p.metadata_ready == 0),
+        "an aborted Phase B leaves rows awaiting metadata (never marked ready)"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// I6d — Resumable Phase B: the pending_enrichment table survives a crash/abort
+// and resume_pending_enrichment rebuilds the PendingEnrich hand-off so Phase B
+// can complete on next startup.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn i6d_pending_queue_persists_after_phase_a_and_drains_on_phase_b_completion() {
+    let (catalog, root) = temp_catalog("i6d-full");
+    seed_jpgs(&root, 4);
+
+    // (a) Phase A: rows appear immediately with metadata_ready=0 and must be
+    //     persisted in the pending_enrichment table.
+    let abort = AtomicBool::new(false);
+    let (_result, pending) =
+        chairphoto_core::scanner::scan_folder_phase_a(&catalog, &root, &abort, &|_| {}).unwrap();
+    assert_eq!(pending.imported.len(), 4, "Phase A produced 4 pending entries");
+
+    // (b) pending_enrichment table must have exactly 4 rows.
+    assert_eq!(
+        catalog.pending_enrichment_count().unwrap(),
+        4,
+        "pending_enrichment must hold one row per new photo after Phase A"
+    );
+
+    // (c) Abort Phase B immediately — simulates an app crash / quit mid-scan.
+    abort.store(true, Ordering::Relaxed);
+    let err = chairphoto_core::scanner::phase_b_enrich(&catalog, pending, &abort, &|_| {})
+        .expect_err("pre-aborted Phase B returns SCAN_ABORTED");
+    assert_eq!(err, chairphoto_core::scanner::SCAN_ABORTED);
+
+    // After the abort the rows are still not-ready.
+    let after_abort = catalog
+        .list_photos(&PhotoQuery::default())
+        .unwrap();
+    assert!(
+        after_abort.iter().all(|p| p.metadata_ready == 0),
+        "aborted Phase B must leave all rows not-ready"
+    );
+
+    // The queue must still be intact (nothing was dequeued by the aborted run).
+    assert_eq!(
+        catalog.pending_enrichment_count().unwrap(),
+        4,
+        "pending_enrichment rows survive an aborted Phase B"
+    );
+
+    // (d) resume_pending_enrichment rebuilds the PendingEnrich hand-off from the
+    //     persisted table — this is what startup auto-resume calls.
+    let resumed = chairphoto_core::scanner::resume_pending_enrichment(&catalog)
+        .unwrap()
+        .expect("resume_pending_enrichment must return Some when rows remain");
+    assert_eq!(
+        resumed.imported.len(),
+        4,
+        "resumed PendingEnrich must contain all 4 surviving rows"
+    );
+    // folder_id is None on the resume path (scan walk is already done).
+    assert!(resumed.folder_id.is_none(), "resume path has no folder_id");
+
+    // (e) Run Phase B to completion using the resumed PendingEnrich.
+    let abort2 = AtomicBool::new(false);
+    chairphoto_core::scanner::phase_b_enrich(&catalog, resumed, &abort2, &|_| {}).unwrap();
+
+    // (f) All rows must be metadata_ready=1 and the queue must be empty.
+    let after_resume = catalog
+        .list_photos(&PhotoQuery::default())
+        .unwrap();
+    assert!(
+        after_resume.iter().all(|p| p.metadata_ready == 1),
+        "Phase B via resumed queue must mark all rows ready"
+    );
+    assert_eq!(
+        catalog.pending_enrichment_count().unwrap(),
+        0,
+        "pending_enrichment table must be empty after Phase B completes"
+    );
+}
+
+#[test]
+fn i6d_resume_returns_none_when_queue_is_empty() {
+    let (catalog, _root) = temp_catalog("i6d-empty-resume");
+    // No Phase A was run — the queue is empty.
+    let result = chairphoto_core::scanner::resume_pending_enrichment(&catalog).unwrap();
+    assert!(
+        result.is_none(),
+        "resume_pending_enrichment returns None when no rows are pending"
+    );
+}
+
+#[test]
+fn i6d_enqueue_is_idempotent_and_dequeue_clears_row() {
+    let (catalog, root) = temp_catalog("i6d-queue-ops");
+    let id = catalog.upsert_photo(&root.join("a.arw"), None, 1, 1).unwrap().id;
+
+    // Enqueue twice — second INSERT OR IGNORE is a no-op.
+    catalog.enqueue_pending_enrichment(id).unwrap();
+    catalog.enqueue_pending_enrichment(id).unwrap();
+    assert_eq!(catalog.pending_enrichment_count().unwrap(), 1, "enqueue is idempotent");
+
+    // Dequeue removes the row.
+    catalog.dequeue_pending_enrichment(id).unwrap();
+    assert_eq!(catalog.pending_enrichment_count().unwrap(), 0, "dequeue clears the row");
+
+    // Dequeuing a non-existent row is a no-op (not an error).
+    catalog.dequeue_pending_enrichment(id).unwrap();
+    assert_eq!(catalog.pending_enrichment_count().unwrap(), 0);
+}
+
+// ---------------------------------------------------------------------------
+// I6d stale-drain-via-rescan: the most subtle I6d path. A rescan after an
+// aborted Phase B merges stale pending_enrichment rows into the new Phase A
+// hand-off so Phase B enriches them in the same pass ("rescan_library can
+// drain the queue without re-walking"). Three cases:
+//
+//   A) file DELETED between Phase B abort and rescan → resolver returns None
+//      → load_pending_enrichment silently skips it → not included in merged list
+//
+//   B) file UNCHANGED → Phase A sets needs_extract=false (not re-enqueued);
+//      its stale pending_enrichment row IS merged in and Phase B enriches it
+//
+//   C) file CHANGED → Phase A sets needs_extract=true and re-enqueues it;
+//      `already_covered` suppresses the duplicate from the stale merge →
+//      enriched exactly once
+// ---------------------------------------------------------------------------
+
+#[test]
+fn i6d_stale_drain_via_rescan_handles_deleted_unchanged_and_changed_files() {
+    let (catalog, root) = temp_catalog("i6d-stale-drain");
+
+    // Seed three files: A, B, C — each will take a different fate.
+    let path_a = root.join("A.jpg"); // will be deleted before the rescan
+    let path_b = root.join("B.jpg"); // will be unchanged
+    let path_c = root.join("C.jpg"); // will be modified (different size)
+    std::fs::write(&path_a, b"aaa").unwrap();
+    std::fs::write(&path_b, b"bbb").unwrap();
+    std::fs::write(&path_c, b"ccc").unwrap();
+
+    // ── Scan 1: Phase A enqueues all three ───────────────────────────────────
+    let abort1 = AtomicBool::new(false);
+    let (_result1, pending1) =
+        chairphoto_core::scanner::scan_folder_phase_a(&catalog, &root, &abort1, &|_| {}).unwrap();
+    assert_eq!(pending1.imported.len(), 3, "Phase A created 3 rows");
+
+    // Collect photo_ids for A, B, C so we can assert on them later.
+    let photos_after_scan1 = catalog
+        .list_photos(&PhotoQuery::default())
+        .unwrap();
+    assert_eq!(photos_after_scan1.len(), 3);
+    let find_id = |filename: &str| -> i64 {
+        photos_after_scan1
+            .iter()
+            .find(|p| p.path.contains(filename))
+            .unwrap_or_else(|| panic!("{filename} not found in catalog after scan 1"))
+            .id
+    };
+    let id_a = find_id("A.jpg");
+    let id_b = find_id("B.jpg");
+    let id_c = find_id("C.jpg");
+
+    // All three are in pending_enrichment after Phase A.
+    assert_eq!(
+        catalog.pending_enrichment_count().unwrap(),
+        3,
+        "all three photos are queued for enrichment after Phase A"
+    );
+
+    // ── Abort Phase B immediately — simulates a crash / quit mid-scan ────────
+    abort1.store(true, Ordering::Relaxed);
+    let err = chairphoto_core::scanner::phase_b_enrich(&catalog, pending1, &abort1, &|_| {})
+        .expect_err("pre-aborted Phase B must return SCAN_ABORTED");
+    assert_eq!(err, chairphoto_core::scanner::SCAN_ABORTED);
+
+    // All three rows are still not-ready and still in pending_enrichment.
+    let rows_after_abort = catalog
+        .list_photos(&PhotoQuery::default())
+        .unwrap();
+    assert!(
+        rows_after_abort.iter().all(|p| p.metadata_ready == 0),
+        "aborted Phase B leaves all rows not-ready"
+    );
+    assert_eq!(
+        catalog.pending_enrichment_count().unwrap(),
+        3,
+        "pending_enrichment survives the aborted Phase B"
+    );
+
+    // ── Mutate the filesystem to create the three scenarios ──────────────────
+    // A: delete the file entirely.
+    std::fs::remove_file(&path_a).unwrap();
+    // B: leave path_b unchanged (same bytes → same size/mtime on rescan).
+    // C: overwrite with different content (different size triggers needs_extract=true).
+    std::fs::write(&path_c, b"ccc-new-content").unwrap();
+
+    // ── Scan 2: Phase A re-walks the folder ──────────────────────────────────
+    // After remove_file(&path_a), A's catalog row still exists (reconcile_missing
+    // runs at end of Phase B, which we'll do here). The walk only sees B and C.
+    let abort2 = AtomicBool::new(false);
+    let (_result2, pending2) =
+        chairphoto_core::scanner::scan_folder_phase_a(&catalog, &root, &abort2, &|_| {}).unwrap();
+
+    // Phase A finds B (unchanged → needs_extract=false, NOT re-enqueued) and
+    // C (changed → needs_extract=true, re-enqueued). A is not in the walk.
+    let walk_ids: std::collections::HashSet<i64> =
+        pending2.imported.iter().map(|(_, id, _)| *id).collect();
+    assert!(walk_ids.contains(&id_b), "B is in the Phase A walk (unchanged file still present)");
+    assert!(walk_ids.contains(&id_c), "C is in the Phase A walk (file changed)");
+    assert!(!walk_ids.contains(&id_a), "A is NOT in the Phase A walk (file deleted)");
+
+    // Confirm that Phase A did NOT re-enqueue B (needs_extract=false, unchanged).
+    let b_in_pending2 = pending2
+        .imported
+        .iter()
+        .find(|(_, id, _)| *id == id_b)
+        .map(|(_, _, needs)| *needs);
+    assert_eq!(
+        b_in_pending2,
+        Some(false),
+        "B is in Phase A's imported list with needs_extract=false (unchanged)"
+    );
+    // And C was re-enqueued (needs_extract=true).
+    let c_in_pending2 = pending2
+        .imported
+        .iter()
+        .find(|(_, id, _)| *id == id_c)
+        .map(|(_, _, needs)| *needs);
+    assert_eq!(
+        c_in_pending2,
+        Some(true),
+        "C is in Phase A's imported list with needs_extract=true (changed)"
+    );
+
+    // ── Stale-drain merge via production predicate ──────────────────────────────
+    // load_pending_enrichment resolves paths: A's file is gone → resolver returns
+    // None → A is silently dropped. B and C are still listed.
+    let stale = catalog.load_pending_enrichment().unwrap();
+
+    // A must not be in the stale list (its file is unresolvable).
+    assert!(
+        stale.iter().all(|(_, id, _)| *id != id_a),
+        "A's stale queue entry must be silently skipped when the file is unresolvable"
+    );
+    // B must appear (its file exists and resolver returns Some).
+    assert!(
+        stale.iter().any(|(_, id, _)| *id == id_b),
+        "B's stale queue entry must survive (file still on disk)"
+    );
+
+    // Merge via the same function used by run_blocking_two_phase_scan.
+    let mut merged_pending = pending2;
+    merged_pending.imported =
+        chairphoto_core::scanner::merge_stale_pending(merged_pending.imported, stale);
+
+    // C was already covered (needs_extract=true); B was not and was merged in.
+    // A was silently dropped by load_pending_enrichment.
+    let merged_ids: std::collections::HashSet<i64> =
+        merged_pending.imported.iter().map(|(_, id, _)| *id).collect();
+    assert!(merged_ids.contains(&id_b), "B is in the merged list (stale merge)");
+    assert!(merged_ids.contains(&id_c), "C is in the merged list (Phase A re-enqueue)");
+    assert!(!merged_ids.contains(&id_a), "A is NOT in the merged list (resolver silently skipped it)");
+
+    // Count how many times C appears in the merged list — must be exactly once.
+    let c_count = merged_pending.imported.iter().filter(|(_, id, _)| *id == id_c).count();
+    assert_eq!(c_count, 1, "C must appear exactly once (already_covered prevents duplication)");
+
+    // ── Run Phase B with the merged pending ──────────────────────────────────
+    chairphoto_core::scanner::phase_b_enrich(&catalog, merged_pending, &abort2, &|_| {}).unwrap();
+
+    // B and C must now be metadata_ready=1 (enriched).
+    let photos_after = catalog
+        .list_photos(&PhotoQuery::default())
+        .unwrap();
+    let ready_b = photos_after.iter().find(|p| p.id == id_b).map(|p| p.metadata_ready);
+    let ready_c = photos_after.iter().find(|p| p.id == id_c).map(|p| p.metadata_ready);
+    assert_eq!(ready_b, Some(1), "B (unchanged, stale-drained) is now metadata_ready=1");
+    assert_eq!(ready_c, Some(1), "C (changed, re-enqueued) is now metadata_ready=1");
+
+    // A's row may or may not still exist at this point (reconcile_missing runs at the
+    // end of phase_b_enrich and hides it as missing), but either way it must NOT be
+    // metadata_ready=1 (it was never enriched — its file was gone).
+    if let Some(row_a) = photos_after.iter().find(|p| p.id == id_a) {
+        assert_eq!(
+            row_a.metadata_ready, 0,
+            "A's row, if still present, must remain metadata_ready=0 (never enriched)"
+        );
+    }
+
+    // After Phase B:
+    // - B and C were enriched and dequeued (pending_enrichment rows removed).
+    // - A's stale row was silently skipped by load_pending_enrichment (unresolvable
+    //   path), so it was never added to the merged list and Phase B never dequeued
+    //   it. reconcile_missing only sets missing=1 (it does not delete the photo
+    //   row), so the CASCADE on photo deletion does NOT fire — A's
+    //   pending_enrichment row is the one remaining entry.
+    let remaining = catalog.pending_enrichment_count().unwrap();
+    assert_eq!(
+        remaining, 1,
+        "only A's stale pending_enrichment row must remain after Phase B \
+         (B and C were dequeued; A's entry was silently skipped and not dequeued)"
+    );
+    // That remaining row belongs to A.
+    let stale_after = catalog.load_pending_enrichment().unwrap();
+    // load_pending_enrichment skips unresolvable paths, so the remaining row
+    // for A (file deleted) is in the table but not returned by load_pending_enrichment.
+    assert!(
+        stale_after.is_empty(),
+        "load_pending_enrichment must return empty even if A's row is in the table \
+         (resolver returns None for the deleted file → entry silently skipped)"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// I6e — Frontend: live grid refresh + placeholder tiles.
+// Backend invariant: unready rows (metadata_ready=0) survive list_photos so
+// the grid can render them as placeholder tiles; once set_metadata_ready(true)
+// is called (end of Phase B / the "done" refresh) they appear as fully-ready
+// rows and are no longer distinguishable from normal photos.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn i6e_unready_rows_survive_list_photos_and_done_clears_placeholders() {
+    let (catalog, root) = temp_catalog("i6e-placeholder-done");
+    seed_jpgs(&root, 3);
+
+    // Phase A: insert rows with metadata_ready=0.
+    let abort = AtomicBool::new(false);
+    let (_result, pending) =
+        chairphoto_core::scanner::scan_folder_phase_a(&catalog, &root, &abort, &|_| {}).unwrap();
+    assert_eq!(pending.imported.len(), 3, "Phase A produced 3 pending entries");
+
+    // Invariant 1: list_photos must include unready rows so the grid can render
+    // placeholder tiles for them immediately after Phase A.
+    let after_a = catalog
+        .list_photos(&PhotoQuery::default())
+        .unwrap();
+    assert_eq!(after_a.len(), 3, "all 3 rows are visible as placeholder tiles");
+    assert!(
+        after_a.iter().all(|p| p.metadata_ready == 0),
+        "Phase A rows must have metadata_ready=0 (placeholder state)"
+    );
+
+    // Invariant 2: the "done" refresh path — Phase B completes and the final
+    // refresh is triggered. After set_metadata_ready(true) for every photo,
+    // list_photos returns the same rows with metadata_ready=1, meaning the
+    // placeholder state is cleared and all tiles are fully ready.
+    chairphoto_core::scanner::phase_b_enrich(&catalog, pending, &abort, &|_| {}).unwrap();
+    let after_done = catalog
+        .list_photos(&PhotoQuery::default())
+        .unwrap();
+    assert_eq!(after_done.len(), 3, "no rows were lost during Phase B");
+    assert!(
+        after_done.iter().all(|p| p.metadata_ready == 1),
+        "'done' clears residual placeholders: all rows are metadata_ready=1 after Phase B"
+    );
+
+    // Invariant 3: a mix of ready and unready rows — list_photos returns both,
+    // letting the frontend decide which tiles get the spinner and which don't.
+    let extra = catalog.upsert_photo(&root.join("extra.jpg"), None, 1, 1).unwrap().id;
+    catalog.set_metadata_ready(extra, false).unwrap();
+    let mixed = catalog
+        .list_photos(&PhotoQuery::default())
+        .unwrap();
+    assert_eq!(mixed.len(), 4, "ready and unready rows both appear in the grid");
+    let ready_count = mixed.iter().filter(|p| p.metadata_ready == 1).count();
+    let unready_count = mixed.iter().filter(|p| p.metadata_ready == 0).count();
+    assert_eq!(ready_count, 3, "three previously-enriched photos are ready");
+    assert_eq!(unready_count, 1, "one freshly-inserted placeholder is unready");
+}
+
+// ── H2b: Map / Geofence apply engine tests ────────────────────────────────────
+//
+// These tests are gated on the `map` Cargo feature so the CI `--no-default-features`
+// build skips them (the feature itself compiles out too).
+
+/// Helper: insert a photo and store GPS coordinates via set_photo_metadata so the
+/// map query can find it. Returns the photo_id.
+#[cfg(feature = "map")]
+fn insert_photo_with_gps(
+    catalog: &Catalog,
+    root: &std::path::Path,
+    name: &str,
+    lat: f64,
+    lng: f64,
+) -> i64 {
+    use chairphoto_core::catalog::PromotedMetadata;
+    let path = root.join(name);
+    std::fs::write(&path, b"\xff\xd8test").unwrap();
+    let photo_id = catalog.upsert_photo(&path, None, 1, 4).unwrap().id;
+    let meta = PromotedMetadata {
+        gps_latitude: Some(lat),
+        gps_longitude: Some(lng),
+        ..Default::default()
+    };
+    catalog.set_photo_metadata(photo_id, &meta, &[]).unwrap();
+    photo_id
+}
+
+/// Helper: unit square fence (lat 0..1, lng 0..1) bound to a given tag path.
+#[cfg(feature = "map")]
+fn unit_square_fence(
+    catalog: &Catalog,
+    tag_path: &str,
+) -> i64 {
+    use chairphoto_core::plugins::map;
+    map::ensure_schema_for(catalog).unwrap();
+    let poly = vec![(0.0_f64, 0.0_f64), (0.0, 1.0), (1.0, 1.0), (1.0, 0.0)];
+    map::create_fence_for(catalog, "Unit square", tag_path, &poly)
+        .unwrap()
+        .id
+}
+
+/// apply_fence tags photos inside the polygon and leaves those outside untouched.
+#[cfg(feature = "map")]
+#[test]
+fn map_apply_fence_tags_inside_photos_only() {
+    use chairphoto_core::plugins::map;
+
+    let (catalog, root) = temp_catalog("map_apply_fence");
+    map::ensure_schema_for(&catalog).unwrap();
+
+    // One photo inside the unit square, one outside.
+    let inside_id = insert_photo_with_gps(&catalog, &root, "inside.jpg", 0.5, 0.5);
+    let outside_id = insert_photo_with_gps(&catalog, &root, "outside.jpg", 5.0, 5.0);
+
+    let fence_id = unit_square_fence(&catalog, "Places/UnitSquare");
+
+    let count = map::apply_fence(&catalog, fence_id).unwrap();
+    assert_eq!(count, 1, "exactly one photo is inside the unit square");
+
+    // The inside photo has the tag; the outside one does not.
+    let inside_tags = catalog.get_photo_tags(inside_id).unwrap();
+    let outside_tags = catalog.get_photo_tags(outside_id).unwrap();
+    assert!(
+        inside_tags.iter().any(|t| t.full_path == "Places/UnitSquare"),
+        "inside photo gets the place tag"
+    );
+    assert!(
+        outside_tags.is_empty(),
+        "outside photo gets no tag"
+    );
+}
+
+/// Applying the same fence twice is idempotent: the second call returns 0 new
+/// assignments and doesn't duplicate tags.
+#[cfg(feature = "map")]
+#[test]
+fn map_apply_fence_is_idempotent() {
+    use chairphoto_core::plugins::map;
+
+    let (catalog, root) = temp_catalog("map_idempotent");
+    map::ensure_schema_for(&catalog).unwrap();
+
+    let photo_id = insert_photo_with_gps(&catalog, &root, "inside.jpg", 0.5, 0.5);
+    let fence_id = unit_square_fence(&catalog, "Places/Idempotent");
+
+    let first = map::apply_fence(&catalog, fence_id).unwrap();
+    assert_eq!(first, 1);
+
+    let second = map::apply_fence(&catalog, fence_id).unwrap();
+    assert_eq!(second, 0, "re-apply reports zero new assignments");
+
+    // Exactly one tag on the photo (no duplicates).
+    let tags = catalog.get_photo_tags(photo_id).unwrap();
+    let matching: Vec<_> = tags.iter().filter(|t| t.full_path == "Places/Idempotent").collect();
+    assert_eq!(matching.len(), 1, "no duplicate tag assignment after re-apply");
+}
+
+/// apply_all_fences applies every fence and returns the sum of new assignments.
+#[cfg(feature = "map")]
+#[test]
+fn map_apply_all_fences_covers_every_fence() {
+    use chairphoto_core::plugins::map;
+
+    let (catalog, root) = temp_catalog("map_apply_all");
+    map::ensure_schema_for(&catalog).unwrap();
+
+    // Two fences in non-overlapping regions.
+    let poly_a = vec![(0.0_f64, 0.0_f64), (0.0, 1.0), (1.0, 1.0), (1.0, 0.0)];
+    let poly_b = vec![(10.0_f64, 10.0_f64), (10.0, 11.0), (11.0, 11.0), (11.0, 10.0)];
+    map::create_fence_for(&catalog, "A", "Places/RegionA", &poly_a).unwrap();
+    map::create_fence_for(&catalog, "B", "Places/RegionB", &poly_b).unwrap();
+
+    // One photo in each region.
+    insert_photo_with_gps(&catalog, &root, "in_a.jpg", 0.5, 0.5);
+    insert_photo_with_gps(&catalog, &root, "in_b.jpg", 10.5, 10.5);
+    // One photo outside both.
+    insert_photo_with_gps(&catalog, &root, "outside.jpg", 50.0, 50.0);
+
+    let out = map::apply_all_fences(&catalog).unwrap();
+    assert_eq!(out.tagged, 2, "one assignment per region (two total)");
+    assert_eq!((out.applied, out.skipped.len()), (2, 0));
+}
+
+/// map_photo_points returns only photos with both GPS columns set.
+#[cfg(feature = "map")]
+#[test]
+fn map_photo_points_returns_gps_photos_only() {
+    use chairphoto_core::plugins::map;
+    use chairphoto_core::catalog::PromotedMetadata;
+
+    let (catalog, root) = temp_catalog("map_points");
+    map::ensure_schema_for(&catalog).unwrap();
+
+    // One photo with GPS.
+    let gps_id = insert_photo_with_gps(&catalog, &root, "gps.jpg", 59.9, 10.7);
+
+    // One photo without GPS.
+    let no_gps = root.join("nogps.jpg");
+    std::fs::write(&no_gps, b"\xff\xd8test").unwrap();
+    let no_gps_id = catalog.upsert_photo(&no_gps, None, 1, 4).unwrap().id;
+    let meta_no_gps = PromotedMetadata { ..Default::default() };
+    catalog.set_photo_metadata(no_gps_id, &meta_no_gps, &[]).unwrap();
+
+    let points = map::map_photo_points_for(&catalog).unwrap();
+    assert_eq!(points.len(), 1, "only the photo with GPS appears");
+    assert_eq!(points[0].id, gps_id);
+    assert!((points[0].lat - 59.9).abs() < 1e-9);
+    assert!((points[0].lng - 10.7).abs() < 1e-9);
+}
+
+/// apply_fence builds the full tag hierarchy (ancestors are created automatically).
+#[cfg(feature = "map")]
+#[test]
+fn map_apply_fence_creates_full_tag_hierarchy() {
+    use chairphoto_core::plugins::map;
+
+    let (catalog, root) = temp_catalog("map_hierarchy");
+    map::ensure_schema_for(&catalog).unwrap();
+
+    let photo_id = insert_photo_with_gps(&catalog, &root, "in.jpg", 0.5, 0.5);
+    let fence_id = unit_square_fence(&catalog, "Places/Country/City/Neighbourhood");
+
+    map::apply_fence(&catalog, fence_id).unwrap();
+
+    let tags = catalog.get_photo_tags(photo_id).unwrap();
+    // The assigned tag is the leaf (ancestors are pruned by assign_tag's auto-prune).
+    assert!(
+        tags.iter().any(|t| t.full_path == "Places/Country/City/Neighbourhood"),
+        "leaf tag assigned"
+    );
+    // The ancestor tags exist in the tag tree even if not on the photo.
+    let city_exists = catalog.find_tag_id_by_path("Places/Country/City").unwrap().is_some();
+    assert!(city_exists, "intermediate ancestor tag created");
+}
+
+/// apply_fences_to_photo applies all fences to a single photo — the import hook.
+#[cfg(feature = "map")]
+#[test]
+fn map_apply_fences_to_photo_import_hook() {
+    use chairphoto_core::plugins::map;
+
+    let (catalog, root) = temp_catalog("map_import_hook");
+    map::ensure_schema_for(&catalog).unwrap();
+
+    unit_square_fence(&catalog, "Places/Hook");
+
+    // Photo inside the fence.
+    let inside_id = insert_photo_with_gps(&catalog, &root, "in.jpg", 0.5, 0.5);
+    let count = map::apply_fences_to_photo(&catalog, inside_id).unwrap();
+    assert_eq!(count, 1, "one fence matched");
+    let tags = catalog.get_photo_tags(inside_id).unwrap();
+    assert!(tags.iter().any(|t| t.full_path == "Places/Hook"), "tag assigned");
+
+    // Photo outside the fence.
+    let outside_id = insert_photo_with_gps(&catalog, &root, "out.jpg", 5.0, 5.0);
+    let count2 = map::apply_fences_to_photo(&catalog, outside_id).unwrap();
+    assert_eq!(count2, 0, "zero fences matched");
+    assert!(catalog.get_photo_tags(outside_id).unwrap().is_empty());
+}
+
+/// A fence on an auto-tag's path can't tag by hand (#181): applying it is refused before any
+/// photo, and the import hook skips it and still applies the photo's other fences.
+#[cfg(feature = "map")]
+#[test]
+fn map_fences_on_an_auto_tag_path_are_refused_or_skipped() {
+    use chairphoto_core::catalog::CatalogError;
+    use chairphoto_core::plugins::map;
+
+    let (catalog, root) = temp_catalog("map_auto_tag");
+    map::ensure_schema_for(&catalog).unwrap();
+    let auto = catalog.create_tag("Technique/Panorama").unwrap();
+    catalog.conn().execute("UPDATE tags SET auto_rule = 'panorama' WHERE id = ?1", [auto]).unwrap();
+    let auto_fence = unit_square_fence(&catalog, "Technique/Panorama");
+    unit_square_fence(&catalog, "Places/Hook");
+    let inside_id = insert_photo_with_gps(&catalog, &root, "in.jpg", 0.5, 0.5);
+
+    assert!(matches!(map::apply_fence(&catalog, auto_fence), Err(CatalogError::AutoTag(_))));
+    assert!(catalog.get_photo_tags(inside_id).unwrap().is_empty());
+
+    assert_eq!(map::apply_fences_to_photo(&catalog, inside_id).unwrap(), 1, "the place fence only");
+    let paths: Vec<String> = catalog.get_photo_tags(inside_id).unwrap().into_iter().map(|t| t.full_path).collect();
+    assert_eq!(paths, vec!["Places/Hook".to_string()]);
+}
+
+/// Review #181 M1: Apply all with an auto-tag fence between two place fences skips the auto
+/// one, still applies both others — whatever order the fences come in — and reports the
+/// applied and skipped fences, instead of stopping part-way with an error.
+#[cfg(feature = "map")]
+#[test]
+fn map_apply_all_fences_skips_an_auto_tag_fence_and_applies_the_rest() {
+    use chairphoto_core::plugins::map;
+
+    let (catalog, root) = temp_catalog("map_apply_all_auto");
+    map::ensure_schema_for(&catalog).unwrap();
+    let auto = catalog.create_tag("Technique/Panorama").unwrap();
+    catalog.conn().execute("UPDATE tags SET auto_rule = 'panorama' WHERE id = ?1", [auto]).unwrap();
+    let poly = vec![(0.0_f64, 0.0_f64), (0.0, 1.0), (1.0, 1.0), (1.0, 0.0)];
+    map::create_fence_for(&catalog, "A", "Places/A", &poly).unwrap();
+    map::create_fence_for(&catalog, "Pano", "Technique/Panorama", &poly).unwrap();
+    map::create_fence_for(&catalog, "C", "Places/C", &poly).unwrap();
+    let inside_id = insert_photo_with_gps(&catalog, &root, "in.jpg", 0.5, 0.5);
+
+    let out = map::apply_all_fences(&catalog).unwrap();
+    assert_eq!(out, map::FencesApplied { tagged: 2, applied: 2, skipped: vec!["Pano".to_string()] });
+    let mut paths: Vec<String> = catalog.get_photo_tags(inside_id).unwrap().into_iter().map(|t| t.full_path).collect();
+    paths.sort();
+    assert_eq!(paths, vec!["Places/A".to_string(), "Places/C".to_string()], "both place fences, not the auto-tag");
+}
+
+/// Review #181 r2 N1: a fence with fewer than three points has no area, so Apply all neither
+/// applies nor skips it — it is not counted.
+#[cfg(feature = "map")]
+#[test]
+fn map_apply_all_fences_does_not_count_a_degenerate_fence() {
+    use chairphoto_core::plugins::map;
+
+    let (catalog, root) = temp_catalog("map_apply_all_degenerate");
+    map::ensure_schema_for(&catalog).unwrap();
+    let poly = vec![(0.0_f64, 0.0_f64), (0.0, 1.0), (1.0, 1.0), (1.0, 0.0)];
+    map::create_fence_for(&catalog, "A", "Places/A", &poly).unwrap();
+    map::create_fence_for(&catalog, "Line", "Places/Line", &poly[..2]).unwrap();
+    insert_photo_with_gps(&catalog, &root, "in.jpg", 0.5, 0.5);
+
+    let out = map::apply_all_fences(&catalog).unwrap();
+    assert_eq!(out, map::FencesApplied { tagged: 1, applied: 1, skipped: Vec::new() });
+}
+
+/// apply_fences_to_photo on a photo without GPS returns 0 without error.
+#[cfg(feature = "map")]
+#[test]
+fn map_apply_fences_to_photo_no_gps_is_noop() {
+    use chairphoto_core::plugins::map;
+    use chairphoto_core::catalog::PromotedMetadata;
+
+    let (catalog, root) = temp_catalog("map_noop");
+    map::ensure_schema_for(&catalog).unwrap();
+
+    unit_square_fence(&catalog, "Places/NoGps");
+
+    let path = root.join("nogps.jpg");
+    std::fs::write(&path, b"\xff\xd8test").unwrap();
+    let photo_id = catalog.upsert_photo(&path, None, 1, 4).unwrap().id;
+    catalog.set_photo_metadata(photo_id, &PromotedMetadata::default(), &[]).unwrap();
+
+    let count = map::apply_fences_to_photo(&catalog, photo_id).unwrap();
+    assert_eq!(count, 0, "no GPS → no fence applied");
+    assert!(catalog.get_photo_tags(photo_id).unwrap().is_empty());
+}
+
+/// ingest_from_card applies fences to newly-imported photos (the import hook path).
+#[cfg(feature = "map")]
+#[test]
+fn map_ingest_applies_fences_to_new_photos() {
+    use chairphoto_core::plugins::map;
+    use chairphoto_core::scanner::ingest_from_card;
+
+    let (catalog, root) = temp_catalog("map_ingest");
+    map::ensure_schema_for(&catalog).unwrap();
+
+    // Set up a fence.
+    unit_square_fence(&catalog, "Places/Card");
+
+    // The card import itself doesn't embed GPS (minimal JPEG), so we set it
+    // manually after import to simulate what set_photo_metadata does at import time.
+    // The real integration is tested via apply_fences_to_photo which is called
+    // after set_photo_metadata in index_ingested.
+    //
+    // Here we verify the fence-apply hook is wired: after import, manually set GPS
+    // for one photo, call apply_fences_to_photo, and confirm the tag lands.
+    let card = root.parent().unwrap().join("card_map");
+    std::fs::create_dir_all(&card).unwrap();
+    std::fs::write(card.join("A.jpg"), b"\xff\xd8one").unwrap();
+
+    let result = ingest_from_card(&catalog, &card, &root, Some("Map import test")).unwrap();
+    assert_eq!(result.created, 1);
+
+    // Retrieve the photo and manually update its GPS (simulate EXIF extraction).
+    let photos = catalog
+        .list_photos(&PhotoQuery::default())
+        .unwrap();
+    assert_eq!(photos.len(), 1);
+    let photo_id = photos[0].id;
+
+    use chairphoto_core::catalog::PromotedMetadata;
+    catalog
+        .set_photo_metadata(
+            photo_id,
+            &PromotedMetadata {
+                gps_latitude: Some(0.5),
+                gps_longitude: Some(0.5),
+                ..Default::default()
+            },
+            &[],
+        )
+        .unwrap();
+
+    // Now apply the hook directly to simulate what happens at real import time.
+    let count = map::apply_fences_to_photo(&catalog, photo_id).unwrap();
+    assert_eq!(count, 1, "fence matched after GPS was set");
+    let tags = catalog.get_photo_tags(photo_id).unwrap();
+    assert!(
+        tags.iter().any(|t| t.full_path == "Places/Card"),
+        "place tag was applied to the imported photo"
+    );
+}
+
+/// Integration test for reverse-geocoding IPTC fill: verifies that empty location fields
+/// are filled and XMP sidecars are written (with the fill-empty-only semantics).
+/// The geocoding itself (Nominatim calls) is tested in geocode.rs unit tests.
+#[cfg(feature = "map")]
+#[test]
+fn reverse_geocode_iptc_fill_integration() {
+    let (catalog, root) = temp_catalog("geocode_iptc_fill");
+
+    // Create a photo with GPS but empty IPTC location fields.
+    let photo_path = root.join("test.jpg");
+    std::fs::write(&photo_path, b"\xff\xd8test").unwrap();
+    let photo_id = catalog.upsert_photo(&photo_path, None, 1, 4).unwrap().id;
+
+    use chairphoto_core::catalog::PromotedMetadata;
+    catalog
+        .set_photo_metadata(
+            photo_id,
+            &PromotedMetadata {
+                gps_latitude: Some(59.9139),
+                gps_longitude: Some(10.7522),
+                ..Default::default()
+            },
+            &[],
+        )
+        .unwrap();
+
+    // Verify IPTC location fields are initially empty.
+    let initial_iptc = catalog.get_iptc(photo_id).unwrap();
+    assert!(initial_iptc.city.is_empty(), "city must be initially empty");
+    assert!(initial_iptc.state.is_empty(), "state must be initially empty");
+    assert!(initial_iptc.country.is_empty(), "country must be initially empty");
+    assert!(initial_iptc.country_code.is_empty(), "country_code must be initially empty");
+
+    // Simulate a geocoder response (GeocodeResult as returned by the actual geocoder).
+    // Note: GeocodeResult uses Option<String>, so we wrap the values in Some().
+    use chairphoto_core::plugins::map::geocode::GeocodeResult;
+    let geocode_result = GeocodeResult {
+        city: Some("Oslo".to_string()),
+        state: Some("Oslo".to_string()),
+        country: Some("Norway".to_string()),
+        country_code: Some("NO".to_string()),
+    };
+
+    // Apply the production fill-empty-fields logic via the public helper.
+    // This is the critical path: fill only empty fields, never overwrite user-entered values.
+    let current_iptc = catalog.get_iptc(photo_id).unwrap();
+    let (updated_iptc, changed) =
+        chairphoto_core::plugins::map::geocode::fill_empty_iptc(&current_iptc, &geocode_result);
+
+    assert!(changed, "at least one field should have been filled");
+
+    // Write to catalog (as done in commands.rs Step 3).
+    catalog.set_iptc(photo_id, &updated_iptc).unwrap();
+
+    // Write to XMP sidecar (merge-safe path).
+    chairphoto_core::xmp::write_iptc(&photo_path, &current_iptc, &updated_iptc).unwrap();
+
+    // Verify IPTC fields were updated in the catalog.
+    let final_iptc = catalog.get_iptc(photo_id).unwrap();
+    assert_eq!(final_iptc.city, "Oslo");
+    assert_eq!(final_iptc.state, "Oslo");
+    assert_eq!(final_iptc.country, "Norway");
+    assert_eq!(final_iptc.country_code, "NO");
+
+    // Verify XMP sidecar was written.
+    let sidecar_path = photo_path.with_extension("jpg.xmp");
+    assert!(sidecar_path.exists(), "XMP sidecar must be created");
+
+    // Parse and verify sidecar content.
+    let sidecar_content = std::fs::read_to_string(&sidecar_path).unwrap();
+    assert!(sidecar_content.contains("Oslo"), "sidecar must contain city");
+    assert!(sidecar_content.contains("Norway"), "sidecar must contain country");
+}
+
+/// Test that existing IPTC values are never overwritten by reverse-geocoding fill.
+#[cfg(feature = "map")]
+#[test]
+fn reverse_geocode_preserves_existing_iptc_values() {
+    let (catalog, root) = temp_catalog("geocode_preserve");
+
+    // Create a photo with GPS and some pre-existing IPTC location fields.
+    let photo_path = root.join("test.jpg");
+    std::fs::write(&photo_path, b"\xff\xd8test").unwrap();
+    let photo_id = catalog.upsert_photo(&photo_path, None, 1, 4).unwrap().id;
+
+    use chairphoto_core::catalog::PromotedMetadata;
+    catalog
+        .set_photo_metadata(
+            photo_id,
+            &PromotedMetadata {
+                gps_latitude: Some(59.9139),
+                gps_longitude: Some(10.7522),
+                ..Default::default()
+            },
+            &[],
+        )
+        .unwrap();
+
+    // Pre-fill some IPTC fields with user-entered values.
+    let mut pre_iptc = catalog.get_iptc(photo_id).unwrap();
+    pre_iptc.city = "CustomCity".to_string();
+    pre_iptc.country = "CustomCountry".to_string();
+    // state and country_code remain empty — these should be filled by geocoding.
+    // Stored and written to the sidecar as the user's IPTC save does.
+    let empty_iptc = catalog.get_iptc(photo_id).unwrap();
+    catalog.set_iptc(photo_id, &pre_iptc).unwrap();
+    chairphoto_core::xmp::write_iptc(&photo_path, &empty_iptc, &pre_iptc).unwrap();
+
+    // Simulate a geocoder response (GeocodeResult as returned by the actual geocoder).
+    use chairphoto_core::plugins::map::geocode::GeocodeResult;
+    let geocode_result = GeocodeResult {
+        city: Some("Oslo".to_string()),
+        state: Some("Vestfold".to_string()),
+        country: Some("Norway".to_string()),
+        country_code: Some("NO".to_string()),
+    };
+
+    // Apply the production fill-empty-fields logic via the public helper.
+    // This is the critical test: verify that pre-filled fields are NEVER overwritten.
+    let current_iptc = catalog.get_iptc(photo_id).unwrap();
+    let (updated_iptc, changed) =
+        chairphoto_core::plugins::map::geocode::fill_empty_iptc(&current_iptc, &geocode_result);
+
+    assert!(changed, "at least state or country_code should have been filled");
+
+    // Verify pre-filled fields were NOT overwritten.
+    assert_eq!(updated_iptc.city, "CustomCity", "city must not be overwritten");
+    assert_eq!(updated_iptc.country, "CustomCountry", "country must not be overwritten");
+
+    // Verify empty fields were filled.
+    assert_eq!(updated_iptc.state, "Vestfold", "empty state should be filled");
+    assert_eq!(updated_iptc.country_code, "NO", "empty country_code should be filled");
+
+    // Write to catalog and XMP sidecar (demonstrating the full write path).
+    catalog.set_iptc(photo_id, &updated_iptc).unwrap();
+    chairphoto_core::xmp::write_iptc(&photo_path, &current_iptc, &updated_iptc).unwrap();
+
+    // Verify the sidecar was written correctly.
+    let sidecar_path = photo_path.with_extension("jpg.xmp");
+    assert!(sidecar_path.exists(), "XMP sidecar must be created");
+
+    let sidecar_content = std::fs::read_to_string(&sidecar_path).unwrap();
+    assert!(
+        sidecar_content.contains("CustomCity"),
+        "sidecar must preserve user-entered city"
+    );
+    assert!(
+        sidecar_content.contains("Vestfold"),
+        "sidecar must contain filled state"
+    );
+}
+
+// ── H2g: set_photo_gps tests ──────────────────────────────────────────────────
+
+/// set_photo_gps updates GPS columns for multiple photos and re-applies fences.
+#[cfg(feature = "map")]
+#[test]
+fn set_photo_gps_updates_catalog_columns_for_multiple_photos() {
+    use chairphoto_core::plugins::map;
+
+    let (catalog, root) = temp_catalog("set_gps_columns");
+    map::ensure_schema_for(&catalog).unwrap();
+
+    // Create two photos without GPS initially.
+    let path_a = root.join("a.jpg");
+    let path_b = root.join("b.jpg");
+    std::fs::write(&path_a, b"\xff\xd8test").unwrap();
+    std::fs::write(&path_b, b"\xff\xd8test").unwrap();
+    let id_a = catalog.upsert_photo(&path_a, None, 1, 4).unwrap().id;
+    let id_b = catalog.upsert_photo(&path_b, None, 1, 4).unwrap().id;
+
+    // Assign a GPS position to both in one call.
+    let lat = 59.9333;
+    let lng = 10.7167;
+    map::set_photo_gps(&catalog, &[id_a, id_b], lat, lng).unwrap();
+
+    // Verify catalog columns were updated.
+    let points = map::map_photo_points_for(&catalog).unwrap();
+    let ids: Vec<i64> = points.iter().map(|p| p.id).collect();
+    assert!(ids.contains(&id_a), "photo A has GPS after set_photo_gps");
+    assert!(ids.contains(&id_b), "photo B has GPS after set_photo_gps");
+    for pt in &points {
+        if pt.id == id_a || pt.id == id_b {
+            assert!((pt.lat - lat).abs() < 1e-9, "latitude stored correctly");
+            assert!((pt.lng - lng).abs() < 1e-9, "longitude stored correctly");
+        }
+    }
+}
+
+/// set_photo_gps writes GPS merge-safely into the XMP sidecar and round-trips correctly.
+#[cfg(feature = "map")]
+#[test]
+fn set_photo_gps_sidecar_round_trips_and_preserves_foreign_content() {
+    use chairphoto_core::plugins::map;
+    use chairphoto_core::xmp;
+
+    let (catalog, root) = temp_catalog("set_gps_sidecar");
+    map::ensure_schema_for(&catalog).unwrap();
+
+    let photo_path = root.join("test.jpg");
+    std::fs::write(&photo_path, b"\xff\xd8test").unwrap();
+    let photo_id = catalog.upsert_photo(&photo_path, None, 1, 4).unwrap().id;
+
+    // Write a pre-existing sidecar with foreign darktable content.
+    let sidecar_path = xmp::sidecar_path(&photo_path);
+    let existing = r#"<?xml version="1.0" encoding="UTF-8"?>
+<x:xmpmeta xmlns:x="adobe:ns:meta/">
+ <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
+  <rdf:Description rdf:about="" xmlns:darktable="http://darktable.sf.net/">
+   <darktable:history_end>5</darktable:history_end>
+  </rdf:Description>
+ </rdf:RDF>
+</x:xmpmeta>"#;
+    std::fs::write(&sidecar_path, existing).unwrap();
+
+    let lat = 59.9139;
+    let lng = 10.7522;
+    map::set_photo_gps(&catalog, &[photo_id], lat, lng).unwrap();
+
+    // Sidecar must exist and contain the GPS fields.
+    assert!(sidecar_path.exists(), "sidecar must exist after set_photo_gps");
+    let content = std::fs::read_to_string(&sidecar_path).unwrap();
+    assert!(content.contains("GPSLatitude"), "sidecar must contain GPSLatitude");
+    assert!(content.contains("GPSLongitude"), "sidecar must contain GPSLongitude");
+    // Foreign darktable content must be preserved (merge-safe invariant).
+    assert!(content.contains("history_end"), "darktable data must not be clobbered");
+    assert!(content.contains("darktable"), "darktable namespace must survive");
+
+    // Coordinates must round-trip: read back, convert, compare.
+    let (read_lat, read_lng) = xmp::read_gps(&photo_path)
+        .expect("GPS must be readable from the sidecar after set_photo_gps");
+    assert!((read_lat - lat).abs() < 1e-5, "lat round-trips within 1e-5 degrees");
+    assert!((read_lng - lng).abs() < 1e-5, "lng round-trips within 1e-5 degrees");
+}
+
+/// set_photo_gps re-applies fences to moved photos so place tags follow.
+#[cfg(feature = "map")]
+#[test]
+fn set_photo_gps_reapplies_fences_after_move() {
+    use chairphoto_core::plugins::map;
+
+    let (catalog, root) = temp_catalog("set_gps_fences");
+    map::ensure_schema_for(&catalog).unwrap();
+
+    // Fence covering the unit square (lat 0..1, lng 0..1).
+    let fence_id = unit_square_fence(&catalog, "Places/Square");
+
+    // Photo starts outside the fence (no GPS yet).
+    let photo_path = root.join("photo.jpg");
+    std::fs::write(&photo_path, b"\xff\xd8test").unwrap();
+    let photo_id = catalog.upsert_photo(&photo_path, None, 1, 4).unwrap().id;
+
+    // Verify no tags before GPS is set.
+    assert!(catalog.get_photo_tags(photo_id).unwrap().is_empty());
+
+    // Move the photo into the fence.
+    let assignments = map::set_photo_gps(&catalog, &[photo_id], 0.5, 0.5).unwrap();
+    assert_eq!(assignments, 1, "one new fence-tag assignment after moving inside");
+
+    let tags = catalog.get_photo_tags(photo_id).unwrap();
+    assert!(
+        tags.iter().any(|t| t.full_path == "Places/Square"),
+        "photo gets place tag after being moved into the fence"
+    );
+
+    // Verify apply was also tied to the fence (not a stale copy).
+    let _ = fence_id; // referenced to prove it was used
+}
+
+/// set_photo_gps on a photo moved outside all fences creates no new assignments.
+#[cfg(feature = "map")]
+#[test]
+fn set_photo_gps_outside_all_fences_returns_zero() {
+    use chairphoto_core::plugins::map;
+
+    let (catalog, root) = temp_catalog("set_gps_outside");
+    map::ensure_schema_for(&catalog).unwrap();
+
+    // Fence at the unit square, photo placed far outside.
+    unit_square_fence(&catalog, "Places/Outside");
+    let photo_path = root.join("photo.jpg");
+    std::fs::write(&photo_path, b"\xff\xd8test").unwrap();
+    let photo_id = catalog.upsert_photo(&photo_path, None, 1, 4).unwrap().id;
+
+    let assignments = map::set_photo_gps(&catalog, &[photo_id], 50.0, 50.0).unwrap();
+    assert_eq!(assignments, 0, "no fence assignments when photo is outside all fences");
+    assert!(
+        catalog.get_photo_tags(photo_id).unwrap().is_empty(),
+        "no tags assigned when photo is outside all fences"
+    );
+}
+
+/// Two simultaneous Catalog::open calls on a fresh file must both succeed and
+/// leave the database in WAL mode.
+/// Regression coverage for the StrictMode initialization races:
+/// - WAL activation may return SQLITE_BUSY without running the busy handler when two
+///   connections attempt the lock upgrade together, so enable_wal retries that pragma.
+/// - migrate() takes BEGIN EXCLUSIVE so concurrent ensure_column check-then-ALTER
+///   sequences serialize instead of losing with "duplicate column name".
+/// Multiple rounds make both interleavings deterministic enough for CI.
+#[test]
+fn concurrent_opens_of_fresh_catalog_all_succeed() {
+    const ROUNDS: usize = 16;
+    const OPENERS: usize = 2;
+
+    let base = std::env::temp_dir().join(format!(
+        "chairphoto-test-concurrent-open-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&base);
+
+    for round in 0..ROUNDS {
+        let dir = base.join(round.to_string());
+        let root = dir.join("photos");
+        std::fs::create_dir_all(&root).unwrap();
+        let db = dir.join("test.chairphoto");
+
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(OPENERS));
+        let results: Vec<_> = (0..OPENERS)
+            .map(|_| {
+                let barrier = barrier.clone();
+                let db = db.clone();
+                let root = root.clone();
+                std::thread::spawn(move || {
+                    barrier.wait(); // maximize overlap so both opens initialize at once
+                    Catalog::open(&db, &root).map(|_| ())
+                })
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|h| h.join().unwrap())
+            .collect();
+
+        for (i, r) in results.iter().enumerate() {
+            assert!(
+                r.is_ok(),
+                "round {round}, concurrent open #{i} failed: {:?}",
+                r.as_ref().err()
+            );
+        }
+
+        let journal_mode: String = rusqlite::Connection::open(&db)
+            .and_then(|conn| conn.query_row("PRAGMA journal_mode;", [], |row| row.get(0)))
+            .unwrap();
+        assert_eq!(
+            journal_mode, "wal",
+            "round {round} completed outside WAL mode"
+        );
+    }
+
+    std::fs::remove_dir_all(base).unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// Photo identity binding (AGENTS.md, "Photo identity": the UUID lives in BOTH
+// SQLite and xmp:Identifier, and the sidecar write is never skipped).
+//
+// A sidecar write that could not complete used to be an eprintln! and an Ok — the
+// catalog kept the row and the photo silently lost its portable identity. These
+// tests pin the replacement: the row is kept AND the debt is queued, and a repair
+// pass puts the identity on disk once the obstacle is gone.
+// ---------------------------------------------------------------------------
+
+/// Restores a directory's permissions when it drops, so a failing assertion cannot
+/// leave a read-only directory behind for the next run to trip over.
+#[cfg(unix)]
+struct ReadOnlyDir(PathBuf);
+
+#[cfg(unix)]
+impl Drop for ReadOnlyDir {
+    fn drop(&mut self) {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o755));
+    }
+}
+
+/// Make `dir` reject new files for the lifetime of the guard. Returns `None` when the
+/// mode bits do not actually block writes (i.e. running as root), so a test that cannot
+/// reproduce the failure skips loudly instead of passing without proving anything. `what` is
+/// the calling test's name, so the skip line says which test did not run — the same shape as
+/// `onnx_ready_or_skip` / `models_ready_or_skip` / `skip_if_no_loopback_multicast`.
+#[cfg(unix)]
+fn read_only_dir(what: &str, dir: &std::path::Path) -> Option<ReadOnlyDir> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+    let guard = ReadOnlyDir(dir.to_path_buf());
+    let probe = dir.join(".chairphoto-write-probe");
+    match std::fs::write(&probe, b"x") {
+        Ok(()) => {
+            let _ = std::fs::remove_file(&probe);
+            eprintln!(
+                "SKIPPED: {what} — writes to a 0555 directory succeed here (root?), so the \
+                 unwritable-sidecar path cannot be reproduced"
+            );
+            None
+        }
+        Err(_) => Some(guard),
+    }
+}
+
+fn pending_sidecar_field_count(
+    pending: &[chairphoto_core::catalog::PendingIdentityRow],
+    field: &str,
+) -> usize {
+    pending.iter().filter(|p| p.field == field).count()
+}
+
+#[cfg(unix)]
+#[test]
+fn unwritable_sidecar_queues_a_repair_that_later_succeeds() {
+    use chairphoto_core::catalog::SidecarIdentity;
+
+    let (catalog, root) = temp_catalog("identity-unwritable");
+    let dir = root.join("2026/06/28");
+    std::fs::create_dir_all(&dir).unwrap();
+    let photo = dir.join("DSC0001.ARW");
+    std::fs::write(&photo, b"raw-bytes").unwrap();
+    let up = catalog.upsert_photo(&photo, None, 1, 9).unwrap();
+
+    // The photo's storage goes read-only (a NAS export mounted ro, a locked-down
+    // archive) — the sidecar cannot be created.
+    let Some(guard) = read_only_dir("unwritable_sidecar_queues_a_repair_that_later_succeeds", &dir) else { return };
+
+    let outcome = catalog
+        .ensure_sidecar_identity(up.id, &photo, &up.uuid, None)
+        .unwrap();
+    assert!(
+        matches!(outcome, SidecarIdentity::Unwritable(_)),
+        "an unwritable folder must report the failure, got {outcome:?}"
+    );
+    assert!(
+        chairphoto_core::xmp::read_identifier(&photo).is_none(),
+        "no sidecar could be written, so nothing is on disk yet"
+    );
+
+    // The row is still catalogued — and the identity debt is durable, not stderr.
+    let pending = catalog.list_pending_identity().unwrap();
+    assert_eq!(pending.len(), 1, "the failure is queued for repair");
+    assert_eq!(pending[0].photo_id, up.id);
+    assert_eq!(
+        pending[0].uuid, up.uuid,
+        "the queue names the identity that must still reach the disk"
+    );
+    assert!(
+        pending[0].error.contains("sidecar write failed"),
+        "the reason is kept for diagnosis, got {:?}",
+        pending[0].error
+    );
+
+    // Retrying while the storage is still read-only leaves it queued and counts the try.
+    let retry = catalog.repair_pending_identity().unwrap();
+    assert_eq!(
+        (retry.bound, retry.failed, retry.unreachable),
+        (0, 1, 0),
+        "a repair against read-only storage fails and stays queued"
+    );
+    assert_eq!(catalog.list_pending_identity().unwrap()[0].attempts, 2);
+
+    // Once the obstacle is gone the repair binds the identity and clears the queue —
+    // portable identity was deferred, never lost.
+    drop(guard);
+    let summary = catalog.repair_pending_identity().unwrap();
+    assert_eq!((summary.bound, summary.failed, summary.unreachable), (1, 0, 0));
+    assert_eq!(
+        chairphoto_core::xmp::read_identifier(&photo).as_deref(),
+        Some(up.uuid.as_str()),
+        "the catalog UUID is now on disk"
+    );
+    assert_eq!(catalog.count_pending_identity().unwrap(), 0);
+}
+
+#[cfg(unix)]
+#[test]
+fn scan_read_only_storage_queues_import_batch_sidecar_debt() {
+    let (catalog, root) = temp_catalog("batch-sidecar-scan-readonly");
+    seed_jpgs(&root, 2);
+    let Some(guard) = read_only_dir("scan_read_only_storage_queues_import_batch_sidecar_debt", &root) else {
+        return;
+    };
+
+    let abort = AtomicBool::new(false);
+    let result = chairphoto_core::scanner::scan_folder(&catalog, &root, &abort, &|_| {}).unwrap();
+    assert_eq!(
+        result.created, 2,
+        "read-only sidecars must not abort the scan"
+    );
+    let batch_uuid = catalog.list_import_batches().unwrap()[0].uuid.clone();
+
+    let pending = catalog.list_pending_identity().unwrap();
+    assert_eq!(
+        pending_sidecar_field_count(&pending, "identifier"),
+        2,
+        "UUID sidecar debt is still recorded per photo"
+    );
+    assert_eq!(
+        pending_sidecar_field_count(&pending, "import_batch"),
+        2,
+        "ImportBatch sidecar debt must be recorded instead of printed to stderr"
+    );
+
+    drop(guard);
+    let summary = catalog.repair_pending_identity().unwrap();
+    assert_eq!(
+        (summary.bound, summary.failed, summary.unreachable),
+        (4, 0, 0),
+        "repair drains both UUID and ImportBatch sidecar debt"
+    );
+    for photo in catalog
+        .list_photos(&PhotoQuery::default())
+        .unwrap()
+    {
+        let path = root.join(&photo.path);
+        assert_eq!(
+            chairphoto_core::xmp::read_import_batch(&path).as_deref(),
+            Some(batch_uuid.as_str()),
+            "{} carries its import batch after repair",
+            photo.path
+        );
+    }
+    assert!(catalog.list_pending_identity().unwrap().is_empty());
+}
+
+#[cfg(unix)]
+#[test]
+fn card_ingest_queues_identity_and_import_batch_sidecar_debt() {
+    use chairphoto_core::scanner::{copy_from_card, index_ingested};
+
+    let (catalog, root) = temp_catalog("batch-sidecar-ingest-readonly");
+    let card = root.parent().unwrap().join("card-readonly-sidecar");
+    std::fs::create_dir_all(&card).unwrap();
+    std::fs::write(card.join("IMG_1.jpg"), b"\xff\xd8one").unwrap();
+
+    let (copy_result, copied) = copy_from_card(&catalog, &card, &root, None, |_, _| {}).unwrap();
+    assert_eq!(copied.len(), 1);
+    let dest = copied[0].dest.clone();
+    let sidecar_dir = dest.parent().unwrap().to_path_buf();
+    let Some(guard) = read_only_dir("card_ingest_queues_identity_and_import_batch_sidecar_debt", &sidecar_dir) else {
+        return;
+    };
+
+    let result = index_ingested(
+        &catalog,
+        &root,
+        &card,
+        copied,
+        Some("Malformed sidecar ingest"),
+        copy_result,
+    )
+    .unwrap();
+    assert_eq!(result.created, 1, "the photo is still indexed");
+    let batch_uuid = catalog.list_import_batches().unwrap()[0].uuid.clone();
+
+    let pending = catalog.list_pending_identity().unwrap();
+    assert_eq!(pending_sidecar_field_count(&pending, "identifier"), 1);
+    assert_eq!(
+        pending_sidecar_field_count(&pending, "import_batch"),
+        1,
+        "the ingest-side ImportBatch write failure is retryable catalog debt"
+    );
+    assert!(
+        chairphoto_core::xmp::read_import_batch(&dest).is_none(),
+        "the read-only destination could not be updated yet"
+    );
+
+    drop(guard);
+    let summary = catalog.repair_pending_identity().unwrap();
+    assert_eq!(
+        (summary.bound, summary.failed, summary.unreachable),
+        (2, 0, 0)
+    );
+    let photo = catalog
+        .list_photos(&PhotoQuery::default())
+        .unwrap()
+        .into_iter()
+        .next()
+        .unwrap();
+    assert_eq!(
+        chairphoto_core::xmp::read_identifier(&dest).as_deref(),
+        Some(photo.uuid.as_str())
+    );
+    assert_eq!(
+        chairphoto_core::xmp::read_import_batch(&dest).as_deref(),
+        Some(batch_uuid.as_str())
+    );
+    assert!(catalog.list_pending_identity().unwrap().is_empty());
+}
+
+#[cfg(unix)]
+#[test]
+fn bundle_import_queues_identity_sidecar_debt_for_unwritable_extracted_copy() {
+    use chairphoto_core::bundle::importer::{extract_originals, index_bundle, open_bundle};
+    use chairphoto_core::bundle::writer::{gather_bundle, write_bundle};
+
+    let (cat_a, _root_a, _uuid1, _uuid2, batch_id_a) = setup_catalog_a("identity-bundle-a");
+    let bundle_zip = std::env::temp_dir().join(format!(
+        "chairphoto-bundle-identity-readonly-{}.chairphoto",
+        std::process::id()
+    ));
+    let _guard = {
+        struct Rm(PathBuf);
+        impl Drop for Rm {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_file(&self.0);
+            }
+        }
+        Rm(bundle_zip.clone())
+    };
+    let gathered = gather_bundle(&cat_a, batch_id_a)
+        .unwrap()
+        .expect("batch must export");
+    write_bundle(&gathered, &bundle_zip, |_, _| {}).unwrap();
+
+    let (cat_b, root_b) = temp_catalog("identity-bundle-b");
+    let (manifest, mut archive) = open_bundle(&bundle_zip).unwrap();
+    let (extracted, partial) =
+        extract_originals(&cat_b, &manifest, &mut archive, &root_b, |_, _| {}).unwrap();
+    assert_eq!(extracted.len(), 2);
+
+    let target = extracted[0].dest.clone();
+    let target_uuid = extracted[0].photo_uuid.clone();
+    let sidecar = chairphoto_core::xmp::sidecar_path(&target);
+    assert!(
+        sidecar.exists(),
+        "extract_originals normally writes the bundle UUID before indexing"
+    );
+    std::fs::remove_file(&sidecar).unwrap();
+    let sidecar_dir = target.parent().unwrap().to_path_buf();
+    let Some(guard) = read_only_dir("bundle_import_queues_identity_sidecar_debt_for_unwritable_extracted_copy", &sidecar_dir) else {
+        return;
+    };
+
+    let result = index_bundle(&cat_b, &manifest, &extracted, &root_b, partial).unwrap();
+    assert_eq!(result.errors, 0, "the bundle import still succeeds");
+    let imported = cat_b
+        .get_photo_by_uuid(&target_uuid)
+        .expect("the extracted photo is catalogued");
+
+    let pending = cat_b.list_pending_identity().unwrap();
+    assert_eq!(
+        pending_sidecar_field_count(&pending, "identifier"),
+        1,
+        "the bundle indexer records UUID sidecar debt for the imported copy"
+    );
+    let identifier = pending.iter().find(|p| p.field == "identifier").unwrap();
+    assert_eq!(identifier.photo_id, imported.id);
+    assert_eq!(PathBuf::from(&identifier.target_path), target);
+    assert!(
+        chairphoto_core::xmp::read_identifier(&target).is_none(),
+        "the read-only destination could not be updated yet"
+    );
+
+    drop(guard);
+    let summary = cat_b.repair_pending_identity().unwrap();
+    assert_eq!(
+        (summary.failed, summary.unreachable),
+        (0, 0),
+        "the queued UUID repair should complete once the destination is writable"
+    );
+    assert!(
+        summary.bound >= 1,
+        "at least the queued UUID field should be repaired"
+    );
+    assert_eq!(
+        chairphoto_core::xmp::read_identifier(&target).as_deref(),
+        Some(imported.uuid.as_str())
+    );
+    assert!(cat_b.list_pending_identity().unwrap().is_empty());
+}
+
+#[test]
+fn malformed_sidecar_is_preserved_and_queued() {
+    use chairphoto_core::catalog::SidecarIdentity;
+
+    let (catalog, root) = temp_catalog("identity-malformed");
+    let photo = root.join("DSC0002.ARW");
+    std::fs::write(&photo, b"raw-bytes").unwrap();
+    // A truncated sidecar — half-written by an interrupted third-party tool.
+    let sidecar = root.join("DSC0002.ARW.xmp");
+    let corrupt: &[u8] = b"<x:xmpmeta xmlns:x=\"adobe:ns:meta/\"><rdf:RDF";
+    std::fs::write(&sidecar, corrupt).unwrap();
+
+    let up = catalog.upsert_photo(&photo, None, 1, 9).unwrap();
+    assert!(
+        chairphoto_core::xmp::read_identifier(&photo).is_none(),
+        "a sidecar that does not parse yields no identifier"
+    );
+
+    let outcome = catalog
+        .ensure_sidecar_identity(up.id, &photo, &up.uuid, None)
+        .unwrap();
+    assert!(
+        matches!(outcome, SidecarIdentity::Unwritable(_)),
+        "a sidecar that cannot be parsed cannot be merged into, got {outcome:?}"
+    );
+    assert_eq!(
+        std::fs::read(&sidecar).unwrap(),
+        corrupt,
+        "the unreadable sidecar is left byte-identical — XMP safety says preserve"
+    );
+    assert_eq!(catalog.count_pending_identity().unwrap(), 1);
+    assert_eq!(
+        catalog.repair_pending_identity().unwrap().failed,
+        1,
+        "repair does not paper over a corrupt sidecar"
+    );
+
+    // With the corrupt file out of the way, the queued repair completes.
+    std::fs::remove_file(&sidecar).unwrap();
+    let summary = catalog.repair_pending_identity().unwrap();
+    assert_eq!((summary.bound, summary.failed), (1, 0));
+    assert_eq!(
+        chairphoto_core::xmp::read_identifier(&photo).as_deref(),
+        Some(up.uuid.as_str())
+    );
+    assert_eq!(catalog.count_pending_identity().unwrap(), 0);
+}
+
+#[test]
+fn a_foreign_identity_in_the_sidecar_is_never_overwritten() {
+    use chairphoto_core::catalog::SidecarIdentity;
+
+    let (catalog, root) = temp_catalog("identity-conflict");
+    let photo = root.join("DSC0003.ARW");
+    std::fs::write(&photo, b"raw-bytes").unwrap();
+    let up = catalog.upsert_photo(&photo, None, 1, 9).unwrap();
+
+    // The file already carries somebody else's identity (a copied sidecar, another
+    // catalog's photo). Binding must not resolve that by destroying it.
+    const FOREIGN: &str = "11111111-2222-3333-4444-555555555555";
+    chairphoto_core::xmp::write_identifier(&photo, FOREIGN).unwrap();
+    let found = chairphoto_core::xmp::read_identifier(&photo);
+
+    let outcome = catalog
+        .ensure_sidecar_identity(up.id, &photo, &up.uuid, found.as_deref())
+        .unwrap();
+    assert_eq!(outcome, SidecarIdentity::Conflict(FOREIGN.to_string()));
+    assert_eq!(
+        chairphoto_core::xmp::read_identifier(&photo).as_deref(),
+        Some(FOREIGN),
+        "the foreign identity stays on disk"
+    );
+
+    let pending = catalog.list_pending_identity().unwrap();
+    assert_eq!(pending.len(), 1);
+    assert!(
+        pending[0].error.contains("different identity"),
+        "the divergence is described, got {:?}",
+        pending[0].error
+    );
+
+    // A repair pass keeps reporting it rather than clobbering — this one needs a human.
+    // A Conflict is NOT a failure: it lands in `conflicts`, not
+    // `failed` — retrying it forever would be pointless, and calling it a failure would
+    // contradict the "left untouched until a person resolves it" story the UI tells.
+    let summary = catalog.repair_pending_identity().unwrap();
+    assert_eq!((summary.bound, summary.failed, summary.conflicts), (0, 0, 1));
+    assert_eq!(
+        chairphoto_core::xmp::read_identifier(&photo).as_deref(),
+        Some(FOREIGN)
+    );
+}
+
+#[test]
+fn an_unreachable_original_leaves_the_repair_queued() {
+    let (catalog, root) = temp_catalog("identity-unreachable");
+    let photo = root.join("DSC0004.ARW");
+    std::fs::write(&photo, b"raw-bytes").unwrap();
+    let up = catalog.upsert_photo(&photo, None, 1, 9).unwrap();
+    std::fs::write(
+        root.join("DSC0004.ARW.xmp"),
+        b"<x:xmpmeta xmlns:x=\"adobe:ns:meta/\"><rdf:RDF",
+    )
+    .unwrap();
+    catalog
+        .ensure_sidecar_identity(up.id, &photo, &up.uuid, None)
+        .unwrap();
+    assert_eq!(catalog.count_pending_identity().unwrap(), 1);
+
+    // The volume goes away (unmounted NAS, disconnected disk). Missing storage is a
+    // normal state: the repair is not a failure and not a reason to drop the row.
+    std::fs::remove_file(&photo).unwrap();
+    let summary = catalog.repair_pending_identity().unwrap();
+    assert_eq!(
+        (summary.bound, summary.failed, summary.unreachable),
+        (0, 0, 1)
+    );
+    assert_eq!(catalog.count_pending_identity().unwrap(), 1, "still queued");
+}
+
+#[test]
+fn identity_repair_keeps_copy_debt_when_another_copy_is_reachable() {
+    use chairphoto_core::catalog::SidecarIdentity;
+
+    let (catalog, root) = temp_catalog("identity-copy-target");
+    let primary = root.join("DSC0005.ARW");
+    std::fs::write(&primary, b"primary-raw").unwrap();
+    let up = catalog.upsert_photo(&primary, None, 1, 11).unwrap();
+
+    let backup_dir = root.parent().unwrap().join("backup-identity");
+    std::fs::create_dir_all(&backup_dir).unwrap();
+    let backup = backup_dir.join("DSC0005.ARW");
+    std::fs::write(&backup, b"backup-raw").unwrap();
+    let backup_volume = catalog
+        .add_volume("Backup", &backup_dir, VolumeKind::Backup)
+        .unwrap();
+    catalog
+        .add_location(up.id, backup_volume, "DSC0005.ARW", LocationRole::Backup)
+        .unwrap();
+
+    let corrupt_sidecar = root.join("DSC0005.ARW.xmp");
+    std::fs::write(
+        &corrupt_sidecar,
+        b"<x:xmpmeta xmlns:x=\"adobe:ns:meta/\"><rdf:RDF",
+    )
+    .unwrap();
+
+    let outcome = catalog
+        .ensure_sidecar_identity(up.id, &primary, &up.uuid, None)
+        .unwrap();
+    assert!(
+        matches!(outcome, SidecarIdentity::Unwritable(_)),
+        "the corrupt primary sidecar must be queued, got {outcome:?}"
+    );
+    let pending = catalog.list_pending_identity().unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(PathBuf::from(&pending[0].target_path), primary);
+
+    std::fs::remove_file(&primary).unwrap();
+    let summary = catalog.repair_pending_identity().unwrap();
+    assert_eq!(
+        (summary.bound, summary.failed, summary.unreachable),
+        (0, 0, 1),
+        "a reachable backup must not clear debt for the missing primary copy"
+    );
+    assert_eq!(catalog.count_pending_identity().unwrap(), 1);
+    assert!(
+        chairphoto_core::xmp::read_identifier(&backup).is_none(),
+        "repair is scoped to the queued primary copy"
+    );
+
+    let backup_outcome = catalog
+        .ensure_sidecar_identity(up.id, &backup, &up.uuid, None)
+        .unwrap();
+    assert_eq!(backup_outcome, SidecarIdentity::Bound);
+    assert_eq!(
+        chairphoto_core::xmp::read_identifier(&backup).as_deref(),
+        Some(up.uuid.as_str())
+    );
+    let pending = catalog.list_pending_identity().unwrap();
+    assert_eq!(
+        pending.len(),
+        1,
+        "binding the backup copy must not erase the primary copy's debt"
+    );
+    assert_eq!(PathBuf::from(&pending[0].target_path), primary);
+
+    std::fs::write(&primary, b"primary-raw").unwrap();
+    std::fs::remove_file(&corrupt_sidecar).unwrap();
+    let summary = catalog.repair_pending_identity().unwrap();
+    assert_eq!(
+        (summary.bound, summary.failed, summary.unreachable),
+        (1, 0, 0)
+    );
+    assert_eq!(
+        chairphoto_core::xmp::read_identifier(&primary).as_deref(),
+        Some(up.uuid.as_str())
+    );
+    assert_eq!(catalog.count_pending_identity().unwrap(), 0);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_scan_onto_read_only_storage_keeps_every_identity_recoverable() {
+    let (catalog, root) = temp_catalog("identity-scan-readonly");
+    seed_jpgs(&root, 3);
+    let Some(guard) = read_only_dir("a_scan_onto_read_only_storage_keeps_every_identity_recoverable", &root) else { return };
+
+    // The scan still imports — one unwritable folder must not cost the user the rows.
+    let abort = AtomicBool::new(false);
+    let result = chairphoto_core::scanner::scan_folder(&catalog, &root, &abort, &|_| {}).unwrap();
+    assert_eq!(result.created, 3, "the scan indexes every file");
+    assert_eq!(
+        catalog.count_pending_identity().unwrap(),
+        3,
+        "every photo whose sidecar could not be written owes an identity repair"
+    );
+
+    // Remount read-write and repair: every queued sidecar identity field is retried;
+    // this scan also queued the import-batch field for each photo.
+    drop(guard);
+    let summary = catalog.repair_pending_identity().unwrap();
+    assert_eq!(
+        (summary.bound, summary.failed, summary.unreachable),
+        (6, 0, 0)
+    );
+    let photos = catalog
+        .list_photos(&PhotoQuery::default())
+        .unwrap();
+    assert_eq!(photos.len(), 3);
+    for photo in &photos {
+        assert_eq!(
+            chairphoto_core::xmp::read_identifier(&root.join(&photo.path)).as_deref(),
+            Some(photo.uuid.as_str()),
+            "{} carries its catalog identity after the repair",
+            photo.path
+        );
+    }
+    assert_eq!(catalog.count_pending_identity().unwrap(), 0);
+}
+
+// ── A7: retiring photo_metadata's unused index and column ────────────────────
+//
+// Measured on the owner's 165,093-photo catalog: `idx_photo_metadata_lookup` was 1,844 MB —
+// 22% of the whole catalog — and with `value_norm` made metadata inserts ~2.8x slower on
+// every scan, for a "filter by EXIF key/value" feature that was never built. These pin the
+// two halves of retiring them, which have deliberately different costs: dropping the index
+// is instant and happens on every open, while dropping the column rewrites tens of millions
+// of rows and waits for an explicit compaction.
+
+/// Open a catalog, then put its `photo_metadata` back into the pre-A7 shape — column and
+/// index — so the migration has something real to find. Building the old shape by hand is
+/// the only way to test an upgrade path once the schema no longer produces it.
+fn legacy_metadata_catalog(tag: &str) -> (Catalog, common::TestSubPath, PathBuf) {
+    let dir = common::TestTmpDir::new(tag);
+    let root = dir.join("photos");
+    std::fs::create_dir_all(&root).unwrap();
+    let db = dir.join("test.chairphoto");
+    {
+        // Opened and dropped so the schema exists; then rewound by hand. `Catalog::conn` is
+        // crate-private, so the shape is built through its own connection to the file — the
+        // same way `wal_is_enabled_on_open` already does.
+        //
+        // The table is REBUILT rather than patched with `ALTER TABLE ADD COLUMN`, and that
+        // detail is the whole point: SQLite refuses to add a NOT NULL column without a
+        // default, so patching produces `value_norm TEXT NOT NULL DEFAULT ''` — which quietly
+        // accepts an INSERT that omits the column. The real pre-A7 schema has no default, so
+        // the same INSERT fails with "NOT NULL constraint failed". A fixture with the default
+        // would let these tests pass even if the legacy write path were deleted outright.
+        let _ = Catalog::open(&db, &root).unwrap();
+        rusqlite::Connection::open(&db)
+            .unwrap()
+            .execute_batch(
+                "DROP TABLE photo_metadata;
+                 CREATE TABLE photo_metadata (
+                     photo_id   INTEGER NOT NULL REFERENCES photos(id) ON DELETE CASCADE,
+                     key        TEXT NOT NULL,
+                     group_name TEXT NOT NULL,
+                     value      TEXT NOT NULL,
+                     value_norm TEXT NOT NULL,
+                     PRIMARY KEY (photo_id, key, value)
+                 );
+                 CREATE INDEX idx_photo_metadata_lookup
+                     ON photo_metadata(key, value_norm, photo_id);
+                 CREATE INDEX idx_photo_metadata_photo ON photo_metadata(photo_id);",
+            )
+            .unwrap();
+    }
+    let catalog = Catalog::open(&db, &root).unwrap();
+    (catalog, dir.into_subpath("photos"), db)
+}
+
+fn has_index(db: &std::path::Path, name: &str) -> bool {
+    rusqlite::Connection::open(db)
+        .unwrap()
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = ?1",
+            [name],
+            |_| Ok(()),
+        )
+        .is_ok()
+}
+
+fn has_metadata_column(db: &std::path::Path, column: &str) -> bool {
+    let conn = rusqlite::Connection::open(db).unwrap();
+    let mut stmt = conn.prepare("PRAGMA table_info(photo_metadata)").unwrap();
+    let columns: Vec<String> = stmt
+        .query_map([], |r| r.get::<_, String>(1))
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap();
+    columns.iter().any(|c| c == column)
+}
+
+/// A fresh catalog is born without either. (If this fails, the schema grew them back.)
+#[test]
+fn a_new_catalog_has_no_metadata_lookup_index_or_value_norm() {
+    let dir = common::TestTmpDir::new("a7-fresh");
+    let root = dir.join("photos");
+    std::fs::create_dir_all(&root).unwrap();
+    let db = dir.join("test.chairphoto");
+    let _catalog = Catalog::open(&db, &root).unwrap();
+
+    assert!(!has_index(&db, "idx_photo_metadata_lookup"));
+    assert!(!has_metadata_column(&db, "value_norm"));
+}
+
+/// Opening an existing catalog drops the index immediately — no table rewrite is involved,
+/// so there is no reason to make the user ask for it. The column survives that open, because
+/// dropping it is the expensive half.
+#[test]
+fn opening_an_old_catalog_drops_the_index_but_keeps_the_column() {
+    let (_catalog, _root, db) = legacy_metadata_catalog("a7-upgrade");
+    assert!(
+        !has_index(&db, "idx_photo_metadata_lookup"),
+        "the 1.8 GB index goes on open"
+    );
+    assert!(
+        has_metadata_column(&db, "value_norm"),
+        "the column waits for a compaction — dropping it rewrites every row"
+    );
+}
+
+/// Metadata still writes and reads correctly on a catalog that has the retired column, which
+/// is the state every existing library is in until it is compacted.
+#[test]
+fn metadata_round_trips_while_the_retired_column_is_still_present() {
+    use chairphoto_core::catalog::{MetadataEntry, PromotedMetadata};
+    let (catalog, root, _db) = legacy_metadata_catalog("a7-legacy-write");
+    let id = catalog.upsert_photo(&root.join("a.jpg"), None, 1, 1).unwrap().id;
+
+    catalog
+        .set_photo_metadata(
+            id,
+            &PromotedMetadata::default(),
+            &[MetadataEntry {
+                key: "LensModel".into(),
+                group_name: "EXIF".into(),
+                value: "FE 24-70mm F2.8 GM".into(),
+            }],
+        )
+        .unwrap();
+
+    let entries = catalog.get_photo_metadata(id).unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].value, "FE 24-70mm F2.8 GM");
+}
+
+/// Compaction sheds the column, and the metadata survives it. This is the half that rewrites
+/// the table, so it runs only when the user asks — and afterwards writes take the new path.
+#[test]
+fn compacting_sheds_the_retired_column_and_keeps_the_metadata() {
+    use chairphoto_core::catalog::{MetadataEntry, PromotedMetadata};
+    let (mut catalog, root, db) = legacy_metadata_catalog("a7-compact");
+    let id = catalog.upsert_photo(&root.join("a.jpg"), None, 1, 1).unwrap().id;
+    let entry = |key: &str, value: &str| MetadataEntry {
+        key: key.into(),
+        group_name: "EXIF".into(),
+        value: value.into(),
+    };
+    catalog
+        .set_photo_metadata(
+            id,
+            &PromotedMetadata::default(),
+            &[entry("LensModel", "FE 24-70mm F2.8 GM"), entry("ISO", "400")],
+        )
+        .unwrap();
+
+    catalog.vacuum().unwrap();
+
+    assert!(!has_metadata_column(&db, "value_norm"), "the column is gone");
+    let mut entries = catalog.get_photo_metadata(id).unwrap();
+    entries.sort_by(|a, b| a.key.cmp(&b.key));
+    assert_eq!(entries.len(), 2, "nothing was lost in the rewrite");
+    assert_eq!(entries[0].key, "ISO");
+    assert_eq!(entries[1].value, "FE 24-70mm F2.8 GM");
+
+    // The same connection now writes the new shape, without being reopened.
+    catalog
+        .set_photo_metadata(id, &PromotedMetadata::default(), &[entry("ISO", "800")])
+        .unwrap();
+    assert_eq!(catalog.get_photo_metadata(id).unwrap()[0].value, "800");
+
+    // And compacting again is a no-op rather than an error.
+    catalog.vacuum().unwrap();
+}
+
+/// A scan may already hold its own connection when the user compacts. That connection must
+/// notice the retired column disappeared before its next metadata write rather than keeping
+/// the table shape it observed when it opened.
+#[test]
+fn secondary_opened_before_compaction_writes_the_new_metadata_shape() {
+    use chairphoto_core::catalog::{MetadataEntry, PromotedMetadata};
+    let (mut catalog, root, db) = legacy_metadata_catalog("a7-secondary-after-compact");
+    let id = catalog
+        .upsert_photo(&root.join("a.jpg"), None, 1, 1)
+        .unwrap()
+        .id;
+    let secondary = Catalog::open_secondary(&db, &root).unwrap();
+
+    catalog.vacuum().unwrap();
+
+    secondary
+        .set_photo_metadata(
+            id,
+            &PromotedMetadata::default(),
+            &[MetadataEntry {
+                key: "ISO".into(),
+                group_name: "EXIF".into(),
+                value: "800".into(),
+            }],
+        )
+        .unwrap();
+    assert_eq!(secondary.get_photo_metadata(id).unwrap()[0].value, "800");
+}

@@ -54,7 +54,11 @@ portrait and rotated photos render the right way up.
 - Folder → `make_collage_freeform` writes the image where you choose.
 - Library → `save_collage_to_catalog` writes it under `<library root>/Collages/` and
   indexes it via `scanner::index_generated_file` (UUID, sidecar, metadata, no import
-  batch), so it appears as a normal catalog photo.
+  batch), so it appears as a normal catalog photo. Its name (`collage.jpg`, else
+  `collage (n).jpg`) is claimed on disk and is never one a catalog row holds — a collage
+  deleted outside the app keeps its row, and indexing by path would hand that row to the
+  new file — in any case variant, nor one beside a sidecar left there (#231 T1, the
+  import rule of `docs/storage-and-import.md`).
 
 A collage saved to the library is stamped with the **current time as its capture date** —
 it has no EXIF date, which would otherwise sort it to the bottom of a date-ordered library
@@ -111,18 +115,18 @@ because it has no alpha, and the dialog nudges you toward PNG when that matters.
 
 ## Implementation
 
-Backend `collage::{compose_freeform, resize_cover_offset}` with commands
-`collage_auto_arrange` (async, upright-aspect layout), `make_collage_freeform`, and
-`save_collage_to_catalog`. Frontend `CollageDialog` plus `collageTemplates.ts`.
-
-`CollageDialog.tsx` owns the module's backend surface: private
-`CollageFormat`/`CollageOptions`/`Placement`/`FreeformOptions` DTOs and wrappers over
-`ChairPhotoAPI.invoke`, not core `api.ts` wrappers, per the module isolation rule.
+Backend `collage::compose_freeform` (pure composition, `crates/core/src/collage/`; its
+per-photo `resize_cover_offset` helper is private), under the job/catalog-binding layer
+`app::collage::{auto_arrange,
+make_freeform, save_to_catalog}` (`crates/core/src/app/collage.rs`) that the GPUI Collage
+module (`crates/app/src/modules/collage/`) calls directly, binding them to the
+`CatalogIdentity` its dialog opened with. `chairphoto_model::collage` holds the templates and
+canvas gestures. A library save indexes only into the catalog its photos were resolved in: if
+another catalog opened while the collage rendered, it fails closed and removes the rendered
+file.
 
 An earlier iteration of the dialog showed a static server-rendered preview; the canvas
-replaced it. Its `make_collage` and `collage_preview` Rust commands remain defined and
-registered, but the frontend no longer calls them, and their `api.ts` wrappers are gone.
-The justified `layout()` underneath still backs Auto-arrange.
+replaced it. The justified `layout()` underneath still backs Auto-arrange.
 
 ## Limits
 

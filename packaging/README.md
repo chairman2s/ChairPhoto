@@ -9,7 +9,68 @@ separate source of truth.
 | File | Purpose |
 |---|---|
 | `PKGBUILD` | The package recipe. |
-| `chairphoto.desktop` | Launcher entry, plus the `chairphoto://` scheme registration. |
+| `chairphoto.desktop` | Launcher entry for the `chairphoto` binary, plus the `chairphoto://` scheme registration. |
+| `icons/` | The app icon, installed into `hicolor` at each size `PKGBUILD` needs. |
+| `omarchy/chairphoto.lua` | Hyprland window rule for Omarchy, keeping the app opaque (see below). |
+
+## Third-party notices (`THIRD_PARTY_LICENSES.txt`)
+
+`THIRD_PARTY_LICENSES.txt` (repository root) collects the license text for every crate in
+`chairphoto-app`'s dependency graph as packaged — default features plus the `flickr`/`smugmug`
+opt-ins `build()` enables below — deduplicated by exact text. `PKGBUILD` installs it under
+`/usr/share/licenses/chairphoto/`, next to `LICENSE` and the other bundled notices
+`MODULE_LICENSING.md` documents.
+
+It is generated with [`cargo-about`](https://github.com/EmbarkStudios/cargo-about) from two
+repo-root files: `about.toml` (the accepted-license allowlist and scan settings) and
+`about.hbs` (the plain-text Handlebars template). It is committed rather than generated inside
+`build()`, so a `makepkg` build stays offline — the same reason `prepare()` runs `cargo fetch`
+ahead of time rather than letting `build()` reach the network. Regenerate it after any change
+to `Cargo.lock` (a dependency added, removed, or bumped to a version with different license
+text):
+
+```bash
+cargo install --locked --features cli cargo-about@0.9.2   # once; a dev-only tool, not a build dependency
+cargo about generate about.hbs -m crates/app/Cargo.toml --features flickr,smugmug \
+  --locked --fail -o THIRD_PARTY_LICENSES.txt
+git diff --stat THIRD_PARTY_LICENSES.txt   # review before committing
+```
+
+The version is pinned and must match `.github/workflows/ci.yml`'s "Third-party notices
+staleness check" exactly: `cargo-about`'s own license-detection corpus and output formatting
+can shift between releases even with an unchanged `about.toml`/`about.hbs`, which would make a
+locally-regenerated file read as "stale" against a differently-pinned CI (or vice versa).
+Bump both together, deliberately, when there's a reason to move to a newer `cargo-about`.
+
+`-m crates/app/Cargo.toml` (without `--workspace`) scans the shipped binary's own graph:
+`chairphoto-app` plus its path dependencies `chairphoto-core`/`chairphoto-model`, not every
+workspace member's dev-dependencies. `--fail` makes `cargo-about` exit non-zero if any crate's
+license doesn't resolve against `about.toml`'s `accepted` list, which is how a dependency
+change that introduces a new license gets caught here instead of shipping unreviewed: add the
+new SPDX id to `accepted` (with a comment, matching the ones already there) only after checking
+it's compatible with linking into a GPL-3.0-only binary — permissive is fine, anything
+copyleft needs the same reasoning `MODULE_LICENSING.md` gives for MPL-2.0, and anything else
+needs a maintainer decision, not a reflexive allow. `about.toml`'s `targets` is pinned to
+`x86_64-unknown-linux-gnu` (this package's only target) specifically so a dependency that is
+real in the full cross-platform graph but never actually linked into this binary doesn't need
+vetting at all — lifting that pin during the #244 investigation surfaced exactly one such case,
+`libfuzzer-sys` under the unreviewed `NCSA` license, confirming the filter earns its keep.
+
+CI regenerates the file on every push and fails if it differs from the committed copy
+(`.github/workflows/ci.yml`, "Third-party notices staleness check"), so a `Cargo.lock` change
+that should have come with a regenerated notices file can't merge silently out of date.
+
+## Why `omarchy/chairphoto.lua` exists
+
+Omarchy 4 tags every window `default-opacity` and applies `opacity = "0.985 0.96"` to the
+tag, so the wallpaper shows faintly through every app. For a photo editor that is a defect:
+every tone judged in Develop is mixed with whatever is behind the window. No Wayland
+protocol lets an app ask the compositor to make it opaque, and the app should not run
+`hyprctl` to change a user's compositor behind their back, so the fix is a window rule.
+Omarchy keeps such rules per app under `default/hypr/apps/` (DaVinci Resolve and RetroArch
+opt out for the same reason); `omarchy/chairphoto.lua` is that file, ready to submit
+upstream. Until it lands there, users add the same line to their own `hyprland.lua` — the
+top-level README shows it.
 
 ## Why `onnxruntime-cpu` is an *optional* dependency
 
@@ -17,7 +78,7 @@ Face tagging and Smart Tagging run inference through `ort`. Left alone, `ort` do
 own ONNX Runtime during the build — fine for development, wrong for a distro package, which
 must build from declared dependencies rather than an unpinned network fetch.
 
-`src-tauri/Cargo.toml` turns `download-binaries` off and enables ort's `load-dynamic`
+`crates/core/Cargo.toml` turns `download-binaries` off and enables ort's `load-dynamic`
 instead, so the binary carries no `libonnxruntime` in its `NEEDED` entries and `dlopen`s the
 library on first use. That is what lets this recipe list it under `optdepends`: a user who
 never opens face tagging or Smart Tagging does not install a ~25 MB inference runtime to run
@@ -26,7 +87,7 @@ missing one degrades its feature and nothing else.
 
 The catch is that ort does not degrade politely. Its loader **hangs indefinitely with no
 error** when the library is absent, which is worse than crashing: no message, no recovery,
-and a wedged worker. So `src-tauri/src/plugins/onnx.rs` loads the library itself first,
+and a wedged worker. So `crates/core/src/plugins/onnx.rs` loads the library itself first,
 caches the verdict, and returns an error before anything reaches ort. It mirrors ort's own
 resolution (`ORT_DYLIB_PATH`, then next to the executable, then the loader's search path) and
 asks the same three questions ort asks — symbol present, version at or above the floor, and
@@ -103,9 +164,9 @@ a git source with the tarball's directory layout fails too.
  makedepends=(
    'cargo'
    'clang'
+   'fontconfig'
+   'freetype2'
 +  'git'
-   'nodejs>=24'
-   'npm'
    'pkgconf'
  )
 
@@ -159,9 +220,10 @@ verification on new releases starts failing.
 
 ## Cutting a release
 
-1. Make sure `package.json`, `src-tauri/Cargo.toml`, and `src-tauri/tauri.conf.json` all
-   carry the same version — calendar versioning, unpadded month (`2026.8.0`, never
-   `2026.08.0`, which is not valid semver).
+1. Bump `[workspace.package] version` in the root `Cargo.toml` — the one version source
+   (#167; AGENTS.md "Versioning") every crate pulls with `version.workspace = true`.
+   Calendar versioning, unpadded month (`2026.8.0`, never `2026.08.0`, which is not valid
+   semver).
 2. Tag and push. `-s` signs it; `tag.gpgsign` makes that the default, but being explicit
    documents the intent:
    ```bash
@@ -170,7 +232,8 @@ verification on new releases starts failing.
    git push origin v2026.8.1
    ```
 3. Create the GitHub release for that tag so the source tarball URL resolves.
-4. Set `pkgver` in `PKGBUILD` to match, then refresh the checksums:
+4. Set `pkgver` in `PKGBUILD` to match — `prepare()` refuses to build if the two disagree —
+   then refresh the checksums:
    ```bash
    cd packaging
    updpkgsums          # from pacman-contrib
@@ -187,13 +250,23 @@ verification on new releases starts failing.
    namcap chairphoto-*.pkg.tar.zst
    ```
 
+**The tag is created at step 2 — not before.** Step 1 (bump `Cargo.toml`) and the `pkgver`
+half of step 4 can land in their own commit ahead of steps 2–3, to prepare this recipe for a
+release that has not been cut yet (its tag does not exist, so its GitHub release tarball does
+not either). In that gap, `sha256sums`' first entry is necessarily still the *previous*
+release's hash — there is nothing real to hash for the new `pkgver` until step 2 creates the
+tag and step 3 publishes the tarball it names. Leave it as a visible, known-wrong placeholder
+(commented as such) rather than guessing; a plain `makepkg` correctly fails integrity on it
+until step 4's `updpkgsums` replaces it with the real hash, which needs the tag and the
+release to already exist.
+
 ## Testing without a release
 
 To exercise the recipe against the working tree, build a tarball shaped like GitHub's and
 point the recipe at it:
 
 ```bash
-VER=$(python3 -c "import json;print(json.load(open('../package.json'))['version'])")
+VER=$(sed -n 's/^version = "\(.*\)"/\1/p' ../Cargo.toml | head -n1)
 git -C .. archive --format=tar.gz --prefix="ChairPhoto-$VER/" -o "/tmp/chairphoto-$VER.tar.gz" HEAD
 cp "/tmp/chairphoto-$VER.tar.gz" .
 makepkg -si --skipchecksums   # picks the local tarball over the release URL

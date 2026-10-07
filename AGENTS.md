@@ -1,6 +1,6 @@
 # ChairPhoto Agent Guide
 
-ChairPhoto is a native photo organizer built with Tauri (Rust) and React/TypeScript.
+ChairPhoto is a native photo organizer built with Rust and GPUI.
 It is catalog-first, non-destructive, local-first, and optimized for culling large RAW
 collections.
 
@@ -38,7 +38,13 @@ Read only the documents triggered by the task:
 ### Photo identity
 
 - Assign every photo a UUID v4 on first import.
-- Persist it in both SQLite and `xmp:Identifier`; never skip the sidecar write.
+- One exception: a non-UUID value that already served as a photo's identity (a foreign
+  DAM id from a sidecar, an old bundle, or a pre-#141 catalog) is re-minted as
+  `catalog::legacy_photo_identity`, a UUID v5 under the fixed `LEGACY_IDENTITY_NAMESPACE`,
+  which must never change, so independent catalogs agree on it. See
+  `docs/storage-and-import.md`.
+- Store identities lowercase; never store a non-UUID or blank `photos.uuid`.
+- Persist the identity in both SQLite and `xmp:Identifier`; never skip the sidecar write.
 - Catalog merge matches photos by UUID, not path.
 
 ### Paths and storage
@@ -55,15 +61,42 @@ Read only the documents triggered by the task:
 ### XMP safety
 
 - Read-modify-write the existing sidecar. Each writer touches only what it owns:
-  `write_iptc` through `MANAGED`, `write_keywords` through its local set, identifier/import/GPS
-  through their named elements, and face regions by Name + Area match. Preserve every other
-  element/attribute and foreign namespace.
+  IPTC through the `MANAGED` fields the photo owes its sidecar (any other field, empty
+  included, is left as the sidecar has it), `write_keywords` through its local set,
+  identifier/import/GPS through their named elements, and face regions by Name + Area
+  match. Preserve every other element/attribute and foreign namespace.
+- An existing row's IPTC changes only through `Catalog::set_iptc`, which records
+  the fields it changed as owed (`pending_sidecar_iptc`) in the transaction that
+  stores them. (Bundle import uses `set_iptc_carried`, which does not owe a field the
+  bundled sidecar already has a value for; a catalog merge inserting a new row carries
+  IPTC without owing it.) A caller resolves the original's path before that store, so
+  an unreachable original changes nothing; writes the returned owed set (this change
+  plus any earlier write that never landed) off the lock; and clears it only through
+  `settle_iptc_write`'s compare-and-set, never directly. The one other clear is a user's
+  Dismiss (`dismiss_owed_iptc`), itself a compare-and-set on the generation and UUID the
+  user was shown. A save or geocode fill takes
+  the sidecar's write turn (`xmp::lock::WriteOrder`) before that store and keeps it
+  through the write, so overlapping saves store and write in one order. A write that
+  fails after the commit stays owed, and the next save of the photo or the identity
+  repair pass writes it. A front end reports such a save as saved to the catalog with
+  the sidecar pending, never as saved to the sidecar.
 - Sidecars are `<original_filename>.xmp`, alongside the original.
 - Before ChairPhoto's first in-library write to an existing sidecar, back it up if it lacks
   `chairphoto:LastWrite`. Export-only destination copies are not subject to this rule.
-- Face-region writes replace only matching ChairPhoto regions and preserve foreign regions.
-  MWG areas use normalized center coordinates and oriented pixel dimensions. When uncertain,
-  preserve.
+- Face-region writes replace or remove only regions carrying the writing catalog's own
+  `chairphoto:FaceId` marker, `<catalog UUID>/<face id>` (a stable format, see
+  `docs/face-tagging.md`) for a face that catalog knows on that photo, or, for pre-marker
+  regions, matching the catalog's record of what it exported. Every other region — another
+  catalog's or a copied catalog's included — is foreign and preserved.
+  MWG areas use normalized center coordinates in the stored frame — the image before its EXIF
+  Orientation is applied (the MWG 2.0 guidelines' region rule; section and wording unverified,
+  see `docs/face-tagging.md`) — and `AppliedToDimensions` is the stored pixel size;
+  ChairPhoto's face boxes are in the oriented preview's frame and are converted on export and
+  import. A HEIF's turn is its container's `irot`/`imir`. An unknown orientation is never
+  guessed; a HEIF whose container and EXIF disagree, or a preview whose aspect is not the
+  recorded size so turned, writes and imports no region. An existing `AppliedToDimensions` is
+  never rewritten: ChairPhoto writes into the frame it declares or refuses the write. When
+  uncertain, preserve.
 
 ### Background work and ownership
 
@@ -71,17 +104,32 @@ Read only the documents triggered by the task:
   are async or moved to a blocking worker; they must not block the UI thread.
 - A newer job start or catalog switch must make older workers abortable and unreachable as
   owners. Job status/progress/terminal mutation is scoped to the current job id.
-- Where a subsystem exposes a queryable job-status slot (currently Faces, Smart Tagging and
-  identity repair), clear it before the terminal event and only if that job still owns it.
+- Where a subsystem exposes a queryable job-status slot (currently Faces, Smart Tagging,
+  identity repair and the bulk identity-conflict resolution, `identity_resolve`), clear it
+  before the terminal event and only if that job still owns it.
 - Acquire every lock needed for an ownership transition before the first mutation. Keep a
   documented global lock order; do not repair one side of a start/switch protocol in isolation.
 - Event listeners are resources: give each async registration an owner, stop late registrations,
   and release only the listener owned by that attempt.
 
+### Catalog identity
+
+- Every UI-originated write keyed by photo/tag/fence ids captures the catalog's
+  `CatalogIdentity` when it reads (`with_catalog_identified`) and writes with
+  `with_catalog_as`, which checks and writes under one catalog lock (`crates/core/src/app/`).
+  A generation check on the UI thread is not enough: a switch publishes the new catalog
+  before `catalog:switched` reaches the UI.
+- Dialogs and panels capture the identity when they open and close on a switch. A row's
+  action captures that row (ids, uuid, generation) and its catalog when it is drawn, never
+  an index looked up at click time.
+- Tests swap the catalog for one with colliding ids, with and without delivering
+  `catalog:switched`.
+
 ### Performance
 
 - Thumbnail/grid work never decodes on the UI thread.
-- Serve image bytes through the native media protocols/cache, never as base64 IPC payloads.
+- Pixels reach the screen through `ImageStore` (`crates/app/src/image_store.rs`) as GPU
+  textures, decoded on the image pool.
 - Navigation loads the requested photo first, then preloads N-1 and N+1. Target display latency
   is under 50 ms when preloaded and under 500 ms cold.
 - Scans, indexing, export, and model work expose progress without making progress events a
@@ -91,50 +139,66 @@ Read only the documents triggered by the task:
 
 - Core tables live in `catalog/schema.rs`; plugins use prefixed tables such as `faces__*` and
   `smarttags__*` and never alter core tables.
-- Modules reach host/backend services through `ChairPhotoAPI`, declared core wrappers, and host
-  hooks; never through `window.__TAURI__` or arbitrary app internals.
-- Core command wrappers stay in `modules/api.ts`; module-owned wrappers stay with the module
-  and call `ChairPhotoAPI.invoke` / optional host capabilities.
+- GPUI modules are compiled in: each implements the `Module` trait in
+  `crates/app/src/modules/` and registers in `modules/registry.rs`, behind the same Cargo
+  feature as its backend. Module logic that needs no UI goes in `crates/model`; backend bodies
+  in `crates/core/src/app/` or `plugins/`.
 - Missing optional host capabilities degrade only the cosmetic/optional behavior. A required
   terminal signal must fail closed with an explicit state.
 
 ## Architecture
 
 ```
-src/                    React/TypeScript UI and host/module contracts
-src-tauri/src/          Rust I/O, catalog, image processing, and Tauri commands
+crates/core/src/        Rust I/O, catalog, image processing, jobs (`chairphoto-core`, no UI)
+crates/app/src/         GPUI front end, the only UI (`chairphoto-app`, bin `chairphoto`)
+crates/model/src/       UI logic with no I/O, unit-tested on its own (`chairphoto-model`)
 ```
 
-Frontend/backend communication is asynchronous Tauri IPC. Rust owns file access,
-catalog queries, image decoding, XMP, and external processes. TypeScript invokes typed
-commands and renders their results; it never reads photo files directly.
+The GPUI app is the only front end; all UI work goes here.
+
+The Rust side is a Cargo workspace rooted at the repository root, of the three crates above.
+The core crate has no UI dependency, GPUI included; `crates/app` links the core directly and
+forwards each of its features to the core's feature of the same name — except `tag-graph` and
+`dev-module` (`crates/app/Cargo.toml`), which are app-only and have no matching core feature.
+
+The core owns file access, catalog queries, image decoding, XMP, and external processes.
+The GPUI app calls the core directly (`crates/core/src/app/` services, through `AppState`)
+and never reads photo files itself; blocking calls run on a worker or the storage `Runner`.
 
 ### Backend map
 
+Paths are under `crates/core/src/`.
+
 | Path | Responsibility |
 |---|---|
-| `commands/` | Flat Tauri command surface; one submodule per domain. `mod.rs` holds `AppState` and genuinely shared helpers only. |
+| `app/` | The service layer GPUI calls: `AppState`, `with_catalog*` and `CatalogIdentity` (`mod.rs`), job families and the documented lock order (`jobs.rs`), events (`events.rs`), and one file per domain (`iptc.rs`, `faces.rs`, `scans.rs`, `uploads.rs`, …). |
 | `catalog/` | SQLite schema, migrations, lifecycle, locations/resolver, vocabulary (incl. tag maintenance), albums, and merge. |
-| `scanner/`, `thumbnails/`, `image_pool/`, `protocol/` | Import/index, preview generation/cache, bounded decode work, and native media protocols. |
+| `scanner/`, `thumbnails/`, `image_pool/` | Import/index, preview generation/cache, and bounded decode work. |
 | `xmp/` | Merge-safe sidecar reads/writes. |
 | `raw/`, `export/`, `bundle/` | Full RAW decode, one-way export, and portable catalogs. |
 | `burst*`, `phash*`, `sharpness*` | Derived culling signals and grouping. |
 | `plugins/*` | Feature-gated module backends and their prefixed tables. |
 | `flickr/`, `smugmug/`, `instagram/`, `localsend/`, `oauth1/` | Publishing, web automation, LAN send, and shared OAuth. |
 
-Add commands to their domain submodule, not `commands/mod.rs`.
+### GPUI front-end map
 
-### Frontend map
+Paths are under `crates/app/src/`.
 
 | Path | Responsibility |
 |---|---|
-| `App.tsx` | Shell state and panel wiring. |
-| `components/CatalogGrid*`, `Thumbnail*` | Virtualized library/culling hot path. |
-| `components/PhotoInspector*`, `Tag*`, `Editor*`, `Preferences*` | Core user workflows. |
-| `modules/registry.ts` | Pure module and `ChairPhotoAPI` types. |
-| `modules/host.ts` | Capability adaptation, enablement, requirements, and slots. |
-| `modules/api.ts` | Typed wrappers for core commands only. |
-| `modules/plugins/*` | First-party modules; each owns its DTOs and command/event wrappers. |
+| `lib.rs`, `view.rs`, `model.rs` | Startup and wiring (`run`, `wire`), the root view, app-wide state. |
+| `shell/`, `keymap.rs` | Title bar, menus, command pill, bench, collection browser, splash, `ShellState`; actions, key contexts and bindings. |
+| `library/` | The virtualised grid, its context menu (`grid_menu.rs`) and photo commands (`photo_actions.rs`). |
+| `loupe/`, `darkroom/`, `inspector/`, `tags/` | Loupe/Compare/Cull/pop-out, Develop, the inspector column, tags. |
+| `storage/`, `albums/`, `export/`, `preferences/` | Import, catalogs, identity debt (`identity_debt.rs`), the `Runner` (`runner.rs`); albums; export; Preferences. |
+| `image_store.rs` | `ImageStore`: thumbnail/preview/zoom tiers as textures, claims, looks, catalog binding. |
+| `events.rs` | Core events into GPUI entities. |
+| `modules/` | The `Module` trait, `registry.rs`, and one directory per first-party module. |
+| `*_tests.rs`, `*/tests.rs` | Headless GPUI tests (TestAppContext) per area; `tests.rs` holds the shared rig. |
+
+`crates/model/src/` holds the pure logic behind these views (library session/query, darkroom,
+editing, presets, tag tree/graph, statistics, deep links, theme), ported from the TypeScript
+with its vitest cases.
 
 ## Working Agreements
 
@@ -148,28 +212,46 @@ Add commands to their domain submodule, not `commands/mod.rs`.
 
 ### Build and test
 
-Run the full suite for every package touched, not a scoped test that can hide breakage:
+Run the full suite for every package touched, not a scoped test that can hide breakage.
+`.claude/skills/merge-verify/verify.sh <label> [--root DIR] [--features a,b]` runs all of the
+below, counts distinct SKIPPED tests, and prints a summary; use it rather than filtering
+cargo output by hand. It puts test temp files under `/home`, because `/tmp` is a
+quota-limited tmpfs and one test copies the 8 GB real catalog.
 
 ```bash
-# frontend, from repository root
-npx tsc --noEmit
-npm test
-npm run build
-
-# backend, from src-tauri/
-cargo test
-cargo check --all-features --all-targets
-cargo check --no-default-features
+# from repository root (the Cargo workspace: crates/core, crates/model, crates/app)
+cargo test --workspace
+cargo check --workspace --all-features --all-targets
+cargo check --workspace --no-default-features
 ```
 
-`cargo check --all-features --all-targets` includes `#[cfg(test)]` code; plain
+New tests go next to the code they test or in that area's own test module, grouped under a
+section comment. Don't append to the end of a large shared test file: parallel branches that
+all add there conflict, and twice in October 2026 the merge dropped a closing brace.
+
+`cargo check --workspace --all-features --all-targets` includes `#[cfg(test)]` code; plain
 `cargo check` does not. Keep every feature combination warning-clean.
 
 Tests that cannot run on a given machine — no ONNX Runtime, no `ffmpeg`, no model behind
 `SMARTTAGS_TEST_MODEL`, no loopback multicast — skip rather than fail, and announce it as
 `SKIPPED: <test_name> — <why>`. `cargo test` captures that line for a *passing* test, so run
-`cargo test -- --nocapture` when you need to know what actually executed. A plain green run
+`cargo test --workspace -- --nocapture` when you need to know what actually executed. A plain green run
 does not distinguish "passed" from "never ran".
+
+### Agent worktrees
+
+Agents launched with `isolation: "worktree"` get a checkout under `.claude/worktrees/` that
+starts from the main checkout's HEAD (`worktree.baseRef: "head"` in `.claude/settings.json`).
+`.worktreeinclude` copies in the gitignored CodeGraph index and the project skills and
+agents. Use `codegraph explore "<symbols or question>"` before grep to find code and its
+callers; the copied index is a snapshot from when the worktree was created. The LibRaw
+submodule is not copied; initialise it from the local clone before the first build:
+
+```bash
+git submodule update --init --reference "$(git rev-parse --git-common-dir)/../crates/core/vendor/LibRaw" crates/core/vendor/LibRaw
+```
+
+Delete the worktree's `target/` (40–65 GB) once its branch is merged.
 
 ### Verify, then report
 
@@ -218,9 +300,15 @@ restarts at `0`, so it is not a patch/minor distinction and carries no compatibi
 
 - **Never zero-pad the month.** `2026.08.0` is not valid semver ("invalid leading zero in
   minor version number") and Cargo refuses to build. Write `2026.8.0`.
-- One version, three files, always in step: `package.json`, `src-tauri/Cargo.toml`, and
-  `src-tauri/tauri.conf.json`. Bumping one alone ships a build that disagrees with itself.
-- Tag a release `v2026.8.0`, matching the manifests exactly.
+- **One version source** (#167): `[workspace.package] version` in the root `Cargo.toml`. Every
+  member crate (`chairphoto-core`, `chairphoto-model`, `chairphoto-app`) pulls it with
+  `version.workspace = true` instead of carrying its own. `packaging/PKGBUILD`'s `pkgver`
+  must match it — `prepare()` asserts this on every build — so bump both together; there is
+  no other manifest to keep in step.
+- Tag a release `vYEAR.MONTH.RELEASE`, matching `Cargo.toml` and `PKGBUILD` exactly. The last
+  tagged release is `v2026.8.0`; `[workspace.package] version` and `pkgver` are already bumped
+  together to `2026.10.0` for the next one — tagging `v2026.10.0` is what's left (see
+  `packaging/README.md` "Cutting a release").
 
 ## Runtime Notes
 
@@ -236,9 +324,11 @@ Missing runtime tools degrade only their feature; they must not crash the app:
 LibRaw is a link-time dependency for full-resolution decode under the `raw` feature, not a
 runtime fallback.
 
-On NVIDIA/Wayland, WebKitGTK may crash without
-`WEBKIT_DISABLE_DMABUF_RENDERER=1`. `src-tauri/src/lib.rs::run` sets it on Linux while
-respecting an existing value. Do not remove it without a tested replacement.
+Native code that can kill the process — LibRaw today, a GPU driver if a GPU backend lands —
+runs under a crash marker (`crates/core/src/crash_marker.rs`): `enter(kind, subject, label)`
+before the call, `blocked(kind, subject)` checked first. A subject that took the process down
+twice is skipped and the caller takes its fallback; a clean quit is not a crash. Choose the
+subject so a change (decoder version, file size/mtime, driver) earns a fresh chance.
 
 Optional `faces-cuda` accelerates face inference and must fall back to CPU without crashing.
 See `docs/face-tagging.md` before changing model execution or `indexing.speed`.

@@ -47,17 +47,28 @@ remembered as `smugmug.last_album` and pre-selected next time.
 
 ## Implementation
 
-All network I/O is in Rust. OAuth 1.0a signing lives in `src-tauri/src/oauth1.rs` — RFC 5849
+All network I/O is in Rust. OAuth 1.0a signing lives in `crates/core/src/oauth1.rs` — RFC 5849
 HMAC-SHA1, pure and unit-tested against a reference vector, and shared with the Flickr
-module.
+module. Every signed request (token steps, API calls, upload) sends the OAuth params, the
+access token and signature included, in the `Authorization: OAuth` header; only request
+params go in the URL (#190). The one URL with a token is the browser authorize URL, which
+carries the short-lived request token. Header OAuth on the token steps still needs a live
+check with a real account.
 
-`src-tauri/src/smugmug/mod.rs` handles the request/access token exchange, listing the user's
+`crates/core/src/smugmug/mod.rs` handles the request/access token exchange, listing the user's
 albums against `api.smugmug.com` (API v2), and the raw-binary upload to
 `upload.smugmug.com`.
 
-Commands, all gated on the `smugmug` feature: `smugmug_begin_auth`,
-`smugmug_complete_auth`, `smugmug_connected`, `post_to_smugmug`, `smugmug_list_albums`,
-`smugmug_create_album`.
+The command bodies live in core so both front ends run them: `crates/core/src/app/oauth.rs`
+(sign-in), `app/smugmug.rs` (albums and upload, over a `SmugMugApi` trait whose live impl is
+`crate::smugmug` and which tests fake) and `app/uploads.rs` (a publish as an owned,
+cancellable job). Commands, all gated on the `smugmug` feature and thin wrappers over those:
+`smugmug_begin_auth`, `smugmug_complete_auth`, `smugmug_connected`, `post_to_smugmug`,
+`smugmug_list_albums`, `smugmug_create_album`.
+
+The GPUI app's module is `crates/app/src/modules/smugmug/`: the shared `OAuthSettings` on its
+Preferences tab and the shared `PublishPanel` (album picker, no tags; the description is the
+caption) as its publish target.
 
 Frontend: `src/modules/plugins/smugmug.tsx` is a thin module definition over shared UI in
 `plugins/publishing.tsx` — the OAuth settings panel and the per-photo publish panel, whose

@@ -32,6 +32,10 @@ The module's Preferences tab takes two values:
 
 Creating a note without a vault name set shows a reminder rather than failing silently.
 
+In the GPUI app, Save checks both values: the vault field refuses a path (Obsidian wants
+the name), and the folder must stay inside the vault — no `..`, `.` or empty segments, no
+`\`. Surrounding slashes are dropped, so `Notes/` is stored as `Notes`.
+
 ## Photo notes
 
 The inspector gains a **Note** panel. **Create note in Obsidian** opens Obsidian with a new
@@ -101,9 +105,12 @@ Street Photography/Old Town   →   StreetPhotography/OldTown
 
 ## Linking back
 
-`chairphoto://` is a real OS-level scheme, registered in `tauri.conf.json` and delivered by
-`tauri-plugin-deep-link`, with `tauri-plugin-single-instance` forwarding a second launch's
-URL into the running app rather than starting a new one. Three targets:
+`chairphoto://` is a real OS-level scheme. An installed build registers it through its
+`.desktop` file (`packaging/chairphoto.desktop`, `MimeType=x-scheme-handler/chairphoto`);
+`crates/app/src/desktop.rs` covers a dev build's opt-in registration. A single-instance
+protocol (`crates/app/src/single_instance.rs`: a lock file plus a Unix socket under
+`$XDG_RUNTIME_DIR/chairphoto`) forwards a second launch's URL into the already-running app
+rather than starting a new one. Three targets:
 
 | link | opens |
 |------|-------|
@@ -123,6 +130,23 @@ tag, re-parenting it, moving the photo on disk, or merging catalogs across machi
 
 `src/modules/plugins/obsidian.tsx`. The module registers an inspector panel, a tag-editor
 panel, and a settings panel, and reaches the OS only through `openExternal`.
+
+In the GPUI app it is `crates/app/src/modules/obsidian/` (the panels, the settings and the
+state behind them), with the notes themselves — names, initial text, the `obsidian://`
+URIs and the record's JSON — in `chairphoto_model::obsidian`, tested against the React
+functions' output. URIs go to the desktop's opener (`App::open_url`: `xdg-open` or the
+portal, the URI as one argument, no shell). Reads and writes run off the UI thread and are
+bound to the catalog the photo or tag was read from: after a catalog switch, Create and
+Forget are refused rather than write a record keyed by another catalog's ids. Create stores
+its record and then opens Obsidian, so a refused write opens nothing.
+
+The other side of that order: the record is stored **before** Obsidian is asked, and the
+desktop opener does not report whether the launch worked. On Linux, GPUI hands the URI to
+`xdg-open` (or the portal) and only logs a failure — no Obsidian installed, no handler for
+`obsidian://`, or a URI too long for one argument (a long tag description, percent-encoded)
+all go unnoticed. The panel then shows **Open note** for a note Obsidian never created.
+**Forget** clears that record, and Create can be run again. (React awaited the opener before
+storing, but it too only learned of a failure to spawn, not of a handler that failed.)
 
 The photo↔note mapping is stored in the module's own settings, keyed by the subject's UUID
 — `obsidian.note.<photo-uuid>` and `obsidian.tagnote.<tag-uuid>` after the host namespaces

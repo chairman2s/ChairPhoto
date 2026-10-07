@@ -1,0 +1,551 @@
+//! Availability probe for the system ONNX Runtime, shared by the `faces` and `smarttags`
+//! backends.
+//!
+//! Both link ONNX Runtime dynamically (`ort/load-dynamic`), so the library is an optional
+//! runtime dependency rather than a link-time one — matching how `exiftool`, `ffmpeg`, and
+//! ImageMagick are treated. Missing it must degrade those two modules and nothing else.
+//!
+//! ort cannot be asked politely whether the runtime is present: its lazy `setup_api()` loads
+//! the dylib on first use, and when that fails the call **hangs indefinitely with no error**
+//! rather than returning one. A hang is worse than a crash here — no message, no recovery,
+//! and a wedged worker — so nothing may reach ort until we know the library is usable.
+//!
+//! [`ensure_available`] therefore performs the load itself, first, and caches the verdict.
+//! It deliberately mirrors ort's own resolution (see `ort::load_dylib_from_path`), because a
+//! probe that looked somewhere else would answer a different question than the one that
+//! matters:
+//!
+//! 1. `ORT_DYLIB_PATH` when set and non-empty, else the platform default name;
+//! 2. a relative name is tried against the executable's directory first, then left bare for
+//!    the dynamic loader's own search path;
+//! 3. `OrtGetApiBase` must be present, the runtime's minor version must be at least
+//!    [`MIN_MINOR`], and `GetApi(MIN_MINOR)` must return non-null — the last because that is
+//!    the call ort actually makes and unwraps, so a runtime can report a new enough version
+//!    and still panic there. Refusing all three here means an explicit error instead of that
+//!    same hang or panic.
+
+use std::ffi::{c_char, c_void, CStr};
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex, OnceLock};
+
+/// The ONNX Runtime minor version ort requires, taken from ort itself rather than restated
+/// here. `ort::MINOR_VERSION` is `ort_sys::ORT_API_VERSION`, which is computed from whichever
+/// `api-*` feature is enabled, so raising that feature raises this floor with it and the two
+/// cannot drift. A hand-written constant could sit at 24 while the feature moved to 25,
+/// leaving the probe to accept runtimes ort then rejects — which is the hang this module
+/// exists to prevent.
+const MIN_MINOR: u32 = ort::MINOR_VERSION;
+
+/// The two entry points every ONNX Runtime exports. This is the C API's stable entry
+/// struct — the one part whose layout cannot change without breaking every consumer — so
+/// declaring it here avoids taking a direct dependency on `ort-sys` just to run this check.
+/// Only the leading two members are declared because only they are called.
+#[repr(C)]
+struct OrtApiBase {
+    get_api: unsafe extern "C" fn(u32) -> *const c_void,
+    get_version_string: unsafe extern "C" fn() -> *const c_char,
+}
+
+/// The library name/path ort will use, resolved the way ort resolves it.
+fn dylib_path() -> PathBuf {
+    let name = match std::env::var("ORT_DYLIB_PATH") {
+        Ok(s) if !s.is_empty() => s,
+        _ => default_dylib_name().to_owned(),
+    };
+    let path = PathBuf::from(&name);
+    if path.is_absolute() {
+        return path;
+    }
+    // Mirror ort: prefer a copy sitting next to the executable, otherwise hand the bare name
+    // to the loader so it searches the usual system paths.
+    match std::env::current_exe().ok().and_then(|exe| {
+        let candidate = exe.parent()?.join(&path);
+        candidate.exists().then_some(candidate)
+    }) {
+        Some(next_to_exe) => next_to_exe,
+        None => path,
+    }
+}
+
+const fn default_dylib_name() -> &'static str {
+    #[cfg(target_os = "windows")]
+    {
+        "onnxruntime.dll"
+    }
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    {
+        "libonnxruntime.dylib"
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "ios")))]
+    {
+        "libonnxruntime.so"
+    }
+}
+
+/// Load the runtime, read its version, and confirm it serves the API level ort will ask for.
+fn probe() -> Result<String, String> {
+    probe_at(&dylib_path())
+}
+
+/// [`probe`] against an explicit path, so tests can exercise the failure path without
+/// mutating `ORT_DYLIB_PATH` — which would race every other test in the binary.
+///
+/// On success the [`libloading::Library`] handle is deliberately leaked. ort dlopens the same
+/// file moments later; keeping this handle makes that a refcount bump instead of an unload
+/// followed by a fresh map. Dropping it here would take the refcount to zero — nothing else
+/// holds a reference at probe time — and unloading a library that registers atexit handlers
+/// and thread-local destructors, as ONNX Runtime does, only to immediately reload it is risk
+/// taken for nothing. One handle per process, and only when the runtime is usable.
+fn probe_at(path: &std::path::Path) -> Result<String, String> {
+    // Deliberately worded to avoid the "not available"/"no file" phrasing the model managers
+    // use: a runtime failure and a missing-model failure must stay tellable apart, including
+    // by the tests that assert on each.
+    //
+    // SAFETY: loading a shared library runs its initialisers, which is exactly what ort will
+    // do moments later.
+    let lib = unsafe { libloading::Library::new(path) }.map_err(|e| {
+        format!(
+            "ONNX Runtime could not be loaded from `{}` ({e}). \
+             Install onnxruntime (Arch: onnxruntime-cpu, or onnxruntime-cuda for GPU), \
+             or set ORT_DYLIB_PATH.",
+            path.display()
+        )
+    })?;
+
+    // Scoped so the symbol's borrow of `lib` ends before the handle is leaked below.
+    let probed = (|| -> Result<String, String> {
+        // SAFETY: `OrtGetApiBase` and the two members read from it are the ONNX Runtime C
+        // API's documented entry points, and their layout is fixed by that contract.
+        let base_getter: libloading::Symbol<unsafe extern "C" fn() -> *const OrtApiBase> =
+            unsafe { lib.get(b"OrtGetApiBase") }.map_err(|_| {
+                format!(
+                    "`{}` is not an ONNX Runtime library (no OrtGetApiBase symbol).",
+                    path.display()
+                )
+            })?;
+        let base = unsafe { base_getter() };
+        if base.is_null() {
+            return Err(format!("`{}` returned a null OrtApiBase.", path.display()));
+        }
+
+        let version = unsafe { CStr::from_ptr(((*base).get_version_string)()) }
+            .to_string_lossy()
+            .into_owned();
+        let Some(minor) = version.split('.').nth(1).and_then(|m| m.parse::<u32>().ok()) else {
+            // Distinct from "too old": an unparseable version is not evidence of an old
+            // runtime, and telling the user to upgrade a current one wastes their time.
+            return Err(format!(
+                "could not read a version from the ONNX Runtime at `{}` (got {version:?}).",
+                path.display()
+            ));
+        };
+        if minor < MIN_MINOR {
+            return Err(format!(
+                "ONNX Runtime {version} at `{}` is too old; 1.{MIN_MINOR} or newer is required.",
+                path.display()
+            ));
+        }
+
+        // The version string is not the check that matters. ort calls
+        // `GetApi(ORT_API_VERSION)` and unwraps the result, so a runtime that reports a new
+        // enough version but declines that API level would pass every check above and then
+        // panic inside ort. Ask the same question ort asks.
+        if unsafe { ((*base).get_api)(MIN_MINOR) }.is_null() {
+            return Err(format!(
+                "ONNX Runtime {version} at `{}` does not provide API version {MIN_MINOR}.",
+                path.display()
+            ));
+        }
+
+        Ok(version)
+    })();
+
+    match probed {
+        Ok(version) => {
+            std::mem::forget(lib);
+            Ok(version)
+        }
+        // Unusable: let the handle drop, since nothing will load it.
+        Err(e) => Err(e),
+    }
+}
+
+/// `Ok(version)` when the system ONNX Runtime is present and new enough, `Err(reason)`
+/// otherwise. Probed once and cached, so a machine without the runtime pays one failed
+/// `dlopen` rather than one per session.
+///
+/// Call this before touching any `ort` API. Returning its error keeps a missing runtime a
+/// reported failure of one module instead of a hang.
+pub fn ensure_available() -> Result<&'static str, String> {
+    static CELL: OnceLock<Result<String, String>> = OnceLock::new();
+    match CELL.get_or_init(probe) {
+        Ok(version) => Ok(version.as_str()),
+        Err(e) => Err(e.clone()),
+    }
+}
+
+/// Build one ONNX session against the model at `model_path`.
+///
+/// **This is the only supported way to obtain an `ort` session.** Constructing one directly
+/// skips [`ensure_available`], and ort's loader does not fail when the runtime is missing —
+/// it hangs indefinitely with no error. A module that forgot the preflight would not fail
+/// loudly during review; it would ship, and then wedge for any user without the runtime
+/// installed. `ort_sessions_are_only_built_through_this_module` fails the build rather than
+/// relying on the next author knowing that.
+///
+/// `register_ep` is where a caller adds an execution provider, because that part genuinely
+/// differs per module: the CUDA feature gates (`faces-cuda`, `smarttags-cuda`) and the
+/// force-CPU settings are owned by each plugin. It returns whether its provider was
+/// registered, which is returned alongside the session so callers can report GPU-vs-CPU.
+/// Registering must never be fatal — a provider that fails to attach leaves the builder on
+/// CPU — and neither may building on it: a provider that registers but then fails the build
+/// (the CUDA provider attaches, then session creation fails on the GPU, #210) is dropped and
+/// the session built again on CPU ([`with_cpu_fallback`]), reported as not registered.
+#[cfg(any(feature = "faces", feature = "smarttags"))]
+pub fn build_session<F>(
+    model_path: &std::path::Path,
+    intra_threads: usize,
+    register_ep: F,
+) -> Result<(ort::session::Session, bool), String>
+where
+    F: FnOnce(&mut ort::session::builder::SessionBuilder) -> bool,
+{
+    ensure_available()?;
+    let mut register_ep = Some(register_ep);
+    with_cpu_fallback(|try_ep| {
+        let builder = ort::session::Session::builder()
+            .map_err(|e| e.to_string())
+            .and_then(|b| b.with_intra_threads(intra_threads.max(1)).map_err(|e| e.to_string()));
+        let mut builder = match builder {
+            Ok(b) => b,
+            Err(e) => return (Err(e), false),
+        };
+        let registered = try_ep && register_ep.take().is_some_and(|register| register(&mut builder));
+        (builder.commit_from_file(model_path).map_err(|e| e.to_string()), registered)
+    })
+}
+
+/// Build with the execution provider, and once more without it when a build that registered
+/// it fails. `attempt(try_ep)` builds a session — registering the provider only when `try_ep`
+/// — and answers the outcome with whether the provider registered. A build that fails with
+/// nothing registered fails as it is: the provider is not why, and a CPU retry would fail the
+/// same way. Returns the value and whether it runs on the provider.
+#[cfg(any(feature = "faces", feature = "smarttags"))]
+pub fn with_cpu_fallback<S>(
+    mut attempt: impl FnMut(bool) -> (Result<S, String>, bool),
+) -> Result<(S, bool), String> {
+    match attempt(true) {
+        (Ok(session), registered) => Ok((session, registered)),
+        (Err(e), true) => {
+            eprintln!("onnx: the session did not build on its execution provider ({e}); building it on CPU");
+            attempt(false).0.map(|session| (session, false))
+        }
+        (Err(e), false) => Err(e),
+    }
+}
+
+// ── Keyed session-pool cache (issue #18) ────────────────────────────────────────
+//
+// `faces::engine` and `smarttags::embed` each used to cache their ONNX session pool behind a
+// plain `OnceLock`: the first pool built won, permanently, so a later change to
+// `indexing.speed`, `faces.force_cpu`, or `smarttags.model_path` had no effect until restart.
+// [`KeyedCache`] replaces that: every fetch compares the configuration it was asked to build
+// against whatever is cached, and rebuilds when it differs.
+
+/// A process-global slot holding at most one built `V`, tagged with the `K` that produced it.
+///
+/// [`get_or_build`](KeyedCache::get_or_build) is the whole interface: an equal key returns the
+/// cached `Arc` (cheap, no rebuild); a different key builds a fresh value, replaces the slot,
+/// and returns that. A caller already holding a clone of the *old* `Arc` — e.g. a worker
+/// mid-inference on a pool checked out before the swap — keeps it alive and unaffected, because
+/// the guarantee is `Arc` reference counting, not a lock held across the value's use. The old
+/// value is only ever dropped once every clone of it is gone. The *next* fetch is what observes
+/// the new value.
+///
+/// A failed build is **not** cached: the slot is left exactly as it was, so the next call
+/// retries the builder instead of being stuck behind a transient failure until restart — the
+/// same staleness this type exists to remove, just for the error case too.
+#[cfg(any(feature = "faces", feature = "smarttags"))]
+pub struct KeyedCache<K, V> {
+    slot: Mutex<Option<(K, Arc<V>)>>,
+}
+
+#[cfg(any(feature = "faces", feature = "smarttags"))]
+impl<K, V> KeyedCache<K, V> {
+    /// An empty cache. `const` so it can back a `static` the same way `OnceLock::new()` did.
+    pub const fn new() -> Self {
+        KeyedCache { slot: Mutex::new(None) }
+    }
+}
+
+#[cfg(any(feature = "faces", feature = "smarttags"))]
+impl<K, V> Default for KeyedCache<K, V> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(any(feature = "faces", feature = "smarttags"))]
+impl<K: Clone + PartialEq, V> KeyedCache<K, V> {
+    /// Return the value cached for `key`, building (and caching) a fresh one with `build` if
+    /// nothing is cached yet or the cached entry's key differs. `build`'s error is returned but
+    /// never cached — see the type docs.
+    pub fn get_or_build<E>(
+        &self,
+        key: K,
+        build: impl FnOnce() -> Result<V, E>,
+    ) -> Result<Arc<V>, E> {
+        let mut slot = self.slot.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((cached_key, value)) = slot.as_ref() {
+            if *cached_key == key {
+                return Ok(value.clone());
+            }
+        }
+        let value = Arc::new(build()?);
+        *slot = Some((key, value.clone()));
+        Ok(value)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// When a runtime *is* installed the probe must accept it and report a version at or above
+    /// the floor — this is the only test that can prove the probe does not reject a good
+    /// runtime. CI runners have no ONNX Runtime, so an absent one auto-skips (printing why),
+    /// matching `tests/faces_engine.rs`; the failure path is covered unconditionally below.
+    #[test]
+    fn probe_accepts_an_installed_runtime() {
+        // The floor is derived from ort's enabled api-* feature, so it is not readable from
+        // this file. Print it: a wrong derivation would otherwise be invisible here, since
+        // too low a floor accepts everything and asserts nothing.
+        eprintln!("probe floor: ONNX Runtime 1.{MIN_MINOR} or newer");
+        assert!(
+            MIN_MINOR >= 17,
+            "derived floor {MIN_MINOR} is below the oldest API ort supports; \
+             ort::MINOR_VERSION did not resolve to a real API level"
+        );
+        match ensure_available() {
+            Ok(version) => {
+                let minor: u32 = version
+                    .split('.')
+                    .nth(1)
+                    .and_then(|m| m.parse().ok())
+                    .unwrap_or_else(|| panic!("unparseable ONNX Runtime version {version:?}"));
+                assert!(
+                    minor >= MIN_MINOR,
+                    "probe accepted ONNX Runtime {version}, below the 1.{MIN_MINOR} floor"
+                );
+            }
+            Err(e) => {
+                eprintln!("SKIPPED: no usable ONNX Runtime on this machine ({e})");
+                return;
+            }
+        }
+    }
+
+    /// A missing runtime must produce an error rather than the hang ort exhibits when it
+    /// loads the dylib itself. This is the whole reason the probe exists.
+    #[test]
+    fn missing_runtime_reports_an_error() {
+        let err = probe_at(std::path::Path::new("/nonexistent/libonnxruntime.so"))
+            .expect_err("a nonexistent dylib must not probe as available");
+        assert!(
+            err.contains("could not be loaded"),
+            "error should explain the runtime is missing, got: {err}"
+        );
+    }
+
+    /// No module may construct an ort session itself; [`build_session`] is the only route,
+    /// because it is the only one that runs the preflight.
+    ///
+    /// This is the point of the facade. A future plugin — a car detector, anything — that
+    /// calls `Session::builder()` directly compiles cleanly, passes review, and then hangs
+    /// forever for every user without ONNX Runtime installed. Nothing else catches that: the
+    /// author gets a working build because *their* machine has the runtime, exactly as
+    /// happened when this change was first written. So the rule is enforced here instead of
+    /// documented and hoped for.
+    ///
+    /// Scans source rather than relying on visibility because Rust has no way to restrict a
+    /// dependency to one module within a crate.
+    #[test]
+    fn ort_sessions_are_only_built_through_this_module() {
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let facade = src.join("plugins").join("onnx.rs");
+        // The workspace's other crates — the GPUI app and the UI model — link ort through this
+        // crate too, so their source is held to the same rule (as the Tauri shell's was until
+        // it went in #165). Each is asserted to exist so that moving or deleting one narrows
+        // the scan on purpose, not silently.
+        let crates = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+        let mut dirs = vec![src.clone()];
+        for sibling in ["app/src", "model/src"] {
+            let dir = crates.join(sibling);
+            assert!(dir.is_dir(), "the workspace crate's source is not at {}", dir.display());
+            dirs.push(dir);
+        }
+
+        let offenders: Vec<String> = dirs
+            .iter()
+            .flat_map(walkdir::WalkDir::new)
+            .filter_map(Result::ok)
+            .filter(|e| e.file_type().is_file())
+            .filter(|e| e.path().extension().is_some_and(|x| x == "rs"))
+            .filter(|e| e.path() != facade)
+            .filter(|e| {
+                std::fs::read_to_string(e.path())
+                    .is_ok_and(|text| text.contains("Session::builder"))
+            })
+            .map(|e| e.path().display().to_string())
+            .collect();
+
+        assert!(
+            offenders.is_empty(),
+            "these build an ort session directly and so skip the runtime preflight, which \
+             means they hang instead of erroring when ONNX Runtime is absent — use \
+             plugins::onnx::build_session instead: {offenders:?}"
+        );
+    }
+
+    /// A real library that is not ONNX Runtime must be rejected on the missing symbol rather
+    /// than loaded and handed to ort, which would fail far less clearly.
+    #[test]
+    fn non_onnx_library_is_rejected() {
+        let libc = std::path::Path::new("/usr/lib/libc.so.6");
+        if !libc.exists() {
+            eprintln!("SKIPPED: /usr/lib/libc.so.6 not present (not a glibc system)");
+            return;
+        }
+        let err = probe_at(libc).expect_err("libc is not an ONNX Runtime");
+        assert!(
+            err.contains("OrtGetApiBase"),
+            "error should name the missing symbol, got: {err}"
+        );
+    }
+
+    // ── The CPU fallback of a provider that fails the build (#210) ─────────────
+    //
+    // The policy with a fake builder: no GPU, no runtime. Each attempt records whether it
+    // was allowed the provider.
+
+    /// The provider registers but the build fails (CUDA attached, the GPU session did not
+    /// build): built again without it, on CPU, and reported as CPU.
+    #[cfg(any(feature = "faces", feature = "smarttags"))]
+    #[test]
+    fn a_build_that_fails_on_its_provider_is_retried_on_cpu() {
+        let mut tries = Vec::new();
+        let got = with_cpu_fallback(|try_ep| {
+            tries.push(try_ep);
+            if try_ep { (Err("CUDA failure 100: no CUDA-capable device".to_string()), true) } else { (Ok("cpu"), false) }
+        });
+        assert_eq!(got, Ok(("cpu", false)));
+        assert_eq!(tries, [true, false]);
+    }
+
+    /// A build on the provider that works is kept; a failure with nothing registered is not
+    /// retried (CPU is what failed); a CPU retry that fails too reports its own error.
+    #[cfg(any(feature = "faces", feature = "smarttags"))]
+    #[test]
+    fn only_a_failure_on_the_provider_is_retried() {
+        let mut tries = Vec::new();
+        assert_eq!(with_cpu_fallback(|t| { tries.push(t); (Ok("gpu"), true) }), Ok(("gpu", true)));
+        assert_eq!(tries, [true]);
+
+        let mut tries = Vec::new();
+        let got: Result<(&str, bool), String> = with_cpu_fallback(|t| { tries.push(t); (Err("bad model".into()), false) });
+        assert_eq!(got, Err("bad model".to_string()));
+        assert_eq!(tries, [true], "no provider registered: no retry");
+
+        let got: Result<(&str, bool), String> =
+            with_cpu_fallback(|t| (Err(if t { "on gpu" } else { "on cpu" }.to_string()), t));
+        assert_eq!(got, Err("on cpu".to_string()));
+    }
+
+    // ── KeyedCache (issue #18) ──────────────────────────────────────────────────
+    //
+    // Exercised with plain `u32`/`String` values rather than real ONNX sessions — same
+    // reasoning as `faces::engine::Pool`'s own tests: the caching/rebuild *policy* has no
+    // model dependency, so it is unit-tested offline and the ONNX-backed callers only need to
+    // prove they feed it the right key (see the `PoolKey` tests alongside them).
+
+    #[cfg(any(feature = "faces", feature = "smarttags"))]
+    #[test]
+    fn same_key_reuses_the_cached_value_without_rebuilding() {
+        let cache: KeyedCache<u32, u32> = KeyedCache::new();
+        let builds = std::sync::atomic::AtomicUsize::new(0);
+        let build = || {
+            builds.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok::<u32, ()>(100)
+        };
+
+        let a = cache.get_or_build(1, build).unwrap();
+        let b = cache.get_or_build(1, build).unwrap();
+        assert_eq!(*a, 100);
+        assert!(Arc::ptr_eq(&a, &b), "an equal key must return the same cached Arc, not rebuild");
+        assert_eq!(builds.load(std::sync::atomic::Ordering::Relaxed), 1, "built exactly once");
+    }
+
+    #[cfg(any(feature = "faces", feature = "smarttags"))]
+    #[test]
+    fn a_different_key_rebuilds() {
+        let cache: KeyedCache<u32, u32> = KeyedCache::new();
+        let builds = std::sync::atomic::AtomicUsize::new(0);
+
+        let a = cache
+            .get_or_build(1, || {
+                builds.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                Ok::<u32, ()>(10)
+            })
+            .unwrap();
+        let b = cache
+            .get_or_build(2, || {
+                builds.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                Ok::<u32, ()>(20)
+            })
+            .unwrap();
+
+        assert_eq!(*a, 10);
+        assert_eq!(*b, 20, "a changed key must produce the new value, not the stale one");
+        assert_eq!(builds.load(std::sync::atomic::Ordering::Relaxed), 2, "rebuilt on the key change");
+
+        // The cache now serves key 2 without rebuilding again.
+        let b2 = cache
+            .get_or_build::<()>(2, || panic!("must not rebuild for an unchanged key"))
+            .unwrap();
+        assert!(Arc::ptr_eq(&b, &b2));
+    }
+
+    /// The ownership property the doc comment promises: a caller holding a clone of the old
+    /// `Arc` when a rebuild happens keeps a live, correct value — the rebuild only ever affects
+    /// what the *next* fetch sees. Models the "sessions in flight when a job's settings change"
+    /// scenario without needing a real ONNX session.
+    #[cfg(any(feature = "faces", feature = "smarttags"))]
+    #[test]
+    fn an_in_flight_arc_survives_a_rebuild() {
+        let cache: KeyedCache<u32, u32> = KeyedCache::new();
+        let in_flight = cache.get_or_build(1, || Ok::<u32, ()>(111)).unwrap();
+
+        // A different key rebuilds and replaces the slot...
+        let rebuilt = cache.get_or_build(2, || Ok::<u32, ()>(222)).unwrap();
+
+        // ...but the value the "in-flight worker" is still holding is untouched.
+        assert_eq!(*in_flight, 111, "an in-flight checkout must not see the rebuild");
+        assert_eq!(*rebuilt, 222);
+        assert!(!Arc::ptr_eq(&in_flight, &rebuilt));
+    }
+
+    /// A failed build must not poison the cache — the very next call (even with the same key)
+    /// gets to try again, unlike the `OnceLock` this replaces (which cached `Err` forever).
+    #[cfg(any(feature = "faces", feature = "smarttags"))]
+    #[test]
+    fn a_failed_build_is_not_cached_so_a_retry_can_succeed() {
+        let cache: KeyedCache<u32, u32> = KeyedCache::new();
+
+        let err = cache.get_or_build(1, || Err::<u32, &'static str>("model not downloaded"));
+        assert_eq!(err, Err("model not downloaded"));
+
+        // Same key, but this time the builder succeeds — must not still be "cached" as an error.
+        let ok = cache.get_or_build(1, || Ok::<u32, &'static str>(7)).unwrap();
+        assert_eq!(*ok, 7);
+    }
+}

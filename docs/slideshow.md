@@ -48,29 +48,38 @@ that invoke ffmpeg skip gracefully when it is not on PATH.
 `transition` on/off with `transition_duration` (clamped below `duration_per_photo` so every
 clip keeps some non-overlapping visible time), `ken_burns` on/off, `fps` (default 30), and
 an aspect/resolution preset: 16:9 1080p, 16:9 4K, 1:1 1080, or 9:16 1080×1920. Plus the
-output folder, defaulting to `~/Videos` or `~/Pictures/Export`.
+output folder, defaulting to `~/Videos` or `~/Pictures/Export`. It must be an absolute local
+path (`~` expanded); a relative path or a URL is refused before the render is claimed, and
+every path reaches ffmpeg as a `file:` URL, so it is never read as an option or a protocol.
 
 The dialog also lets you drag-reorder the selected photos before rendering; the default
 order is the current grid order.
 
 ## Implementation
 
-- `src-tauri/src/slideshow/mod.rs` — ffmpeg detection, filtergraph construction, and the
+- `crates/core/src/slideshow/mod.rs` — ffmpeg detection, filtergraph construction, and the
   run with progress parsing.
-- The `make_slideshow` async command renders the frames into a temp dir, calls the engine
-  off the UI thread, and streams progress.
+- `crates/core/src/app/slideshow.rs` — the render as a job (`JobRegistry::slideshow`):
+  `claim_slideshow` resolves the Originals and claims the job under one catalog lock
+  (optionally bound to a `CatalogIdentity`), and `SlideshowJob::run` renders the frames into
+  a private cache directory (the app's cache dir, not `/tmp`, which can be a quota-limited
+  tmpfs) and encodes. A newer render, Cancel (the job's own abort
+  handle) or a catalog switch kills ffmpeg, removes the partial movie and answers
+  "Slideshow cancelled". Missing ffmpeg is refused before anything is claimed.
+- The GPUI Slideshow module (`crates/app/src/modules/slideshow/`) calls that job directly,
+  off the UI thread; progress is cosmetic, the job's return value is the terminal result.
 
   ```
-  make_slideshow(photoIds, opts, destDir) -> outputPath
-  event "slideshow:progress" { done, total }
+  claim_slideshow(state, expected: Option<CatalogIdentity>, photoIds, opts, destDir, ffmpeg)
+    -> Result<SlideshowJob, String>
+  event CoreEvent::SlideshowProgress { done, total, job }
   ```
 
-- `SlideshowDialog.tsx` owns the module's backend surface: private `SlideshowOptions` and
-  `SlideshowProgress` DTOs, a `ChairPhotoAPI.invoke` wrapper for `make_slideshow`, and the
-  `slideshow:progress` subscription through the **optional** `ChairPhotoAPI.onEvent` — not
-  core `api.ts` wrappers, and never Tauri directly. Progress is nonessential: if `onEvent`
-  is absent or the subscription fails, the encode still runs and the UI shows an
-  indeterminate "Rendering…" instead of a determinate bar.
+- The dialog subscribes to the app model's events and matches
+  `CoreEvent::SlideshowProgress`, filtering to its own job id so a stale or another
+  dialog's job never moves its bar. Progress is nonessential: a lost or missed event still
+  lets the encode finish, and the UI simply shows an indeterminate "Rendering…" instead of a
+  determinate bar.
 
 ## Limits
 

@@ -343,6 +343,10 @@ Emits `loupe:photo`;
 opens the loupe `WebviewWindow`.
 Host: initHost, setSelection, setHostActiveVersion, setFilterContext, setEditingTagContext,
 setChangeSink, setNavSink, toolbarActionGroups, mainViews, panelsForSlot("loupe").
+GPUI reaches these core paths instead of the unbound Tauri ones (#240):
+`reconcileNow` + `applyOffloadPolicy` → `storage/state.rs` `run_reconcile` (`claim_reconcile`,
+`drain`, then `apply_offload_policy` under one claim; core `reconcile_now` is test-only);
+`cacheImages` → `cache::claim_cache` + `cache_images_claimed`.
 
 **Port ticket:** Shell chrome (layout, menus, modals wiring);
 key bindings with Library view and Loupe;
@@ -924,6 +928,8 @@ Footnote.
 **Commands / events:** `listTrash`→list_trash, `restorePhotos`→restore_photos,
 `emptyTrash`→empty_trash;
 `thumb://`
+GPUI: `restore_trashed_as` / `empty_trash_as` (#240: the unbound `restore_trashed` has no
+caller).
 
 **Port ticket:** **No ticket names it** (closest: Storage and import)
 
@@ -1048,6 +1054,7 @@ creates the path when nothing matches;
 `restorePhoto`→restore_photo;
 ev: `rapidraw:progress` (one global listener, keyed by photo);
 `thumb://`
+GPUI: `importDeveloped` → `external_edit::import_developed_as` (#240).
 
 **Port ticket:** Photo inspector
 
@@ -2103,6 +2110,7 @@ Decode-cache input: Enter saves.
 `getSystemTheme`→get_system_theme;
 ev: `appearance:theme_changed`;
 dialog `confirm`
+GPUI: `vacuumCatalog` → `catalogs::vacuum_catalog_as` (#240).
 
 **Port ticket:** Preferences (module tabs via Module trait)
 

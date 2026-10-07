@@ -154,10 +154,26 @@ pub fn rotate_image(img: DynamicImage, degrees: i64) -> DynamicImage {
 /// The persistent thumbnail of a rotated photo (`media::render_image`): JPEG quality 90, the
 /// same file the Tauri shell's byte path wrote before #165.
 pub(crate) fn encode_rotated_jpeg(img: &DynamicImage) -> Result<Vec<u8>, String> {
-    let mut out = Cursor::new(Vec::new());
-    img.write_with_encoder(JpegEncoder::new_with_quality(&mut out, 90))
-        .map_err(|e| e.to_string())?;
-    Ok(out.into_inner())
+    encode_jpeg(img, 90)
+}
+
+/// JPEG-encode `img` at `quality` with the pure-Rust `jpeg-encoder` (#243), which encodes a
+/// 24 MP-class tier markedly faster than `image`'s encoder. Grey stays one channel; every
+/// other colour type goes out as 8-bit RGB (alpha dropped), as before.
+pub(crate) fn encode_jpeg(img: &DynamicImage, quality: u8) -> Result<Vec<u8>, String> {
+    use jpeg_encoder::{ColorType, Encoder};
+    let (w, h) = (u16::try_from(img.width()).map_err(|e| e.to_string())?, u16::try_from(img.height()).map_err(|e| e.to_string())?);
+    let mut out = Vec::new();
+    let mut encoder = Encoder::new(&mut out, quality);
+    // No chroma subsampling, as `image`'s encoder: the tiers keep their colour detail.
+    encoder.set_sampling_factor(jpeg_encoder::SamplingFactor::F_1_1);
+    match img {
+        DynamicImage::ImageLuma8(g) => encoder.encode(g.as_raw(), w, h, ColorType::Luma),
+        DynamicImage::ImageRgb8(rgb) => encoder.encode(rgb.as_raw(), w, h, ColorType::Rgb),
+        other => encoder.encode(other.to_rgb8().as_raw(), w, h, ColorType::Rgb),
+    }
+    .map_err(|e| e.to_string())?;
+    Ok(out)
 }
 
 // --- persistent offline thumbnails -------------------------------------------------------
@@ -756,7 +772,6 @@ fn encode_size(path: &Path, img: &DynamicImage, size: Size) -> Result<Vec<u8>, S
     // `thumbnail`, byte for byte, without its per-pixel overhead.
     let fits = img.width() <= size.max && img.height() <= size.max;
     let resized = if fits { std::borrow::Cow::Borrowed(img) } else { std::borrow::Cow::Owned(downscale::thumbnail(img, size.max)) };
-    let mut out = Cursor::new(Vec::new());
     // The webview shows untagged JPEGs as sRGB. Sony shoots Adobe RGB (wider gamut), so
     // an Adobe RGB preview displayed as-is looks dull/desaturated. Convert it to sRGB for
     // display. The original RAW is untouched; the edited export also renders in sRGB
@@ -765,15 +780,10 @@ fn encode_size(path: &Path, img: &DynamicImage, size: Size) -> Result<Vec<u8>, S
     if is_adobe_rgb(path) {
         let mut rgb = resized.to_rgb8();
         adobe_rgb_to_srgb(&mut rgb);
-        DynamicImage::ImageRgb8(rgb)
-            .write_with_encoder(JpegEncoder::new_with_quality(&mut out, size.quality))
-            .map_err(|e| e.to_string())?;
+        encode_jpeg(&DynamicImage::ImageRgb8(rgb), size.quality)
     } else {
-        resized
-            .write_with_encoder(JpegEncoder::new_with_quality(&mut out, size.quality))
-            .map_err(|e| e.to_string())?;
+        encode_jpeg(&resized, size.quality)
     }
-    Ok(out.into_inner())
 }
 
 /// Decode encoded image bytes and apply orientation: the override when given (source
@@ -813,7 +823,8 @@ fn probe_colour_space_beside(path: &Path) -> Option<std::thread::JoinHandle<()>>
 }
 
 /// Whether a file's color space is Adobe RGB (Sony tags this as ColorSpace=Uncalibrated
-/// + InteroperabilityIndex R03). Detected via exiftool and memoized per path, since
+/// + InteroperabilityIndex R03). Read in-process from EXIF (exiftool only as a fallback, #243)
+/// and memoized per path, since
 /// `generate` runs up to 3× per image (thumb/preview/zoom).
 fn is_adobe_rgb(path: &Path) -> bool {
     static CACHE: OnceLock<Mutex<HashMap<PathBuf, bool>>> = OnceLock::new();
@@ -830,7 +841,46 @@ fn is_adobe_rgb(path: &Path) -> bool {
     detected
 }
 
+/// How much of a file's head holds the EXIF a colour-space read needs. A JPEG keeps it in
+/// an APP1 segment within the first 64 KiB; a TIFF-based RAW (ARW, DNG, NEF, …) keeps its
+/// IFDs near the front, ahead of the strips. A head too short for the IFDs it points to is
+/// an error from the parser, which sends [`detect_adobe_rgb`] to exiftool, so the read can
+/// only miss a tag, never invent one (#243).
+const COLOUR_SPACE_HEAD: u64 = 4 << 20;
+
 fn detect_adobe_rgb(path: &Path) -> bool {
+    match adobe_rgb_in_process(path) {
+        Some(v) => v,
+        None => detect_adobe_rgb_exiftool(path),
+    }
+}
+
+/// Read ColorSpace and InteroperabilityIndex from the file's EXIF in-process (#243), the same
+/// two tags `exiftool -ColorSpace -InteropIndex` reported: Adobe RGB is `ColorSpace = 2` or
+/// an interoperability index of `R03` (Sony tags `ColorSpace = Uncalibrated` + `R03`).
+/// `None` when the file has no readable EXIF container (the caller asks exiftool, which also
+/// knows formats the parser does not).
+fn adobe_rgb_in_process(path: &Path) -> Option<bool> {
+    use std::io::Read;
+    let file = std::fs::File::open(path).ok()?;
+    let mut head = Vec::new();
+    file.take(COLOUR_SPACE_HEAD).read_to_end(&mut head).ok()?;
+    let exif = exif::Reader::new().read_from_container(&mut Cursor::new(&head)).ok()?;
+    Some(adobe_rgb_from_exif(&exif))
+}
+
+fn adobe_rgb_from_exif(exif: &exif::Exif) -> bool {
+    let colour_space = exif
+        .get_field(exif::Tag::ColorSpace, exif::In::PRIMARY)
+        .and_then(|f| f.value.get_uint(0));
+    let interop = exif.get_field(exif::Tag::InteroperabilityIndex, exif::In::PRIMARY).map(|f| match &f.value {
+        exif::Value::Ascii(v) => v.iter().flatten().map(|&b| b as char).collect::<String>(),
+        _ => String::new(),
+    });
+    colour_space == Some(2) || interop.is_some_and(|i| i.contains("R03"))
+}
+
+fn detect_adobe_rgb_exiftool(path: &Path) -> bool {
     let output = Command::new("exiftool")
         .args(["-s3", "-ColorSpace", "-InteropIndex"])
         .arg(path)
@@ -1367,6 +1417,8 @@ mod downscale;
 
 #[cfg(test)]
 mod bench;
+#[cfg(test)]
+mod colour_space_tests;
 
 #[cfg(test)]
 pub(crate) mod tests {

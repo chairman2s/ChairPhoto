@@ -202,6 +202,8 @@ socket2 = { version = "0.6", optional = true }
 # out to `openssl` instead would make a runtime tool load-bearing for a core send path, which
 # the Runtime Notes in AGENTS.md do not allow.
 rcgen = { version = "0.14.9", default-features = false, features = ["pem", "ring"], optional = true }
+kamadak-exif = "0.6.1"
+jpeg-encoder = "0.7.1"
 
 # Only compiled when the `localsend` feature is on, on unix (Linux/macOS). `getifaddrs(3)` for
 # per-interface multicast join/announce (localsend/mod.rs) — std has no portable interface

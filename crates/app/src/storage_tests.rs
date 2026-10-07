@@ -447,6 +447,70 @@ fn a_warm_up_started_by_a_stale_rescan_is_stopped_by_the_switch(cx: &mut TestApp
     assert!(gray, "the dropped warm-up ran on over catalog B and rewrote its flags");
 }
 
+// --- legacy sharpness re-measure (#262) ----------------------------------------------------
+
+/// A catalog at `dir/photos` holding one photo whose original is a real 1200×800 JPEG and
+/// whose score is legacy (0.5, no `sharpness_basis`): measured on a pre-#245 preview
+/// enlarged to 2048 px, so stale. Returns its id; the catalog is not installed yet.
+fn catalog_with_legacy_score(dir: &TempDir) -> (Catalog, i64) {
+    let root = dir.0.join("photos");
+    let file = root.join("2026/small.jpg");
+    std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+    let img = image::GrayImage::from_fn(1200, 800, |x, y| image::Luma([if (x / 4 + y / 4) % 2 == 0 { 0 } else { 255 }]));
+    image::DynamicImage::ImageLuma8(img).save_with_format(&file, image::ImageFormat::Jpeg).unwrap();
+    let catalog = Catalog::open(&dir.0.join("shell.chairphoto"), &root).unwrap();
+    let id = catalog.upsert_photo(&file, None, 0, 1).unwrap().id;
+    catalog
+        .conn()
+        .execute("UPDATE photos SET sharpness = 0.5, sharpness_method = 'tile', sharpness_basis = NULL WHERE id = ?1", [id])
+        .unwrap();
+    (catalog, id)
+}
+
+fn sharpness_row(c: &Catalog, id: i64) -> (Option<f64>, Option<i64>) {
+    c.conn()
+        .query_row("SELECT sharpness, sharpness_basis FROM photos WHERE id = ?1", [id], |r| Ok((r.get(0)?, r.get(1)?)))
+        .unwrap()
+}
+
+/// M1: opening a catalog settles its legacy sharpness scores with no photo opened — the
+/// stale one is measured again and stamped — and the job's own result sets the status line.
+#[gpui_kit::test]
+fn opening_a_catalog_re_measures_its_legacy_sharpness_scores(cx: &mut TestAppContext) {
+    let dir = TempDir::new("sharpness-legacy");
+    let app = start(cx);
+    let (catalog, id) = catalog_with_legacy_score(&dir);
+    *app.state.catalog.lock().unwrap() = Some(catalog);
+    app.state.send(CoreEvent::CatalogSwitched(dir.0.join("shell.chairphoto").to_string_lossy().to_string()));
+    cx.run_until_parked();
+    assert!(app.wired.storage.read_with(cx, |s, _| s.sharpness).is_some(), "the catalog open started the re-measure");
+    work(cx);
+    let (score, basis) = chairphoto_core::app::with_catalog(&app.state, |c| Ok(sharpness_row(c, id))).unwrap();
+    assert!(score.is_some_and(|s| s != 0.5), "the stale score was measured again, got {score:?}");
+    assert_eq!(basis, Some(chairphoto_core::sharpness_indexer::SHARPNESS_BASIS));
+    assert_eq!(app.wired.storage.read_with(cx, |s, _| s.sharpness), None, "its result ended the follow");
+    assert_eq!(status(&app, cx), "Sharpness re-measured: 1 updated, 0 kept");
+}
+
+/// A switch before the re-measure's worker runs drops the follow and trips its claim: the
+/// left catalog's legacy score is untouched, and nothing reports.
+#[gpui_kit::test]
+fn a_switch_stops_the_legacy_sharpness_re_measure(cx: &mut TestAppContext) {
+    let dir = TempDir::new("sharpness-switch");
+    let app = start(cx);
+    let (catalog, id) = catalog_with_legacy_score(&dir);
+    *app.state.catalog.lock().unwrap() = Some(catalog);
+    app.state.send(CoreEvent::CatalogSwitched(dir.0.join("shell.chairphoto").to_string_lossy().to_string()));
+    cx.run_until_parked();
+    assert!(app.wired.storage.read_with(cx, |s, _| s.sharpness).is_some());
+    storage_sees_switch(&app, cx);
+    assert_eq!(app.wired.storage.read_with(cx, |s, _| s.sharpness), None, "the switch dropped it");
+    work(cx);
+    let row = chairphoto_core::app::with_catalog(&app.state, |c| Ok(sharpness_row(c, id))).unwrap();
+    assert_eq!(row, (Some(0.5), None), "the tripped re-measure ran on");
+    assert!(!status(&app, cx).starts_with("Sharpness"), "the dropped re-measure reported");
+}
+
 // --- catalog switcher ---------------------------------------------------------------------
 
 /// The catalog pill opens the switcher; creating a catalog switches to it (the model, the

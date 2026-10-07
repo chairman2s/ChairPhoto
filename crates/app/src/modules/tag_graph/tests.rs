@@ -633,6 +633,9 @@ fn the_module_reads_the_open_catalog_through_the_shell(cx: &mut TestAppContext) 
     let dir = TempDir(std::env::temp_dir().join(format!("cp-tg-{}-{nanos}", std::process::id())));
     std::fs::create_dir_all(&dir.0).unwrap();
     let (state, events_rx, ()) = start_core(|_| ());
+    // Storage jobs (the launch reconcile check, the legacy sharpness re-measure) queue on
+    // `Runner::manual`: the core runtime's threads would wake the deterministic scheduler.
+    cx.update(|cx| cx.set_global(crate::storage::Runner::manual()));
     let wired = cx.update(|cx| {
         wire(
             cx,
@@ -703,6 +706,9 @@ fn the_inspector_is_mirrored_to_the_pop_out_loupe(cx: &mut TestAppContext) {
     let dir = TempDir(std::env::temp_dir().join(format!("cp-tg-loupe-{}-{nanos}", std::process::id())));
     std::fs::create_dir_all(&dir.0).unwrap();
     let (state, events_rx, ()) = start_core(|_| ());
+    // Storage jobs (the launch reconcile check, the legacy sharpness re-measure) queue on
+    // `Runner::manual`: the core runtime's threads would wake the deterministic scheduler.
+    cx.update(|cx| cx.set_global(crate::storage::Runner::manual()));
     let wired = cx.update(|cx| {
         wire(cx, state.clone(), events_rx, None, &SystemThemeResult::unavailable(), WireOptions::headless(Rc::new(|| {})))
     });

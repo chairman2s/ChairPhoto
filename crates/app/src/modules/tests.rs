@@ -1116,6 +1116,9 @@ impl Shell {
 /// `run`'s wiring with a fresh catalog holding one photo, opened as `catalog:switched` does.
 fn shell(dir: &TempDir, cx: &mut TestAppContext) -> (Shell, i64) {
     let (state, events_rx, ()) = start_core(|_| ());
+    // Storage jobs (the launch reconcile check, the legacy sharpness re-measure) queue on
+    // `Runner::manual`: the core runtime's threads would wake the deterministic scheduler.
+    cx.update(|cx| cx.set_global(crate::storage::Runner::manual()));
     let wired = cx.update(|cx| {
         wire(
             cx,

@@ -114,16 +114,10 @@ source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz"
         "libraw-$_libraw_commit.tar.gz::https://github.com/LibRaw/LibRaw/archive/$_libraw_commit.tar.gz"
         "$pkgname.desktop")
 # Regenerate with `updpkgsums` after every pkgver bump; see README.md in this directory.
-#
-# Index 0 is still v2026.8.0's hash: this recipe targets the *next* tag (v2026.10.0, not yet
-# created — see README.md "Cutting a release" and its note on preparing a recipe ahead of the
-# tag it names), so there is no real v2026.10.0 tarball to hash yet. Left as a visible,
-# known-wrong placeholder rather than a guess; a plain `makepkg` will fail integrity on it
-# until the actual release's `updpkgsums` run replaces it. Index 2 (chairphoto.desktop) is
-# current — that file lives in this repo, not behind a tag, so `sha256sum
-# packaging/chairphoto.desktop` could be computed for real, offline, right now.
-sha256sums=('9243bce8e428bf534228c598f0b5e78cb932684adf4fa91965d583bd1ebb2ebf'
-            'SKIP'
+# All three are real hashes: the v2026.10.0 release tarball, the pinned LibRaw snapshot
+# (dde798dd, the submodule commit at that tag) and chairphoto.desktop from this directory.
+sha256sums=('edd3b7e04fa1b01d1fc66c62c86124a44dc74d19cbb39bc27e920d72edb0e35f'
+            '05424cb65b15cd404d0f7b786c53222ff414958ad83edeeb4ad114e8123065b2'
             '1472df45baa14daafd92f4bfda8796fecdb0d8f938742fe19484a816bb14702e')
 
 prepare() {

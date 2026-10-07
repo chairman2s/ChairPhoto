@@ -27,7 +27,7 @@
 //! pool's threads, and the real platform needs a display — neither measures wall-clock frame
 //! time headless. So this loop drives the stage's own policy functions on real time instead
 //! of re-implementing them: `darkroom::fast_wait` (the fast-frame throttle — a change's fast
-//! frame is due at most every `FAST_INTERVAL`, the timer replaced per change),
+//! frame is due at most every `max(FAST_INTERVAL_MIN, last fast render time)`, the timer replaced per change),
 //! `darkroom::frame_outcome` (a frame is taken only if newer; cancelled or stale frames are
 //! superseded; the rest failed), the full frame `SETTLE` after the last change, and older
 //! queued requests cancelled by a newer one, as `DarkroomStage::cancel_older` does. What the
@@ -47,7 +47,7 @@
 #[path = "support/bench_catalog.rs"]
 mod bench_catalog;
 
-use chairphoto_app::darkroom::{failed_frames, fast_wait, frame_outcome, FrameOutcome, FrameTier, SETTLE};
+use chairphoto_app::darkroom::{failed_frames, fast_render_time, fast_wait, frame_outcome, FrameOutcome, FrameTier, SETTLE};
 use chairphoto_app::image_store::Loaded;
 use chairphoto_core::app::{catalog_identity, editing, runtime, with_catalog, AppState, CatalogIdentity};
 use chairphoto_core::catalog::PhotoQuery;
@@ -181,6 +181,7 @@ fn drag(pool: &ImagePool<Loaded>, catalog: CatalogIdentity, photo: i64, source: 
     let mut ev = -1.0;
     let mut next_event = t0;
     let mut last_fast: Option<Instant> = None;
+    let mut last_render: Option<Duration> = None;
     let mut fast_due: Option<Instant> = None;
     let mut settle_due: Option<Instant> = None;
     loop {
@@ -188,7 +189,7 @@ fn drag(pool: &ImagePool<Loaded>, catalog: CatalogIdentity, photo: i64, source: 
         if next_event < end && now >= next_event {
             generation += 1;
             ev = -1.0 + 2.0 * next_event.duration_since(t0).as_secs_f64() / DRAG.as_secs_f64();
-            fast_due = Some(now + fast_wait(last_fast, now));
+            fast_due = Some(now + fast_wait(last_fast, last_render, now));
             settle_due = Some(now + SETTLE);
             next_event += EVENT;
             continue;
@@ -216,6 +217,10 @@ fn drag(pool: &ImagePool<Loaded>, catalog: CatalogIdentity, photo: i64, source: 
         if let Ok(a) = rx.recv_timeout(wake.saturating_duration_since(now)) {
             queued.retain(|(g, k)| !(*g == a.generation && matches!(k, JobKey::Edit(j) if j.max_edge == a.tier.max_edge())));
             take(a, &mut samples, &mut shown);
+            // The stage's own adaptive input: the newest taken fast frame's render time.
+            if let Some(t) = samples.iter().rev().find_map(fast_render_time) {
+                last_render = Some(t);
+            }
         }
     }
     samples

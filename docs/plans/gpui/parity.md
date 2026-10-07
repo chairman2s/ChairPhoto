@@ -1596,7 +1596,7 @@ GeometryRail (`editor.crop_overlay`).
 waits while the RAW prepares;
 saves on unmount, step, switch and cover.
 The first change on Original creates "Version N".
-**Render tiers:** fast 720 px (≈90 ms throttle), settled 1400 px after 250 ms, plus zone
+**Render tiers:** fast 720 px (throttle: max(33 ms, last fast render time), #242), settled 1400 px after 250 ms, plus zone
 masses and the loupe broadcast.
 Crop is an overlay;
 perspective is un-warped while its handles are up.

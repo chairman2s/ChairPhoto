@@ -569,14 +569,19 @@ pub fn backup_drift_as(
         return Err(DRIFT_SUPERSEDED.into());
     }
     let cat = bound(state, expected)?;
+    // Stamped before any read (#261): a companion saved while the check reads has an mtime at
+    // or after this, so it never looks older than the carry it was adopted as.
+    let at = now_secs();
     let candidates = cat.with(|c| c.plan_replace_candidates(photo_id))?;
     let Some(plan) = crate::catalog::resolve_replace_plan(candidates) else { return Ok(None) };
     match crate::catalog::backup_drift(&plan, stop).map_err(|e| crate::catalog::user_reason(&e))? {
         Some((drift, adopt)) => {
             // Rows from before `carried_hash` heal here as the check confirms them (LOW-B);
             // a failure only means the next check or carry tries again.
+            #[cfg(test)]
+            stack_tests::AFTER_DRIFT.with(|h| h.take().map(|hook| hook()));
             if !adopt.is_empty() {
-                if let Err(e) = cat.with(|c| c.adopt_carried(plan.backup_location_id, &adopt)) {
+                if let Err(e) = cat.with(|c| c.adopt_carried(plan.backup_location_id, &adopt, at)) {
                     eprintln!("storage: could not record the confirmed companions of photo {photo_id}: {e}");
                 }
             }
@@ -748,6 +753,11 @@ mod stack_tests {
 
     // ── #257: a backup the local version moved on from ────────────────────────────────
 
+    thread_local! {
+        /// Run once by `backup_drift_as` after the comparison, before it records what it adopted.
+        pub(super) static AFTER_DRIFT: std::cell::Cell<Option<Box<dyn FnOnce()>>> = std::cell::Cell::new(None);
+    }
+
     fn drift(state: &AppState, id: i64) -> crate::catalog::BackupDrift {
         backup_drift_as(state, super::super::catalog_identity(state).unwrap(), id, &|| false).unwrap().unwrap()
     }
@@ -912,6 +922,52 @@ mod stack_tests {
         crate::xmp::write_gps(&raw, 61.0, 6.0).unwrap();
         assert_eq!(drift(&state, master).companions, ["DSC1.ARW.xmp"]);
         assert_eq!(recorded(), None);
+    }
+
+    /// #261 LOW-1: a carry that records the companion's hash between the check's comparison and
+    /// its adoption wins; the guard keeps the adoption from moving that reference.
+    #[test]
+    fn adoption_never_overwrites_a_hash_recorded_meanwhile() {
+        let (_dir, state, master, _frame, raw, _jpg) = stacked("261-adopt-guard");
+        crate::xmp::write_gps(&raw, 59.9, 10.7).unwrap();
+        backup_photo(&state, master).unwrap();
+        with_catalog(&state, |c| Ok(c.conn().execute("UPDATE photo_location_companions SET carried_hash = NULL", [])?)).unwrap();
+        let st = std::sync::Arc::new(state);
+        AFTER_DRIFT.with(|h| {
+            let st = st.clone();
+            h.set(Some(Box::new(move || {
+                with_catalog(&st, |c| {
+                    Ok(c.conn().execute("UPDATE photo_location_companions SET carried_hash = 'recorded-meanwhile'", [])?)
+                })
+                .unwrap();
+            })))
+        });
+
+        assert!(!drift(&st, master).changed());
+
+        let got = with_catalog(&st, |c| {
+            Ok(c.conn().query_row("SELECT carried_hash FROM photo_location_companions WHERE name = 'DSC1.ARW.xmp'", [], |r| r.get::<_, Option<String>>(0))?)
+        })
+        .unwrap();
+        assert_eq!(got.as_deref(), Some("recorded-meanwhile"));
+    }
+
+    /// #261 LOW-2: `carried_at` is the check's start, not the time its reads finished.
+    #[test]
+    fn adoption_stamps_carried_at_at_the_start_of_the_check() {
+        let (_dir, state, master, _frame, raw, _jpg) = stacked("261-adopt-at");
+        crate::xmp::write_gps(&raw, 59.9, 10.7).unwrap();
+        backup_photo(&state, master).unwrap();
+        with_catalog(&state, |c| Ok(c.conn().execute("UPDATE photo_location_companions SET carried_hash = NULL", [])?)).unwrap();
+        AFTER_DRIFT.with(|h| h.set(Some(Box::new(|| std::thread::sleep(std::time::Duration::from_secs(3))))));
+
+        assert!(!drift(&state, master).changed());
+
+        let at = with_catalog(&state, |c| {
+            Ok(c.conn().query_row("SELECT carried_at FROM photo_location_companions WHERE name = 'DSC1.ARW.xmp'", [], |r| r.get::<_, i64>(0))?)
+        })
+        .unwrap();
+        assert!(super::super::now_secs() - at >= 2, "stamped after the reads: {at}");
     }
 
     /// Review relA2, LOW-A: a Replace confirmed for a sidecar alone replaces the sidecar

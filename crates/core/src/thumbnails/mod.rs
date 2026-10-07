@@ -163,25 +163,6 @@ pub(crate) fn encode_rotated_jpeg(img: &DynamicImage) -> Result<Vec<u8>, String>
     Ok(out.into_inner())
 }
 
-/// JPEG-encode `img` at `quality` with the pure-Rust `jpeg-encoder` (#243), which encodes a
-/// 24 MP-class tier markedly faster than `image`'s encoder. Grey stays one channel; every
-/// other colour type goes out as 8-bit RGB (alpha dropped), as before.
-pub(crate) fn encode_jpeg(img: &DynamicImage, quality: u8) -> Result<Vec<u8>, String> {
-    use jpeg_encoder::{ColorType, Encoder};
-    let (w, h) = (u16::try_from(img.width()).map_err(|e| e.to_string())?, u16::try_from(img.height()).map_err(|e| e.to_string())?);
-    let mut out = Vec::new();
-    let mut encoder = Encoder::new(&mut out, quality);
-    // No chroma subsampling, as `image`'s encoder: the tiers keep their colour detail.
-    encoder.set_sampling_factor(jpeg_encoder::SamplingFactor::F_1_1);
-    match img {
-        DynamicImage::ImageLuma8(g) => encoder.encode(g.as_raw(), w, h, ColorType::Luma),
-        DynamicImage::ImageRgb8(rgb) => encoder.encode(rgb.as_raw(), w, h, ColorType::Rgb),
-        other => encoder.encode(other.to_rgb8().as_raw(), w, h, ColorType::Rgb),
-    }
-    .map_err(|e| e.to_string())?;
-    Ok(out)
-}
-
 // --- persistent offline thumbnails -------------------------------------------------------
 // The normal disk cache is keyed by path+mtime+size, so it can't be found once the
 // original is unreachable (e.g. a photo offloaded to a NAS that's now unmounted). This
@@ -778,6 +759,7 @@ fn encode_size(path: &Path, img: &DynamicImage, size: Size) -> Result<Vec<u8>, S
     // `thumbnail`, byte for byte, without its per-pixel overhead.
     let fits = img.width() <= size.max && img.height() <= size.max;
     let resized = if fits { std::borrow::Cow::Borrowed(img) } else { std::borrow::Cow::Owned(downscale::thumbnail(img, size.max)) };
+    let mut out = Cursor::new(Vec::new());
     // The webview shows untagged JPEGs as sRGB. Sony shoots Adobe RGB (wider gamut), so
     // an Adobe RGB preview displayed as-is looks dull/desaturated. Convert it to sRGB for
     // display. The original RAW is untouched; the edited export also renders in sRGB
@@ -786,10 +768,15 @@ fn encode_size(path: &Path, img: &DynamicImage, size: Size) -> Result<Vec<u8>, S
     if is_adobe_rgb(path) {
         let mut rgb = resized.to_rgb8();
         adobe_rgb_to_srgb(&mut rgb);
-        encode_jpeg(&DynamicImage::ImageRgb8(rgb), size.quality)
+        DynamicImage::ImageRgb8(rgb)
+            .write_with_encoder(JpegEncoder::new_with_quality(&mut out, size.quality))
+            .map_err(|e| e.to_string())?;
     } else {
-        encode_jpeg(&resized, size.quality)
+        resized
+            .write_with_encoder(JpegEncoder::new_with_quality(&mut out, size.quality))
+            .map_err(|e| e.to_string())?;
     }
+    Ok(out.into_inner())
 }
 
 /// Decode encoded image bytes and apply orientation: the override when given (source

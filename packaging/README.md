@@ -249,6 +249,22 @@ verification on new releases starts failing.
    namcap PKGBUILD
    namcap chairphoto-*.pkg.tar.zst
    ```
+   `namcap PKGBUILD` is clean. On the package, these findings are expected (seen for
+   2026.10.0, #269); anything else is new and needs a look:
+   - **E: Uncommon license identifiers … Found 9/10 required license files.** namcap counts
+     the files under `/usr/share/licenses/chairphoto/` against the uncommon identifiers in
+     `license=()`; it does not read them. Every crate licence text (MIT, ISC, BSD, Zlib,
+     Unicode-3.0, …) is shipped in full in the single `THIRD_PARTY_LICENSES.txt`, so nothing
+     is missing.
+   - **W: Unused shared library `/usr/lib64/ld-linux-x86-64.so.2`.** The dynamic loader of
+     every dynamically linked program; namcap reports it routinely.
+   - **W: Dependency included, but may not be needed (`vulkan-icd-loader`, `wayland`).**
+     Both are loaded at runtime (dlopen), so namcap does not see them used; the app cannot
+     open a window without them. Keep them in `depends=` — see the comment there.
+
+   `makepkg` may also print `libfakeroot internal error: payload not recognized!` during
+   `package()`. For 2026.10.0 the package was still created and installs; the message was
+   not investigated further.
 
 **The tag is created at step 2 — not before.** Step 1 (bump `Cargo.toml`) and the `pkgver`
 half of step 4 can land in their own commit ahead of steps 2–3, to prepare this recipe for a

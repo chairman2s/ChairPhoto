@@ -118,6 +118,13 @@ pub struct MergeOutcome {
     /// The photos versions were added to, existing or new — each owes the monochrome
     /// refresh a version write owes.
     pub versions_added_to: Vec<i64>,
+    /// The (uuid, relative path) of each bundle photo with no row here that the merge did not
+    /// insert: the importer refused its original for a name too long for a sidecar
+    /// (`merge_bundle_into`'s `refused`), or its own path is too long for one
+    /// (`xmp::sidecar_fits`), so its identity could never be written. Decided inside the merge transaction, against the rows it
+    /// sees, so a row removed while the originals unpacked cannot be mistaken for one that
+    /// is still there.
+    pub refused: Vec<(String, String)>,
 }
 
 impl Catalog {
@@ -125,7 +132,7 @@ impl Catalog {
     /// docs). Pure-DB: it never touches the filesystem — placing originals is the
     /// importer's job. The whole apply is one transaction.
     pub fn merge_bundle(&self, manifest: &BundleManifest) -> Result<MergeSummary> {
-        Ok(self.merge_bundle_into(manifest, &HashSet::new(), &HashSet::new())?.summary)
+        Ok(self.merge_bundle_into(manifest, &HashSet::new(), &HashSet::new(), &HashSet::new())?.summary)
     }
 
     /// [`Self::merge_bundle`], told which rows the caller created for this bundle's photos
@@ -134,12 +141,18 @@ impl Catalog {
     /// [`super::photo_identity_for`] gives them) of the bundle's photos the caller kept apart:
     /// their original is in the library already under another identity, so one with no row is
     /// kept apart here too ([`MergeSummary::photos_kept_apart`]) rather than inserted at its
-    /// path. Returns the IPTC fills left to the caller (see [`MergeOutcome`]).
+    /// path. `refused` holds the (uuid, relative path) of each photo whose original the caller
+    /// refused for a name too long for a sidecar: one with no row is not inserted
+    /// ([`MergeOutcome::refused`]), one with a row merges onto it. So is a photo with no row
+    /// whose own path cannot hold a sidecar. Both are decided here, inside the transaction, so
+    /// a row removed while the originals unpacked is not mistaken for one still there.
+    /// Returns the IPTC fills left to the caller (see [`MergeOutcome`]).
     pub fn merge_bundle_into(
         &self,
         manifest: &BundleManifest,
         fresh: &HashSet<i64>,
         kept_apart: &HashSet<String>,
+        refused: &HashSet<(String, String)>,
     ) -> Result<MergeOutcome> {
         let tx = self.conn.unchecked_transaction()?;
         let outcome = {
@@ -149,6 +162,8 @@ impl Catalog {
                 tag_id_by_uuid: HashMap::new(),
                 fresh,
                 kept_apart,
+                refused,
+                root: self.root(),
                 batch_uuid: manifest.batch.uuid.trim(),
                 bundle_created_at: manifest.created_at,
             };
@@ -172,6 +187,10 @@ struct MergeCtx<'a> {
     fresh: &'a HashSet<i64>,
     /// Identities the importer kept apart (see `merge_bundle_into`).
     kept_apart: &'a HashSet<String>,
+    /// Photos the importer refused (see `merge_bundle_into`).
+    refused: &'a HashSet<(String, String)>,
+    /// The catalog root, which a relative path resolves against for the sidecar-name check.
+    root: &'a std::path::Path,
     /// The bundle's batch uuid, which `bundle_merges` records per photo (#248). Blank: a
     /// bundle with no batch identity, recorded nowhere.
     batch_uuid: &'a str,
@@ -445,6 +464,18 @@ impl MergeCtx<'_> {
                 );
                 self.outcome.summary.photos_kept_apart += 1;
                 self.outcome.summary.kept_apart_names.push(photo.relative_path.clone());
+                return Ok(());
+            }
+            None if self.refused.contains(&(photo.uuid.clone(), photo.relative_path.clone()))
+                || !crate::xmp::sidecar_fits(&self.root.join(&photo.relative_path)) =>
+            {
+                // No row holds this identity (seen in this transaction), and a row here would
+                // be one whose sidecar can never be written (AGENTS.md, "Photo identity").
+                eprintln!(
+                    "bundle merge: photo {uuid} not added: no name for it fits a sidecar beside it: {}",
+                    photo.relative_path
+                );
+                self.outcome.refused.push((photo.uuid.clone(), photo.relative_path.clone()));
                 return Ok(());
             }
             None => {
@@ -920,7 +951,7 @@ mod tests {
         cat.set_version_edit(mine, r#"{"local":1}"#).unwrap();
         let before = face(&cat, id);
         assert_eq!(before.map(|f| f.0), Some(mine));
-        let out = cat.merge_bundle_into(&sample_manifest(), &HashSet::new(), &HashSet::new()).unwrap();
+        let out = cat.merge_bundle_into(&sample_manifest(), &HashSet::new(), &HashSet::new(), &HashSet::new()).unwrap();
         assert_eq!(out.summary.versions_added, 2);
         assert_eq!(face(&cat, id), before, "the face and its rev are unchanged");
         // The merged versions are set aside, not left at 0, so the heal after an older build
@@ -931,7 +962,7 @@ mod tests {
         // No versions of its own: the original stays the face, through a later refresh too.
         let (cat, _root) = temp_catalog("face-original");
         let id = insert(&cat);
-        cat.merge_bundle_into(&sample_manifest(), &HashSet::new(), &HashSet::new()).unwrap();
+        cat.merge_bundle_into(&sample_manifest(), &HashSet::new(), &HashSet::new(), &HashSet::new()).unwrap();
         let merged = cat.list_versions(id).unwrap();
         assert_eq!(merged.len(), 2);
         assert_eq!(face(&cat, id), None, "the original is still the face");
@@ -974,7 +1005,7 @@ mod tests {
             )
             .unwrap();
 
-        let out = cat.merge_bundle_into(&sample_manifest(), &HashSet::new(), &HashSet::new()).unwrap();
+        let out = cat.merge_bundle_into(&sample_manifest(), &HashSet::new(), &HashSet::new(), &HashSet::new()).unwrap();
         let s = &out.summary;
         assert_eq!(s.photos_added, 0);
         assert_eq!(s.photos_existing, 1);
@@ -1021,7 +1052,7 @@ mod tests {
         );
 
         // A second merge adds no version: the photo has those settings now.
-        let again = cat.merge_bundle_into(&sample_manifest(), &HashSet::new(), &HashSet::new()).unwrap();
+        let again = cat.merge_bundle_into(&sample_manifest(), &HashSet::new(), &HashSet::new(), &HashSet::new()).unwrap();
         assert_eq!((again.summary.versions_added, again.summary.photos_filled), (0, 0));
         assert_eq!(cat.list_versions(after.id).unwrap().len(), 3);
 
@@ -1051,7 +1082,7 @@ mod tests {
         let local = cat.get_photo_by_uuid("photo-a").unwrap();
         cat.set_edit_record(local.id, r#"{ "basic-editor": { "exposure": 0.3 } }"#).unwrap();
 
-        let out = cat.merge_bundle_into(&sample_manifest(), &HashSet::new(), &HashSet::new()).unwrap();
+        let out = cat.merge_bundle_into(&sample_manifest(), &HashSet::new(), &HashSet::new(), &HashSet::new()).unwrap();
         let after = cat.get_photo(local.id).unwrap();
         assert_eq!(after.rating, 2, "a rating it has wins");
         assert_eq!(after.label, "green", "a blank label is filled");
@@ -1083,7 +1114,7 @@ mod tests {
             let mut manifest = sample_manifest();
             manifest.photos[0].edit_record = Some(blank.into());
             manifest.photos[0].versions.clear();
-            let out = cat.merge_bundle_into(&manifest, &HashSet::new(), &HashSet::new()).unwrap();
+            let out = cat.merge_bundle_into(&manifest, &HashSet::new(), &HashSet::new(), &HashSet::new()).unwrap();
             assert_eq!(out.summary.versions_added, 0, "{blank:?}");
             assert!(cat.list_versions(id).unwrap().is_empty(), "{blank:?}");
         }
@@ -1102,7 +1133,7 @@ mod tests {
             )
             .unwrap();
         let id = cat.conn().last_insert_rowid();
-        let out = cat.merge_bundle_into(&sample_manifest(), &HashSet::from([id]), &HashSet::new()).unwrap();
+        let out = cat.merge_bundle_into(&sample_manifest(), &HashSet::from([id]), &HashSet::new(), &HashSet::new()).unwrap();
         assert_eq!((out.summary.photos_filled, out.summary.versions_added), (0, 0));
         assert!(out.iptc_fills.is_empty());
         assert_eq!(cat.get_photo(id).unwrap().rating, 0);
@@ -1128,7 +1159,7 @@ mod tests {
             )
             .unwrap();
         let id = cat.conn().last_insert_rowid();
-        let first = cat.merge_bundle_into(&sample_manifest(), &HashSet::new(), &HashSet::new()).unwrap();
+        let first = cat.merge_bundle_into(&sample_manifest(), &HashSet::new(), &HashSet::new(), &HashSet::new()).unwrap();
         assert_eq!((first.summary.photos_filled, first.summary.versions_added), (1, 2));
         assert_eq!(first.iptc_fills.len(), 1);
 
@@ -1139,7 +1170,7 @@ mod tests {
         }
         cat.conn().execute("DELETE FROM photo_tags WHERE photo_id = ?1", params![id]).unwrap();
 
-        let again = cat.merge_bundle_into(&sample_manifest(), &HashSet::new(), &HashSet::new()).unwrap();
+        let again = cat.merge_bundle_into(&sample_manifest(), &HashSet::new(), &HashSet::new(), &HashSet::new()).unwrap();
         let s = &again.summary;
         assert_eq!((s.photos_existing, s.photos_merged_before, s.photos_filled, s.versions_added), (1, 1, 0, 0), "{s:?}");
         assert!(again.iptc_fills.is_empty(), "no IPTC offered again");
@@ -1153,7 +1184,7 @@ mod tests {
         // Another batch is another bundle: its blanks are filled.
         let mut other = sample_manifest();
         other.batch.uuid = "batch-2".into();
-        let third = cat.merge_bundle_into(&other, &HashSet::new(), &HashSet::new()).unwrap();
+        let third = cat.merge_bundle_into(&other, &HashSet::new(), &HashSet::new(), &HashSet::new()).unwrap();
         assert_eq!((third.summary.photos_merged_before, third.summary.photos_filled), (0, 1));
         assert_eq!(cat.get_photo(id).unwrap().rating, 4);
     }
@@ -1177,19 +1208,19 @@ mod tests {
         early.photos[0].iptc = Default::default();
         early.photos[0].edit_record = None;
         early.photos[0].versions.clear();
-        cat.merge_bundle_into(&early, &HashSet::new(), &HashSet::new()).unwrap();
+        cat.merge_bundle_into(&early, &HashSet::new(), &HashSet::new(), &HashSet::new()).unwrap();
         assert!(cat.list_versions(id).unwrap().is_empty());
 
         let mut later = sample_manifest();
         later.created_at = early.created_at + 86_400;
-        let out = cat.merge_bundle_into(&later, &HashSet::new(), &HashSet::new()).unwrap();
+        let out = cat.merge_bundle_into(&later, &HashSet::new(), &HashSet::new(), &HashSet::new()).unwrap();
         let s = &out.summary;
         assert_eq!((s.photos_merged_before, s.photos_filled, s.versions_added), (0, 1, 2), "{s:?}");
         assert_eq!(out.iptc_fills.len(), 1, "its IPTC is offered for the blanks");
         assert_eq!(cat.get_photo(id).unwrap().rating, 4);
 
         // And that later bundle, imported once more, applies nothing.
-        let again = cat.merge_bundle_into(&later, &HashSet::new(), &HashSet::new()).unwrap();
+        let again = cat.merge_bundle_into(&later, &HashSet::new(), &HashSet::new(), &HashSet::new()).unwrap();
         assert_eq!((again.summary.photos_merged_before, again.summary.photos_filled), (1, 0));
     }
 
@@ -1215,8 +1246,8 @@ mod tests {
             )
             .unwrap();
         let fresh = cat.conn().last_insert_rowid();
-        cat.merge_bundle_into(&sample_manifest(), &HashSet::from([fresh]), &HashSet::new()).unwrap();
-        let again = cat.merge_bundle_into(&sample_manifest(), &HashSet::new(), &HashSet::new()).unwrap();
+        cat.merge_bundle_into(&sample_manifest(), &HashSet::from([fresh]), &HashSet::new(), &HashSet::new()).unwrap();
+        let again = cat.merge_bundle_into(&sample_manifest(), &HashSet::new(), &HashSet::new(), &HashSet::new()).unwrap();
         assert_eq!((again.summary.photos_merged_before, again.summary.photos_filled), (1, 0));
         assert_eq!(cat.get_photo(fresh).unwrap().rating, 0, "the blank the user left is not filled");
     }
@@ -1251,7 +1282,7 @@ mod tests {
     fn an_identity_the_importer_kept_apart_is_not_inserted_at_its_free_path() {
         let (cat, _root) = temp_catalog("apart-free");
         let kept = HashSet::from([crate::catalog::photo_identity_for("photo-a").unwrap()]);
-        let out = cat.merge_bundle_into(&sample_manifest(), &HashSet::new(), &kept).unwrap();
+        let out = cat.merge_bundle_into(&sample_manifest(), &HashSet::new(), &kept, &HashSet::new()).unwrap();
         let s = out.summary;
         assert_eq!((s.photos_added, s.photos_existing, s.photos_kept_apart), (0, 0, 1));
         assert_eq!(cat.count_photos(&Default::default()).unwrap(), 0);

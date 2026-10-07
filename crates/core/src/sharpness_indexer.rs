@@ -1019,6 +1019,29 @@ mod tests {
         assert_eq!(load_queue(&conn).unwrap(), vec![(1, true), (2, true)]);
     }
 
+    /// `keep_legacy_sharpness` stamps a legacy score and nothing else (#262 N1): an unscored
+    /// row is not stamped (a stamp would claim a measurement that never happened), and a
+    /// stamped row's basis is not rewritten.
+    #[test]
+    fn keeping_a_legacy_score_touches_no_unscored_or_stamped_row() {
+        let conn = mem_conn();
+        for id in 1i64..=3 {
+            insert_photo(&conn, id);
+        }
+        legacy_score(&conn, 1, 5.0);
+        // 2: unscored. 3: stamped with a basis this build never writes, so a rewrite to
+        // `SHARPNESS_BASIS` would show.
+        conn.execute("UPDATE photos SET sharpness = 6.0, sharpness_method = 'tile', sharpness_basis = 99 WHERE id = 3", [])
+            .unwrap();
+        for id in 1i64..=3 {
+            keep_legacy_sharpness(&conn, id).unwrap();
+        }
+        assert_eq!(basis(&conn, 1), Some(SHARPNESS_BASIS), "the legacy score is stamped");
+        assert_eq!(get_sharpness(&conn, 1).unwrap().0, 5.0, "and kept as it was");
+        assert_eq!(basis(&conn, 2), None, "an unscored row is not stamped");
+        assert_eq!(basis(&conn, 3), Some(99), "a stamped row is left as it is");
+    }
+
     fn insert_at(conn: &Connection, id: i64, path: &str) {
         conn.execute("INSERT INTO photos (id, path) VALUES (?1, ?2)", rusqlite::params![id, path]).unwrap();
     }

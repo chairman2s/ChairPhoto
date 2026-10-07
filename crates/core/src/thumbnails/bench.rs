@@ -75,6 +75,15 @@ fn cold_preview_stage_timings() {
     line("preview: downscale (ours)", (p50, max));
     let (p50, max, preview) = time(n, |_| encode_size(&path, &img, PREVIEW).unwrap());
     line("preview: downscale + encode", (p50, max));
+    let small = downscale::thumbnail(&img, PREVIEW_MAX);
+    let (p50, max, _) = time(n, |_| {
+        let mut out = Cursor::new(Vec::new());
+        small.write_with_encoder(JpegEncoder::new_with_quality(&mut out, PREVIEW.quality)).unwrap();
+        out.into_inner()
+    });
+    line("preview: encode only (image's, pre-#243)", (p50, max));
+    let (p50, max, _) = time(n, |_| encode_jpeg(&small, PREVIEW.quality).unwrap());
+    line("preview: encode only (jpeg-encoder)", (p50, max));
     let (p50, max, _) = time(n, |_| encode_size(&path, &img, THUMB).unwrap());
     line("thumb (derived): downscale + encode", (p50, max));
     let (p50, max, _) = time(n, |_| image::load_from_memory(&preview).unwrap());

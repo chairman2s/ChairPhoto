@@ -880,8 +880,9 @@ impl Catalog {
     /// column existed, or never — gets the confirmed hash, as a carry would have recorded it.
     /// A row that has a hash is left as it is (the carry that recorded it is the reference),
     /// so this can only heal, never move a reference past a change.
-    pub fn adopt_carried(&self, location_id: i64, adopt: &[CarriedCompanion]) -> Result<()> {
-        let at = now();
+    /// `at` is when the check began, before it read anything (#261): a companion saved while
+    /// it read has an mtime after it and reads as changed, not as already carried.
+    pub fn adopt_carried(&self, location_id: i64, adopt: &[CarriedCompanion], at: i64) -> Result<()> {
         for c in adopt {
             self.conn.execute(
                 "INSERT INTO photo_location_companions(location_id, name, carried_mtime, carried_at, carried_hash)

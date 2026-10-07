@@ -153,8 +153,14 @@ pub fn rotate_image(img: DynamicImage, degrees: i64) -> DynamicImage {
 
 /// The persistent thumbnail of a rotated photo (`media::render_image`): JPEG quality 90, the
 /// same file the Tauri shell's byte path wrote before #165.
+///
+/// Stays on `image`'s encoder on purpose (#243): the file is byte-pinned to what the pre-#165
+/// path wrote (`tests/media_render_image.rs`), and this is not a cold-preview stage.
 pub(crate) fn encode_rotated_jpeg(img: &DynamicImage) -> Result<Vec<u8>, String> {
-    encode_jpeg(img, 90)
+    let mut out = Cursor::new(Vec::new());
+    img.write_with_encoder(JpegEncoder::new_with_quality(&mut out, 90))
+        .map_err(|e| e.to_string())?;
+    Ok(out.into_inner())
 }
 
 /// JPEG-encode `img` at `quality` with the pure-Rust `jpeg-encoder` (#243), which encodes a

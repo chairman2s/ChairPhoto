@@ -1141,8 +1141,8 @@ fn resolve_offload_member(mut member: OffloadMember) -> Result<PhotoOffload> {
     let hint = member.verified_backups.first().and_then(|c| missing_backup_hint(&c.abs));
     let backup = first_present(member.verified_backups).ok_or_else(|| {
         CatalogError::Validation(match hint {
-            Some(hint) => format!("no verified backup — refusing to offload; {hint}"),
-            None => "no verified backup — refusing to offload".into(),
+            Some(hint) => format!("no verified backup; {hint}"),
+            None => "no verified backup".into(),
         })
     })?;
     let local_location_ids = member.locals.iter().map(|c| c.location_id).collect();

@@ -873,7 +873,7 @@ fn offload_of_a_stack_says_what_it_freed_and_what_it_left(cx: &mut TestAppContex
     insp.update(cx, |i, cx| i.offload(cx));
     work(cx);
     insp.read_with(cx, |i, _| {
-        assert_eq!(i.storage_msg.as_deref(), Some("Freed 1 of 2 — no verified backup — refusing to offload"))
+        assert_eq!(i.storage_msg.as_deref(), Some("Freed 1 of 2 — no verified backup"))
     });
     assert!(!dir.0.join("photos/2026/p0.ARW").exists(), "the master was freed");
     assert!(dir.0.join("photos/2026/p1.ARW").exists(), "the frame, with no backup of its own, stayed");

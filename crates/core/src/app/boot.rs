@@ -6,8 +6,10 @@
 //! window.
 
 use super::{app_data_dir, AppState};
+use crate::catalog::Catalog;
 use crate::image_pool::{self, ImagePool};
-use std::sync::{Arc, Once};
+use std::path::Path;
+use std::sync::{Arc, Mutex, Once};
 
 /// What [`boot_with`] started, for the front end to hold and report.
 pub struct Boot<T> {
@@ -104,6 +106,28 @@ pub fn boot_with<T: Clone + Send + 'static>(state: &AppState, runner: image_pool
     Boot { pool, strikes, following_omarchy }
 }
 
+/// The sharpness analyzer [`register_decode_analyzers`] registers: settle the photo at the
+/// absolute `path` from the decode `img` (`sharpness_indexer::settle_from_decode`), under a
+/// brief lock of the open catalog. `None` when there was nothing to do — no catalog, a
+/// poisoned lock, a file outside the catalog root (a card import's source, or a copy on
+/// another volume: those wait for the legacy re-measure, `app::sharpness`), or a photo
+/// whose score is current.
+fn settle_sharpness_from_decode(
+    catalog: &Mutex<Option<Catalog>>,
+    img: &image::DynamicImage,
+    path: &Path,
+) -> Option<crate::sharpness_indexer::Settled> {
+    let guard = catalog.lock().ok()?;
+    let catalog = guard.as_ref()?;
+    // Convert the absolute path to a catalog-root-relative path — the same key used in
+    // photos.path.
+    let rel = path.strip_prefix(catalog.root()).ok()?.to_string_lossy().to_string();
+    // Score an unscored photo, settle a legacy score, and leave a current score and a file
+    // with no catalog row alone. Region-aware (H16c): faces → AF point → tiles, read under
+    // the lock already held.
+    crate::sharpness_indexer::settle_from_decode(catalog.conn(), &rel, img).ok().flatten()
+}
+
 /// H16b + H15a: score sharpness and hash every newly decoded preview on the fly — the
 /// analyzers ride the decode that was already paid for (the I7b hook) instead of re-reading
 /// the file. Score-on-index and `index_phashes` handle the backfill.
@@ -121,26 +145,7 @@ fn register_decode_analyzers(state: &AppState) {
 
     let catalog_arc = state.catalog.clone();
     crate::thumbnails::register_analyzer(Arc::new(move |img, path| {
-        let guard = match catalog_arc.lock() {
-            Ok(g) => g,
-            Err(_) => return,
-        };
-        let catalog = match guard.as_ref() {
-            Some(c) => c,
-            None => return,
-        };
-        // Convert the absolute path to a catalog-root-relative path — the same key used in
-        // photos.path. If the file is outside the catalog root (e.g. a card import source
-        // path), skip silently.
-        let root = catalog.root();
-        let rel = match path.strip_prefix(root) {
-            Ok(r) => r.to_string_lossy().to_string(),
-            Err(_) => return,
-        };
-        // Score an unscored photo, settle a legacy score, and leave a current score and a
-        // file with no catalog row alone. Region-aware (H16c): faces → AF point → tiles,
-        // read under the lock already held.
-        let _ = crate::sharpness_indexer::settle_from_decode(catalog.conn(), &rel, img);
+        settle_sharpness_from_decode(&catalog_arc, img, path);
     }));
 
     // Unlike sharpness, the dHash is resolution-invariant, so any decode that reaches the
@@ -176,4 +181,73 @@ fn register_decode_analyzers(state: &AppState) {
             crate::phash_indexer::hash_and_store(catalog.conn(), id, img);
         }
     }));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sharpness_indexer::{Settled, SHARPNESS_BASIS};
+
+    // ── #262 L2: the sharpness decode hook's wiring ─────────────────────────────
+
+    fn sharp(w: u32, h: u32) -> image::DynamicImage {
+        image::DynamicImage::ImageLuma8(image::GrayImage::from_fn(w, h, |x, y| {
+            image::Luma([if (x / 4 + y / 4) % 2 == 0 { 0 } else { 255 }])
+        }))
+    }
+
+    fn row(c: &Catalog, id: i64) -> (Option<f64>, Option<i64>) {
+        c.conn()
+            .query_row("SELECT sharpness, sharpness_basis FROM photos WHERE id = ?1", [id], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+    }
+
+    /// The analyzer `register_decode_analyzers` installs maps the decoded file's absolute
+    /// path to its catalog row and settles a legacy score there: measured again from a decode
+    /// under 2048 px, kept and stamped from a larger one. A file outside the catalog root,
+    /// and a closed catalog, are left alone.
+    #[test]
+    fn the_sharpness_hook_settles_a_legacy_row_by_its_absolute_path() {
+        let dir = crate::test_support::TestTmpDir::new("boot-sharpness-hook");
+        let root = dir.join("library");
+        std::fs::create_dir_all(&root).unwrap();
+        let catalog = Catalog::open(&dir.join("c.chairphoto"), &root).unwrap();
+        let mut ids = Vec::new();
+        for name in ["small.jpg", "large.jpg"] {
+            let path = root.join(name);
+            std::fs::write(&path, b"x").unwrap();
+            let id = catalog.upsert_photo(&path, None, 0, 1).unwrap().id;
+            // As the pre-#245 indexer left it: a score with no basis stamp.
+            catalog
+                .conn()
+                .execute(
+                    "UPDATE photos SET sharpness = 0.5, sharpness_method = 'tile', sharpness_basis = NULL WHERE id = ?1",
+                    [id],
+                )
+                .unwrap();
+            ids.push(id);
+        }
+        let (small_id, large_id) = (ids[0], ids[1]);
+        let catalog = Mutex::new(Some(catalog));
+        let (small, large) = (sharp(1200, 800), sharp(2048, 1365));
+
+        let outside = dir.join("card").join("small.jpg");
+        assert_eq!(settle_sharpness_from_decode(&catalog, &small, &outside), None, "outside the root");
+        assert_eq!(row(catalog.lock().unwrap().as_ref().unwrap(), small_id), (Some(0.5), None));
+
+        assert_eq!(settle_sharpness_from_decode(&catalog, &small, &root.join("small.jpg")), Some(Settled::Scored));
+        assert_eq!(settle_sharpness_from_decode(&catalog, &large, &root.join("large.jpg")), Some(Settled::Kept));
+        {
+            let guard = catalog.lock().unwrap();
+            let c = guard.as_ref().unwrap();
+            let (score, basis) = row(c, small_id);
+            assert!(score.is_some_and(|s| s != 0.5), "the stale score is measured again, got {score:?}");
+            assert_eq!(basis, Some(SHARPNESS_BASIS));
+            assert_eq!(row(c, large_id), (Some(0.5), Some(SHARPNESS_BASIS)), "kept and stamped");
+        }
+        assert_eq!(settle_sharpness_from_decode(&catalog, &small, &root.join("small.jpg")), None, "settled once");
+
+        *catalog.lock().unwrap() = None;
+        assert_eq!(settle_sharpness_from_decode(&catalog, &small, &root.join("small.jpg")), None, "no catalog");
+    }
 }

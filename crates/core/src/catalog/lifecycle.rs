@@ -880,8 +880,9 @@ impl Catalog {
     /// column existed, or never — gets the confirmed hash, as a carry would have recorded it.
     /// A row that has a hash is left as it is (the carry that recorded it is the reference),
     /// so this can only heal, never move a reference past a change.
-    pub fn adopt_carried(&self, location_id: i64, adopt: &[CarriedCompanion]) -> Result<()> {
-        let at = now();
+    /// `at` is when the check began, before it read anything (#261): a companion saved while
+    /// it read has an mtime after it and reads as changed, not as already carried.
+    pub fn adopt_carried(&self, location_id: i64, adopt: &[CarriedCompanion], at: i64) -> Result<()> {
         for c in adopt {
             self.conn.execute(
                 "INSERT INTO photo_location_companions(location_id, name, carried_mtime, carried_at, carried_hash)
@@ -1141,8 +1142,8 @@ fn resolve_offload_member(mut member: OffloadMember) -> Result<PhotoOffload> {
     let hint = member.verified_backups.first().and_then(|c| missing_backup_hint(&c.abs));
     let backup = first_present(member.verified_backups).ok_or_else(|| {
         CatalogError::Validation(match hint {
-            Some(hint) => format!("no verified backup — refusing to offload; {hint}"),
-            None => "no verified backup — refusing to offload".into(),
+            Some(hint) => format!("no verified backup; {hint}"),
+            None => "no verified backup".into(),
         })
     })?;
     let local_location_ids = member.locals.iter().map(|c| c.location_id).collect();
@@ -1706,13 +1707,38 @@ pub struct ReplaceOutcome {
 /// by then is still returned for the caller to record — the image at home is the local
 /// version by then, and its new hash must be recorded or the next offload would take the
 /// changed backup for bit rot.
-pub fn replace_backup_with_local(plan: &PhotoReplace) -> Result<ReplaceOutcome> {
+///
+/// `confirmed` is the drift the user was shown and agreed to (#260). A file that would be
+/// replaced and is not named in it — the image, or a companion that changed after the
+/// question was asked — is never touched: the call refuses with nothing at home changed, and
+/// the user decides again on a fresh comparison. A companion not yet at home is only carried.
+pub fn replace_backup_with_local(plan: &PhotoReplace, confirmed: &BackupDrift) -> Result<ReplaceOutcome> {
     if !plan.home_reachable {
         let why = missing_backup_hint(&plan.backup_abs).unwrap_or_else(|| "the backup is not reachable".into());
         return Err(CatalogError::Validation(why));
     }
     let mut out = ReplaceOutcome::default();
     let local_hash = sha256_file(&plan.local)?;
+    let changed_since = |what: &str| {
+        CatalogError::Validation(format!(
+            "{what} changed since the replacement was confirmed; nothing was replaced — check again"
+        ))
+    };
+    let confirmed_companion =
+        |n: &str| confirmed.companions.iter().chain(&confirmed.own_sidecars).any(|c| c == n);
+    // Refuse before the first change: an unconfirmed image or companion is not replaced.
+    if local_hash != plan.expected_hash && confirmed.image.is_none() && sha256_file(&plan.backup_abs)? != local_hash {
+        return Err(changed_since(&name(&plan.local)));
+    }
+    for found in crate::companions::carried_beside(&plan.local) {
+        let home = found.destination(&plan.backup_abs);
+        if home.is_file()
+            && !confirmed_companion(&found.name())
+            && sha256_file(&found.path)? != sha256_file(&home)?
+        {
+            return Err(changed_since(&found.name()));
+        }
+    }
     // Only what the drift check lists (review relA2, LOW-A): the image only when the local one
     // moved on from its recorded hash — an unchanged local image leaves home's alone, unread
     // over the NAS, whatever is there. Then home is read once: already holding the local

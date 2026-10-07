@@ -19,6 +19,14 @@
 //! `cache:progress` events move the status line on the bench only while their job id is the
 //! one followed, and only its own result ends it ("Cache ready", or "Cache failed: …").
 //!
+//! **Legacy sharpness re-measure (#262).** Once a catalog is open (the launch check below),
+//! `app::sharpness` settles every sharpness score still measured on a pre-#245 enlarged
+//! preview — the ones no decode will reach. It is claimed on the UI thread
+//! (`sharpness::claim_sharpness`, one abort lock) and followed like the warm-up: a catalog
+//! switch drops the follow and trips its claim, its `sharpness:progress` moves the status
+//! line only while its job id is the one followed, and only its own result ends it. A
+//! catalog with no legacy score finishes at once, saying nothing.
+//!
 //! **Identity repair.** The pass's events carry its job id; this entity follows exactly one
 //! job. `identity:repair_done` is the required terminal signal. The job id reaches the UI
 //! thread by one channel and the events by another, so a terminal event can arrive before the
@@ -29,7 +37,7 @@
 use super::runner::Runner;
 use crate::model::{AppModel, AppModelEvent};
 use crate::shell::ShellState;
-use chairphoto_core::app::{cache, scans, storage, AppState, CatalogIdentity, CoreEvent, IdentityRepairDone};
+use chairphoto_core::app::{cache, scans, sharpness, storage, AppState, CatalogIdentity, CoreEvent, IdentityRepairDone};
 use chairphoto_core::bundle::importer::BundleImportResult;
 use chairphoto_core::catalog::IdentityRepairSummary;
 use chairphoto_core::scanner::ScanResult;
@@ -60,6 +68,14 @@ pub struct CacheJob {
     epoch: u64,
     /// Whether it warms previews too ("Cache previews on import" when it started).
     pub previews: bool,
+}
+
+/// The legacy sharpness re-measure this entity follows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SharpnessJob {
+    /// The core job id its `sharpness:progress` events carry.
+    pub job: u64,
+    epoch: u64,
 }
 
 /// The identity repair pass as the debt panel shows it.
@@ -109,6 +125,11 @@ pub struct StorageState {
     /// warm-up started by a rescan result that landed between the core's switch and the
     /// event (it reads the new catalog) never runs on unfollowed.
     cache_abort: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    /// The legacy sharpness re-measure followed.
+    pub sharpness: Option<SharpnessJob>,
+    /// Its claim's abort flag, tripped when `catalog:switched` drops the follow (as the
+    /// warm-up's).
+    sharpness_abort: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     /// The epoch of the back-up drain running now: overlapping triggers in one catalog start
     /// no second one (React's `reconciling` ref). A drain from before a catalog switch does
     /// not count — the switch tripped it in the core (`storage::ReconcileClaim`), so the new
@@ -129,11 +150,13 @@ impl StorageState {
         let app = model.read(cx).state().clone();
         let _model_events = cx.subscribe(model, |this, _, event: &AppModelEvent, cx| match event {
             AppModelEvent::Core(event) => this.on_core_event(event, cx),
-            // The catalog is open (startup, or after a switch): back up what waits, once.
+            // The catalog is open (startup, or after a switch): back up what waits, and settle
+            // the legacy sharpness scores, once.
             AppModelEvent::CatalogRead => {
                 if this.launch_checked != Some(this.epoch) {
                     this.launch_checked = Some(this.epoch);
                     this.check_reconcile(cx);
+                    this.start_sharpness_rescore(cx);
                 }
             }
             AppModelEvent::DeepLink(_) => {}
@@ -148,6 +171,8 @@ impl StorageState {
             scan: None,
             cache: None,
             cache_abort: None,
+            sharpness: None,
+            sharpness_abort: None,
             reconciling: None,
             repair: RepairState::default(),
             last_dialog: None,
@@ -206,6 +231,10 @@ impl StorageState {
                 if let Some(abort) = self.cache_abort.take() {
                     abort.store(true, std::sync::atomic::Ordering::Relaxed);
                 }
+                self.sharpness = None;
+                if let Some(abort) = self.sharpness_abort.take() {
+                    abort.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
                 self.repair = RepairState::default();
                 cx.emit(StorageEvent::CatalogSwitched);
                 cx.notify();
@@ -221,6 +250,9 @@ impl StorageState {
                 let line =
                     if p.done < p.total { format!("Caching {}/{}…", p.done, p.total) } else { format!("Cache ready ({})", p.total) };
                 self.status(line, cx);
+            }
+            CoreEvent::SharpnessProgress(p) if self.sharpness.is_some_and(|j| j.job == p.job) && p.done < p.total => {
+                self.status(format!("Re-measuring sharpness {}/{}…", p.done, p.total), cx);
             }
             CoreEvent::IdentityRepairDone(d) => match self.repair.job {
                 Some(job) if self.repair.running && job == d.job => self.end_repair(d.clone(), cx),
@@ -405,6 +437,50 @@ impl StorageState {
                 self.invalidate(cx);
             }
             Err(e) => self.status(format!("Cache failed: {e}"), cx),
+        }
+    }
+
+    /// Settle the legacy sharpness scores of the open catalog (#262) in the background. A
+    /// newer start trips the one before it.
+    pub fn start_sharpness_rescore(&mut self, cx: &mut Context<Self>) {
+        let claim = match sharpness::claim_sharpness(&self.app) {
+            Ok(c) => c,
+            Err(e) => return self.status(format!("Sharpness re-measure failed: {e}"), cx),
+        };
+        let token = SharpnessJob { job: claim.job, epoch: self.epoch };
+        self.sharpness = Some(token);
+        self.sharpness_abort = Some(claim.abort.clone());
+        let state = self.app.clone();
+        let rx = Runner::get(cx).run(move || sharpness::rescore_legacy_claimed(&state, &claim));
+        cx.spawn(async move |this, cx| {
+            let result = rx.await.unwrap_or_else(|_| Err("the sharpness worker stopped".into()));
+            this.update(cx, |s, cx| s.finish_sharpness_rescore(token, result, cx)).ok();
+        })
+        .detach();
+    }
+
+    /// The re-measure's own result: the terminal signal. Silent when there was nothing to
+    /// settle; the grid re-reads when a score changed.
+    fn finish_sharpness_rescore(
+        &mut self,
+        token: SharpnessJob,
+        result: Result<chairphoto_core::sharpness_indexer::IndexOutcome, String>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.sharpness != Some(token) || token.epoch != self.epoch {
+            return; // superseded by a newer start, or by a catalog switch
+        }
+        self.sharpness = None;
+        self.sharpness_abort = None;
+        match result {
+            Ok(o) if o.total == 0 => {}
+            Ok(o) => {
+                self.status(sharpness_line(&o), cx);
+                if o.done > 0 {
+                    self.invalidate(cx);
+                }
+            }
+            Err(e) => self.status(format!("Sharpness re-measure failed: {e}"), cx),
         }
     }
 
@@ -696,6 +772,16 @@ pub fn rescan_line(r: &ScanResult) -> String {
     let mut line = format!("Scanned {}, imported {} ({} new)", r.scanned, r.imported, r.created);
     if r.errors > 0 {
         line += &format!(", {} errors", r.errors);
+    }
+    line
+}
+
+/// The status line after a legacy sharpness re-measure that had something to settle.
+pub fn sharpness_line(o: &chairphoto_core::sharpness_indexer::IndexOutcome) -> String {
+    let mut line = format!("Sharpness re-measured: {} updated, {} kept", o.done, o.kept);
+    let waiting = o.total.saturating_sub(o.done + o.kept);
+    if waiting > 0 {
+        line += &format!(", {waiting} waiting (offline or unreadable)");
     }
     line
 }

@@ -12,6 +12,10 @@ use crate::tests::{colliding_catalog, core_switch, deliver_switch, start, App, T
 // `test_hooks` is `cfg(unix)` in core (#228); gated here too, so a non-Unix test build still
 // compiles — it just falls back to the real cache dir in `catalog_with_files` below, same as
 // before #228 fixed this isolation on the platform that runs these tests today.
+// Accepted, not CI-checked (#265): no job compiles a real non-Unix target. The app links xcb/
+// xkbcommon/Wayland and builds LibRaw from source, so a Windows cross-check was judged not
+// worth adding untried; the README says non-Linux is unexercised.
+// Only the cfg simulation above guards this gating.
 #[cfg(unix)]
 use chairphoto_core::app::slideshow::test_hooks::set_test_frame_root;
 use chairphoto_core::app::slideshow::{FrameWriter, FFMPEG_MISSING, SLIDESHOW_CANCELLED};

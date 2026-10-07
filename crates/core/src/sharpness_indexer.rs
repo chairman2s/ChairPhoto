@@ -41,8 +41,9 @@
 //! `thumbnails::register_analyzer`. The hook receives the freshly decoded image from the
 //! thumbnail/preview/warm-all pipeline and calls [`settle_from_decode`], so scoring rides the
 //! existing decode instead of re-reading the file. [`run_index`] is the batch backfill; since
-//! the Tauri shell's `index_sharpness` command went (#165) nothing in the GPUI app starts it,
-//! so the hook is the only writer that runs today.
+//! the Tauri shell's `index_sharpness` command went (#165) nothing in the GPUI app starts it.
+//! [`run_legacy_rescore`] is the same pass over the legacy scores alone, which the GPUI app
+//! runs once a catalog is open (`app::sharpness`, #262).
 //!
 //! ## Scores from before #245
 //!
@@ -53,7 +54,8 @@
 //! written before the stamp existed, or by an older build, by a path that is not recorded.
 //! Whether it is stale depends on the size of the decode it came from, which the catalog does
 //! not hold (for a RAW it is the embedded preview's size, not the sensor's), so it is decided
-//! the next time that decode is in hand ([`legacy_score_is_stale`]): a decode under 2048 px
+//! when that decode is in hand ([`legacy_score_is_stale`]) — by the hook, or by the legacy
+//! re-measure, which makes the preview itself: a decode under 2048 px
 //! was enlarged then, and the photo is scored again; one of 2048 px or more was only ever
 //! shrunk, and its score is kept and stamped. Either way the old score stays in place until
 //! that moment, so no culling signal goes blank while it waits.
@@ -136,6 +138,57 @@ pub fn run_index<ResolveFn, RegionsFn, PreviewFn, ScoreFn, EmitFn>(
     preview_fn: &PreviewFn,
     score_fn: &ScoreFn,
     abort: &AtomicBool,
+    emit_progress: EmitFn,
+) -> Result<IndexOutcome, String>
+where
+    ResolveFn: Fn(i64) -> Result<Option<std::path::PathBuf>, String>,
+    RegionsFn: Fn(i64) -> RegionInputs,
+    PreviewFn: Fn(&Path) -> Result<Vec<u8>, String> + Sync,
+    ScoreFn: Fn(&[u8], &RegionInputs) -> Option<(f64, &'static str)> + Sync,
+    EmitFn: FnMut(SharpnessProgress),
+{
+    // Collect all unscored and legacy photo ids. This is the implicit queue.
+    let queue = load_queue(conn)?;
+    run_queue(conn, queue, resolve_path_fn, regions_fn, preview_fn, score_fn, abort, emit_progress)
+}
+
+/// The legacy re-measure (#262): [`run_index`] over the legacy scores alone — every photo
+/// whose score carries no [`SHARPNESS_BASIS`] — leaving unscored photos to the decode hook.
+/// Each is settled as [`run_index`] settles it: measured again when its preview is under
+/// 2048 px ([`legacy_score_is_stale`]), else kept and stamped. The old score stays in place
+/// until then, and a photo that is offline or whose preview fails keeps it for a later run.
+/// Same arguments and outcome as [`run_index`]; the GPUI app runs it through
+/// `app::sharpness::rescore_legacy_claimed`.
+pub fn run_legacy_rescore<ResolveFn, RegionsFn, PreviewFn, ScoreFn, EmitFn>(
+    conn: &Connection,
+    resolve_path_fn: ResolveFn,
+    regions_fn: RegionsFn,
+    preview_fn: &PreviewFn,
+    score_fn: &ScoreFn,
+    abort: &AtomicBool,
+    emit_progress: EmitFn,
+) -> Result<IndexOutcome, String>
+where
+    ResolveFn: Fn(i64) -> Result<Option<std::path::PathBuf>, String>,
+    RegionsFn: Fn(i64) -> RegionInputs,
+    PreviewFn: Fn(&Path) -> Result<Vec<u8>, String> + Sync,
+    ScoreFn: Fn(&[u8], &RegionInputs) -> Option<(f64, &'static str)> + Sync,
+    EmitFn: FnMut(SharpnessProgress),
+{
+    let queue = load_legacy_queue(conn)?;
+    run_queue(conn, queue, resolve_path_fn, regions_fn, preview_fn, score_fn, abort, emit_progress)
+}
+
+/// The work of [`run_index`] and [`run_legacy_rescore`] over a queue of `(id, legacy)`.
+#[allow(clippy::too_many_arguments)]
+fn run_queue<ResolveFn, RegionsFn, PreviewFn, ScoreFn, EmitFn>(
+    conn: &Connection,
+    queue: Vec<(i64, bool)>,
+    resolve_path_fn: ResolveFn,
+    regions_fn: RegionsFn,
+    preview_fn: &PreviewFn,
+    score_fn: &ScoreFn,
+    abort: &AtomicBool,
     mut emit_progress: EmitFn,
 ) -> Result<IndexOutcome, String>
 where
@@ -147,8 +200,6 @@ where
 {
     use rayon::prelude::*;
 
-    // Collect all unscored and legacy photo ids. This is the implicit queue.
-    let queue = load_queue(conn)?;
     let total = queue.len();
     let mut outcome = IndexOutcome { total, ..IndexOutcome::default() };
     let mut done = 0usize;
@@ -388,6 +439,23 @@ fn load_queue(conn: &Connection) -> Result<Vec<(i64, bool)>, String> {
         .map_err(|e| e.to_string())?;
     let rows = stmt
         .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, bool>(1)?)))
+        .map_err(|e| e.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())?;
+    Ok(rows)
+}
+
+/// The legacy re-measure's queue: every legacy score (no [`SHARPNESS_BASIS`]), as
+/// `(id, true)`, ordered by `id`.
+fn load_legacy_queue(conn: &Connection) -> Result<Vec<(i64, bool)>, String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT id FROM photos
+              WHERE sharpness IS NOT NULL AND sharpness_basis IS NULL ORDER BY id ASC",
+        )
+        .map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map([], |r| Ok((r.get::<_, i64>(0)?, true)))
         .map_err(|e| e.to_string())?
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| e.to_string())?;
@@ -1017,6 +1085,70 @@ mod tests {
         assert_eq!(get_sharpness(&conn, 2).unwrap().0, 20.0);
         assert_eq!((basis(&conn, 1), basis(&conn, 2)), (None, None));
         assert_eq!(load_queue(&conn).unwrap(), vec![(1, true), (2, true)]);
+    }
+
+    /// `keep_legacy_sharpness` stamps a legacy score and nothing else (#262 N1): an unscored
+    /// row is not stamped (a stamp would claim a measurement that never happened), and a
+    /// stamped row's basis is not rewritten.
+    #[test]
+    fn keeping_a_legacy_score_touches_no_unscored_or_stamped_row() {
+        let conn = mem_conn();
+        for id in 1i64..=3 {
+            insert_photo(&conn, id);
+        }
+        legacy_score(&conn, 1, 5.0);
+        // 2: unscored. 3: stamped with a basis this build never writes, so a rewrite to
+        // `SHARPNESS_BASIS` would show.
+        conn.execute("UPDATE photos SET sharpness = 6.0, sharpness_method = 'tile', sharpness_basis = 99 WHERE id = 3", [])
+            .unwrap();
+        for id in 1i64..=3 {
+            keep_legacy_sharpness(&conn, id).unwrap();
+        }
+        assert_eq!(basis(&conn, 1), Some(SHARPNESS_BASIS), "the legacy score is stamped");
+        assert_eq!(get_sharpness(&conn, 1).unwrap().0, 5.0, "and kept as it was");
+        assert_eq!(basis(&conn, 2), None, "an unscored row is not stamped");
+        assert_eq!(basis(&conn, 3), Some(99), "a stamped row is left as it is");
+    }
+
+    /// The legacy re-measure (#262) settles legacy scores only: an unscored photo is left to
+    /// the decode hook (no preview made for it), and a stamped one is never loaded.
+    #[test]
+    fn run_legacy_rescore_settles_legacy_scores_and_nothing_else() {
+        use std::sync::Mutex;
+        let conn = mem_conn();
+        for id in 1i64..=4 {
+            insert_photo(&conn, id);
+        }
+        legacy_score(&conn, 1, 10.0); // small: measured again
+        legacy_score(&conn, 2, 20.0); // large: kept
+        write_sharpness(&conn, 3, 30.0, METHOD_TILE).unwrap(); // current
+        // 4: unscored.
+        let small = jpeg_of(&GrayImage::new(1200, 800));
+        let large = jpeg_of(&GrayImage::new(2048, 1365));
+        let loaded = Mutex::new(Vec::new());
+        let abort = AtomicBool::new(false);
+        let outcome = run_legacy_rescore(
+            &conn,
+            |id| Ok(Some(std::path::PathBuf::from(format!("/fake/{id}.jpg")))),
+            no_regions,
+            &|path: &Path| {
+                loaded.lock().unwrap().push(path.to_path_buf());
+                Ok(if path.ends_with("2.jpg") { large.clone() } else { small.clone() })
+            },
+            &|_jpeg: &[u8], _r: &RegionInputs| Some((42.0, METHOD_TILE)),
+            &abort,
+            |_| {},
+        )
+        .unwrap();
+        assert_eq!((outcome.total, outcome.done, outcome.kept), (2, 1, 1));
+        let mut loaded = loaded.into_inner().unwrap();
+        loaded.sort();
+        assert_eq!(loaded, [std::path::PathBuf::from("/fake/1.jpg"), std::path::PathBuf::from("/fake/2.jpg")]);
+        assert_eq!(get_sharpness(&conn, 1).unwrap().0, 42.0);
+        assert_eq!(get_sharpness(&conn, 2).unwrap().0, 20.0);
+        assert_eq!(get_sharpness(&conn, 3).unwrap().0, 30.0);
+        assert!(get_sharpness(&conn, 4).is_none(), "an unscored photo is left to the decode hook");
+        assert!(load_legacy_queue(&conn).unwrap().is_empty());
     }
 
     fn insert_at(conn: &Connection, id: i64, path: &str) {

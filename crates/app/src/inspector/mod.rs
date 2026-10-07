@@ -400,6 +400,9 @@ pub struct PhotoInspector {
     /// The photo whose "Replace backup with the local version" is asking for its
     /// confirmation (#257); cleared when the photo or the catalog changes.
     pub replace_confirm: Option<i64>,
+    /// The drift shown with the question (#260): the Replace acts on exactly this, never
+    /// on a fresh comparison. `None` when no comparison was on screen to confirm.
+    replace_drift: Option<chairphoto_core::catalog::BackupDrift>,
     pub editors: Option<Editors>,
     editors_reading: bool,
     /// Bumped by every editors read started; only the newest one's result lands.
@@ -480,6 +483,7 @@ impl PhotoInspector {
             storage_msg: None,
             storage_running: HashSet::new(),
             replace_confirm: None,
+            replace_drift: None,
             drift_wanted: Default::default(),
             editors: None,
             editors_reading: false,
@@ -542,6 +546,7 @@ impl PhotoInspector {
             self.stack_key = photo.map(|p| (p.1, p.2));
             self.storage_msg = None;
             self.replace_confirm = None;
+            self.replace_drift = None;
             self.drift_wanted.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             self.renaming = None;
             self.publish_version = active_version;
@@ -736,6 +741,7 @@ impl PhotoInspector {
                 // photos, so none of them is in flight here.
                 self.storage_running.clear();
                 self.replace_confirm = None;
+                self.replace_drift = None;
                 self.drift_wanted.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 self.data = PhotoData::default();
                 self.editors = None;
@@ -956,11 +962,16 @@ impl PhotoInspector {
     /// [`Self::replace_backup`] is pressed on the question.
     pub fn ask_replace_backup(&mut self, cx: &mut Context<Self>) {
         self.replace_confirm = self.photo_id;
+        self.replace_drift = match &self.data.drift.load {
+            Load::Ready(Some(d)) if d.needs_replace() => Some(d.clone()),
+            _ => None,
+        };
         cx.notify();
     }
 
     pub fn cancel_replace_backup(&mut self, cx: &mut Context<Self>) {
         self.replace_confirm = None;
+        self.replace_drift = None;
         cx.notify();
     }
 
@@ -969,7 +980,13 @@ impl PhotoInspector {
     /// `<name>.chairphoto-prev-<n>`, the local version copied, verified and recorded.
     pub fn replace_backup(&mut self, cx: &mut Context<Self>) {
         let (Some(id), Some(from)) = (self.photo_id, self.from) else { return };
-        if self.replace_confirm.take() != Some(id) || self.storage_running.contains(&id) {
+        let confirmed = self.replace_drift.take();
+        let Some(confirmed) = confirmed.filter(|_| self.replace_confirm.take() == Some(id)) else {
+            self.replace_confirm = None;
+            cx.notify();
+            return;
+        };
+        if self.storage_running.contains(&id) {
             cx.notify();
             return;
         }
@@ -978,7 +995,7 @@ impl PhotoInspector {
         self.storage_action(
             id,
             move |state| {
-                chairphoto_core::app::storage::replace_backup_as(state, from, id, true)
+                chairphoto_core::app::storage::replace_backup_as(state, from, id, Some(&confirmed))
                     .map(|report| chairphoto_model::storage_outcome::replace_message(&report))
             },
             cx,

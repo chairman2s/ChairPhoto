@@ -409,7 +409,7 @@ impl Folder {
             let in_place = rustix::fs::stat(&self.path).is_ok_and(|at_path| same(&at_path, &here));
             let is_file = match rustix::fs::statat(&self.fd, name, rustix::fs::AtFlags::empty()) {
                 Ok(st) => rustix::fs::FileType::from_raw_mode(st.st_mode) == rustix::fs::FileType::RegularFile,
-                Err(rustix::io::Errno::ACCESS) => {
+                Err(rustix::io::Errno::ACCESS) if in_place => {
                     return Err(format!(
                         "cannot check {}: permission denied reading its folder",
                         original.display()
@@ -1829,6 +1829,33 @@ mod tests {
         let err = err.expect("open must refuse a folder we cannot search");
         assert!(err.contains("permission denied"), "{err}");
         assert!(!err.contains("offline or moved"), "{err}");
+    }
+
+    /// #266 (from #221 r8): a folder that is unsearchable *and* was moved away after it was
+    /// opened reports missing — `in_place` is decided before the `EACCES` of the `statat`.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn an_unsearchable_folder_that_moved_away_reports_missing_not_permission_denied() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = crate::test_support::TestTmpDir::new("doc-266-moved-eacces");
+        let locked = dir.join("locked");
+        std::fs::create_dir_all(&locked).unwrap();
+        let p = locked.join("X.ARW");
+        std::fs::write(&p, b"raw").unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::read_dir(&locked).is_ok() {
+            std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+            println!("SKIPPED: an_unsearchable_folder_that_moved_away_reports_missing_not_permission_denied — running with privileges that ignore the mode (root?)");
+            return;
+        }
+        let folder = Folder::open(&p).unwrap();
+        let moved = dir.join("moved");
+        std::fs::rename(&locked, &moved).unwrap();
+        let err = folder.require_original(&p).err();
+        std::fs::set_permissions(&moved, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let err = err.expect("a moved folder is refused");
+        assert!(!err.contains("permission denied"), "{err}");
+        assert_eq!(err, missing_folder(&p));
     }
 
     /// #155 review L1: a FIFO named like a day-old temp neither hangs the commit's sweep (an

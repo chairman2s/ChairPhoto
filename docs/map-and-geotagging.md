@@ -106,7 +106,7 @@ since (#229). A build before #231 drops that record when it saves an answer; suc
 may then be merged again in full: denied wins over an answer here, and a host with no answer
 takes the catalog's (an Allow included, as at its first merge). Once a read finds the copy
 actually empty, `cleared` is set; a *later* read that finds the copy non-empty again is then
-treated as new content — a pre-#231 build writing into it again — and only its Denies are
+treated as new content — a build from before consent moved to machine prefs (4203b66) writing into it again — and only its Denies are
 folded in, never an Allow (#231), and only for hosts this machine has no answer for: new
 content with no known provenance can only block a host that had no answer, never silently
 allow one, and never override an Allow. `cleared` is kept per UUID, not per file, so a file

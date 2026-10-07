@@ -243,6 +243,9 @@ pub fn sweep_tree(root: &Path) -> usize {
     let mut swept = 0;
     let folders = walkdir::WalkDir::new(root)
         .follow_links(false)
+        // One filesystem per root: a hard-mounted NFS folder under it that hangs must not park
+        // the sweep (#266). A mount point is yielded but not entered.
+        .same_file_system(true)
         .into_iter()
         .filter_entry(|e| e.depth() == 0 || !e.file_name().to_str().is_some_and(|n| n.starts_with('.')))
         .flatten()

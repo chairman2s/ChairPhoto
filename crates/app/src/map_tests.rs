@@ -962,7 +962,7 @@ fn a_catalog_whose_clear_was_refused_is_not_merged_again(cx: &mut TestAppContext
 /// **#231**: catalog A's legacy copy Allows `b.example`; it merges and its clear runs,
 /// uninterrupted, and a later read confirms the clear (`cleared_catalogs` turns `true`). Only
 /// then does something write into A's old per-catalog setting again — a file copy sharing the
-/// UUID, or a pre-#231 build using its old consent UI on a host it has not seen — Denying a
+/// UUID, or a build from before consent moved to machine prefs (4203b66) using its old consent UI on a host it has not seen — Denying a
 /// new host `c.example` and (harmlessly) repeating the Allow for `b.example`. The repopulated
 /// Deny merges (blocking a host with no answer); the repopulated Allow never does, so a stale
 /// copy can only block a host, never silently allow one.

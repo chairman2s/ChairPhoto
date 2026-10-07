@@ -569,14 +569,19 @@ pub fn backup_drift_as(
         return Err(DRIFT_SUPERSEDED.into());
     }
     let cat = bound(state, expected)?;
+    // Stamped before any read (#261): a companion saved while the check reads has an mtime at
+    // or after this, so it never looks older than the carry it was adopted as.
+    let at = now_secs();
     let candidates = cat.with(|c| c.plan_replace_candidates(photo_id))?;
     let Some(plan) = crate::catalog::resolve_replace_plan(candidates) else { return Ok(None) };
     match crate::catalog::backup_drift(&plan, stop).map_err(|e| crate::catalog::user_reason(&e))? {
         Some((drift, adopt)) => {
             // Rows from before `carried_hash` heal here as the check confirms them (LOW-B);
             // a failure only means the next check or carry tries again.
+            #[cfg(test)]
+            stack_tests::AFTER_DRIFT.with(|h| h.take().map(|hook| hook()));
             if !adopt.is_empty() {
-                if let Err(e) = cat.with(|c| c.adopt_carried(plan.backup_location_id, &adopt)) {
+                if let Err(e) = cat.with(|c| c.adopt_carried(plan.backup_location_id, &adopt, at)) {
                     eprintln!("storage: could not record the confirmed companions of photo {photo_id}: {e}");
                 }
             }
@@ -594,7 +599,10 @@ pub const DRIFT_SUPERSEDED: &str = "the comparison with the backup was supersede
 /// the image, and any carried companion whoever changed it — is replaced by the local
 /// version, its previous bytes kept beside it as `<name>.chairphoto-prev-<n>`, copied and
 /// verified, and the new hash recorded, so the photo can then be offloaded. Nothing at home
-/// is overwritten or deleted. Refused without `confirm` ([`REPLACE_NEEDS_CONFIRMATION`]).
+/// is overwritten or deleted. Refused without `confirmed` ([`REPLACE_NEEDS_CONFIRMATION`]):
+/// the drift the user was shown and agreed to (#260). Only the files it names are replaced; a
+/// file that differs now and was not listed is refused, nothing changed, so a Replace never
+/// takes more home than the question said.
 ///
 /// The photo alone, not its stack: each frame has its own copy at home to answer for. Claims
 /// the photo for the whole run ([`ClaimKind::Keeps`]: the local files stay), so it never
@@ -605,18 +613,16 @@ pub fn replace_backup_as(
     state: &AppState,
     expected: super::CatalogIdentity,
     photo_id: i64,
-    confirm: bool,
+    confirmed: Option<&crate::catalog::BackupDrift>,
 ) -> Result<ReplaceReport, String> {
-    if !confirm {
-        return Err(REPLACE_NEEDS_CONFIRMATION.into());
-    }
+    let Some(confirmed) = confirmed else { return Err(REPLACE_NEEDS_CONFIRMATION.into()) };
     let cat = bound(state, expected)?;
     let db = cat.with(|c| Ok(c.db_path().to_path_buf()))?;
     let claim = state.storage_claims.claim(&db, photo_id, &[]).ok_or_else(|| IN_PROGRESS.to_string())?;
     let candidates = cat.with(|c| c.plan_replace_candidates(photo_id))?;
     let plan = crate::catalog::resolve_replace_plan(candidates)
         .ok_or_else(|| "no local copy and verified backup to compare".to_string())?;
-    let outcome = crate::catalog::replace_backup_with_local(&plan).map_err(|e| crate::catalog::user_reason(&e))?;
+    let outcome = crate::catalog::replace_backup_with_local(&plan, confirmed).map_err(|e| crate::catalog::user_reason(&e))?;
     // Recorded whatever the companions did: the image at home is the local version by now.
     cat.with(|c| c.record_replaced_backup(photo_id, plan.backup_location_id, &outcome.hash, &outcome.carried))?;
     drop(claim);
@@ -748,6 +754,11 @@ mod stack_tests {
 
     // ── #257: a backup the local version moved on from ────────────────────────────────
 
+    thread_local! {
+        /// Run once by `backup_drift_as` after the comparison, before it records what it adopted.
+        pub(super) static AFTER_DRIFT: std::cell::Cell<Option<Box<dyn FnOnce()>>> = std::cell::Cell::new(None);
+    }
+
     fn drift(state: &AppState, id: i64) -> crate::catalog::BackupDrift {
         backup_drift_as(state, super::super::catalog_identity(state).unwrap(), id, &|| false).unwrap().unwrap()
     }
@@ -784,8 +795,61 @@ mod stack_tests {
         assert_eq!(drift(&state, master).image.as_deref(), Some("DSC1.ARW"), "a changed file is read again");
     }
 
+    /// Replace as the inspector does after the question: `confirm` agrees to the drift as it
+    /// reads now.
     fn replace(state: &AppState, id: i64, confirm: bool) -> Result<ReplaceReport, String> {
-        replace_backup_as(state, super::super::catalog_identity(state).unwrap(), id, confirm)
+        let shown = confirm.then(|| drift(state, id));
+        replace_backup_as(state, super::super::catalog_identity(state).unwrap(), id, shown.as_ref())
+    }
+
+    // ── Replace acts on the drift the user confirmed (#260) ──
+
+    /// The sidecar alone was listed when the user confirmed; the local image changed
+    /// before the Replace ran. The image is not replaced, and nothing at home changes.
+    #[test]
+    fn replace_refuses_an_image_that_changed_after_the_confirmation() {
+        let (dir, state, master, _frame, raw, _jpg) = stacked("260-image");
+        crate::xmp::write_gps(&raw, 59.9, 10.7).unwrap();
+        backup_photo(&state, master).unwrap();
+        let sidecar = crate::xmp::sidecar_path(&raw);
+        let xml = std::fs::read_to_string(&sidecar).unwrap();
+        std::fs::write(&sidecar, xml.replacen("</rdf:Description>", r#"<dt:x xmlns:dt="http://darktable.sf.net/">1</dt:x></rdf:Description>"#, 1)).unwrap();
+        let shown = drift(&state, master);
+        assert_eq!((shown.image.clone(), shown.companions.clone()), (None, vec!["DSC1.ARW.xmp".to_string()]));
+        let home = dir.join("nas/2026/08/DSC1.ARW");
+        let home_sidecar = dir.join("nas/2026/08/DSC1.ARW.xmp");
+        let sidecar_before = std::fs::read(&home_sidecar).unwrap();
+
+        std::fs::write(&raw, b"raw-bytes edited after the question").unwrap();
+        let from = super::super::catalog_identity(&state).unwrap();
+        let err = replace_backup_as(&state, from, master, Some(&shown)).unwrap_err();
+
+        assert!(err.contains("changed since the replacement was confirmed"), "{err}");
+        assert_eq!(std::fs::read(&home).unwrap(), b"raw-bytes", "the image at home is untouched");
+        assert_eq!(std::fs::read(&home_sidecar).unwrap(), sidecar_before, "and so is the sidecar");
+        assert!(!dir.join("nas/2026/08/DSC1.ARW.chairphoto-prev-1").exists());
+        assert!(!dir.join("nas/2026/08/DSC1.ARW.xmp.chairphoto-prev-1").exists());
+    }
+
+    /// The image alone was listed; a sidecar changed since. It is refused too.
+    #[test]
+    fn replace_refuses_a_companion_that_changed_after_the_confirmation() {
+        let (dir, state, master, _frame, raw, _jpg) = stacked("260-companion");
+        crate::xmp::write_gps(&raw, 59.9, 10.7).unwrap();
+        backup_photo(&state, master).unwrap();
+        std::fs::write(&raw, b"raw-bytes rewritten in place").unwrap();
+        let shown = drift(&state, master);
+        assert_eq!((shown.image.as_deref(), shown.companions.is_empty()), (Some("DSC1.ARW"), true));
+        let sidecar = crate::xmp::sidecar_path(&raw);
+        let xml = std::fs::read_to_string(&sidecar).unwrap();
+        std::fs::write(&sidecar, xml.replacen("</rdf:Description>", r#"<dt:x xmlns:dt="http://darktable.sf.net/">1</dt:x></rdf:Description>"#, 1)).unwrap();
+
+        let from = super::super::catalog_identity(&state).unwrap();
+        let err = replace_backup_as(&state, from, master, Some(&shown)).unwrap_err();
+
+        assert!(err.contains("DSC1.ARW.xmp changed since"), "{err}");
+        assert_eq!(std::fs::read(dir.join("nas/2026/08/DSC1.ARW")).unwrap(), b"raw-bytes");
+        assert!(!dir.join("nas/2026/08/DSC1.ARW.chairphoto-prev-1").exists());
     }
 
     /// ChairPhoto's own sidecar rewritten after the backup (an IPTC/GPS write) shows as
@@ -912,6 +976,52 @@ mod stack_tests {
         crate::xmp::write_gps(&raw, 61.0, 6.0).unwrap();
         assert_eq!(drift(&state, master).companions, ["DSC1.ARW.xmp"]);
         assert_eq!(recorded(), None);
+    }
+
+    /// #261 LOW-1: a carry that records the companion's hash between the check's comparison and
+    /// its adoption wins; the guard keeps the adoption from moving that reference.
+    #[test]
+    fn adoption_never_overwrites_a_hash_recorded_meanwhile() {
+        let (_dir, state, master, _frame, raw, _jpg) = stacked("261-adopt-guard");
+        crate::xmp::write_gps(&raw, 59.9, 10.7).unwrap();
+        backup_photo(&state, master).unwrap();
+        with_catalog(&state, |c| Ok(c.conn().execute("UPDATE photo_location_companions SET carried_hash = NULL", [])?)).unwrap();
+        let st = std::sync::Arc::new(state);
+        AFTER_DRIFT.with(|h| {
+            let st = st.clone();
+            h.set(Some(Box::new(move || {
+                with_catalog(&st, |c| {
+                    Ok(c.conn().execute("UPDATE photo_location_companions SET carried_hash = 'recorded-meanwhile'", [])?)
+                })
+                .unwrap();
+            })))
+        });
+
+        assert!(!drift(&st, master).changed());
+
+        let got = with_catalog(&st, |c| {
+            Ok(c.conn().query_row("SELECT carried_hash FROM photo_location_companions WHERE name = 'DSC1.ARW.xmp'", [], |r| r.get::<_, Option<String>>(0))?)
+        })
+        .unwrap();
+        assert_eq!(got.as_deref(), Some("recorded-meanwhile"));
+    }
+
+    /// #261 LOW-2: `carried_at` is the check's start, not the time its reads finished.
+    #[test]
+    fn adoption_stamps_carried_at_at_the_start_of_the_check() {
+        let (_dir, state, master, _frame, raw, _jpg) = stacked("261-adopt-at");
+        crate::xmp::write_gps(&raw, 59.9, 10.7).unwrap();
+        backup_photo(&state, master).unwrap();
+        with_catalog(&state, |c| Ok(c.conn().execute("UPDATE photo_location_companions SET carried_hash = NULL", [])?)).unwrap();
+        AFTER_DRIFT.with(|h| h.set(Some(Box::new(|| std::thread::sleep(std::time::Duration::from_secs(3))))));
+
+        assert!(!drift(&state, master).changed());
+
+        let at = with_catalog(&state, |c| {
+            Ok(c.conn().query_row("SELECT carried_at FROM photo_location_companions WHERE name = 'DSC1.ARW.xmp'", [], |r| r.get::<_, i64>(0))?)
+        })
+        .unwrap();
+        assert!(super::super::now_secs() - at >= 2, "stamped after the reads: {at}");
     }
 
     /// Review relA2, LOW-A: a Replace confirmed for a sidecar alone replaces the sidecar

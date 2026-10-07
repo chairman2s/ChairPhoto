@@ -70,6 +70,9 @@ fn open_catalog(dir: &TempDir, name: &str, n: usize) -> (Catalog, PathBuf, i64) 
 /// Statistics module enabled.
 fn app(dir: &TempDir, n: usize, cx: &mut TestAppContext) -> App {
     let (state, events_rx, ()) = start_core(|_| ());
+    // Storage jobs (the launch reconcile check, the legacy sharpness re-measure) queue on
+    // `Runner::manual`: the core runtime's threads would wake the deterministic scheduler.
+    cx.update(|cx| cx.set_global(crate::storage::Runner::manual()));
     let wired = cx.update(|cx| {
         wire(
             cx,

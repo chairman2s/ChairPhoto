@@ -45,6 +45,10 @@ Read only the documents triggered by the task:
   `docs/storage-and-import.md`.
 - Store identities lowercase; never store a non-UUID or blank `photos.uuid`.
 - Persist the identity in both SQLite and `xmp:Identifier`; never skip the sidecar write.
+  The one exception: a photo whose name leaves no room for a sidecar (`xmp::sidecar_fits`
+  fails, a 212 to 251 byte name from a folder scan or the old import rule) cannot carry
+  `xmp:Identifier`. Its debt reads `name_too_long`, is not retried as a write, and clears only
+  when the file is renamed.
 - Catalog merge matches photos by UUID, not path.
 
 ### Paths and storage

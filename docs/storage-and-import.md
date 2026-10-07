@@ -810,7 +810,7 @@ Two conditions keep the cascade honest:
   without its own verified backup stays local rather than being freed on the strength of
   the master's. Backup likewise skips a frame with no local copy to send.
 - **What was skipped is reported**, with the reason, the way `empty_trash` reports what it
-  refused: *"Freed 4 of 7 — no verified backup — refusing to offload"*.
+  refused: *"Freed 4 of 7 — no verified backup"*.
 
 The sweep inherits one more thing, and it is worth stating plainly: **`offload_age_days`
 selects moments, not photos.** The cutoff picks which photos are candidates, but the cascade

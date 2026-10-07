@@ -27,7 +27,7 @@ use chairphoto_model::editing::VersionEdit;
 use gpui_kit::assets::IconName;
 use gpui_kit::prelude::*;
 use gpui_kit::{
-    div, px, AnyElement, Context, ElementId, Entity, EventEmitter, FocusHandle, ObjectFit, SharedString, Subscription,
+    div, px, AnyElement, Context, ElementId, Entity, EventEmitter, FocusHandle, MouseButton, ObjectFit, SharedString, Subscription,
     TestSupportExt as _, Window,
 };
 use std::rc::Rc;
@@ -379,6 +379,10 @@ impl Render for DuelView {
             .on_action(cx.listener(|this, _: &DuelRight, _, cx| this.pick(1, cx)))
             .on_action(cx.listener(|this, _: &DuelSame, _, cx| this.advance(cx)))
             .on_action(cx.listener(|this, _: &DuelClose, _, cx| this.close(cx)))
+            // Shield: the Darkroom root's catch-all `on_mouse_down` grabs focus for itself on any
+            // left mouse-down it sees; stop it here so a click on the overlay keeps the keys
+            // (same as `#proof-overlay`, #231, #265).
+            .on_mouse_down(MouseButton::Left, cx.listener(|_, _, _, cx| cx.stop_propagation()))
             .child(head)
             .child(panes)
             .test_support()

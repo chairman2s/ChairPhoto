@@ -99,6 +99,11 @@ pub enum SidecarIdentity {
     /// preserve") and the divergence is recorded for a human to resolve — through
     /// [`Catalog::resolve_identity_conflict`] (Adopt / Overwrite / Dismiss, #33).
     Conflict(String),
+    /// The photo's own name is too long for a sidecar beside it: the sidecar plus the writer's
+    /// temp and backup names exceed the filesystem's name limit (`xmp::sidecar_fits`, a 212 to
+    /// 251 byte photo name). No write can ever land, so nothing is attempted; renaming the file
+    /// is the only way out (#264).
+    NameTooLong,
 }
 
 // Distinguishing prefixes of the non-`Bound` `error_text()` outputs below. `error_text()`
@@ -122,6 +127,10 @@ pub enum SidecarIdentity {
 // a differently-cased error string.
 const UNWRITABLE_PREFIX: &str = "sidecar write failed";
 const CONFLICT_PREFIX: &str = "sidecar carries a different identity";
+pub const NAME_TOO_LONG_PREFIX: &str = "name too long for a sidecar";
+/// What a person is told about a photo whose name leaves no room for a sidecar (#264).
+pub const NAME_TOO_LONG_MESSAGE: &str =
+    "name too long for a sidecar; rename the file to write its metadata";
 
 impl SidecarIdentity {
     /// The message stored in `pending_sidecar_identity.error`; empty when bound.
@@ -130,6 +139,7 @@ impl SidecarIdentity {
             SidecarIdentity::Bound => String::new(),
             SidecarIdentity::Unreachable => "queued copy is not reachable".to_string(),
             SidecarIdentity::Unwritable(e) => format!("{UNWRITABLE_PREFIX}: {e}"),
+            SidecarIdentity::NameTooLong => NAME_TOO_LONG_MESSAGE.to_string(),
             SidecarIdentity::Conflict(found) => {
                 format!("{CONFLICT_PREFIX} ({found}); left untouched")
             }
@@ -148,6 +158,8 @@ impl SidecarIdentity {
 fn debt_state_from_error(error: &str) -> &'static str {
     if error.starts_with(CONFLICT_PREFIX) {
         "conflict"
+    } else if error.starts_with(NAME_TOO_LONG_PREFIX) {
+        "name_too_long"
     } else if error.starts_with(UNWRITABLE_PREFIX) {
         "unwritable"
     } else {
@@ -290,6 +302,7 @@ pub fn bind_sidecar_identity(
     match found {
         Some(existing) if carries_identity(existing, uuid) => SidecarIdentity::Bound,
         Some(existing) => SidecarIdentity::Conflict(existing.to_string()),
+        None if !crate::xmp::sidecar_fits(photo_path) => SidecarIdentity::NameTooLong,
         None => match crate::xmp::write_identifier(photo_path, uuid) {
             Ok(()) => SidecarIdentity::Bound,
             Err(e) => SidecarIdentity::Unwritable(e),
@@ -298,6 +311,9 @@ pub fn bind_sidecar_identity(
 }
 
 fn bind_sidecar_import_batch(photo_path: &Path, batch_uuid: &str) -> SidecarIdentity {
+    if !crate::xmp::sidecar_fits(photo_path) {
+        return SidecarIdentity::NameTooLong;
+    }
     match crate::xmp::write_import_batch(photo_path, batch_uuid) {
         Ok(()) => SidecarIdentity::Bound,
         Err(e) => SidecarIdentity::Unwritable(e),
@@ -766,7 +782,7 @@ impl IdentityRepairSummary {
             SidecarIdentity::Bound => self.bound += 1,
             SidecarIdentity::Unreachable => self.unreachable += 1,
             SidecarIdentity::Conflict(_) => self.conflicts += 1,
-            SidecarIdentity::Unwritable(_) => self.failed += 1,
+            SidecarIdentity::Unwritable(_) | SidecarIdentity::NameTooLong => self.failed += 1,
         }
     }
 
@@ -2478,6 +2494,29 @@ mod tests {
         let states: std::collections::HashSet<&str> =
             pending.iter().map(|p| p.state.as_str()).collect();
         assert_eq!(states, std::collections::HashSet::from(["unreachable", "conflict"]));
+    }
+
+    // --- #264: names too long for a sidecar ---
+
+    #[test]
+    fn a_220_byte_name_reads_as_name_too_long_after_repair_and_is_never_written() {
+        let (catalog, root, _dir) = temp_catalog("name-too-long");
+        let name = format!("{}.arw", "n".repeat(216));
+        assert_eq!(name.len(), 220);
+        let (id, path) = seed_photo(&catalog, &root, &name);
+        assert!(!crate::xmp::sidecar_fits(&path));
+        catalog
+            .record_sidecar_identity(id, &path, &SidecarIdentity::Unwritable("ENAMETOOLONG".into()))
+            .unwrap();
+
+        let summary = catalog.repair_pending_identity().unwrap();
+        assert_eq!((summary.bound, summary.failed), (0, 1), "{summary:?}");
+        let pending = catalog.list_pending_identity().unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].state, "name_too_long", "{pending:?}");
+        assert!(queue_row(&catalog, id, &path).unwrap().1.starts_with(NAME_TOO_LONG_PREFIX));
+        let leftovers = std::fs::read_dir(&root).unwrap().count();
+        assert_eq!(leftovers, 1, "only the photo: no sidecar, temp or backup was attempted");
     }
 
     #[test]

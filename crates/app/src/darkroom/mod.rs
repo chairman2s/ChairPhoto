@@ -21,7 +21,7 @@ mod tests;
 
 pub use session::Darkroom;
 pub use stage::{
-    failed_frames, fast_wait, frame_outcome, DarkroomStage, FrameOutcome, FrameStats, FrameTier, StageFailure, StageFrame, FAST_EDGE,
-    FAST_INTERVAL, FULL_EDGE, SETTLE,
+    failed_frames, fast_interval, fast_render_time, fast_wait, frame_outcome, DarkroomStage, FrameOutcome, FrameStats, FrameTier, StageFailure, StageFrame, FAST_EDGE,
+    FAST_INTERVAL_MIN, FULL_EDGE, SETTLE,
 };
 pub use view::DarkroomView;

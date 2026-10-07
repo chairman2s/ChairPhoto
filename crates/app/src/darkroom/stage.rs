@@ -4,7 +4,8 @@
 //! `RenderImage` — no JPEG or PNG anywhere on this path (`media::render_edit_image`).
 //!
 //! The React Darkroom's timing, kept: while the record changes (a slider drag) a **fast**
-//! frame at [`FAST_EDGE`] goes out at most every [`FAST_INTERVAL`] (leading edge); once the
+//! frame at [`FAST_EDGE`] goes out at most every [`fast_interval`] (leading edge): the longer
+//! of [`FAST_INTERVAL_MIN`] and the last fast frame's measured render time (#242); once the
 //! record has been quiet for [`SETTLE`], one **full** frame at [`FULL_EDGE`] follows.
 //!
 //! Every change bumps a generation, and each frame carries the generation it rendered. A
@@ -63,8 +64,9 @@ pub const MAX_SAMPLES: usize = 400;
 pub const FAST_EDGE: u32 = 720;
 /// The settled tier's longest edge (React `PREVIEW_MAX`).
 pub const FULL_EDGE: u32 = 1400;
-/// At most one fast frame per this interval while the record changes.
-pub const FAST_INTERVAL: Duration = Duration::from_millis(90);
+/// The floor of the fast-frame interval while the record changes: one frame of the 29.9 Hz
+/// display. The interval is [`fast_interval`], longer when renders are slower (#242).
+pub const FAST_INTERVAL_MIN: Duration = Duration::from_millis(33);
 /// Quiet time after the last change before the full frame renders.
 pub const SETTLE: Duration = Duration::from_millis(250);
 
@@ -129,12 +131,30 @@ pub enum FrameOutcome {
     Failed,
 }
 
+/// The adaptive fast-frame interval (#242): `max(FAST_INTERVAL_MIN, last fast render time)`.
+/// RAW drag-tier renders measure 1.5-2.6 ms, so the floor governs; a slow render stretches
+/// the interval so the pool is not fed faster than it answers.
+pub fn fast_interval(last_render: Option<Duration>) -> Duration {
+    FAST_INTERVAL_MIN.max(last_render.unwrap_or_default())
+}
+
+/// How long a fast frame took, request to answer, if `sample` is a fast frame that was taken
+/// as the stage's frame; the input of [`fast_interval`]. Shared with `examples/darkroom_bench.rs`.
+pub fn fast_render_time(sample: &FrameSample) -> Option<Duration> {
+    if sample.tier != Tier::Fast || sample.painted.is_none() {
+        return None;
+    }
+    let ms = sample.resolved? - sample.requested;
+    (ms.is_finite() && ms >= 0.0).then(|| Duration::from_secs_f64(ms / 1e3))
+}
+
 /// How long a change waits for its fast frame: nothing on the leading edge, else the rest of
-/// [`FAST_INTERVAL`] since the last fast frame went out. The stage's throttle — shared with
-/// `examples/darkroom_bench.rs`, which plays a drag through it on real wall-clock time.
-pub fn fast_wait(last_fast: Option<Instant>, now: Instant) -> Duration {
+/// [`fast_interval`]`(last_render)` since the last fast frame went out. The stage's throttle —
+/// shared with `examples/darkroom_bench.rs`, which plays a drag through it on real wall-clock
+/// time.
+pub fn fast_wait(last_fast: Option<Instant>, last_render: Option<Duration>, now: Instant) -> Duration {
     match last_fast {
-        Some(at) => FAST_INTERVAL.saturating_sub(now.saturating_duration_since(at)),
+        Some(at) => fast_interval(last_render).saturating_sub(now.saturating_duration_since(at)),
         None => Duration::ZERO,
     }
 }
@@ -189,6 +209,8 @@ pub struct DarkroomStage {
     /// Set when the current generation's render failed; see the module docs.
     failure: Option<StageFailure>,
     last_fast: Option<Instant>,
+    /// How long the last fast frame taken took, request to answer (`fast_render_time`).
+    last_fast_render: Option<Duration>,
     fast_timer: Option<Task<()>>,
     settle_timer: Option<Task<()>>,
     done: UnboundedSender<FrameDone>,
@@ -237,6 +259,7 @@ impl DarkroomStage {
             frame: None,
             failure: None,
             last_fast: None,
+            last_fast_render: None,
             fast_timer: None,
             settle_timer: None,
             done,
@@ -301,6 +324,9 @@ impl DarkroomStage {
             FrameOutcome::Superseded => s.superseded = true,
             FrameOutcome::Failed => {}
         }
+        if let Some(took) = fast_render_time(s) {
+            self.last_fast_render = Some(took);
+        }
         if self.log_timing {
             eprintln!("{}", format_sample(s));
         }
@@ -330,7 +356,7 @@ impl DarkroomStage {
     pub fn edit_changed(&mut self, edit_json: String, cx: &mut Context<Self>) {
         self.edit_json = edit_json;
         self.generation += 1;
-        let wait = fast_wait(self.last_fast, cx.background_executor().now());
+        let wait = fast_wait(self.last_fast, self.last_fast_render, cx.background_executor().now());
         self.fast_timer = Some(self.after(wait, FrameTier::Fast, cx));
         self.settle_timer = Some(self.after(SETTLE, FrameTier::Full, cx));
     }
@@ -463,7 +489,7 @@ impl DarkroomStage {
 /// throttle/settle timers on GPUI's fake clock.
 #[cfg(test)]
 mod tests {
-    use super::{DarkroomStage, FrameTier, FAST_EDGE, FAST_INTERVAL, FULL_EDGE, SETTLE};
+    use super::{DarkroomStage, FrameTier, FAST_EDGE, FAST_INTERVAL_MIN, FULL_EDGE, SETTLE};
     use crate::image_store::Submit;
     use crate::image_tests::{identity, pixels, FakePool};
     use chairphoto_core::image_pool::JobKey;
@@ -554,7 +580,7 @@ mod tests {
         });
     }
 
-    /// While the record keeps changing, fast frames go out at most every FAST_INTERVAL and no
+    /// While the record keeps changing, fast frames go out at most every FAST_INTERVAL_MIN (renders are instant here) and no
     /// full frame; SETTLE after the last change, exactly one full frame of the last record.
     #[gpui_kit::test]
     fn fast_while_dragging_full_after_settle(cx: &mut TestAppContext) {
@@ -566,9 +592,9 @@ mod tests {
             cx.executor().advance_clock(step);
             cx.run_until_parked();
         }
-        // 10 changes over 300 ms: the leading edge at 0, then one per FAST_INTERVAL.
+        // 10 changes over 300 ms: the leading edge at 0, then one per FAST_INTERVAL_MIN.
         let (fast, full) = stage.update(cx, |s, _| (s.stats().fast_requested, s.stats().full_requested));
-        let most = 1 + (step * 10).as_millis() / FAST_INTERVAL.as_millis();
+        let most = 1 + (step * 10).as_millis() / FAST_INTERVAL_MIN.as_millis();
         assert!(fast >= 3 && fast as u128 <= most, "fast frames: {fast} (at most {most})");
         assert_eq!(full, 0, "no full frame while dragging");
 
@@ -588,6 +614,35 @@ mod tests {
             _ => unreachable!(),
         }
         assert!(batches[..batches.len() - 1].iter().all(|b| edge(&b[0]) == FAST_EDGE));
+    }
+
+    /// #242: the throttle follows the last fast frame's render time: after a 60 ms render the
+    /// next fast frame waits 60 ms from the last one, not the 33 ms floor.
+    #[gpui_kit::test]
+    fn a_slow_fast_render_stretches_the_throttle(cx: &mut TestAppContext) {
+        let (pool, stage) = stage(cx);
+        let ms = Duration::from_millis;
+        let fast = |stage: &Entity<DarkroomStage>, cx: &mut TestAppContext| stage.update(cx, |s, _| s.stats().fast_requested);
+        stage.update(cx, |s, cx| s.edit_changed(r#"{"tone":{"ev":0.1}}"#.into(), cx));
+        cx.run_until_parked();
+        assert_eq!(fast(&stage, cx), 1, "the leading edge");
+        cx.executor().advance_clock(ms(60));
+        pool.finish_nth(0, Ok(pixels(4, 4))); // a 60 ms render, taken
+        cx.run_until_parked();
+        // 60 ms since the last fast frame: due at once. Left unanswered.
+        stage.update(cx, |s, cx| s.edit_changed(r#"{"tone":{"ev":0.2}}"#.into(), cx));
+        cx.run_until_parked();
+        assert_eq!(fast(&stage, cx), 2);
+        cx.executor().advance_clock(ms(10));
+        stage.update(cx, |s, cx| s.edit_changed(r#"{"tone":{"ev":0.3}}"#.into(), cx));
+        cx.run_until_parked();
+        // The fixed 33 ms floor would have fired by now (43 ms after the last fast frame).
+        cx.executor().advance_clock(ms(40));
+        cx.run_until_parked();
+        assert_eq!(fast(&stage, cx), 2, "still waiting out the 60 ms render time");
+        cx.executor().advance_clock(ms(10));
+        cx.run_until_parked();
+        assert_eq!(fast(&stage, cx), 3);
     }
 
     /// A newer request cancels the older ones still queued — but not one the pool merged the
@@ -694,9 +749,13 @@ mod tests {
         use super::{fast_wait, frame_outcome, FrameOutcome};
         use chairphoto_core::image_pool::CANCELLED;
         let t = std::time::Instant::now();
-        assert_eq!(fast_wait(None, t), Duration::ZERO);
-        assert_eq!(fast_wait(Some(t), t + Duration::from_millis(30)), FAST_INTERVAL - Duration::from_millis(30));
-        assert_eq!(fast_wait(Some(t), t + FAST_INTERVAL * 2), Duration::ZERO);
+        let ms = Duration::from_millis;
+        assert_eq!(fast_wait(None, None, t), Duration::ZERO);
+        assert_eq!(fast_wait(Some(t), None, t + ms(30)), FAST_INTERVAL_MIN - ms(30));
+        assert_eq!(fast_wait(Some(t), None, t + FAST_INTERVAL_MIN * 2), Duration::ZERO);
+        // A render under the floor leaves the floor; a slower one stretches the interval (#242).
+        assert_eq!(fast_wait(Some(t), Some(ms(2)), t + ms(30)), ms(3));
+        assert_eq!(fast_wait(Some(t), Some(ms(120)), t + ms(30)), ms(90));
 
         let (fast, full) = (FrameTier::Fast, FrameTier::Full);
         assert_eq!(frame_outcome(1, fast, None, None, Ok(())), FrameOutcome::Shown);

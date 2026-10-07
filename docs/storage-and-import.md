@@ -1032,7 +1032,11 @@ Two modes over the same core location model:
   row even when its original is refused. A bundle entry with no original, at a path too long
   for a sidecar, for a photo the catalog does not have, gets no metadata-only row either
   (relB3 LOW-A): no later import could place its original there with its identity beside
-  it. The result counts a refused photo apart ("name too long for a sidecar"), as it does a
+  it. Whether the catalog has the photo is decided inside the merge transaction (#263), so
+  a row removed while the originals unpack is not mistaken for one still there. A file
+  already in the library at such a name that no row holds (copied in by hand, or its row
+  removed) is not "a photo the catalog already has": the import gives it no row, though the
+  bundle carries the same bytes, and counts it as refused. The result counts a refused photo apart ("name too long for a sidecar"), as it does a
   file whose name fits but whose ` (n)` names, needed because the name is taken, do not. On
   a filesystem with neither (some FUSE mounts; current Linux vfat, exFAT and SMB drivers
   accept the no-replace rename) the name is claimed by an exclusive create and the

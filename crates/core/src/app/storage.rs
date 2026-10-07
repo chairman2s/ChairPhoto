@@ -594,7 +594,10 @@ pub const DRIFT_SUPERSEDED: &str = "the comparison with the backup was supersede
 /// the image, and any carried companion whoever changed it — is replaced by the local
 /// version, its previous bytes kept beside it as `<name>.chairphoto-prev-<n>`, copied and
 /// verified, and the new hash recorded, so the photo can then be offloaded. Nothing at home
-/// is overwritten or deleted. Refused without `confirm` ([`REPLACE_NEEDS_CONFIRMATION`]).
+/// is overwritten or deleted. Refused without `confirmed` ([`REPLACE_NEEDS_CONFIRMATION`]):
+/// the drift the user was shown and agreed to (#260). Only the files it names are replaced; a
+/// file that differs now and was not listed is refused, nothing changed, so a Replace never
+/// takes more home than the question said.
 ///
 /// The photo alone, not its stack: each frame has its own copy at home to answer for. Claims
 /// the photo for the whole run ([`ClaimKind::Keeps`]: the local files stay), so it never
@@ -605,18 +608,16 @@ pub fn replace_backup_as(
     state: &AppState,
     expected: super::CatalogIdentity,
     photo_id: i64,
-    confirm: bool,
+    confirmed: Option<&crate::catalog::BackupDrift>,
 ) -> Result<ReplaceReport, String> {
-    if !confirm {
-        return Err(REPLACE_NEEDS_CONFIRMATION.into());
-    }
+    let Some(confirmed) = confirmed else { return Err(REPLACE_NEEDS_CONFIRMATION.into()) };
     let cat = bound(state, expected)?;
     let db = cat.with(|c| Ok(c.db_path().to_path_buf()))?;
     let claim = state.storage_claims.claim(&db, photo_id, &[]).ok_or_else(|| IN_PROGRESS.to_string())?;
     let candidates = cat.with(|c| c.plan_replace_candidates(photo_id))?;
     let plan = crate::catalog::resolve_replace_plan(candidates)
         .ok_or_else(|| "no local copy and verified backup to compare".to_string())?;
-    let outcome = crate::catalog::replace_backup_with_local(&plan).map_err(|e| crate::catalog::user_reason(&e))?;
+    let outcome = crate::catalog::replace_backup_with_local(&plan, confirmed).map_err(|e| crate::catalog::user_reason(&e))?;
     // Recorded whatever the companions did: the image at home is the local version by now.
     cat.with(|c| c.record_replaced_backup(photo_id, plan.backup_location_id, &outcome.hash, &outcome.carried))?;
     drop(claim);
@@ -784,8 +785,61 @@ mod stack_tests {
         assert_eq!(drift(&state, master).image.as_deref(), Some("DSC1.ARW"), "a changed file is read again");
     }
 
+    /// Replace as the inspector does after the question: `confirm` agrees to the drift as it
+    /// reads now.
     fn replace(state: &AppState, id: i64, confirm: bool) -> Result<ReplaceReport, String> {
-        replace_backup_as(state, super::super::catalog_identity(state).unwrap(), id, confirm)
+        let shown = confirm.then(|| drift(state, id));
+        replace_backup_as(state, super::super::catalog_identity(state).unwrap(), id, shown.as_ref())
+    }
+
+    // ── Replace acts on the drift the user confirmed (#260) ──
+
+    /// The sidecar alone was listed when the user confirmed; the local image changed
+    /// before the Replace ran. The image is not replaced, and nothing at home changes.
+    #[test]
+    fn replace_refuses_an_image_that_changed_after_the_confirmation() {
+        let (dir, state, master, _frame, raw, _jpg) = stacked("260-image");
+        crate::xmp::write_gps(&raw, 59.9, 10.7).unwrap();
+        backup_photo(&state, master).unwrap();
+        let sidecar = crate::xmp::sidecar_path(&raw);
+        let xml = std::fs::read_to_string(&sidecar).unwrap();
+        std::fs::write(&sidecar, xml.replacen("</rdf:Description>", r#"<dt:x xmlns:dt="http://darktable.sf.net/">1</dt:x></rdf:Description>"#, 1)).unwrap();
+        let shown = drift(&state, master);
+        assert_eq!((shown.image.clone(), shown.companions.clone()), (None, vec!["DSC1.ARW.xmp".to_string()]));
+        let home = dir.join("nas/2026/08/DSC1.ARW");
+        let home_sidecar = dir.join("nas/2026/08/DSC1.ARW.xmp");
+        let sidecar_before = std::fs::read(&home_sidecar).unwrap();
+
+        std::fs::write(&raw, b"raw-bytes edited after the question").unwrap();
+        let from = super::super::catalog_identity(&state).unwrap();
+        let err = replace_backup_as(&state, from, master, Some(&shown)).unwrap_err();
+
+        assert!(err.contains("changed since the replacement was confirmed"), "{err}");
+        assert_eq!(std::fs::read(&home).unwrap(), b"raw-bytes", "the image at home is untouched");
+        assert_eq!(std::fs::read(&home_sidecar).unwrap(), sidecar_before, "and so is the sidecar");
+        assert!(!dir.join("nas/2026/08/DSC1.ARW.chairphoto-prev-1").exists());
+        assert!(!dir.join("nas/2026/08/DSC1.ARW.xmp.chairphoto-prev-1").exists());
+    }
+
+    /// The image alone was listed; a sidecar changed since. It is refused too.
+    #[test]
+    fn replace_refuses_a_companion_that_changed_after_the_confirmation() {
+        let (dir, state, master, _frame, raw, _jpg) = stacked("260-companion");
+        crate::xmp::write_gps(&raw, 59.9, 10.7).unwrap();
+        backup_photo(&state, master).unwrap();
+        std::fs::write(&raw, b"raw-bytes rewritten in place").unwrap();
+        let shown = drift(&state, master);
+        assert_eq!((shown.image.as_deref(), shown.companions.is_empty()), (Some("DSC1.ARW"), true));
+        let sidecar = crate::xmp::sidecar_path(&raw);
+        let xml = std::fs::read_to_string(&sidecar).unwrap();
+        std::fs::write(&sidecar, xml.replacen("</rdf:Description>", r#"<dt:x xmlns:dt="http://darktable.sf.net/">1</dt:x></rdf:Description>"#, 1)).unwrap();
+
+        let from = super::super::catalog_identity(&state).unwrap();
+        let err = replace_backup_as(&state, from, master, Some(&shown)).unwrap_err();
+
+        assert!(err.contains("DSC1.ARW.xmp changed since"), "{err}");
+        assert_eq!(std::fs::read(dir.join("nas/2026/08/DSC1.ARW")).unwrap(), b"raw-bytes");
+        assert!(!dir.join("nas/2026/08/DSC1.ARW.chairphoto-prev-1").exists());
     }
 
     /// ChairPhoto's own sidecar rewritten after the backup (an IPTC/GPS write) shows as

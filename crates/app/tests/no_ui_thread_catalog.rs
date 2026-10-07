@@ -12,57 +12,102 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-const CALLS: &[&str] = &["with_catalog(", "with_catalog_as(", "with_catalog_identified(", "catalog.lock()"];
+const CALLS: &[&str] = &[
+    "with_catalog(",
+    "with_catalog_as(",
+    "with_catalog_identified(",
+    "with_catalog_from(",
+    "with_catalog_blocking(",
+    "catalog.lock()",
+];
 
 const MARKERS: &[&str] = &[
     "background_executor",
     "Runner::get",
-    ".run(",
-    ".spawn(",
     "spawn_blocking",
     "thread::spawn",
-    "cx.spawn",
 ];
 
-/// (file suffix, trimmed source line prefix, why this is safe).
-const ALLOWED: &[(&str, &str, &str)] = &[
+/// `.run(` / `.spawn(` hand work off only when given a closure or a GPUI context (`self.run(cx,
+/// move |app| ..)`, `Runner::get(cx).run(move || ..)`); a bare `child.spawn()` or `x.run(1)` is
+/// not an executor. `cx.spawn` is deliberately not a marker: it runs on the UI thread.
+const GENERIC_MARKERS: &[&str] = &[".run(", ".spawn("];
+
+fn is_marker(line: &str) -> bool {
+    MARKERS.iter().any(|m| line.contains(m))
+        || (GENERIC_MARKERS.iter().any(|m| line.contains(m))
+            && (line.trim_end().ends_with('(')
+                || ["cx", "move |", "move ||", "|| ", "|_|", "async"].iter().any(|h| line.contains(h))))
+}
+
+/// (file suffix, enclosing fn, trimmed source line prefix, why this is safe).
+const ALLOWED: &[(&str, &str, &str, &str)] = &[
     (
         "darkroom/session/rails.rs",
+        "switch_now",
         "with_catalog_as(state,",
         "the `work` closure of `run_op`, which runs it on `Runner` (rails.rs `Runner::get(cx).run(move || work(&state))`)",
     ),
     (
         "darkroom/session/rails.rs",
+        "toggle_cover",
         "move |state| with_catalog_as(state,",
         "the `work` closure of `run_op`, which runs it on `Runner`",
     ),
     (
         "loupe/cull.rs",
+        "save_cursor",
         "if let Err(e) = with_catalog_as(app,",
         "`save_cursor`, only called inside `background_executor().spawn` (cull.rs, both callers)",
     ),
     (
         "modules/ai_tagging/state.rs",
+        "reload_settings",
         "with_catalog_identified(app,",
         "the `work` closure of `run_off`, which runs it on `Runner`",
     ),
-    ("modules/ai_tagging/state.rs", "with_catalog_as(app,", "the `work` closure of `run_off`, which runs it on `Runner`"),
-    ("modules/ai_tagging/state.rs", "move |app| with_catalog_as(app,", "the `work` closure of `run_off`, which runs it on `Runner`"),
+    ("modules/ai_tagging/state.rs", "save", "with_catalog_as(app,", "the `work` closure of `run_off`, which runs it on `Runner`"),
+    ("modules/ai_tagging/state.rs", "follow_photo", "move |app| with_catalog_as(app,", "the `work` closure of `run_off`, which runs it on `Runner`"),
     (
         "modules/map/state.rs",
+        "read_points",
         "with_catalog_identified(app,",
         "`read_points`, documented as a worker's job and only called from the module's off-thread `run`",
     ),
     (
         "modules/map/state.rs",
+        "migrate_consent",
         "if let Err(e) = with_catalog_as(&app,",
         "the `then` callback of `MachinePrefs::modify_durably`, which runs it on `Runner` off the UI thread",
     ),
     (
         "preferences/mod.rs",
+        "catalog",
         "with_catalog_as(&self.state,",
         "`Scope::catalog`; a `Scope` is only handed to the `work` closures of `Ctx::run*`, which run on `Runner`",
     ),
+    ("modules/ai_tagging/state.rs", "write", "move |app| with_catalog_as(app,", "the `work` closure of `run_off`, which runs it on `Runner`"),
+    (
+        "modules/tag_graph/mod.rs",
+        "catalog_source",
+        "with_catalog(&app,",
+        "the `GraphSource` closure, documented as blocking and run on a background thread",
+    ),
+    (
+        "modules/mod.rs",
+        "get",
+        "with_catalog_as(&self.app,",
+        "`ModuleSettings::get`, blocking by contract; every caller in the app runs it inside `Runner`",
+    ),
+    ("modules/mod.rs", "set", "with_catalog_as(&self.app,", "`ModuleSettings::set`, blocking by contract; every caller runs it inside `Runner`"),
+    ("modules/mod.rs", "set_all", "with_catalog_as(&self.app,", "`ModuleSettings::set_all`, blocking by contract; callers run it inside `Runner`"),
+    ("shell/state.rs", "read_lists", "with_catalog_identified(state,", "`read_lists`, only called inside `background_executor().spawn`"),
+    ("shell/state.rs", "read_counts", "let pending = with_catalog(state,", "`read_counts`, only called inside `background_executor().spawn`"),
+    ("shell/state.rs", "read_counts", "let identity_debt = with_catalog(state,", "`read_counts`, only called inside `background_executor().spawn`"),
+    ("shell/state.rs", "read_counts", "let trash = with_catalog(state,", "`read_counts`, only called inside `background_executor().spawn`"),
+    ("model.rs", "read_summary", "with_catalog_identified(state,", "`read_summary`, only called inside `background_executor().spawn`"),
+    ("model.rs", "resolve_link", "let (from, photo) = with_catalog_identified(state,", "`resolve_link`, only called inside `background_executor().spawn`"),
+    ("model.rs", "resolve_link", "let tags = with_catalog(state,", "`resolve_link`, only called inside `background_executor().spawn`"),
 ];
 
 const LOOK_BACK: usize = 80;
@@ -90,25 +135,98 @@ fn is_comment(line: &str) -> bool {
 }
 
 fn is_fn_header(line: &str) -> bool {
-    let t = line.trim_start();
-    t.starts_with("fn ")
-        || t.starts_with("pub fn ")
-        || t.starts_with("pub(crate) fn ")
-        || t.starts_with("pub(super) fn ")
-        || t.starts_with("async fn ")
-        || t.starts_with("pub async fn ")
+    fn_name(line).is_some()
+}
+
+/// The name in a fn header line, tolerating `pub`, `pub(..)` (incl. `pub(in ..)`), `const`,
+/// `async`, `unsafe` and `extern "C"` in front of `fn`.
+fn fn_name(line: &str) -> Option<&str> {
+    let mut t = line.trim_start();
+    loop {
+        if let Some(r) = t.strip_prefix("pub(") {
+            t = r.split_once(')')?.1.trim_start();
+            continue;
+        }
+        let mut stripped = false;
+        for q in ["pub ", "const ", "async ", "unsafe ", "default "] {
+            if let Some(r) = t.strip_prefix(q) {
+                t = r.trim_start();
+                stripped = true;
+            }
+        }
+        if let Some(r) = t.strip_prefix("extern ") {
+            let r = r.trim_start();
+            t = if r.starts_with('"') { r[1..].split_once('"')?.1.trim_start() } else { r };
+            stripped = true;
+        }
+        if !stripped {
+            break;
+        }
+    }
+    let rest = t.strip_prefix("fn ")?;
+    let end = rest.find(|c: char| !(c.is_alphanumeric() || c == '_'))?;
+    (end > 0).then(|| &rest[..end])
+}
+
+/// Line indices covered by `#[cfg(test)] mod .. { .. }`, brace-matched. A `#[cfg(test)]` on a
+/// field, item or `use` is not a module and hides nothing.
+fn test_module_lines(lines: &[&str]) -> Vec<bool> {
+    let mut skip = vec![false; lines.len()];
+    let mut i = 0;
+    while i < lines.len() {
+        if lines[i].trim() == "#[cfg(test)]" {
+            let mut j = i + 1;
+            while j < lines.len() && (lines[j].trim().is_empty() || lines[j].trim_start().starts_with("#[")) {
+                j += 1;
+            }
+            let head = lines.get(j).map(|l| l.trim_start()).unwrap_or("");
+            let is_mod = head.starts_with("mod ") || head.starts_with("pub mod ") || head.starts_with("pub(crate) mod ");
+            if is_mod && !head.trim_end().ends_with(';') {
+                let mut depth = 0i32;
+                let mut opened = false;
+                let mut k = j;
+                while k < lines.len() {
+                    for c in lines[k].chars() {
+                        match c {
+                            '{' => {
+                                depth += 1;
+                                opened = true;
+                            }
+                            '}' => depth -= 1,
+                            _ => {}
+                        }
+                    }
+                    if opened && depth <= 0 {
+                        break;
+                    }
+                    k += 1;
+                }
+                let last = k.min(lines.len() - 1);
+                for s in skip.iter_mut().take(last + 1).skip(i) {
+                    *s = true;
+                }
+                i = last;
+            }
+        }
+        i += 1;
+    }
+    skip
+}
+
+/// Name of the nearest fn header at or above line `i`.
+fn enclosing_fn<'a>(lines: &[&'a str], i: usize) -> Option<&'a str> {
+    (0..=i).rev().find_map(|j| if is_comment(lines[j]) { None } else { fn_name(lines[j]) })
 }
 
 /// Violations in one file's source: `(line number, line)` for each call with no off-thread
 /// marker between the enclosing `fn` and the call, and no allowance.
 fn violations(file: &str, src: &str) -> Vec<(usize, String)> {
     let lines: Vec<&str> = src.lines().collect();
-    // Inline `#[cfg(test)]` modules sit at the end of the file by convention.
-    let end = lines.iter().position(|l| l.trim() == "#[cfg(test)]").unwrap_or(lines.len());
+    let skip = test_module_lines(&lines);
     let mut found = Vec::new();
-    for i in 0..end {
+    for i in 0..lines.len() {
         let line = lines[i];
-        if is_comment(line) || !CALLS.iter().any(|c| line.contains(c)) {
+        if skip[i] || is_comment(line) || !CALLS.iter().any(|c| line.contains(c)) {
             continue;
         }
         // A `use` or a definition is not a call.
@@ -118,7 +236,7 @@ fn violations(file: &str, src: &str) -> Vec<(usize, String)> {
         let mut safe = false;
         for j in (i.saturating_sub(LOOK_BACK)..=i).rev() {
             let l = lines[j];
-            if !is_comment(l) && MARKERS.iter().any(|m| l.contains(m)) {
+            if !is_comment(l) && is_marker(l) {
                 safe = true;
                 break;
             }
@@ -126,9 +244,12 @@ fn violations(file: &str, src: &str) -> Vec<(usize, String)> {
                 break;
             }
         }
-        let allowed = ALLOWED.iter().any(|(f, p, _)| file.ends_with(f) && line.trim_start().starts_with(p));
+        let encl = enclosing_fn(&lines, i);
+        let allowed = ALLOWED
+            .iter()
+            .any(|(f, func, p, _)| file.ends_with(f) && encl == Some(*func) && line.trim_start().starts_with(p));
         if !safe && !allowed {
-            found.push((i + 1, line.trim().to_string()));
+            found.push((i + 1, format!("[in fn {}] {}", encl.unwrap_or("catalog"), line.trim())));
         }
     }
     found
@@ -172,5 +293,44 @@ fn scanner_flags_a_bare_call_and_passes_a_spawned_one() {
 #[test]
 fn scanner_does_not_borrow_a_previous_functions_marker() {
     let src = "fn a(cx: &App) {\n    Runner::get(cx).run(|| ());\n}\nfn b() {\n    with_catalog_as(&s, f, |c| c.x());\n}\n";
+    assert_eq!(violations("a.rs", src).len(), 1);
+}
+
+#[test]
+fn scanner_scans_code_after_a_cfg_test_field_or_item() {
+    let src = "struct S {\n    #[cfg(test)]\n    probe: u8,\n}\nfn on_click() {\n    with_catalog(&state, |c| c.x());\n}\n";
+    assert_eq!(violations("a.rs", src).len(), 1);
+}
+
+#[test]
+fn scanner_skips_only_the_cfg_test_module() {
+    let src = "fn a() {}\n#[cfg(test)]\nmod tests {\n    fn t() {\n        with_catalog(&s, |c| c.x());\n        if true {\n        }\n    }\n}\nfn b() {\n    with_catalog(&s, |c| c.y());\n}\n";
+    let v = violations("a.rs", src);
+    assert_eq!(v.len(), 1);
+    assert_eq!(v[0].0, 11);
+}
+
+#[test]
+fn scanner_reads_every_fn_qualifier_and_new_calls() {
+    for h in ["unsafe fn f() {", "const fn f() {", "pub(in crate::a) fn f() {", "pub async fn f() {", "pub(crate) unsafe fn f() {"] {
+        assert!(is_fn_header(h), "{h}");
+    }
+    let src = "fn ok() { Runner::get(cx).run(|| ()); }\nunsafe fn b() {\n    with_catalog_from(&s, f, |c| c.x());\n}\n";
+    assert_eq!(violations("a.rs", src).len(), 1);
+    let blocking = "const fn b() {\n    with_catalog_blocking(&s, |c| c.x());\n}\n";
+    assert_eq!(violations("a.rs", blocking).len(), 1);
+}
+
+#[test]
+fn an_allowance_is_tied_to_its_function() {
+    let src = "fn other() {\n    with_catalog_as(&self.state, id, f)\n}\n";
+    assert_eq!(violations("preferences/mod.rs", src).len(), 1);
+    let src = "fn catalog() {\n    with_catalog_as(&self.state, id, f)\n}\n";
+    assert!(violations("preferences/mod.rs", src).is_empty());
+}
+
+#[test]
+fn a_generic_run_or_spawn_is_not_an_off_thread_marker() {
+    let src = "fn f() {\n    child.spawn();\n    let _ = x.run(1);\n    with_catalog(&s, |c| c.x());\n}\n";
     assert_eq!(violations("a.rs", src).len(), 1);
 }

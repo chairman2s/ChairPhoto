@@ -565,6 +565,9 @@ impl Catalog {
             return Ok(None);
         };
         let (outcome, reachable) = match self.resolve_photo_path(photo_id)? {
+            Some(original) if !crate::xmp::sidecar_fits(&original) => {
+                (Err(super::identity::NAME_TOO_LONG_MESSAGE.to_string()), true)
+            }
             Some(original) => (write.run(&original), true),
             None => (Err(format!("no reachable copy of photo {photo_id}")), false),
         };
@@ -633,6 +636,9 @@ impl Catalog {
             return Ok(None);
         };
         let (outcome, reachable) = match retry_busy(abort, || self.resolve_photo_path(photo_id))? {
+            Some(original) if !crate::xmp::sidecar_fits(&original) => {
+                (Err(super::identity::NAME_TOO_LONG_MESSAGE.to_string()), true)
+            }
             Some(original) => (write.run(&original), true),
             None => (Err(format!("no reachable copy of photo {photo_id}")), false),
         };

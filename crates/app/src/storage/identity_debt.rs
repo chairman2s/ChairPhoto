@@ -825,6 +825,7 @@ fn state_label(state: &str) -> &'static str {
     match state {
         "unreachable" => "Unreachable",
         "unwritable" => "Unwritable",
+        "name_too_long" => "Name too long",
         "conflict" => "Conflict",
         "dismissed" => "Dismissed",
         _ => "Unknown",
@@ -834,7 +835,7 @@ fn state_label(state: &str) -> &'static str {
 /// Unreachable and Dismissed read as normal; Unwritable warns; Conflict asks for a decision.
 fn state_color(state: &str, colors: Colors) -> Hsla {
     match state {
-        "unwritable" => colors.danger,
+        "unwritable" | "name_too_long" => colors.danger,
         "conflict" => colors.accent,
         _ => colors.dim,
     }
@@ -863,7 +864,8 @@ impl Render for IdentityDebtPanel {
                  error, whether its volume is offline or the file was moved, renamed, or deleted outside ChairPhoto; a \
                  repair pass picks it up again once the file is reachable at its known location. Unwritable means the \
                  file was found but its sidecar could not be written (read-only storage, a corrupt sidecar, a full \
-                 disk) — see Detail for why. Conflict means the file's sidecar already carries a different identity — \
+                 disk) — see Detail for why. Name too long means the photo's file name leaves no room for a sidecar \
+                 beside it (names of 212 bytes or more); rename the file to write its metadata. Conflict means the file's sidecar already carries a different identity — \
                  the file is left untouched until you decide: Adopt the identity that is in the file (changes the \
                  catalog, never the file), Overwrite the file with the catalog's (destroys the identifier that was \
                  there; the sidecar is backed up first), or Dismiss the copy (changes nothing, stops the retries). \

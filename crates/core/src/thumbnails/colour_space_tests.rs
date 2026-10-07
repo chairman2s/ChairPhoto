@@ -1,5 +1,4 @@
-//! #243: the in-process colour-space read agrees with exiftool, and the `jpeg-encoder` tier
-//! encode matches `image`'s encoder to within lossy-encode noise.
+//! #243: the in-process colour-space read agrees with exiftool.
 
 use super::*;
 use exif::experimental::Writer;
@@ -13,7 +12,7 @@ fn jpeg_with_exif(dir: &Path, name: &str, fields: &[Field]) -> PathBuf {
     }
     let mut tiff = Cursor::new(Vec::new());
     writer.write(&mut tiff, false).unwrap();
-    let plain = encode_jpeg(&DynamicImage::ImageRgb8(RgbImage::from_pixel(16, 16, image::Rgb([90, 120, 200]))), 90).unwrap();
+    let plain = encode_rotated_jpeg(&DynamicImage::ImageRgb8(RgbImage::from_pixel(16, 16, image::Rgb([90, 120, 200])))).unwrap();
     let mut seg = b"Exif\0\0".to_vec();
     seg.extend(tiff.into_inner());
     let mut out = vec![0xFF, 0xD8, 0xFF, 0xE1];
@@ -78,41 +77,4 @@ fn in_process_read_matches_exiftool_on_real_raws() {
     for p in raws {
         assert_eq!(adobe_rgb_in_process(&p), Some(detect_adobe_rgb_exiftool(&p)), "{}", p.display());
     }
-}
-
-// --- JPEG tier encoder -------------------------------------------------------------------
-
-fn psnr(a: &RgbImage, b: &RgbImage) -> f64 {
-    assert_eq!(a.dimensions(), b.dimensions());
-    let se: f64 = a.as_raw().iter().zip(b.as_raw()).map(|(&x, &y)| (x as f64 - y as f64).powi(2)).sum();
-    let mse = se / a.as_raw().len() as f64;
-    if mse == 0.0 { f64::INFINITY } else { 10.0 * (255.0f64 * 255.0 / mse).log10() }
-}
-
-#[test]
-fn tier_encode_matches_image_encoder_quality() {
-    let img = DynamicImage::ImageRgb8(RgbImage::from_fn(640, 427, |x, y| {
-        image::Rgb([(x / 3) as u8, (y / 2) as u8, ((x * y) / 97) as u8])
-    }));
-    for quality in [80u8, 85, 92] {
-        let ours = encode_jpeg(&img, quality).unwrap();
-        let mut theirs = Cursor::new(Vec::new());
-        img.write_with_encoder(JpegEncoder::new_with_quality(&mut theirs, quality)).unwrap();
-        let ours_px = image::load_from_memory(&ours).unwrap().to_rgb8();
-        let theirs_px = image::load_from_memory(&theirs.into_inner()).unwrap().to_rgb8();
-        let (a, b) = (psnr(&img.to_rgb8(), &ours_px), psnr(&img.to_rgb8(), &theirs_px));
-        assert!(a > 30.0 && a > b - 1.5, "q{quality}: ours {a:.1} dB, image's {b:.1} dB");
-    }
-}
-
-#[test]
-fn tier_encode_handles_grey_and_alpha() {
-    let grey = DynamicImage::ImageLuma8(image::GrayImage::from_pixel(9, 7, image::Luma([77])));
-    let g = image::load_from_memory(&encode_jpeg(&grey, 85).unwrap()).unwrap();
-    assert_eq!((g.width(), g.height()), (9, 7));
-    let rgba = DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(9, 7, image::Rgba([10, 200, 30, 5])));
-    let a = image::load_from_memory(&encode_jpeg(&rgba, 85).unwrap()).unwrap().to_rgb8();
-    assert!((a.get_pixel(4, 3)[1] as i32 - 200).abs() < 8);
-    let wide = DynamicImage::ImageRgb8(RgbImage::new(70_000, 1));
-    assert!(encode_jpeg(&wide, 85).is_err(), "beyond JPEG's 65535 px limit is an error, not a wrap");
 }

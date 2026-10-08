@@ -641,7 +641,8 @@ in input order.
 **Port ticket:** Shell chrome
 
 **Status:** built (#105: `crates/app/src/shell/sidebar.rs` `rail_order`, unit-tested),
-awaiting the visual check.
+checked (2026-10-08: the rail draws Library, Develop, then map, people, statistics bars and the
+tag-graph network in that order, gear last; `shots/142327-a.png`).
 
 ### `src/components/shell/useNarrow.ts`
 
@@ -672,7 +673,9 @@ photo's edit is never drawn on another.
 
 **Status:** built (#109: `ShellState::loupe_target`;
 #110: the inspector, inline loupe and pop-out follow it, a version renders only on its own
-photo, `LoupeView::sync_version`), awaiting the visual check.
+photo, `LoupeView::sync_version`), partly checked (2026-10-08: selecting a tile makes the inspector
+header and bench marking follow that photo, `shots/142411-sel.png`; the pop-out and the
+edit-broadcast guard were not checked, and Compare's focused pane was checked 2026-10-03).
 
 ### `src/modules/shellTiming.ts`
 
@@ -722,7 +725,9 @@ Payload types for the Omarchy palette and system theme.
 **Port ticket:** App crate (theme builder)
 
 **Status:** built (#102: `crates/model/src/theme/tokens.rs`;
-consumed by `crates/app/src/theme/mod.rs`, #99), awaiting the visual check.
+consumed by `crates/app/src/theme/mod.rs`, #99), checked (2026-10-08: the Standard and Omarchy palettes
+both paint every surface, rail, grid chrome, dialog and inspector with the 19 tokens;
+`shots/142350-standard.png`, `shots/142401-follow.png`).
 
 ### `src/theme/standard.ts`
 
@@ -735,7 +740,9 @@ consumed by `crates/app/src/theme/mod.rs`, #99), awaiting the visual check.
 **Port ticket:** App crate (theme builder)
 
 **Status:** built (#102: `crates/model/src/theme/standard.rs`;
-#99: applied by `crates/app/src/theme/mod.rs`), awaiting the visual check.
+#99: applied by `crates/app/src/theme/mod.rs`), checked (2026-10-08: Preferences >
+Appearance > ChairPhoto Standard repaints the app in the warm dark amber-accent palette,
+selected pill and rail highlight included; `shots/142350-standard.png`).
 
 ### `src/theme/omarchy.ts`
 
@@ -750,7 +757,9 @@ or black.
 **Port ticket:** Library logic (named in the ticket)
 
 **Status:** built (#102: `crates/model/src/theme/omarchy.rs`, incl. the WCAG contrast guard;
-the app uses it since `b0fea9f`, #99), awaiting the visual check.
+the app uses it since `b0fea9f`, #99), partly checked (2026-10-08: Follow Omarchy paints the
+live tokyo-night-dark palette, a blue-accent dark theme, `shots/142401-follow.png`; the WCAG
+contrast guard's stepping is not visible in one palette and stays awaiting).
 
 ### `src/theme/controller.ts`
 
@@ -769,7 +778,11 @@ ev: `appearance:theme_changed`
 
 **Status:** built (#99, #113: `crates/app/src/theme/mod.rs` `Appearance` global,
 `on_system_theme` routed from `CoreEvent::ThemeChanged` in `events.rs`;
-tracks the system theme only in follow mode), awaiting the visual check.
+tracks the system theme only in follow mode), partly checked (2026-10-08: the Appearance
+buttons switch Follow Omarchy and Standard live, repaint at once and the open dialog follows,
+"Following Omarchy·tokyo-night-dark" caption shown; `shots/142344-appear.png`,
+`shots/142350-standard.png`; a live system theme change was not triggered, since the
+system/Omarchy theme must not be changed, and the pop-out following was not checked).
 Every window shares the theme, so the pop-out follows a mode change (React's did not).
 
 ### `src/theme/prefs.ts`
@@ -785,7 +798,9 @@ The GPUI app needs a per-machine store, because this value is not in the catalog
 **Port ticket:** App crate (with Preferences → Appearance)
 
 **Status:** built (#113: `crates/app/src/machine_prefs.rs` `MachinePrefs`, key
-`appearance.mode`, default follow-omarchy), awaiting the visual check.
+`appearance.mode`, default follow-omarchy), checked (2026-10-08: first launch followed Omarchy; picking Standard
+wrote `"appearance.mode": "standard"` to `machine-prefs.json` and picking Follow Omarchy wrote
+`"follow-omarchy"`; relaunch restore not exercised).
 
 ### `src/theme/apply.ts`
 

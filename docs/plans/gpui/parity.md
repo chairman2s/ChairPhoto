@@ -641,7 +641,8 @@ in input order.
 **Port ticket:** Shell chrome
 
 **Status:** built (#105: `crates/app/src/shell/sidebar.rs` `rail_order`, unit-tested),
-awaiting the visual check.
+checked (2026-10-08: the rail draws Library, Develop, then map, people, statistics bars and the
+tag-graph network in that order, gear last; `shots/142327-a.png`).
 
 ### `src/components/shell/useNarrow.ts`
 
@@ -672,7 +673,9 @@ photo's edit is never drawn on another.
 
 **Status:** built (#109: `ShellState::loupe_target`;
 #110: the inspector, inline loupe and pop-out follow it, a version renders only on its own
-photo, `LoupeView::sync_version`), awaiting the visual check.
+photo, `LoupeView::sync_version`), partly checked (2026-10-08: selecting a tile makes the inspector
+header and bench marking follow that photo, `shots/142411-sel.png`; the pop-out and the
+edit-broadcast guard were not checked, and Compare's focused pane was checked 2026-10-03).
 
 ### `src/modules/shellTiming.ts`
 
@@ -722,7 +725,9 @@ Payload types for the Omarchy palette and system theme.
 **Port ticket:** App crate (theme builder)
 
 **Status:** built (#102: `crates/model/src/theme/tokens.rs`;
-consumed by `crates/app/src/theme/mod.rs`, #99), awaiting the visual check.
+consumed by `crates/app/src/theme/mod.rs`, #99), checked (2026-10-08: the Standard and Omarchy palettes
+both paint every surface, rail, grid chrome, dialog and inspector with the 19 tokens;
+`shots/142350-standard.png`, `shots/142401-follow.png`).
 
 ### `src/theme/standard.ts`
 
@@ -735,7 +740,9 @@ consumed by `crates/app/src/theme/mod.rs`, #99), awaiting the visual check.
 **Port ticket:** App crate (theme builder)
 
 **Status:** built (#102: `crates/model/src/theme/standard.rs`;
-#99: applied by `crates/app/src/theme/mod.rs`), awaiting the visual check.
+#99: applied by `crates/app/src/theme/mod.rs`), checked (2026-10-08: Preferences >
+Appearance > ChairPhoto Standard repaints the app in the warm dark amber-accent palette,
+selected pill and rail highlight included; `shots/142350-standard.png`).
 
 ### `src/theme/omarchy.ts`
 
@@ -750,7 +757,9 @@ or black.
 **Port ticket:** Library logic (named in the ticket)
 
 **Status:** built (#102: `crates/model/src/theme/omarchy.rs`, incl. the WCAG contrast guard;
-the app uses it since `b0fea9f`, #99), awaiting the visual check.
+the app uses it since `b0fea9f`, #99), partly checked (2026-10-08: Follow Omarchy paints the
+live tokyo-night-dark palette, a blue-accent dark theme, `shots/142401-follow.png`; the WCAG
+contrast guard's stepping is not visible in one palette and stays awaiting).
 
 ### `src/theme/controller.ts`
 
@@ -769,7 +778,11 @@ ev: `appearance:theme_changed`
 
 **Status:** built (#99, #113: `crates/app/src/theme/mod.rs` `Appearance` global,
 `on_system_theme` routed from `CoreEvent::ThemeChanged` in `events.rs`;
-tracks the system theme only in follow mode), awaiting the visual check.
+tracks the system theme only in follow mode), partly checked (2026-10-08: the Appearance
+buttons switch Follow Omarchy and Standard live, repaint at once and the open dialog follows,
+"Following Omarchy·tokyo-night-dark" caption shown; `shots/142344-appear.png`,
+`shots/142350-standard.png`; a live system theme change was not triggered, since the
+system/Omarchy theme must not be changed, and the pop-out following was not checked).
 Every window shares the theme, so the pop-out follows a mode change (React's did not).
 
 ### `src/theme/prefs.ts`
@@ -785,7 +798,9 @@ The GPUI app needs a per-machine store, because this value is not in the catalog
 **Port ticket:** App crate (with Preferences → Appearance)
 
 **Status:** built (#113: `crates/app/src/machine_prefs.rs` `MachinePrefs`, key
-`appearance.mode`, default follow-omarchy), awaiting the visual check.
+`appearance.mode`, default follow-omarchy), checked (2026-10-08: first launch followed Omarchy; picking Standard
+wrote `"appearance.mode": "standard"` to `machine-prefs.json` and picking Follow Omarchy wrote
+`"follow-omarchy"`; relaunch restore not exercised).
 
 ### `src/theme/apply.ts`
 
@@ -883,6 +898,10 @@ filmstrip, import-from-card tiles and the trash grid; the Stack dialog had no gr
 (eight photos, no bursts), and the card wall, Map/Slideshow strips, Tag graph and Flickr
 import were not opened. The placeholder and the On NAS / Missing / No preview labels were
 not reached (every original is local).
+Rechecked 2026-10-08 (`wf/visual-check-2`): the grid tiles with star/pick/version badges, the
+rejected tile dimmed with its red ✕ and a rotated tile re-rendering at once with the cover crop
+(shot `143049-rot.png`); the placeholder and the On NAS / Missing / No preview labels still not
+reached (every original is local, and the isolated library has no offline storage).
 
 ### `src/components/StackProposalsDialog.tsx`
 
@@ -913,6 +932,10 @@ thumbnails windowed and released.
 Visually checked 2026-10-03 (`wf/visual-recheck`): only the empty result ("No groups in 8
 photos — nothing here was shot within 15s of a similar frame."); the sample library has no
 bursts, so groups, frames and keeper controls were not seen.
+Rechecked 2026-10-08: the dialog opened from the bench's Stack with one photo selected shows
+"No groups in 1 photo — nothing here was shot within 15s of a similar frame." and Esc closes it
+(`143103-stack.png`, `143111-esc.png`); groups, frames, keeper override and Stack/Skip still
+not seen (no bursts in the sample library).
 
 ### `src/components/TrashDialog.tsx`
 
@@ -985,6 +1008,9 @@ generation and retried on failure.
 wired in #106 via `ShellState` `apply_page`/`apply_statuses`), awaiting the visual check:
 generation-tagged refresh (stale dropped, old rows kept on error), statuses only for the
 visible window plus pinned ids, de-duplicated per generation, failed ids askable again.
+Checked 2026-10-08 only as far as the UI shows it: the Picks filter re-queried to one row with
+the count line following (`142955-picks.png`) and back to all eight; the stale-drop, error and
+status-window rules are not visible in the app, so the row stays awaiting.
 
 ### `src/modules/previewCache.ts`
 
@@ -1006,6 +1032,8 @@ replace the URLs, `invalidate` replaces `?v=bust`, N±k preload windows replace 
 `chairphoto_core::scanner::is_video` replaces `isVideoPath`. dropped (decision: video =
 poster + system player, #97): the loopback video URL — the loupe shows the poster and "▶
 Play in system player" (`loupe/view.rs`).
+Not checked 2026-10-08: the loupe would not open from the grid (Enter sent with `app.sh key`
+and two slow clicks did not open it), so the preview and zoom tiers were not seen.
 
 ## Inspector and tags
 
@@ -1073,6 +1101,20 @@ Visually checked 2026-10-03 (`wf/visual-recheck`): the IPTC and Metadata section
 rows), the Faces block with an indexed face (✕ reject, ⇄ reassign, – ignore) and the header
 following Compare's focused pane; Orientation, Edit in, Storage and the Stack rows were not
 expanded.
+Rechecked 2026-10-08 (`wf/visual-check-2`), details tab: EXIF line, rating (clicking the current
+star clears it, the tile's badge goes; clicking again restores), Pick/Reject/None, colour swatch
+set and Clear, culling signals, Orientation (↻ Right rotates the grid tile at once; ↺ Left
+restores), the Edit in chips (darktable/RawTherapee/ART with Import result, RapidRAW; none was
+launched), Storage ("Back up" shows "Queued (NAS offline)" on a local-only photo), IPTC and
+Metadata, and a section header click collapses it and writes `inspector.section.<id>`
+(`143005-star_clear.png`, `143049-rot.png`, `143130-backup.png`, `143137-coll.png`). Tags tab:
+the nearby-window menu offers ±30s/±1m/±2m/±5m/±10m (`142804-nb.png`). Not seen: the Stack
+section (no stacks in the sample library), RapidRAW's editing note and Cancel, Restore/Offload,
+the tags tab's chips, Paste and autocomplete. Defect: clicking the inspector's tab labels
+(details/tags/versions/publish) does nothing — the tab and `panel.inspectorTab` stayed put over
+seven clicks at several heights while the filter pills, the nearby menu and the section headers
+beside them took clicks; the details tab was reached by writing `panel.inspectorTab` into
+`machine-prefs.json` of the isolated data and restarting. Row stays `built`.
 
 ### `src/components/SignalsPanel.tsx`
 
@@ -1399,6 +1441,10 @@ NAS and Remove from catalog (#158: `RelocatePhoto` / `RetrieveFromNas` /
 Re-check 2026-10-03 (`wf/visual-recheck`): not checkable with the agent's tools: they send
 left clicks and keys only, so there was no wheel, drag or double-click (two clicks 0.6 s apart
 did not register as one).
+Re-check 2026-10-08 (`wf/visual-check-2`): one click on a tile then Enter opens the inline
+loupe (fit render whole and centred, hint line "scroll zoom · drag pan · dbl-click 100%");
+zoom, drag, double-click, Fit N% and the unavailable state still not checkable (`app.sh click`
+pairs land ~0.7 s apart, so a double-click did not register; no wheel or drag).
 
 ### `src/components/PreviewImage.tsx`
 
@@ -1525,6 +1571,9 @@ a Darkroom proof sheet's previewed candidate — hovered or Tab-focused cell, el
 it is, labelled "Proof: <label> — not applied", its 320 px cell render standing in until the
 loupe-size one lands (#250, `ShellState::loupe_proof_preview`, `LoupeView::sync_version`)
 Not checked: needs the owner (window rule).
+Re-check 2026-10-08: More ⋯ > "Open loupe in a new window" opened the window (placed on
+workspace 6), but opening it left workspace 5 active on the EIZO, so `app.sh shot --loupe`
+refused and nothing of it was seen.
 
 ### `src/components/LoupeCardView.tsx`
 
@@ -1642,6 +1691,7 @@ Visually checked 2026-10-03 (`wf/visual-recheck`): on DSC07354 the badge went fr
 preview · preparing full quality" to "RAW · 16-bit · 32.7 MP", the stage swapped to the
 full-quality render and the ToneStrip filled; the rail below Effects (LUT tooltip, lens,
 geometry, user presets) is out of view and could not be scrolled to (no wheel input).
+Visual check 2026-10-08 (`wf/visual-check-2`, shots 151423-dev2, 151533-bw, 151544-exp, 151548-undo, 151606-saved, 151621-saved2, 151635-proof, 151650-duel): on a 50-photo library the bar, version shelf, RAW badge and ToneStrip seen; the first change (B&W Neutral) created "Version 1" with a "Black & white" history step above "Before"; an Exposure click on the slider (+2.45) added a history step and Ctrl+Z moved back to "Black & white"; "☆ Save as preset" opened the inline name field, typing and Save gave the "Saved preset "Mono test"" notice (Enter through `app.sh key` did not reach the focused field, so Enter/Esc in the field are not judged); "▦ Deal a proof sheet" showed the 12-proof sheet and its X closed it; "⚖ Refine by duel" showed round 1 with Exposure/Warmth/Contrast/Shadows chips and Esc left it. No panics or errors in the log. Not exercised: 🖥 Loupe print (opens the pop-out loupe), Develop with the new engine, the error banner, autosave timing, Ctrl+S, Ctrl+Shift+Z/Y. ◩ Clipping toggled to its active look, but no clip layer was visible even at +2.45 exposure with a blown sky (shot 151544-exp): clipping overlay not confirmed. Rail below Effects is still out of reach (no wheel input in `app.sh`).
 
 ### `src/components/darkroom/DevelopSurface.tsx`
 
@@ -1685,6 +1735,7 @@ Seen 2026-10-03: the current frame highlighted and → stepping seen (eight fram
 overflow the strip, so centring was not exercised). Re-check 2026-10-03
 (`wf/visual-recheck`): the same; #134's centring is still not checkable with the eight-photo
 sample library, and the frames cover-crop (#186).
+Re-check 2026-10-08 (`wf/visual-check-2`, 50-photo library, #134): with the open photo at positions 14, 17 and 25 of 50 the highlighted frame sat at the strip's centre (x about 993 of a 207-1780 strip) after each step (shots 151423-dev2, 151441-right3, 151501-right11), so centring works once the strip overflows; ←/→ stepped without wrap issues and the stage, ToneStrip and rail followed. The "<name> (i of N)" label was not visible in these shots.
 
 ### `src/components/darkroom/filmstrip.ts`
 
@@ -1719,6 +1770,7 @@ double-click resets.
 mass, drag ±2 EV at 60 px/EV, delta label, double-click resets.
 Visual check 2026-10-03 (#163): the 8 zones fill by mass and refill per photo; dragging not
 exercised.
+Visual check 2026-10-08: the 8 zones refill after an edit (shots 151533-bw, 151544-exp: +2.45 exposure shifts the mass into highlights/whites, Ctrl+Z restores it). Drag ±2 EV, the delta label and double-click reset were not exercised (`app.sh` has no drag).
 
 ### `src/components/EditControls.tsx`
 
@@ -1782,6 +1834,7 @@ the rail (#180); its tooltip was not seen (the chip sits below the visible rail 
 cannot scroll or hover without clicking). Stage zoom, crop handles and the level line remain
 unexercised for the same reason.
 Difference: React picks a LUT from a dropdown, which has no tooltip.
+Visual check 2026-10-08 (`wf/visual-check-2`): ToneRail (K field, Temperature 6819 K, Tint +2, Exposure to Blacks, Vibrance, Saturation, slider click sets the value), EffectsRail (Color / B&W chips: B&W Neutral applied and showed in the stage; Fade, Vignette, Grain, Grain size; Split toning chip expands Shadow hue/sat and Highlight hue, shot 151711-split; LUT list with Import…) seen working. Not exercised: stage wheel zoom, pan, "Fit NN%", Enter zoom-to-crop (no crop box was up, shot 151702-enterzoom shows no change), Esc to fit, crop box handles, guides, perspective, level line, GeometryRail aspects and Output W × H (the rail below the LUT list cannot be scrolled to, and `app.sh` has no wheel or drag), LUT Import… file picker, "(missing)" LUT.
 
 ### `src/components/darkroom/HistoryPanel.tsx`
 
@@ -2155,6 +2208,12 @@ the visual check: At risk (oldest waiting), Edits not carried home, Unverified, 
 copy anywhere;
 "Show me" on At risk/Stale sets the storage-tier filter and closes Preferences.
 Visually checked 2026-10-03 (#163): the four buckets with counts and Show me.
+Visually checked 2026-10-08 (#163, shots `151830-prefs.png`, `151838-showme.png`): Preferences →
+Storage → Safety shows At risk 50 (oldest waiting 15 days), Edits not carried home 0,
+Unverified 0, Safe 0 with the React captions and the closing note; "Show me" on At risk
+closed Preferences and set an "At risk" filter chip over the grid. "No copy anywhere" is only
+drawn when its count is above 0 (`storage.rs:206`), so it was not seen; Stale Show me not
+exercised.
 
 ### `src/components/ModulesPanel.tsx`
 
@@ -2280,6 +2339,13 @@ Difference: the Resolve buttons stay on one line (no wrap, a 240 px column), as 
 fixed row height assumed.
 Visual check 2026-10-03 (#163): summary, explanation, Start repair pass and the empty state
 seen; no debt in the isolated catalog, so the table and repair job were not exercised.
+Partly checked 2026-10-08 (#163, shots `151854-debt.png`, `151901-dismissed.png`), opened from
+More ⋯ → Identity debt: "0 copies owe their identity to a sidecar", the full explanation,
+Start repair pass (disabled with no debt), the "Show dismissed" toggle (ticks) and "No
+identity debt — every known copy is bound."; still awaiting (needs owed identity fields the
+isolated catalog lacks): the repair job with "Repairing… X of Y" and Cancel, re-attach,
+finished summary, the "(N)" count on Show dismissed, error lines, the table and Resolve
+buttons, paging.
 
 ### `src/components/CatalogSwitcher.tsx`
 
@@ -2348,6 +2414,13 @@ gpui-pre-linux 0.3.7 sets none), so the pick is previewed like a typed path and 
 check of its contents decides: a renamed real bundle (`.chairphoto.zip`, no extension) is
 accepted, anything else refused with the core's reason, worded as "not a ChairPhoto bundle"
 when the name is not `.chairphoto` (#161, review L6: `preview_error`).
+Partly checked 2026-10-08 (#163, shots `151918-bundle.png`, `151951-bad4.png`), opened from
+Import ▾ → Import a .chairphoto bundle…: path input (placeholder), Browse… and Check, the
+note, disabled "Import bundle"; Check on a missing path showed the red refusal "Could not read
+bundle: open bundle: No such file or directory (os error 2)". Still awaiting: Browse… (system
+picker not opened), Enter checks (an `app.sh key ,Return` sent while the input was focused had
+no visible effect, unconfirmed), the preview of a real bundle and "Import N new" (no bundle
+in the agent data).
 
 ### `src/components/BundleExportDialog.tsx`
 
@@ -2548,6 +2621,7 @@ Re-check 2026-10-03 (`wf/visual-recheck`): typing a LAN URL (`http://nas.lan:114
 saved) shows the remote note and the "Send photos to this Ollama server" checkbox; "Suggest
 for 8 selected" shows with a multi-selection. Cancel batch only appears while a grouped run
 is in flight, and no run was started against a provider, so it is not checked.
+Re-check 2026-10-08: Preferences > AI Tagging shows the engine (Local, Ollama), Ollama URL, model with Pick…, existing-only, min confidence, "Advanced — edit prompt" and Save AI settings (shot 152745-ai); the inspector's AI TAGS block shows the engine and model pickers, Suggest tags, Region and the follow-up Ask field (shot 152651-filmstrip). No suggestion run, bulk cloud confirm, ✓/✗ rows, groups or Re-run were seen (no provider), so the row stays awaiting.
 
 ### `src/modules/plugins/basicEditor.tsx`
 
@@ -2575,6 +2649,7 @@ edited-version loupe renders through `LoupeView::sync_version` +
 `basic-editor.*` keys kept;
 awaiting the visual check.
 Difference: Develop is gated at compile time, not by enabling a module.
+Visual check 2026-10-08: Develop opens from the rail and the Darkroom renders and edits a RAW (shots 151423-dev2, 151533-bw). Edited-version loupe renders (`LoupeView::sync_version`) and the `basic-editor.printOnLoupe` setting were not exercised, so the row stays awaiting.
 
 ### `src/modules/plugins/collage.tsx`
 
@@ -2645,6 +2720,7 @@ Feature + strip top/bottom.
 
 **Status:** built (#125: `chairphoto_model::collage`, the 7 templates and canvas gestures,
 MIN_TILE 6 %, zoom 1–6×), awaiting the visual check
+Visual check 2026-10-08: in Make collage with 3 photos, Feature + column (left), Rows and Feature + strip (top) render the expected layouts, and choosing a template turns Lock layout on (shots 152310-t_fl, 152313-t_rows, 152315-t_stripT). Grid/Columns/Feature + column (right)/strip (bottom), drag/resize (MIN_TILE) and wheel zoom were not exercised (no scroll input in app.sh), so the row stays partly checked.
 
 ### `src/modules/plugins/slideshow.tsx`
 
@@ -2711,6 +2787,7 @@ Visual check 2026-10-03 (#163): only the publish target chip "Device (LocalSend)
 the form was not opened, since showing it starts LAN discovery.
 Re-check 2026-10-03 (`wf/visual-recheck`): same; the form was again not opened, because
 showing it sends a discovery pass on the LAN (no network actions in this pass).
+Checked 2026-10-08: the Publish dialog lists "Device (LocalSend)" beside Instagram and Snapchat, and choosing it shows the form (shot 152214-ls); nothing was sent.
 
 ### `src/modules/plugins/SendToDevicePanel.tsx`
 
@@ -2743,6 +2820,7 @@ progress counts only this send's job;
 the device scan runs when the form is first shown (the Publish dialog builds a form when its
 chip is chosen).
 Not checked 2026-10-03 (`wf/visual-recheck`): opening it starts LAN discovery.
+Visual check 2026-10-08 (partly checked): choosing the chip shows version picker, device dropdown with "Scanning…" then "(none found — use manual IP)" and Refresh, manual IP and port 53317, the discovery hint, optional PIN, a disabled "Send photo" with "Scanning the network…" then "No devices found — enter an IP below." (shots 152214-ls, 152225-ls2). No device was on the LAN, so a populated dropdown, "Sending d/t…", the sent toast and "Select a photo" were not seen; nothing was sent.
 
 ### `src/modules/plugins/snapchat.tsx`
 
@@ -2764,6 +2842,7 @@ every selected one).
 Visual check 2026-10-03 (#163): only the publish target chip and "Requires: LocalSend" were
 seen; the form was not opened (LAN discovery).
 Re-check 2026-10-03 (`wf/visual-recheck`): same, for the same reason.
+Checked 2026-10-08: the Snapchat form shows the same device/IP/PIN controls and the 9:16 preflight warning "Snapchat stories are vertical 9:16 (1080×1920) — make a 9:16 crop for best results." for a landscape photo (shot 152229-snap). Recording a publication needs a real send and was not exercised.
 
 ### `src/modules/plugins/obsidian.tsx`
 
@@ -2795,6 +2874,7 @@ Visual check 2026-10-03 (#163): settings (vault, notes folder, Save) and the ins
 Re-check 2026-10-03 (`wf/visual-recheck`): the tag editor's "Obsidian note" section with its
 explanation and Create button seen; the linked state (name, Open note, Forget) needs a
 created note, so Obsidian was not launched and it is not checked.
+Visual check 2026-10-08 (partly checked): the inspector tags tab shows NOTE with "Create note in Obsidian" (shot 152431-tagtab); Preferences > Obsidian shows vault name and notes folder (ChairPhoto), and Save reports "Obsidian settings saved" on the status line (shots 152415-obs, 152422-obs2). Not clicked Create (it opens Obsidian), so the linked state, URIs and tag-editor note were not re-seen and settings validation refusals were not exercised.
 
 ### `src/modules/plugins/publishing.tsx`
 
@@ -2831,6 +2911,7 @@ SmugMug tabs, and `PublishPanel` for both (version, title, description, Flickr's
 their hint, SmugMug's album "(no albums yet)", Refresh, new album + New, and a disabled
 Publish naming the missing keys). The verifier row, "Connected ✓" and the publish steps
 need a sign-in and were not reached.
+Re-check 2026-10-08: the default build lists Flickr and SmugMug as disabled with "backend “flickr”/“smugmug” not included in this build" (shot 152405-mod), so their `OAuthSettings`/`PublishPanel` forms are not reachable here; the Publish dialog offers only Instagram, Device (LocalSend) and Snapchat (shot 152204-dlg). Row stays as is.
 
 ### `src/modules/plugins/flickr.tsx`
 
@@ -2914,6 +2995,7 @@ Visual check 2026-10-03 (#163): the Publish dialog's Instagram form (version, ca
 publish-automatically, Post to Instagram) seen; nothing posted.
 Re-check 2026-10-03 (`wf/visual-recheck`): the same form; the review box ("Did you click
 Share?") needs a post and was not reached.
+Re-check 2026-10-08: the form again shows version, caption, the unchecked "Publish automatically" box with its Chrome/login note, and Post to Instagram (shot 152204-dlg); not posted, so the review box and outcomes were not reached (partly checked).
 
 ### `src/modules/plugins/faces.tsx`
 
@@ -2987,6 +3069,7 @@ it with reject / reassign / ignore. The ⇄ picker opens below the box and is cl
 image's bottom edge (#220). People's clusters, suggestions and Run matching were not seen
 (one face; Run matching sits below the Preferences pane's visible area). The rail icon shows
 (#173).
+Re-check 2026-10-08 (partly checked): People view tabs People (0) / Unnamed clusters (0) / Review suggestions (0) and Refresh with their empty states, the suggestions tab's 80 % threshold slider and disabled "Confirm all ≥80% (0)" (shots 152627-people, 152634-clusters, 152636-sugg); Preferences > Faces shows models ready, inference idle, indexing speed, people root, threshold 0.45 and Save settings (shot 152749-faces-set); the inspector Faces block shows its empty state (shot 152651-filmstrip). Not seen: Index faces / Run matching (the Index section sits below the Preferences pane's visible area and there is no scroll command), the loupe overlay, naming and merge/split, since this catalog has no faces indexed.
 
 ### `src/modules/plugins/map.tsx`
 
@@ -3042,6 +3125,7 @@ location", quiet select, Show in Library, ×) and the settings (tile URL, tile s
 reverse geocoding) seen; no tiles loaded, no geocoding run.
 Since 6b31727 (#181) Apply all skips a fence whose tag is an auto-tag and applies the rest;
 GPUI's status line names the skipped fence, React's toast shows only the count.
+Re-check 2026-10-08 (partly checked), tiles still blocked: 22-photo cluster marker, filmstrip "22 photos at this location" with Show in Library and ×, the quiet select showing the first photo in the inspector (shot 152651-filmstrip); + Draw shows the three-vertex dashed polygon with the drawing hint and status line (shot 152702-draw); clicking the first vertex closes it and opens the "New fence" dialog with name and tag path (shot 152704-closed); Save gives a coloured polygon with vertex handles and a card with Apply, Edit, Delete and Apply all fences (shot 152713-saved); Edit reopens the editor prefilled and Esc cancels (shot 152721-edit); Delete asks "Delete fence … Existing photo tags are kept" and confirming removes it (shots 152724-del, 152731-deleted). Preferences > Map shows tile URL with Save / Reset to default, attribution, tile server tile.openstreetmap.org blocked with Allow / Ask again, and Geocode all with GPS (shot 152800-mapset2). Not run: tiles (host not allowed), vertex drag (no drag command), Apply / Apply all fences, geocoding (network), so the row stays awaiting.
 
 ### `src/modules/plugins/smartTagging.tsx`
 
@@ -3081,6 +3165,7 @@ Visual check 2026-10-03 (#163): settings (model ready, path, Save, Train classif
 index) and the inspector's Index/Suggest seen; no index run.
 Since 6b31727 (#181) neighbour suggestions and classifiers leave out auto-tags, and pending
 auto-tag suggestions are hidden when listed (core filter, so React too).
+Re-check 2026-10-08 (partly checked): Preferences > Smart Tagging shows the model ready with its path, Model path field, privacy note, Save Smart Tagging settings, Train classifiers and Delete index (shot 152751-st-set); the inspector's SIMILAR TAGS block shows Index and Suggest (shot 152651-filmstrip). Index, Suggest, ✓/✗, Cancel/re-attach, Train classifiers and Delete index were not run (they change or depend on the index), so the row stays awaiting.
 
 ### `src/modules/plugins/statistics.tsx`
 
@@ -3187,7 +3272,7 @@ curveBundle + curveBasis), `relativeToBranch`, `parentPath`.
 its 17 tests one to one)
 
 **Status:** built (#121: `chairphoto_model::tag_graph::bundle`, its 17 tests one to one),
-awaiting the visual check
+checked (2026-10-08: with Tags and Cameras on, the Tag graph view lays the nodes on a ring with one coloured arc per community (Technique, Treatment, Places) plus Cameras, labels outside the ring and bundled curved links between a camera and its tags (shot 152820-graph2); selecting Harbour highlights its bundled link to ILCE-7M4 and fades the rest, with Photos / Children / Links, Connected, Top photos and the Filter / Isolate / Open loupe buttons (shot 152827-node); status line "5 nodes · 3 links · 3 communities")
 
 ## Module infrastructure and core API
 
@@ -3229,6 +3314,9 @@ folder/file pickers via `prompt_for_paths` (`modules::dialog::pick_folder` and p
 Browse…);
 opener via `App::open_url` / `reveal_path` / `open_with_system`.
 Difference: file pickers have no extension filter (`.chairphoto`, `.cube`).
+Visual check 2026-10-08: deep links, folder/file pickers and the opener not exercised (native
+dialogs and external apps would take the user's focus; a second launch would have to be kept off
+the real catalog); still awaiting.
 
 ### `src/modules/host.ts`
 
@@ -3269,6 +3357,17 @@ check: slots inspector/sidebar/loupe/tag-editor, actions grouped by module, `loa
 back with a status line, `requires` with cascade and `modules.enabled` in dependency order,
 `backend_feature`, namespaced `ModuleSettings`, publication marker, `on_event`, owned loupe
 card (`show_in_loupe`), `ModuleInfo`.
+Partly checked (2026-10-08, shots 152948-modules, 152956-stats-off, 153004-smug, 153033-modmenu,
+153104-modmenu-off, 153120-publish): Preferences > Modules lists each module's name, description
+and enabled box (`ModuleInfo`); turning Statistics off removes its rail icon and back on restores
+it; enabling SmugMug/Flickr is refused, the box stays off, the row shows "backend "smugmug" not
+included in this build" in red and the status line and log say "Can't enable SmugMug: backend…"
+(`backend_feature`); the ⋯ menu's Modules submenu groups actions by module (Collage > Make
+collage, Slideshow > Make slideshow) and turning Collage off drops its group, back on restores
+it; inspector slots (AI tags, Note, Geocode, Faces, Similar tags, publish tab with the
+instagram/flickr/smugmug markers) draw. Not seen: `load` Err rollback, `requires` cascade (the
+Snapchat/LocalSend rows sit below the fold of the Modules list, which has no keyboard scroll
+here), `modules.enabled` order, namespaced settings, `on_event`, loupe card.
 Toasts are status lines. dropped (decision: #104): external loader, semver, permission
 grants, origin allowlists, `module_fetch`, `onPhotoSelected`, `getEditRecord`, the
 edit-renderer contribution.
@@ -3292,7 +3391,10 @@ description, backendFeature, publicationMarker, requires, hooks).
 **Status:** built (#104/#122: `ModuleMeta`, `Contributions`, `Panel`, `MainView`,
 `ModuleAction` (`ActionKind::Run`/`Modal`), `PublishTarget`, `SettingsPanel` in
 `crates/app/src/modules/mod.rs`;
-DTOs are core types), awaiting the visual check. dropped (decision: #104): permissions,
+DTOs are core types), partly checked (2026-10-08: a modal action opens with a title, body and
+× that closes it, Make collage with one photo selected shows "Select at least 2 photos" (shot
+153041-collage); panels, settings panels and publish targets draw as listed under host.ts;
+fire-and-forget actions not clicked), awaiting the rest of the visual check. dropped (decision: #104): permissions,
 fetch types, DOM mount ABI, semver ranges.
 
 ### `src/modules/ownedEvents.ts`
@@ -3345,7 +3447,11 @@ closed with `window.close_dialog` (`crates/app/src/modules/mod.rs:221`, #122).
 
 **Status:** built (#122 + per-module ports: `crates/app/src/modules/mod.rs` `bundled()`,
 each behind its cargo feature;
-every module starts disabled), awaiting the visual check.
+every module starts disabled), partly checked (2026-10-08: the Modules list order AI Tagging, Tag
+Graph, Statistics, Instagram, Flickr, SmugMug, Collage, Slideshow matches `BUNDLED_MODULES`; the
+agent catalog already had most of them enabled, so "starts disabled" was not seen on a fresh
+catalog; the rows below Slideshow were not scrolled into view), awaiting the rest of the visual
+check.
 Registration follows `BUNDLED_MODULES` (`basic-editor` is gone): `tag_graph` moved from
 after `faces` to right after `ai` (#161, test `bundled_modules_register_in_reacts_order`).
 

@@ -2621,6 +2621,7 @@ Re-check 2026-10-03 (`wf/visual-recheck`): typing a LAN URL (`http://nas.lan:114
 saved) shows the remote note and the "Send photos to this Ollama server" checkbox; "Suggest
 for 8 selected" shows with a multi-selection. Cancel batch only appears while a grouped run
 is in flight, and no run was started against a provider, so it is not checked.
+Re-check 2026-10-08: Preferences > AI Tagging shows the engine (Local, Ollama), Ollama URL, model with Pick…, existing-only, min confidence, "Advanced — edit prompt" and Save AI settings (shot 152745-ai); the inspector's AI TAGS block shows the engine and model pickers, Suggest tags, Region and the follow-up Ask field (shot 152651-filmstrip). No suggestion run, bulk cloud confirm, ✓/✗ rows, groups or Re-run were seen (no provider), so the row stays awaiting.
 
 ### `src/modules/plugins/basicEditor.tsx`
 
@@ -3068,6 +3069,7 @@ it with reject / reassign / ignore. The ⇄ picker opens below the box and is cl
 image's bottom edge (#220). People's clusters, suggestions and Run matching were not seen
 (one face; Run matching sits below the Preferences pane's visible area). The rail icon shows
 (#173).
+Re-check 2026-10-08 (partly checked): People view tabs People (0) / Unnamed clusters (0) / Review suggestions (0) and Refresh with their empty states, the suggestions tab's 80 % threshold slider and disabled "Confirm all ≥80% (0)" (shots 152627-people, 152634-clusters, 152636-sugg); Preferences > Faces shows models ready, inference idle, indexing speed, people root, threshold 0.45 and Save settings (shot 152749-faces-set); the inspector Faces block shows its empty state (shot 152651-filmstrip). Not seen: Index faces / Run matching (the Index section sits below the Preferences pane's visible area and there is no scroll command), the loupe overlay, naming and merge/split, since this catalog has no faces indexed.
 
 ### `src/modules/plugins/map.tsx`
 
@@ -3123,6 +3125,7 @@ location", quiet select, Show in Library, ×) and the settings (tile URL, tile s
 reverse geocoding) seen; no tiles loaded, no geocoding run.
 Since 6b31727 (#181) Apply all skips a fence whose tag is an auto-tag and applies the rest;
 GPUI's status line names the skipped fence, React's toast shows only the count.
+Re-check 2026-10-08 (partly checked), tiles still blocked: 22-photo cluster marker, filmstrip "22 photos at this location" with Show in Library and ×, the quiet select showing the first photo in the inspector (shot 152651-filmstrip); + Draw shows the three-vertex dashed polygon with the drawing hint and status line (shot 152702-draw); clicking the first vertex closes it and opens the "New fence" dialog with name and tag path (shot 152704-closed); Save gives a coloured polygon with vertex handles and a card with Apply, Edit, Delete and Apply all fences (shot 152713-saved); Edit reopens the editor prefilled and Esc cancels (shot 152721-edit); Delete asks "Delete fence … Existing photo tags are kept" and confirming removes it (shots 152724-del, 152731-deleted). Preferences > Map shows tile URL with Save / Reset to default, attribution, tile server tile.openstreetmap.org blocked with Allow / Ask again, and Geocode all with GPS (shot 152800-mapset2). Not run: tiles (host not allowed), vertex drag (no drag command), Apply / Apply all fences, geocoding (network), so the row stays awaiting.
 
 ### `src/modules/plugins/smartTagging.tsx`
 
@@ -3162,6 +3165,7 @@ Visual check 2026-10-03 (#163): settings (model ready, path, Save, Train classif
 index) and the inspector's Index/Suggest seen; no index run.
 Since 6b31727 (#181) neighbour suggestions and classifiers leave out auto-tags, and pending
 auto-tag suggestions are hidden when listed (core filter, so React too).
+Re-check 2026-10-08 (partly checked): Preferences > Smart Tagging shows the model ready with its path, Model path field, privacy note, Save Smart Tagging settings, Train classifiers and Delete index (shot 152751-st-set); the inspector's SIMILAR TAGS block shows Index and Suggest (shot 152651-filmstrip). Index, Suggest, ✓/✗, Cancel/re-attach, Train classifiers and Delete index were not run (they change or depend on the index), so the row stays awaiting.
 
 ### `src/modules/plugins/statistics.tsx`
 
@@ -3268,7 +3272,7 @@ curveBundle + curveBasis), `relativeToBranch`, `parentPath`.
 its 17 tests one to one)
 
 **Status:** built (#121: `chairphoto_model::tag_graph::bundle`, its 17 tests one to one),
-awaiting the visual check
+checked (2026-10-08: with Tags and Cameras on, the Tag graph view lays the nodes on a ring with one coloured arc per community (Technique, Treatment, Places) plus Cameras, labels outside the ring and bundled curved links between a camera and its tags (shot 152820-graph2); selecting Harbour highlights its bundled link to ILCE-7M4 and fades the rest, with Photos / Children / Links, Connected, Top photos and the Filter / Isolate / Open loupe buttons (shot 152827-node); status line "5 nodes · 3 links · 3 communities")
 
 ## Module infrastructure and core API
 

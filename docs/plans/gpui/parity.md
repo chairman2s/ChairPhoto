@@ -2719,6 +2719,7 @@ Feature + strip top/bottom.
 
 **Status:** built (#125: `chairphoto_model::collage`, the 7 templates and canvas gestures,
 MIN_TILE 6 %, zoom 1–6×), awaiting the visual check
+Visual check 2026-10-08: in Make collage with 3 photos, Feature + column (left), Rows and Feature + strip (top) render the expected layouts, and choosing a template turns Lock layout on (shots 152310-t_fl, 152313-t_rows, 152315-t_stripT). Grid/Columns/Feature + column (right)/strip (bottom), drag/resize (MIN_TILE) and wheel zoom were not exercised (no scroll input in app.sh), so the row stays partly checked.
 
 ### `src/modules/plugins/slideshow.tsx`
 
@@ -2785,6 +2786,7 @@ Visual check 2026-10-03 (#163): only the publish target chip "Device (LocalSend)
 the form was not opened, since showing it starts LAN discovery.
 Re-check 2026-10-03 (`wf/visual-recheck`): same; the form was again not opened, because
 showing it sends a discovery pass on the LAN (no network actions in this pass).
+Checked 2026-10-08: the Publish dialog lists "Device (LocalSend)" beside Instagram and Snapchat, and choosing it shows the form (shot 152214-ls); nothing was sent.
 
 ### `src/modules/plugins/SendToDevicePanel.tsx`
 
@@ -2817,6 +2819,7 @@ progress counts only this send's job;
 the device scan runs when the form is first shown (the Publish dialog builds a form when its
 chip is chosen).
 Not checked 2026-10-03 (`wf/visual-recheck`): opening it starts LAN discovery.
+Visual check 2026-10-08 (partly checked): choosing the chip shows version picker, device dropdown with "Scanning…" then "(none found — use manual IP)" and Refresh, manual IP and port 53317, the discovery hint, optional PIN, a disabled "Send photo" with "Scanning the network…" then "No devices found — enter an IP below." (shots 152214-ls, 152225-ls2). No device was on the LAN, so a populated dropdown, "Sending d/t…", the sent toast and "Select a photo" were not seen; nothing was sent.
 
 ### `src/modules/plugins/snapchat.tsx`
 
@@ -2838,6 +2841,7 @@ every selected one).
 Visual check 2026-10-03 (#163): only the publish target chip and "Requires: LocalSend" were
 seen; the form was not opened (LAN discovery).
 Re-check 2026-10-03 (`wf/visual-recheck`): same, for the same reason.
+Checked 2026-10-08: the Snapchat form shows the same device/IP/PIN controls and the 9:16 preflight warning "Snapchat stories are vertical 9:16 (1080×1920) — make a 9:16 crop for best results." for a landscape photo (shot 152229-snap). Recording a publication needs a real send and was not exercised.
 
 ### `src/modules/plugins/obsidian.tsx`
 
@@ -2869,6 +2873,7 @@ Visual check 2026-10-03 (#163): settings (vault, notes folder, Save) and the ins
 Re-check 2026-10-03 (`wf/visual-recheck`): the tag editor's "Obsidian note" section with its
 explanation and Create button seen; the linked state (name, Open note, Forget) needs a
 created note, so Obsidian was not launched and it is not checked.
+Visual check 2026-10-08 (partly checked): the inspector tags tab shows NOTE with "Create note in Obsidian" (shot 152431-tagtab); Preferences > Obsidian shows vault name and notes folder (ChairPhoto), and Save reports "Obsidian settings saved" on the status line (shots 152415-obs, 152422-obs2). Not clicked Create (it opens Obsidian), so the linked state, URIs and tag-editor note were not re-seen and settings validation refusals were not exercised.
 
 ### `src/modules/plugins/publishing.tsx`
 
@@ -2905,6 +2910,7 @@ SmugMug tabs, and `PublishPanel` for both (version, title, description, Flickr's
 their hint, SmugMug's album "(no albums yet)", Refresh, new album + New, and a disabled
 Publish naming the missing keys). The verifier row, "Connected ✓" and the publish steps
 need a sign-in and were not reached.
+Re-check 2026-10-08: the default build lists Flickr and SmugMug as disabled with "backend “flickr”/“smugmug” not included in this build" (shot 152405-mod), so their `OAuthSettings`/`PublishPanel` forms are not reachable here; the Publish dialog offers only Instagram, Device (LocalSend) and Snapchat (shot 152204-dlg). Row stays as is.
 
 ### `src/modules/plugins/flickr.tsx`
 
@@ -2988,6 +2994,7 @@ Visual check 2026-10-03 (#163): the Publish dialog's Instagram form (version, ca
 publish-automatically, Post to Instagram) seen; nothing posted.
 Re-check 2026-10-03 (`wf/visual-recheck`): the same form; the review box ("Did you click
 Share?") needs a post and was not reached.
+Re-check 2026-10-08: the form again shows version, caption, the unchecked "Publish automatically" box with its Chrome/login note, and Post to Instagram (shot 152204-dlg); not posted, so the review box and outcomes were not reached (partly checked).
 
 ### `src/modules/plugins/faces.tsx`
 

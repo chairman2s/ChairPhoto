@@ -898,6 +898,10 @@ filmstrip, import-from-card tiles and the trash grid; the Stack dialog had no gr
 (eight photos, no bursts), and the card wall, Map/Slideshow strips, Tag graph and Flickr
 import were not opened. The placeholder and the On NAS / Missing / No preview labels were
 not reached (every original is local).
+Rechecked 2026-10-08 (`wf/visual-check-2`): the grid tiles with star/pick/version badges, the
+rejected tile dimmed with its red ✕ and a rotated tile re-rendering at once with the cover crop
+(shot `143049-rot.png`); the placeholder and the On NAS / Missing / No preview labels still not
+reached (every original is local, and the isolated library has no offline storage).
 
 ### `src/components/StackProposalsDialog.tsx`
 
@@ -928,6 +932,10 @@ thumbnails windowed and released.
 Visually checked 2026-10-03 (`wf/visual-recheck`): only the empty result ("No groups in 8
 photos — nothing here was shot within 15s of a similar frame."); the sample library has no
 bursts, so groups, frames and keeper controls were not seen.
+Rechecked 2026-10-08: the dialog opened from the bench's Stack with one photo selected shows
+"No groups in 1 photo — nothing here was shot within 15s of a similar frame." and Esc closes it
+(`143103-stack.png`, `143111-esc.png`); groups, frames, keeper override and Stack/Skip still
+not seen (no bursts in the sample library).
 
 ### `src/components/TrashDialog.tsx`
 
@@ -1000,6 +1008,9 @@ generation and retried on failure.
 wired in #106 via `ShellState` `apply_page`/`apply_statuses`), awaiting the visual check:
 generation-tagged refresh (stale dropped, old rows kept on error), statuses only for the
 visible window plus pinned ids, de-duplicated per generation, failed ids askable again.
+Checked 2026-10-08 only as far as the UI shows it: the Picks filter re-queried to one row with
+the count line following (`142955-picks.png`) and back to all eight; the stale-drop, error and
+status-window rules are not visible in the app, so the row stays awaiting.
 
 ### `src/modules/previewCache.ts`
 
@@ -1021,6 +1032,8 @@ replace the URLs, `invalidate` replaces `?v=bust`, N±k preload windows replace 
 `chairphoto_core::scanner::is_video` replaces `isVideoPath`. dropped (decision: video =
 poster + system player, #97): the loopback video URL — the loupe shows the poster and "▶
 Play in system player" (`loupe/view.rs`).
+Not checked 2026-10-08: the loupe would not open from the grid (Enter sent with `app.sh key`
+and two slow clicks did not open it), so the preview and zoom tiers were not seen.
 
 ## Inspector and tags
 
@@ -1088,6 +1101,20 @@ Visually checked 2026-10-03 (`wf/visual-recheck`): the IPTC and Metadata section
 rows), the Faces block with an indexed face (✕ reject, ⇄ reassign, – ignore) and the header
 following Compare's focused pane; Orientation, Edit in, Storage and the Stack rows were not
 expanded.
+Rechecked 2026-10-08 (`wf/visual-check-2`), details tab: EXIF line, rating (clicking the current
+star clears it, the tile's badge goes; clicking again restores), Pick/Reject/None, colour swatch
+set and Clear, culling signals, Orientation (↻ Right rotates the grid tile at once; ↺ Left
+restores), the Edit in chips (darktable/RawTherapee/ART with Import result, RapidRAW; none was
+launched), Storage ("Back up" shows "Queued (NAS offline)" on a local-only photo), IPTC and
+Metadata, and a section header click collapses it and writes `inspector.section.<id>`
+(`143005-star_clear.png`, `143049-rot.png`, `143130-backup.png`, `143137-coll.png`). Tags tab:
+the nearby-window menu offers ±30s/±1m/±2m/±5m/±10m (`142804-nb.png`). Not seen: the Stack
+section (no stacks in the sample library), RapidRAW's editing note and Cancel, Restore/Offload,
+the tags tab's chips, Paste and autocomplete. Defect: clicking the inspector's tab labels
+(details/tags/versions/publish) does nothing — the tab and `panel.inspectorTab` stayed put over
+seven clicks at several heights while the filter pills, the nearby menu and the section headers
+beside them took clicks; the details tab was reached by writing `panel.inspectorTab` into
+`machine-prefs.json` of the isolated data and restarting. Row stays `built`.
 
 ### `src/components/SignalsPanel.tsx`
 

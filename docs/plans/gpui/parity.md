@@ -1691,6 +1691,7 @@ Visually checked 2026-10-03 (`wf/visual-recheck`): on DSC07354 the badge went fr
 preview · preparing full quality" to "RAW · 16-bit · 32.7 MP", the stage swapped to the
 full-quality render and the ToneStrip filled; the rail below Effects (LUT tooltip, lens,
 geometry, user presets) is out of view and could not be scrolled to (no wheel input).
+Visual check 2026-10-08 (`wf/visual-check-2`, shots 151423-dev2, 151533-bw, 151544-exp, 151548-undo, 151606-saved, 151621-saved2, 151635-proof, 151650-duel): on a 50-photo library the bar, version shelf, RAW badge and ToneStrip seen; the first change (B&W Neutral) created "Version 1" with a "Black & white" history step above "Before"; an Exposure click on the slider (+2.45) added a history step and Ctrl+Z moved back to "Black & white"; "☆ Save as preset" opened the inline name field, typing and Save gave the "Saved preset "Mono test"" notice (Enter through `app.sh key` did not reach the focused field, so Enter/Esc in the field are not judged); "▦ Deal a proof sheet" showed the 12-proof sheet and its X closed it; "⚖ Refine by duel" showed round 1 with Exposure/Warmth/Contrast/Shadows chips and Esc left it. No panics or errors in the log. Not exercised: 🖥 Loupe print (opens the pop-out loupe), Develop with the new engine, the error banner, autosave timing, Ctrl+S, Ctrl+Shift+Z/Y. ◩ Clipping toggled to its active look, but no clip layer was visible even at +2.45 exposure with a blown sky (shot 151544-exp): clipping overlay not confirmed. Rail below Effects is still out of reach (no wheel input in `app.sh`).
 
 ### `src/components/darkroom/DevelopSurface.tsx`
 
@@ -1734,6 +1735,7 @@ Seen 2026-10-03: the current frame highlighted and → stepping seen (eight fram
 overflow the strip, so centring was not exercised). Re-check 2026-10-03
 (`wf/visual-recheck`): the same; #134's centring is still not checkable with the eight-photo
 sample library, and the frames cover-crop (#186).
+Re-check 2026-10-08 (`wf/visual-check-2`, 50-photo library, #134): with the open photo at positions 14, 17 and 25 of 50 the highlighted frame sat at the strip's centre (x about 993 of a 207-1780 strip) after each step (shots 151423-dev2, 151441-right3, 151501-right11), so centring works once the strip overflows; ←/→ stepped without wrap issues and the stage, ToneStrip and rail followed. The "<name> (i of N)" label was not visible in these shots.
 
 ### `src/components/darkroom/filmstrip.ts`
 
@@ -1768,6 +1770,7 @@ double-click resets.
 mass, drag ±2 EV at 60 px/EV, delta label, double-click resets.
 Visual check 2026-10-03 (#163): the 8 zones fill by mass and refill per photo; dragging not
 exercised.
+Visual check 2026-10-08: the 8 zones refill after an edit (shots 151533-bw, 151544-exp: +2.45 exposure shifts the mass into highlights/whites, Ctrl+Z restores it). Drag ±2 EV, the delta label and double-click reset were not exercised (`app.sh` has no drag).
 
 ### `src/components/EditControls.tsx`
 
@@ -1831,6 +1834,7 @@ the rail (#180); its tooltip was not seen (the chip sits below the visible rail 
 cannot scroll or hover without clicking). Stage zoom, crop handles and the level line remain
 unexercised for the same reason.
 Difference: React picks a LUT from a dropdown, which has no tooltip.
+Visual check 2026-10-08 (`wf/visual-check-2`): ToneRail (K field, Temperature 6819 K, Tint +2, Exposure to Blacks, Vibrance, Saturation, slider click sets the value), EffectsRail (Color / B&W chips: B&W Neutral applied and showed in the stage; Fade, Vignette, Grain, Grain size; Split toning chip expands Shadow hue/sat and Highlight hue, shot 151711-split; LUT list with Import…) seen working. Not exercised: stage wheel zoom, pan, "Fit NN%", Enter zoom-to-crop (no crop box was up, shot 151702-enterzoom shows no change), Esc to fit, crop box handles, guides, perspective, level line, GeometryRail aspects and Output W × H (the rail below the LUT list cannot be scrolled to, and `app.sh` has no wheel or drag), LUT Import… file picker, "(missing)" LUT.
 
 ### `src/components/darkroom/HistoryPanel.tsx`
 
@@ -2624,6 +2628,7 @@ edited-version loupe renders through `LoupeView::sync_version` +
 `basic-editor.*` keys kept;
 awaiting the visual check.
 Difference: Develop is gated at compile time, not by enabling a module.
+Visual check 2026-10-08: Develop opens from the rail and the Darkroom renders and edits a RAW (shots 151423-dev2, 151533-bw). Edited-version loupe renders (`LoupeView::sync_version`) and the `basic-editor.printOnLoupe` setting were not exercised, so the row stays awaiting.
 
 ### `src/modules/plugins/collage.tsx`
 

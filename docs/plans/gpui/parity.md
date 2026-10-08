@@ -1110,11 +1110,10 @@ Metadata, and a section header click collapses it and writes `inspector.section.
 (`143005-star_clear.png`, `143049-rot.png`, `143130-backup.png`, `143137-coll.png`). Tags tab:
 the nearby-window menu offers ±30s/±1m/±2m/±5m/±10m (`142804-nb.png`). Not seen: the Stack
 section (no stacks in the sample library), RapidRAW's editing note and Cancel, Restore/Offload,
-the tags tab's chips, Paste and autocomplete. Defect: clicking the inspector's tab labels
-(details/tags/versions/publish) does nothing — the tab and `panel.inspectorTab` stayed put over
-seven clicks at several heights while the filter pills, the nearby menu and the section headers
-beside them took clicks; the details tab was reached by writing `panel.inspectorTab` into
-`machine-prefs.json` of the isolated data and restarting. Row stays `built`.
+the tags tab's chips, Paste and autocomplete. That pass reported the tab labels
+ignoring clicks; a re-check the same day by hand (`145642-tabclick.png`) switched to tags with one
+click and saved `panel.inspectorTab: "tags"`, so it was a coordinate-mapping error, not a defect.
+Row stays `built`.
 
 ### `src/components/SignalsPanel.tsx`
 

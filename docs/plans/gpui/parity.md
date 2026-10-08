@@ -1441,6 +1441,10 @@ NAS and Remove from catalog (#158: `RelocatePhoto` / `RetrieveFromNas` /
 Re-check 2026-10-03 (`wf/visual-recheck`): not checkable with the agent's tools: they send
 left clicks and keys only, so there was no wheel, drag or double-click (two clicks 0.6 s apart
 did not register as one).
+Re-check 2026-10-08 (`wf/visual-check-2`): one click on a tile then Enter opens the inline
+loupe (fit render whole and centred, hint line "scroll zoom · drag pan · dbl-click 100%");
+zoom, drag, double-click, Fit N% and the unavailable state still not checkable (`app.sh click`
+pairs land ~0.7 s apart, so a double-click did not register; no wheel or drag).
 
 ### `src/components/PreviewImage.tsx`
 
@@ -1567,6 +1571,9 @@ a Darkroom proof sheet's previewed candidate — hovered or Tab-focused cell, el
 it is, labelled "Proof: <label> — not applied", its 320 px cell render standing in until the
 loupe-size one lands (#250, `ShellState::loupe_proof_preview`, `LoupeView::sync_version`)
 Not checked: needs the owner (window rule).
+Re-check 2026-10-08: More ⋯ > "Open loupe in a new window" opened the window (placed on
+workspace 6), but opening it left workspace 5 active on the EIZO, so `app.sh shot --loupe`
+refused and nothing of it was seen.
 
 ### `src/components/LoupeCardView.tsx`
 

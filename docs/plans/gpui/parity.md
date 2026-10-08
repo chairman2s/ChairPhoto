@@ -3314,6 +3314,9 @@ folder/file pickers via `prompt_for_paths` (`modules::dialog::pick_folder` and p
 Browse…);
 opener via `App::open_url` / `reveal_path` / `open_with_system`.
 Difference: file pickers have no extension filter (`.chairphoto`, `.cube`).
+Visual check 2026-10-08: deep links, folder/file pickers and the opener not exercised (native
+dialogs and external apps would take the user's focus; a second launch would have to be kept off
+the real catalog); still awaiting.
 
 ### `src/modules/host.ts`
 
@@ -3354,6 +3357,17 @@ check: slots inspector/sidebar/loupe/tag-editor, actions grouped by module, `loa
 back with a status line, `requires` with cascade and `modules.enabled` in dependency order,
 `backend_feature`, namespaced `ModuleSettings`, publication marker, `on_event`, owned loupe
 card (`show_in_loupe`), `ModuleInfo`.
+Partly checked (2026-10-08, shots 152948-modules, 152956-stats-off, 153004-smug, 153033-modmenu,
+153104-modmenu-off, 153120-publish): Preferences > Modules lists each module's name, description
+and enabled box (`ModuleInfo`); turning Statistics off removes its rail icon and back on restores
+it; enabling SmugMug/Flickr is refused, the box stays off, the row shows "backend "smugmug" not
+included in this build" in red and the status line and log say "Can't enable SmugMug: backend…"
+(`backend_feature`); the ⋯ menu's Modules submenu groups actions by module (Collage > Make
+collage, Slideshow > Make slideshow) and turning Collage off drops its group, back on restores
+it; inspector slots (AI tags, Note, Geocode, Faces, Similar tags, publish tab with the
+instagram/flickr/smugmug markers) draw. Not seen: `load` Err rollback, `requires` cascade (the
+Snapchat/LocalSend rows sit below the fold of the Modules list, which has no keyboard scroll
+here), `modules.enabled` order, namespaced settings, `on_event`, loupe card.
 Toasts are status lines. dropped (decision: #104): external loader, semver, permission
 grants, origin allowlists, `module_fetch`, `onPhotoSelected`, `getEditRecord`, the
 edit-renderer contribution.
@@ -3377,7 +3391,10 @@ description, backendFeature, publicationMarker, requires, hooks).
 **Status:** built (#104/#122: `ModuleMeta`, `Contributions`, `Panel`, `MainView`,
 `ModuleAction` (`ActionKind::Run`/`Modal`), `PublishTarget`, `SettingsPanel` in
 `crates/app/src/modules/mod.rs`;
-DTOs are core types), awaiting the visual check. dropped (decision: #104): permissions,
+DTOs are core types), partly checked (2026-10-08: a modal action opens with a title, body and
+× that closes it, Make collage with one photo selected shows "Select at least 2 photos" (shot
+153041-collage); panels, settings panels and publish targets draw as listed under host.ts;
+fire-and-forget actions not clicked), awaiting the rest of the visual check. dropped (decision: #104): permissions,
 fetch types, DOM mount ABI, semver ranges.
 
 ### `src/modules/ownedEvents.ts`
@@ -3430,7 +3447,11 @@ closed with `window.close_dialog` (`crates/app/src/modules/mod.rs:221`, #122).
 
 **Status:** built (#122 + per-module ports: `crates/app/src/modules/mod.rs` `bundled()`,
 each behind its cargo feature;
-every module starts disabled), awaiting the visual check.
+every module starts disabled), partly checked (2026-10-08: the Modules list order AI Tagging, Tag
+Graph, Statistics, Instagram, Flickr, SmugMug, Collage, Slideshow matches `BUNDLED_MODULES`; the
+agent catalog already had most of them enabled, so "starts disabled" was not seen on a fresh
+catalog; the rows below Slideshow were not scrolled into view), awaiting the rest of the visual
+check.
 Registration follows `BUNDLED_MODULES` (`basic-editor` is gone): `tag_graph` moved from
 after `faces` to right after `ai` (#161, test `bundled_modules_register_in_reacts_order`).
 

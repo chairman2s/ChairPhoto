@@ -2208,6 +2208,12 @@ the visual check: At risk (oldest waiting), Edits not carried home, Unverified, 
 copy anywhere;
 "Show me" on At risk/Stale sets the storage-tier filter and closes Preferences.
 Visually checked 2026-10-03 (#163): the four buckets with counts and Show me.
+Visually checked 2026-10-08 (#163, shots `151830-prefs.png`, `151838-showme.png`): Preferences →
+Storage → Safety shows At risk 50 (oldest waiting 15 days), Edits not carried home 0,
+Unverified 0, Safe 0 with the React captions and the closing note; "Show me" on At risk
+closed Preferences and set an "At risk" filter chip over the grid. "No copy anywhere" is only
+drawn when its count is above 0 (`storage.rs:206`), so it was not seen; Stale Show me not
+exercised.
 
 ### `src/components/ModulesPanel.tsx`
 
@@ -2333,6 +2339,13 @@ Difference: the Resolve buttons stay on one line (no wrap, a 240 px column), as 
 fixed row height assumed.
 Visual check 2026-10-03 (#163): summary, explanation, Start repair pass and the empty state
 seen; no debt in the isolated catalog, so the table and repair job were not exercised.
+Partly checked 2026-10-08 (#163, shots `151854-debt.png`, `151901-dismissed.png`), opened from
+More ⋯ → Identity debt: "0 copies owe their identity to a sidecar", the full explanation,
+Start repair pass (disabled with no debt), the "Show dismissed" toggle (ticks) and "No
+identity debt — every known copy is bound."; still awaiting (needs owed identity fields the
+isolated catalog lacks): the repair job with "Repairing… X of Y" and Cancel, re-attach,
+finished summary, the "(N)" count on Show dismissed, error lines, the table and Resolve
+buttons, paging.
 
 ### `src/components/CatalogSwitcher.tsx`
 
@@ -2401,6 +2414,13 @@ gpui-pre-linux 0.3.7 sets none), so the pick is previewed like a typed path and 
 check of its contents decides: a renamed real bundle (`.chairphoto.zip`, no extension) is
 accepted, anything else refused with the core's reason, worded as "not a ChairPhoto bundle"
 when the name is not `.chairphoto` (#161, review L6: `preview_error`).
+Partly checked 2026-10-08 (#163, shots `151918-bundle.png`, `151951-bad4.png`), opened from
+Import ▾ → Import a .chairphoto bundle…: path input (placeholder), Browse… and Check, the
+note, disabled "Import bundle"; Check on a missing path showed the red refusal "Could not read
+bundle: open bundle: No such file or directory (os error 2)". Still awaiting: Browse… (system
+picker not opened), Enter checks (an `app.sh key ,Return` sent while the input was focused had
+no visible effect, unconfirmed), the preview of a real bundle and "Import N new" (no bundle
+in the agent data).
 
 ### `src/components/BundleExportDialog.tsx`
 
